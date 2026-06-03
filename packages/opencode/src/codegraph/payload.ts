@@ -10,7 +10,10 @@ import { Schema } from "effect"
 // async `semantics` layer (tags/hues inferred by an agent) change without ever
 // disturbing the structure the developer relies on for comprehension.
 
-export const PAYLOAD_VERSION = 1
+// Bumped to 2 to invalidate caches written by the old recursive (`**/*`)
+// extractor, whose payloads describe a graph the single-layer extractor no
+// longer produces. Without the bump, codegraph.ts would serve the stale cache.
+export const PAYLOAD_VERSION = 2
 
 export const NodeKind = Schema.Literals(["file", "directory"])
 export type NodeKind = typeof NodeKind.Type

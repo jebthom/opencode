@@ -11,6 +11,7 @@ import Notifications from "../feature-plugins/system/notifications"
 import SessionV2Debug from "../feature-plugins/system/session-v2"
 import WhichKey from "../feature-plugins/system/which-key"
 import DiffViewer from "../feature-plugins/system/diff-viewer"
+import CodeGraph from "../feature-plugins/system/codegraph"
 import SessionSwitcher from "../feature-plugins/session"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
@@ -36,6 +37,7 @@ export function internalTuiPlugins(flags: Pick<RuntimeFlags.Info, "experimentalE
     PluginManager,
     WhichKey,
     DiffViewer,
+    CodeGraph,
     ...(flags.experimentalEventSystem ? [SessionV2Debug] : []),
     ...(Flag.OPENCODE_EXPERIMENTAL_SESSION_SWITCHER ? [SessionSwitcher] : []),
   ]

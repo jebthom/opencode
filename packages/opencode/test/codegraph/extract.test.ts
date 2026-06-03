@@ -17,14 +17,19 @@ const writeFiles = Effect.fnUntraced(function* (root: string, files: Record<stri
   }
 })
 
-// A small fixture exercising: nested dirs, a relative TS import (with extension
-// resolution), a package import (must NOT become an edge), and a Python
-// relative import.
+// A small single-layer fixture: top-level source files (with a relative TS
+// import between them and an ignored package import), top-level Python files
+// with a relative import, plus directories that must appear as collapsed nodes
+// without their contents being walked.
 const SAMPLE = {
-  "src/index.ts": `import { a } from "./lib/a"\nimport _ from "lodash"\n`,
-  "src/lib/a.ts": `export const a = 1\n`,
-  "pkg/main.py": `from .util import helper\nimport os\n`,
-  "pkg/util.py": `def helper(): pass\n`,
+  "index.ts": `import { a } from "./a"\nimport _ from "lodash"\n`,
+  "a.ts": `export const a = 1\n`,
+  "main.py": `from .util import helper\nimport os\n`,
+  "util.py": `def helper(): pass\n`,
+  // Nested content lives under directories that should be collapsed; these files
+  // must never appear as nodes nor produce edges at the single-layer depth.
+  "src/deep.ts": `export const deep = 1\n`,
+  "pkg/nested.py": `def nested(): pass\n`,
 }
 
 const nodeByPath = (payload: CodeGraphPayload.Payload, p: string) => payload.nodes.find((n) => n.path === p)
@@ -35,7 +40,7 @@ const edgeBetween = (payload: CodeGraphPayload.Payload, from: string, to: string
 }
 
 describe("CodeGraph.extract", () => {
-  it.live("produces nodes for files and ancestor directories", () =>
+  it.live("produces nodes for top-level files and directories only", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped()
       yield* writeFiles(dir, SAMPLE)
@@ -43,10 +48,22 @@ describe("CodeGraph.extract", () => {
 
       expect(payload.version).toBe(CodeGraphPayload.PAYLOAD_VERSION)
       const paths = payload.nodes.map((n) => n.path).toSorted()
-      expect(paths).toEqual(["pkg", "pkg/main.py", "pkg/util.py", "src", "src/index.ts", "src/lib", "src/lib/a.ts"])
+      // Top-level source files + collapsed top-level directories. Nothing below
+      // the first layer (e.g. src/deep.ts, pkg/nested.py) is enumerated.
+      expect(paths).toEqual(["a.ts", "index.ts", "main.py", "pkg", "src", "util.py"])
 
       expect(nodeByPath(payload, "src")!.kind).toBe("directory")
-      expect(nodeByPath(payload, "src/index.ts")!.kind).toBe("file")
+      expect(nodeByPath(payload, "index.ts")!.kind).toBe("file")
+    }),
+  )
+
+  it.live("does not walk into top-level directories", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      yield* writeFiles(dir, SAMPLE)
+      const payload = yield* CodeGraphExtract.extract(dir)
+
+      expect(payload.nodes.some((n) => n.path.includes("/"))).toBe(false)
     }),
   )
 
@@ -56,7 +73,7 @@ describe("CodeGraph.extract", () => {
       yield* writeFiles(dir, SAMPLE)
       const payload = yield* CodeGraphExtract.extract(dir)
 
-      expect(edgeBetween(payload, "src/index.ts", "src/lib/a.ts")).toBeDefined()
+      expect(edgeBetween(payload, "index.ts", "a.ts")).toBeDefined()
       // "lodash" is external — no node, no edge.
       expect(payload.nodes.some((n) => n.path.includes("lodash"))).toBe(false)
     }),
@@ -68,32 +85,17 @@ describe("CodeGraph.extract", () => {
       yield* writeFiles(dir, SAMPLE)
       const payload = yield* CodeGraphExtract.extract(dir)
 
-      expect(edgeBetween(payload, "pkg/main.py", "pkg/util.py")).toBeDefined()
+      expect(edgeBetween(payload, "main.py", "util.py")).toBeDefined()
     }),
   )
 
-  it.live("assigns layer by directory depth", () =>
+  it.live("places every node on the single top-level layer", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped()
       yield* writeFiles(dir, SAMPLE)
       const payload = yield* CodeGraphExtract.extract(dir)
 
-      expect(nodeByPath(payload, "src")!.position.layer).toBe(0)
-      expect(nodeByPath(payload, "src/index.ts")!.position.layer).toBe(1)
-      expect(nodeByPath(payload, "src/lib/a.ts")!.position.layer).toBe(2)
-    }),
-  )
-
-  it.live("aggregates directory size from descendant files", () =>
-    Effect.gen(function* () {
-      const dir = yield* tmpdirScoped()
-      yield* writeFiles(dir, SAMPLE)
-      const payload = yield* CodeGraphExtract.extract(dir)
-
-      const srcLib = nodeByPath(payload, "src/lib")!
-      const a = nodeByPath(payload, "src/lib/a.ts")!
-      expect(srcLib.size).toBe(a.size)
-      expect(a.size).toBeGreaterThan(0)
+      expect(payload.nodes.every((n) => n.position.layer === 0)).toBe(true)
     }),
   )
 

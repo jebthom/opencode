@@ -11,6 +11,7 @@ import {
 import * as Socket from "effect/unstable/socket/Socket"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Account } from "@/account/account"
+import { CodeGraph } from "@/codegraph/codegraph"
 import { Agent } from "@/agent/agent"
 import { Auth } from "@/auth"
 import { Config } from "@/config/config"
@@ -66,6 +67,7 @@ import {
 import { EventApi } from "./groups/event"
 import { PtyConnectApi } from "./groups/pty"
 import { eventHandlers } from "./handlers/event"
+import { codegraphHandlers } from "./handlers/codegraph"
 import { configHandlers } from "./handlers/config"
 import { controlHandlers } from "./handlers/control"
 import { experimentalHandlers } from "./handlers/experimental"
@@ -131,6 +133,7 @@ const ptyConnectApiRoutes = HttpApiBuilder.layer(PtyConnectApi).pipe(
 )
 const instanceApiRoutes = HttpApiBuilder.layer(InstanceHttpApi).pipe(
   Layer.provide([
+    codegraphHandlers,
     configHandlers,
     experimentalHandlers,
     fileHandlers,
@@ -196,6 +199,7 @@ export function createRoutes(
       Database.defaultLayer,
       Account.defaultLayer,
       Agent.defaultLayer,
+      CodeGraph.defaultLayer,
       Auth.defaultLayer,
       Command.defaultLayer,
       Config.defaultLayer,

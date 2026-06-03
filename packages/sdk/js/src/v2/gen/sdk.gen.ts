@@ -15,6 +15,8 @@ import type {
   AuthRemoveResponses,
   AuthSetErrors,
   AuthSetResponses,
+  CodegraphGetErrors,
+  CodegraphGetResponses,
   CommandListErrors,
   CommandListResponses,
   Config as Config3,
@@ -647,6 +649,38 @@ export class Event extends HeyApiClient {
     )
     return (options?.client ?? this.client).sse.get<EventSubscribeResponses, unknown, ThrowOnError>({
       url: "/event",
+      ...options,
+      ...params,
+    })
+  }
+}
+
+export class Codegraph extends HeyApiClient {
+  /**
+   * Get code graph
+   *
+   * Retrieve the deterministic code-graph payload for the active instance.
+   */
+  public get<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<CodegraphGetResponses, CodegraphGetErrors, ThrowOnError>({
+      url: "/codegraph",
       ...options,
       ...params,
     })
@@ -5490,6 +5524,11 @@ export class OpencodeClient extends HeyApiClient {
   private _event?: Event
   get event(): Event {
     return (this._event ??= new Event({ client: this.client }))
+  }
+
+  private _codegraph?: Codegraph
+  get codegraph(): Codegraph {
+    return (this._codegraph ??= new Codegraph({ client: this.client }))
   }
 
   private _config?: Config2

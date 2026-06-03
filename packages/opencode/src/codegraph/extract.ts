@@ -9,48 +9,103 @@ import { CodeGraphPayload } from "./payload"
 // involvement here — the output depends only on the files on disk, so the same
 // repo state always yields the same payload (see PLAN.md, step 1).
 
-const SOURCE_GLOB = "**/*.{ts,tsx,js,jsx,mjs,cjs,mts,cts,py}"
+// Single-layer walk: only the immediate children of the root are enumerated.
+// Top-level source files become file nodes; top-level directories become
+// collapsed directory nodes whose contents are never walked or read. Recursing
+// the whole tree (and reading every file) was exhausting memory on large repos,
+// so we deliberately stop after one layer — this is plenty for the current view.
+const SOURCE_GLOB = "*.{ts,tsx,js,jsx,mjs,cjs,mts,cts,py}"
+const ENTRY_GLOB = "*"
 
 // Directories that never carry useful structure and would otherwise dominate the
-// graph. Excluded from the file walk.
+// graph. Pruned during the glob walk so trees like node_modules never appear.
 const IGNORED_DIRS = ["node_modules", ".git", "dist", "build", ".next", "__pycache__", ".venv", "venv"]
+const IGNORE_GLOBS = IGNORED_DIRS.map((dir) => `**/${dir}/**`)
+const IGNORED_DIR_SET = new Set(IGNORED_DIRS)
+
+// Hard caps so a pathological repo can never exhaust memory: cap the node count
+// and skip files too large to parse cheaply. Reads run with bounded concurrency.
+const MAX_FILES = 5000
+const MAX_FILE_BYTES = 512 * 1024
+const READ_CONCURRENCY = 24
 
 export const extract = Effect.fn("CodeGraph.extract")(function* (root: string) {
   const fs = yield* FSUtil.Service
+
+  // Top-level source files only (no recursion).
   const files = yield* fs.glob(SOURCE_GLOB, {
     cwd: root,
     include: "file",
     dot: false,
+    ignore: IGNORE_GLOBS,
   })
 
-  // Stable set of repo-relative POSIX paths, sorted for determinism.
+  // Top-level entries (files + dirs) so we can pick out immediate directories.
+  // These are collapsed nodes — we never descend into them.
+  const entries = yield* fs.glob(ENTRY_GLOB, {
+    cwd: root,
+    include: "all",
+    dot: false,
+    ignore: IGNORE_GLOBS,
+  })
+
+  // Stable set of repo-relative POSIX paths, sorted for determinism, capped.
   const relFiles = files
     .map((f) => toPosix(path.relative(root, path.isAbsolute(f) ? f : path.join(root, f))))
-    .filter((f) => !f.split("/").some((seg) => IGNORED_DIRS.includes(seg)))
     .toSorted()
+    .slice(0, MAX_FILES)
 
-  // Build the node set: every file, plus every ancestor directory.
-  const dirSet = new Set<string>()
-  for (const f of relFiles) {
-    let dir = posixDir(f)
-    while (dir !== "" && !dirSet.has(dir)) {
-      dirSet.add(dir)
-      dir = posixDir(dir)
-    }
-  }
+  // Directory nodes: immediate children of root that are directories and not
+  // ignored. Anything containing a "/" is below the first layer and skipped. We
+  // stat each candidate to tell directories apart from non-source top-level
+  // files (which we don't render).
+  const fileSet = new Set(relFiles)
+  const candidates = [
+    ...new Set(
+      entries
+        .map((e) => toPosix(path.relative(root, path.isAbsolute(e) ? e : path.join(root, e))))
+        .filter((rel) => rel !== "" && !rel.includes("/") && !fileSet.has(rel) && !IGNORED_DIR_SET.has(rel)),
+    ),
+  ]
+  const candidateKinds = yield* Effect.forEach(
+    candidates,
+    (rel) =>
+      fs.stat(path.join(root, rel)).pipe(
+        Effect.map((stat) => [rel, stat.type === "Directory"] as const),
+        Effect.catch(() => Effect.succeed([rel, false] as const)),
+      ),
+    { concurrency: READ_CONCURRENCY },
+  )
+  const dirSet = new Set(candidateKinds.filter(([, isDir]) => isDir).map(([rel]) => rel))
 
-  const fileSizes = new Map<string, number>()
-  for (const f of relFiles) {
-    const stat = yield* fs.stat(path.join(root, f)).pipe(Effect.catch(() => Effect.void))
-    fileSizes.set(f, stat?.type === "File" ? Number(stat.size) : 0)
-  }
+  const sizes = yield* Effect.forEach(
+    relFiles,
+    (f) =>
+      fs.stat(path.join(root, f)).pipe(
+        Effect.map((stat) => [f, stat.type === "File" ? Number(stat.size) : 0] as const),
+        Effect.catch(() => Effect.succeed([f, 0] as const)),
+      ),
+    { concurrency: READ_CONCURRENCY },
+  )
+  const fileSizes = new Map(sizes)
 
-  // Edges: parse imports per file and resolve to known file nodes.
+  // Edges: parse imports per file and resolve to known file nodes. Files larger
+  // than MAX_FILE_BYTES are skipped to avoid loading huge blobs into memory.
   const knownFiles = new Set(relFiles)
+  const parsed = yield* Effect.forEach(
+    relFiles,
+    (f) => {
+      if ((fileSizes.get(f) ?? 0) > MAX_FILE_BYTES) return Effect.succeed([f, undefined] as const)
+      return fs
+        .readFileStringSafe(path.join(root, f))
+        .pipe(Effect.map((content) => [f, content] as const), Effect.orElseSucceed(() => [f, undefined] as const))
+    },
+    { concurrency: READ_CONCURRENCY },
+  )
+
   const edges: CodeGraphPayload.Edge[] = []
   const seenEdges = new Set<string>()
-  for (const f of relFiles) {
-    const content = yield* fs.readFileStringSafe(path.join(root, f)).pipe(Effect.orElseSucceed(() => undefined))
+  for (const [f, content] of parsed) {
     if (!content) continue
     for (const spec of parseImports(f, content)) {
       const target = resolveImport(f, spec, knownFiles)
@@ -69,7 +124,8 @@ export const extract = Effect.fn("CodeGraph.extract")(function* (root: string) {
       id: nodeID(d),
       path: d,
       kind: "directory" as const,
-      size: directorySize(d, fileSizes),
+      // Collapsed node: contents aren't walked at this layer, so size is unknown.
+      size: 0,
       position: positions.get(d)!,
     })),
     ...relFiles.map((f) => ({
@@ -120,18 +176,11 @@ function layout(files: string[], dirs: string[]) {
   return positions
 }
 
-function directorySize(dir: string, fileSizes: Map<string, number>) {
-  let total = 0
-  const prefix = dir + "/"
-  for (const [file, size] of fileSizes) {
-    if (file.startsWith(prefix)) total += size
-  }
-  return total
-}
-
 // --- import parsing --------------------------------------------------------
 
-const TS_IMPORT = /(?:import|export)[\s\S]*?from\s*["']([^"']+)["']/g
+// `from "x"` covers static import/export-from; the `[^"']*?` is bounded to a
+// single quote span (no greedy `[\s\S]*?`) so it can't backtrack catastrophically.
+const TS_FROM = /\bfrom\s*["']([^"']+)["']/g
 const TS_REQUIRE = /require\(\s*["']([^"']+)["']\s*\)/g
 const TS_DYNAMIC = /import\(\s*["']([^"']+)["']\s*\)/g
 const PY_FROM = /^\s*from\s+([.\w]+)\s+import\s+/gm
@@ -145,7 +194,7 @@ function parseImports(file: string, content: string) {
     for (const m of content.matchAll(PY_IMPORT)) specs.add(m[1]!)
     return [...specs]
   }
-  for (const m of content.matchAll(TS_IMPORT)) specs.add(m[1]!)
+  for (const m of content.matchAll(TS_FROM)) specs.add(m[1]!)
   for (const m of content.matchAll(TS_REQUIRE)) specs.add(m[1]!)
   for (const m of content.matchAll(TS_DYNAMIC)) specs.add(m[1]!)
   return [...specs]

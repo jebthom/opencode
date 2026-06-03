@@ -222,6 +222,7 @@ export function Session() {
   const dimensions = useTerminalDimensions()
   const [sidebar, setSidebar] = kv.signal<"auto" | "hide">("sidebar", "auto")
   const [sidebarOpen, setSidebarOpen] = createSignal(false)
+  const [codegraph, setCodegraph] = kv.signal<"show" | "hide">("codegraph", "show")
   const [conceal, setConceal] = createSignal(true)
   const thinking = useThinkingMode()
   const thinkingMode = thinking.mode
@@ -242,6 +243,13 @@ export function Session() {
     return false
   })
   const showTimestamps = createMemo(() => timestamps() === "show")
+  // Code-graph top bar: hidden for subagent sessions and very short terminals,
+  // where the fixed-height strip would crowd out the conversation.
+  const codegraphVisible = createMemo(() => {
+    if (session()?.parentID) return false
+    if (dimensions().height < 20) return false
+    return codegraph() === "show"
+  })
   const contentWidth = createMemo(() => dimensions().width - (sidebarVisible() ? 42 : 0) - 4)
   const providers = createMemo(() => Model.index(sync.data.provider))
 
@@ -667,6 +675,15 @@ export function Session() {
           setSidebar(() => (isVisible ? "hide" : "auto"))
           setSidebarOpen(!isVisible)
         })
+        dialog.clear()
+      },
+    },
+    {
+      title: codegraph() === "show" ? "Hide code graph" : "Show code graph",
+      value: "session.codegraph.toggle",
+      category: "Session",
+      run: () => {
+        setCodegraph((prev) => (prev === "show" ? "hide" : "show"))
         dialog.clear()
       },
     },
@@ -1134,8 +1151,14 @@ export function Session() {
           tui: tuiConfig,
         }}
       >
-        <box flexDirection="row" flexGrow={1} minHeight={0}>
-          <box flexGrow={1} minHeight={0} paddingBottom={1} paddingLeft={2} paddingRight={2} gap={1}>
+        <box flexDirection="column" flexGrow={1} minHeight={0}>
+          <Show when={codegraphVisible()}>
+            <box flexShrink={0}>
+              <TuiPluginRuntime.Slot name="codegraph_top" session_id={route.sessionID} />
+            </box>
+          </Show>
+          <box flexDirection="row" flexGrow={1} minHeight={0}>
+            <box flexGrow={1} minHeight={0} paddingBottom={1} paddingLeft={2} paddingRight={2} gap={1}>
             <Show when={session()}>
               <scrollbox
                 ref={(r) => (scroll = r)}
@@ -1310,6 +1333,7 @@ export function Session() {
               </Match>
             </Switch>
           </Show>
+          </box>
         </box>
       </context.Provider>
     </PathFormatterProvider>

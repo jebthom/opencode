@@ -8,6 +8,10 @@ export namespace Glob {
     include?: "file" | "all"
     dot?: boolean
     symlink?: boolean
+    // Glob patterns to prune during the walk. Matching entries (and their
+    // descendants for directory patterns like "**/node_modules/**") are never
+    // visited, so large ignored trees never enter memory.
+    ignore?: string[]
   }
 
   function toGlobOptions(options: Options): GlobOptions {
@@ -17,6 +21,7 @@ export namespace Glob {
       dot: options.dot,
       follow: options.symlink ?? false,
       nodir: options.include !== "all",
+      ignore: options.ignore,
     }
   }
 

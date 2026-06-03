@@ -4910,6 +4910,57 @@ export type EventSubscribeResponses = {
 
 export type EventSubscribeResponse = EventSubscribeResponses[keyof EventSubscribeResponses]
 
+export type CodegraphGetData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/codegraph"
+}
+
+export type CodegraphGetErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type CodegraphGetError = CodegraphGetErrors[keyof CodegraphGetErrors]
+
+export type CodegraphGetResponses = {
+  /**
+   * The deterministic code-graph payload
+   */
+  200: {
+    version: number
+    nodes: Array<{
+      id: string
+      path: string
+      kind: "file" | "directory"
+      size: number
+      position: {
+        layer: number
+        index: number
+      }
+    }>
+    edges: Array<{
+      from: string
+      to: string
+      kind: "import"
+    }>
+    semantics: {
+      [key: string]: {
+        tags: Array<string>
+        hue?: string
+      }
+    }
+  }
+}
+
+export type CodegraphGetResponse = CodegraphGetResponses[keyof CodegraphGetResponses]
+
 export type ConfigGetData = {
   body?: never
   path?: never

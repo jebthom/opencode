@@ -72,6 +72,52 @@ and reversible.
    tags→hues mapping.
 5. Optional: full-screen "zoom" route for detail.
 
+## ⚠️ Catastrophic failure mode (learned the hard way, step 2)
+
+Symptom: opencode runs fine for a while, then RAM climbs without bound
+(~30MB/s, seen via VmmemWSL) while completely idle — no prompting, no
+navigation. The code-graph top bar never paints. CPU is busy.
+
+Root cause: a slot renderer that reads a `createResource` accessor **directly in
+the render/tracking scope**. In SolidJS, calling the accessor (`graph()`) while
+the resource is in its **error** state *re-throws synchronously inside render*.
+That trips the slot's error boundary (see @opentui/solid `Slot`, which
+re-renders on a version signal and reports via `onPluginError`), which
+re-renders, which re-reads, which throws again — a tight render → catch →
+re-render loop. Every cycle allocates (VNodes, error objects, OpenTUI text/
+layout renderables), so memory grows unbounded. Gating UI with
+`<Show when={(graph()?.nodes.length ?? 0) > 0}>` is the same trap: the condition
+calls the accessor.
+
+Why it hid: the loop only runs when the resource is in error AND something keeps
+re-rendering. A small/empty/idle working directory produces almost no store
+churn, so the component barely re-renders and the leak is invisible. The
+opencode tree (LSP, file watcher, snapshots → constant store updates) drives
+constant re-renders, so the same code there leaks at ~30MB/s. **A bug that
+reproduces only in busy directories is the tell.**
+
+Fix (now in feature-plugins/system/codegraph.tsx): never call a resource
+accessor unguarded in render. Check `resource.error` first and return a fallback
+*without* calling the accessor; route every read through a helper that
+short-circuits on error (e.g. `const nodes = () => graph.error ? [] :
+graph()?.nodes ?? []`). Keep the bar frame always mounted (fixed height) rather
+than gating it behind `<Show when={graph()...}>`.
+
+How it was localized (use this method for render/leak bugs): dewire the data
+path entirely → hardcode a static bar (stable + visible confirms slot/layout is
+sound) → add back the fetch + a count readout only (stable confirms fetch/
+resource is sound) → add back the per-node `For` rendering with guarded reads
+(stable = done). Bisecting one variable at a time beats reading code. Also
+isolate the instance-under-test (run against a scratch dir or a git worktree) so
+your own edits to the watched tree don't confound the memory reading.
+
+Two upstream contributors that made errors more likely, both fixed: (1) the
+extractor used to walk `**/*` and read every file (node_modules included),
+exhausting memory during compute — now single-layer with caps; (2) a stale
+durable cache from the old extractor was served because `PAYLOAD_VERSION` wasn't
+bumped — bump the version (or clear storage/codegraph) whenever the payload
+shape or extractor semantics change.
+
 ## Open follow-ups (not blockers)
 - Edge extraction depth: import/require parsing first, or LSP-backed call/type
   edges later (api.state.lsp()).

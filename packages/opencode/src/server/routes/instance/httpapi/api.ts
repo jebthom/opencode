@@ -3,6 +3,7 @@ import { HttpApi } from "effect/unstable/httpapi"
 import { EventV2 } from "@opencode-ai/core/event"
 import { InstanceDisposed } from "@/server/event"
 import { Question } from "@/question"
+import { CodeGraphApi } from "./groups/codegraph"
 import { ConfigApi } from "./groups/config"
 import { ControlApi } from "./groups/control"
 import { EventApi } from "./groups/event"
@@ -47,6 +48,7 @@ export const RootHttpApi = HttpApi.make("opencode-root")
   .middleware(Authorization)
 
 export const InstanceHttpApi = HttpApi.make("opencode-instance")
+  .addHttpApi(CodeGraphApi)
   .addHttpApi(ConfigApi)
   .addHttpApi(ExperimentalApi)
   .addHttpApi(FileApi)
