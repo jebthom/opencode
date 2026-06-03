@@ -1,6 +1,7 @@
 - To regenerate the JavaScript SDK, run `./packages/sdk/js/script/build.ts`.
 - The default branch in this repo is `dev`.
 - Local `main` ref may not exist; use `dev` or `origin/dev` for diffs.
+- For the code-graph visualization project, see PLAN.md at the repo root.
 
 ## Commits and PR Titles
 
