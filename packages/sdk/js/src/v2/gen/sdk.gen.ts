@@ -665,6 +665,8 @@ export class Codegraph extends HeyApiClient {
     parameters?: {
       directory?: string
       workspace?: string
+      scope?: string
+      refresh?: "true" | "false"
     },
     options?: Options<never, ThrowOnError>,
   ) {
@@ -675,6 +677,8 @@ export class Codegraph extends HeyApiClient {
           args: [
             { in: "query", key: "directory" },
             { in: "query", key: "workspace" },
+            { in: "query", key: "scope" },
+            { in: "query", key: "refresh" },
           ],
         },
       ],

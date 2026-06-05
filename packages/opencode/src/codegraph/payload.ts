@@ -10,10 +10,12 @@ import { Schema } from "effect"
 // async `semantics` layer (tags/hues inferred by an agent) change without ever
 // disturbing the structure the developer relies on for comprehension.
 
-// Bumped to 2 to invalidate caches written by the old recursive (`**/*`)
-// extractor, whose payloads describe a graph the single-layer extractor no
-// longer produces. Without the bump, codegraph.ts would serve the stale cache.
-export const PAYLOAD_VERSION = 2
+// Bump whenever the extractor's output semantics change so stale caches written
+// by an older extractor are never served (codegraph.ts gates reads on this).
+// - 2: single-layer walk replacing the old recursive (`**/*`) extractor.
+// - 3: scoped drill-down walk. `layer` is now scope-relative (see Position) and
+//   payloads are cached per scope, so v2 caches describe a different graph.
+export const PAYLOAD_VERSION = 3
 
 export const NodeKind = Schema.Literals(["file", "directory"])
 export type NodeKind = typeof NodeKind.Type
@@ -21,9 +23,10 @@ export type NodeKind = typeof NodeKind.Type
 export const EdgeKind = Schema.Literals(["import"])
 export type EdgeKind = typeof EdgeKind.Type
 
-// Deterministic placement computed by the extractor. `layer` is the topological
-// depth (used for horizontal/vertical layering); `index` is the stable position
-// within a layer. Renderers map these onto screen coordinates per orientation.
+// Deterministic placement computed by the extractor. `layer` is the depth
+// relative to the requested scope (0 = a direct child of the scope, 1 = a
+// grandchild); `index` is the stable position within a layer. Renderers map
+// these onto screen coordinates per orientation.
 export const Position = Schema.Struct({
   layer: Schema.Int,
   index: Schema.Int,

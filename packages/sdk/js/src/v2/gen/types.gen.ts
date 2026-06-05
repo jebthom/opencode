@@ -66,6 +66,7 @@ export type Event =
   | EventTuiSessionSelect2
   | EventMcpToolsChanged
   | EventMcpBrowserOpenFailed
+  | EventCodegraphInvalidated
   | EventCommandExecuted
   | EventProjectDirectoriesUpdated
   | EventProjectUpdated
@@ -1318,6 +1319,13 @@ export type GlobalEvent = {
         properties: {
           mcpName: string
           url: string
+        }
+      }
+    | {
+        id: string
+        type: "codegraph.invalidated"
+        properties: {
+          scope: string
         }
       }
     | {
@@ -4442,6 +4450,14 @@ export type EventMcpBrowserOpenFailed = {
   }
 }
 
+export type EventCodegraphInvalidated = {
+  id: string
+  type: "codegraph.invalidated"
+  properties: {
+    scope: string
+  }
+}
+
 export type EventCommandExecuted = {
   id: string
   type: "command.executed"
@@ -4916,6 +4932,8 @@ export type CodegraphGetData = {
   query?: {
     directory?: string
     workspace?: string
+    scope?: string
+    refresh?: "true" | "false"
   }
   url: "/codegraph"
 }

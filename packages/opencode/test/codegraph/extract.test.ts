@@ -17,19 +17,20 @@ const writeFiles = Effect.fnUntraced(function* (root: string, files: Record<stri
   }
 })
 
-// A small single-layer fixture: top-level source files (with a relative TS
-// import between them and an ignored package import), top-level Python files
-// with a relative import, plus directories that must appear as collapsed nodes
-// without their contents being walked.
+// A small fixture spanning three directory layers. The extractor draws a 2-level
+// window (scope's children + grandchildren), so layer 0/1 content is visible and
+// anything at layer 2 (e.g. src/sub/too-deep.ts) must be excluded — its parent
+// directory (src/sub) appears as a collapsed node instead.
 const SAMPLE = {
   "index.ts": `import { a } from "./a"\nimport _ from "lodash"\n`,
   "a.ts": `export const a = 1\n`,
   "main.py": `from .util import helper\nimport os\n`,
   "util.py": `def helper(): pass\n`,
-  // Nested content lives under directories that should be collapsed; these files
-  // must never appear as nodes nor produce edges at the single-layer depth.
+  // Grandchildren (layer 1 from the repo root) — now visible.
   "src/deep.ts": `export const deep = 1\n`,
   "pkg/nested.py": `def nested(): pass\n`,
+  // Layer 2 — past the window. src/sub is a collapsed node; its file is excluded.
+  "src/sub/too-deep.ts": `export const tooDeep = 1\n`,
 }
 
 const nodeByPath = (payload: CodeGraphPayload.Payload, p: string) => payload.nodes.find((n) => n.path === p)
@@ -40,7 +41,7 @@ const edgeBetween = (payload: CodeGraphPayload.Payload, from: string, to: string
 }
 
 describe("CodeGraph.extract", () => {
-  it.live("produces nodes for top-level files and directories only", () =>
+  it.live("produces nodes for the scope's children and grandchildren", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped()
       yield* writeFiles(dir, SAMPLE)
@@ -48,22 +49,34 @@ describe("CodeGraph.extract", () => {
 
       expect(payload.version).toBe(CodeGraphPayload.PAYLOAD_VERSION)
       const paths = payload.nodes.map((n) => n.path).toSorted()
-      // Top-level source files + collapsed top-level directories. Nothing below
-      // the first layer (e.g. src/deep.ts, pkg/nested.py) is enumerated.
-      expect(paths).toEqual(["a.ts", "index.ts", "main.py", "pkg", "src", "util.py"])
+      // Layer 0 (top-level files + dirs) and layer 1 (their children). The
+      // collapsed grandchild dir src/sub appears, but nothing at layer 2.
+      expect(paths).toEqual([
+        "a.ts",
+        "index.ts",
+        "main.py",
+        "pkg",
+        "pkg/nested.py",
+        "src",
+        "src/deep.ts",
+        "src/sub",
+        "util.py",
+      ])
 
       expect(nodeByPath(payload, "src")!.kind).toBe("directory")
+      expect(nodeByPath(payload, "src/sub")!.kind).toBe("directory")
       expect(nodeByPath(payload, "index.ts")!.kind).toBe("file")
     }),
   )
 
-  it.live("does not walk into top-level directories", () =>
+  it.live("stops at the view depth (no layer-2 content)", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped()
       yield* writeFiles(dir, SAMPLE)
       const payload = yield* CodeGraphExtract.extract(dir)
 
-      expect(payload.nodes.some((n) => n.path.includes("/"))).toBe(false)
+      // src/sub is shown as a collapsed node; its contents are not walked.
+      expect(nodeByPath(payload, "src/sub/too-deep.ts")).toBeUndefined()
     }),
   )
 
@@ -89,13 +102,48 @@ describe("CodeGraph.extract", () => {
     }),
   )
 
-  it.live("places every node on the single top-level layer", () =>
+  it.live("places nodes on scope-relative layers (0 for children, 1 for grandchildren)", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped()
       yield* writeFiles(dir, SAMPLE)
       const payload = yield* CodeGraphExtract.extract(dir)
 
-      expect(payload.nodes.every((n) => n.position.layer === 0)).toBe(true)
+      expect(nodeByPath(payload, "index.ts")!.position.layer).toBe(0)
+      expect(nodeByPath(payload, "src")!.position.layer).toBe(0)
+      expect(nodeByPath(payload, "src/deep.ts")!.position.layer).toBe(1)
+      expect(nodeByPath(payload, "src/sub")!.position.layer).toBe(1)
+    }),
+  )
+
+  it.live("re-roots at a scope: paths stay repo-relative, layers are scope-relative", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      yield* writeFiles(dir, SAMPLE)
+      const payload = yield* CodeGraphExtract.extract(dir, { scope: "src" })
+
+      const paths = payload.nodes.map((n) => n.path).toSorted()
+      // The window now slides to src: its direct children src/deep.ts and src/sub
+      // (layer 0) plus the grandchild src/sub/too-deep.ts (layer 1) — content that
+      // was past the window from the root view. Paths stay repo-relative.
+      expect(paths).toEqual(["src/deep.ts", "src/sub", "src/sub/too-deep.ts"])
+      expect(nodeByPath(payload, "src/deep.ts")!.position.layer).toBe(0)
+      expect(nodeByPath(payload, "src/sub")!.position.layer).toBe(0)
+      expect(nodeByPath(payload, "src/sub/too-deep.ts")!.position.layer).toBe(1)
+
+      // A file's id is stable whether seen from the root or from a sub-scope.
+      const root = yield* CodeGraphExtract.extract(dir)
+      expect(nodeByPath(payload, "src/deep.ts")!.id).toBe(nodeByPath(root, "src/deep.ts")!.id)
+    }),
+  )
+
+  it.live("returns an empty payload for a non-existent scope", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      yield* writeFiles(dir, SAMPLE)
+      const payload = yield* CodeGraphExtract.extract(dir, { scope: "does/not/exist" })
+
+      expect(payload.nodes).toEqual([])
+      expect(payload.edges).toEqual([])
     }),
   )
 

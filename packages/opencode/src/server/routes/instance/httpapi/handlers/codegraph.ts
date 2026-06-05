@@ -7,8 +7,11 @@ export const codegraphHandlers = HttpApiBuilder.group(InstanceHttpApi, "codegrap
   Effect.gen(function* () {
     const codegraph = yield* CodeGraph.Service
 
-    const get = Effect.fn("CodeGraphHttpApi.get")(function* () {
-      return yield* codegraph.get()
+    const get = Effect.fn("CodeGraphHttpApi.get")(function* (ctx: {
+      query: { scope?: string; refresh?: "true" | "false" }
+    }) {
+      if (ctx.query.refresh === "true") return yield* codegraph.refresh(ctx.query.scope)
+      return yield* codegraph.get(ctx.query.scope)
     })
 
     return handlers.handle("get", get)

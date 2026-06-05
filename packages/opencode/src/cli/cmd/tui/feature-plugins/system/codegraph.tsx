@@ -1,14 +1,20 @@
 import type { TuiPlugin, TuiPluginApi, TuiThemeCurrent } from "@opencode-ai/plugin/tui"
 import type { InternalTuiPlugin } from "../../plugin/internal"
-import { createMemo, createResource, For } from "solid-js"
+import { createMemo, createResource, createSignal, For, onCleanup, Show } from "solid-js"
 
 const id = "internal:codegraph"
 
-// Step 2 renderer (PLAN.md): a persistent top-bar that draws the deterministic
-// code graph. Data comes from the server via api.client.codegraph.get(); layout
-// is computed here by a pluggable strategy keyed on orientation, so moving this
-// pane to a sidebar later only swaps the strategy (and the host slot), not the
-// data path.
+// Step 2.5 renderer (PLAN.md): a persistent top-bar that draws a 2-level window
+// of the deterministic code graph and lets the user drill into directories.
+//
+// The bar is rooted at a `scope` (a repo-relative directory, "" = repo root). It
+// shows the scope's direct children as bordered boxes (layer 0) and their
+// children as smaller boxes (layer 1). Clicking a directory box re-roots the
+// view at it; a root button, an up button, and a clickable breadcrumb walk back
+// out. Data is fetched per scope from api.client.codegraph.get({ scope }); when
+// the server reports a file change inside the viewed scope (codegraph.invalidated)
+// we refetch just that scope, so the visible view stays live without recomputing
+// graphs nobody is looking at.
 
 type GraphNode = {
   id: string
@@ -27,33 +33,70 @@ type Graph = {
   semantics: Record<string, { tags: readonly string[]; hue?: string }>
 }
 
-type Orientation = "horizontal" | "vertical"
+const TOP_BAR_HEIGHT = 13
+// Children drawn per node before collapsing the rest into a single "…" tile.
+const MAX_CHILDREN = 4
+const MAX_LABEL = 16
+const MAX_CHILD_LABEL = 8
 
-type Cell = { node: GraphNode; label: string }
-type Layout = { columns: Cell[][] }
+// Kind is encoded by corner shape only, leaving border/background colors free
+// for the future semantic-painting layer: directories get square corners, files
+// get rounded ones. Both stay full, paintable boxes.
+const SQUARE_CORNERS = {
+  topLeft: "┌",
+  topRight: "┐",
+  bottomLeft: "└",
+  bottomRight: "┘",
+  horizontal: "─",
+  vertical: "│",
+  topT: "┬",
+  bottomT: "┴",
+  leftT: "├",
+  rightT: "┤",
+  cross: "┼",
+}
+const ROUNDED_CORNERS = { ...SQUARE_CORNERS, topLeft: "╭", topRight: "╮", bottomLeft: "╰", bottomRight: "╯" }
+const cornersFor = (kind: GraphNode["kind"]) => (kind === "directory" ? SQUARE_CORNERS : ROUNDED_CORNERS)
 
-const TOP_BAR_HEIGHT = 9
-const MOCK_CHILD_PREFIX = "tmp"
-
-// First graph visual (step 2, placeholder semantics). Each real node from the
-// extractor renders as a bordered square tagged with its filename; beneath it
-// hang 1–3 placeholder children drawn as labeled branches. The children and
-// their count are NOT real structure yet — they stand in for the eventual child
-// nodes so the bar reads as a graph. The child count is derived from the node id
-// (see childCount) rather than Math.random() so it stays stable across renders;
-// re-rolling every frame would thrash the reconciler (see PLAN.md failure mode).
-// Resource reads stay guarded (never call graph() in the error state).
 function View(props: { api: TuiPluginApi; session_id: string }) {
   const theme = () => props.api.theme.current
+  const [scope, setScope] = createSignal("")
 
-  const [graph] = createResource(
-    () => props.api.state.path.directory,
-    async () => {
-      const result = await props.api.client.codegraph.get({}, { throwOnError: true })
+  // Recompute on display (refresh=true): every scope we show — on navigation, on
+  // the manual refresh button, and on a live invalidation event — is recomputed
+  // from disk rather than served from the server cache. The 2-level scoped walk
+  // is cheap, and this keeps a drilled-into view consistent with its parent (a
+  // child that changed/vanished is reflected the moment you open it). The server
+  // cache + invalidation still spare recompute for scopes nobody is viewing.
+  const [graph, { refetch }] = createResource(
+    () => ({ directory: props.api.state.path.directory, scope: scope() }),
+    async (key) => {
+      const result = await props.api.client.codegraph.get(
+        { scope: key.scope, refresh: "true" },
+        { throwOnError: true },
+      )
       return result.data as Graph
     },
   )
 
+  // Live update: refetch only when the change is inside the scope we're showing.
+  const off = props.api.event.on("codegraph.invalidated", (event) => {
+    if (event.properties.scope === scope()) refetch()
+  })
+  onCleanup(() => off())
+
+  // Shell commands (rm, mv, git, scaffolding, …) mutate the tree without firing
+  // file.edited, so nothing else invalidates the view. Recompute is cheap, so we
+  // just refetch the current scope whenever this session's agent finishes a shell
+  // command. (session.next.* rides the experimental event system; when it's off
+  // this is simply inert and the manual ⟳ / navigation refresh still cover it.)
+  const offShell = props.api.event.on("session.next.shell.ended", (event) => {
+    if (event.properties.sessionID === props.session_id) refetch()
+  })
+  onCleanup(() => offShell())
+
+  // Guarded reads — never call the resource accessor in its error state (the
+  // documented render→catch→re-render leak, PLAN.md). The frame stays mounted.
   const nodes = () => (graph.error ? [] : (graph()?.nodes ?? []))
   const summary = () => {
     if (graph.error) return "fetch error"
@@ -62,14 +105,36 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   }
   const hueOf = (nodeID: string) => (graph.error ? undefined : graph()?.semantics[nodeID]?.hue)
 
-  // Real nodes paired with their placeholder children. Memoized on the node set
-  // so it recomputes only when the graph data actually changes.
-  const tree = createMemo(() =>
-    nodes().map((node) => ({
-      node,
-      children: Array.from({ length: childCount(node.id) }, (_, i) => `${MOCK_CHILD_PREFIX}-${i + 1}`),
-    })),
-  )
+  // Layer-0 nodes are the squares; layer-1 nodes hang under their parent (grouped
+  // by path prefix). Memoized on the node set so it recomputes only on new data.
+  const tree = createMemo(() => {
+    const all = nodes()
+    const layer0 = all.filter((n) => n.position.layer === 0).toSorted((a, b) => a.position.index - b.position.index)
+    const byParent = new Map<string, GraphNode[]>()
+    for (const n of all) {
+      if (n.position.layer !== 1) continue
+      const bucket = byParent.get(posixDir(n.path)) ?? []
+      bucket.push(n)
+      byParent.set(posixDir(n.path), bucket)
+    }
+    for (const bucket of byParent.values()) bucket.sort((a, b) => a.position.index - b.position.index)
+    return layer0.map((node) => {
+      const children = byParent.get(node.path) ?? []
+      return { node, children: children.slice(0, MAX_CHILDREN), overflow: children.length - MAX_CHILDREN }
+    })
+  })
+
+  const crumbs = () => {
+    const s = scope()
+    if (s === "") return []
+    const segs = s.split("/")
+    return segs.map((seg, i) => ({ label: seg, path: segs.slice(0, i + 1).join("/") }))
+  }
+  const upTarget = () => {
+    const s = scope()
+    const i = s.lastIndexOf("/")
+    return i === -1 ? "" : s.slice(0, i)
+  }
 
   return (
     <box
@@ -88,22 +153,71 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
         </text>
         <text fg={theme().textMuted}>{summary()}</text>
       </box>
+
+      {/* Navigation row: refresh + root + up + breadcrumb. Always present so the
+          graph area below doesn't jump as the user drills in and out. */}
+      <box flexDirection="row" gap={1} height={1} flexShrink={0}>
+        <text fg={theme().accent} onMouseDown={() => refetch()}>
+          ⟳
+        </text>
+        <Show when={scope() !== ""} fallback={<text fg={theme().textMuted}>/</text>}>
+          <text fg={theme().accent} onMouseDown={() => setScope("")}>
+            ⌂
+          </text>
+          <text fg={theme().accent} onMouseDown={() => setScope(upTarget())}>
+            ◀
+          </text>
+          <For each={crumbs()}>
+            {(crumb, i) => (
+              <text fg={i() === crumbs().length - 1 ? theme().text : theme().textMuted} onMouseDown={() => setScope(crumb.path)}>
+                {(i() === 0 ? "" : "/ ") + crumb.label}
+              </text>
+            )}
+          </For>
+        </Show>
+      </box>
+
       <box flexDirection="row" gap={2} flexGrow={1}>
         <For each={tree()}>
           {(item) => (
-            <box flexDirection="column" flexShrink={0}>
-              <box border borderColor={theme().border} paddingLeft={1} paddingRight={1} flexShrink={0}>
+            <box flexDirection="column" flexShrink={0} gap={0}>
+              <box
+                border
+                customBorderChars={cornersFor(item.node.kind)}
+                borderColor={theme().border}
+                paddingLeft={1}
+                paddingRight={1}
+                flexShrink={0}
+                onMouseDown={() => item.node.kind === "directory" && setScope(item.node.path)}
+              >
                 <text fg={hueColor(theme(), hueOf(item.node.id), item.node.kind)} wrapMode="none">
-                  {basename(item.node.path)}
+                  {truncate(basename(item.node.path), MAX_LABEL)}
                 </text>
               </box>
-              <For each={item.children}>
-                {(child, i) => (
-                  <text fg={theme().textMuted} wrapMode="none">
-                    {(i() === item.children.length - 1 ? "└─ " : "├─ ") + child}
-                  </text>
-                )}
-              </For>
+              <box flexDirection="row" gap={1} flexShrink={0}>
+                <For each={item.children}>
+                  {(child) => (
+                    <box
+                      border
+                      customBorderChars={cornersFor(child.kind)}
+                      borderColor={theme().border}
+                      flexShrink={0}
+                      onMouseDown={() => child.kind === "directory" && setScope(child.path)}
+                    >
+                      <text fg={hueColor(theme(), hueOf(child.id), child.kind)} wrapMode="none">
+                        {truncate(basename(child.path), MAX_CHILD_LABEL)}
+                      </text>
+                    </box>
+                  )}
+                </For>
+                <Show when={item.overflow > 0}>
+                  <box border customBorderChars={SQUARE_CORNERS} borderColor={theme().border} flexShrink={0}>
+                    <text fg={theme().textMuted} wrapMode="none">
+                      …
+                    </text>
+                  </box>
+                </Show>
+              </box>
             </box>
           )}
         </For>
@@ -112,71 +226,19 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   )
 }
 
-// Basename of a repo-relative path, truncated to the node-square tag width.
+// --- helpers ---------------------------------------------------------------
+
 function basename(p: string) {
-  const name = p.split("/").pop() ?? p
-  return name.length > MAX_LABEL ? name.slice(0, MAX_LABEL - 1) + "…" : name
+  return p.split("/").pop() ?? p
 }
 
-// Placeholder child count in [1, 3], derived deterministically from the node id
-// so it never re-rolls between renders. Replace with real child structure when
-// the extractor emits nested nodes.
-function childCount(nodeID: string) {
-  let h = 0
-  for (let i = 0; i < nodeID.length; i++) h = (h * 31 + nodeID.charCodeAt(i)) | 0
-  return 1 + (Math.abs(h) % 3)
+function posixDir(p: string) {
+  const i = p.lastIndexOf("/")
+  return i === -1 ? "" : p.slice(0, i)
 }
 
-// --- pluggable layout strategy ---------------------------------------------
-
-// Maps deterministic (layer, index) positions to a grid of cells. Horizontal:
-// layers become columns (left→right). Vertical (stub for the future sidebar
-// orientation): layers become rows. Only the arrangement differs; the node
-// data and ids are identical, so structure stays stable across orientations.
-function computeLayout(nodes: GraphNode[], orientation: Orientation): Layout {
-  if (orientation === "vertical") return computeVertical(nodes)
-  return computeHorizontal(nodes)
-}
-
-const MAX_ROWS_PER_COLUMN = TOP_BAR_HEIGHT - 2
-const MAX_LABEL = 18
-
-function computeHorizontal(nodes: GraphNode[]): Layout {
-  const byLayer = new Map<number, GraphNode[]>()
-  for (const node of nodes) {
-    const bucket = byLayer.get(node.position.layer) ?? []
-    bucket.push(node)
-    byLayer.set(node.position.layer, bucket)
-  }
-  const columns = [...byLayer.entries()]
-    .toSorted((a, b) => a[0] - b[0])
-    .map(([, members]) => {
-      const sorted = members.toSorted((a, b) => a.position.index - b.position.index)
-      const visible = sorted.slice(0, MAX_ROWS_PER_COLUMN)
-      const cells: Cell[] = visible.map((node) => ({ node, label: cellLabel(node) }))
-      const overflow = sorted.length - visible.length
-      if (overflow > 0 && cells.length > 0) {
-        cells[cells.length - 1] = { node: cells[cells.length - 1]!.node, label: `+${overflow} more` }
-      }
-      return cells
-    })
-  return { columns }
-}
-
-// Stub: arranges layers as a single column for narrow/tall placement. Fleshed
-// out when the pane actually moves to a sidebar.
-function computeVertical(nodes: GraphNode[]): Layout {
-  const sorted = nodes.toSorted((a, b) =>
-    a.position.layer - b.position.layer || a.position.index - b.position.index,
-  )
-  return { columns: [sorted.map((node) => ({ node, label: cellLabel(node) }))] }
-}
-
-function cellLabel(node: GraphNode) {
-  const name = node.path.split("/").pop() ?? node.path
-  const prefix = node.kind === "directory" ? "▸ " : "  "
-  const trimmed = name.length > MAX_LABEL ? name.slice(0, MAX_LABEL - 1) + "…" : name
-  return prefix + trimmed
+function truncate(s: string, max: number) {
+  return s.length > max ? s.slice(0, max - 1) + "…" : s
 }
 
 // --- hue mapping -----------------------------------------------------------
