@@ -4,9 +4,53 @@
 A graph/dependency visualization that stays visible during planning, prompting,
 execution, and review. Structure is deterministic (derived from directory tree +
 syntax, with stable IDs and cached layout) so it doesn't reflow distractingly.
-Semantics are malleable and async — an agent attaches tags/hues (architectural
-layer, language, "critical logic", etc.) over time. First idiom: graph/dependency
-view, rendered initially as a wide top-bar above the chat.
+Semantics are malleable and async — an agent attaches a layer/hue to each file
+over time. First idiom: a wide top-bar above the chat showing a 2-level window of
+the graph that the user can drill into.
+
+## Status (steps 1–4 done)
+
+Implemented and in place: deterministic structure extraction, a top-bar renderer
+with drill-down + mouse navigation, live recompute on file/shell events, and an
+async semantic tagger that paints files by architectural layer.
+
+    [done] 1. Payload schema + structure extractor + Storage caching + `dump.ts`.
+    [done] 2. `codegraph_top` core slot + renderer plugin (horizontal layout).
+    [done] 2.5 Scoped 2-level window + drill-down navigation (mouse).
+    [done] 3. Live recompute: visibility-gated invalidation + recompute-on-display.
+    [done] 4. Semantic layer: async per-file tagger (small model) → layer → hue.
+    [done] A. Foundation A: node-overlay render layer (glyphs + hover line).
+    [done] B. Foundation B: activity substrate + provenance contract.
+    [next] 6. Edges: in-window highlights + immediate dependency-surface links.
+    [wip ] 7. Agent tracking: basic glyphs/hover landed with B; polish remains.
+    [next] 8. Planning representation: plan-mode overlay (dashed proposed files).
+    [shelved] 5. Optional: full-screen "zoom" route for detail.
+
+The next features (6–8) are scoped in "## Next features (planned)" below.
+
+### What diverged from the original plan (read before extending)
+- **Scoped window, not one big graph.** The payload is a 2-level window rooted at
+  a `scope` (a repo-relative directory; `""` = repo root): the scope's direct
+  children (layer 0) and their children (layer 1). Drilling into a directory
+  re-roots the view. Keeps the walk and the render bounded on large repos.
+  `PAYLOAD_VERSION` is now **3** for this scope-relative shape.
+- **Semantics live in a separate per-project store, not in the structure cache.**
+  The store (`semantic-store.ts`) is keyed by node id and holds only
+  `{ layer, hash }`. `hue`/`tags` are *derived* from `layer` at the read boundary
+  (`LAYER_HUE`), so palette/vocabulary changes need no re-tag. Structure caches
+  are never mutated by the paint.
+- **HTTP API, not the structured-tool SSE channel.** The TUI reads the payload
+  via `GET /codegraph?scope=&refresh=`. The tagger writes to the store and
+  publishes a `codegraph.invalidated` event; the renderer refetches on it. The
+  `session.next.tool.success.structured` channel from the original sketch was not
+  used.
+- **Fixed layer vocabulary (resolves the "fixed vs free-form tags" follow-up).**
+  Five layers — interface / application / domain / data / infrastructure — each
+  mapped to a distinct *status* theme hue. See `semantics.ts`.
+- **A dedicated small-model tagger, not system-prompt injection.** Step 4's
+  original "inject guidance so the dev agent self-tags" idea was dropped in favor
+  of a frugal standalone tagger (stale-only, minimal context, forked, soft fail).
+  The prompt-injection extension points are still listed below if we revisit it.
 
 ## Architecture: four separated concerns
 
@@ -16,61 +60,105 @@ view, rendered initially as a wide top-bar above the chat.
                                                            ▼
                                        [4] TUI renderer (pluggable layout strategy)
 
-The payload (#3) is the seam. The producer and extractor never know whether the
-graph is rendered as a top-bar or a sidebar, so layout placement is low-commitment
-and reversible.
+The payload (#3) is the seam. The extractor and tagger never know whether the
+graph is rendered as a top-bar or a sidebar, so layout placement is
+low-commitment and reversible.
 
 ### 1. Structure extractor — deterministic, server-side
-- Build graph from directory tree + lightweight syntactic info (imports/requires →
-  edges; files/dirs → nodes). Stable, content-independent node IDs (hash of
-  repo-relative path).
-- Cache computed layout durably via Storage.Service, keyed
-  [ctx.project.id, "codegraph", ...] so structure persists across runs.
-- Recompute incrementally on file.watcher.updated / file.edited.
+`packages/opencode/src/codegraph/extract.ts`
+- Builds the payload from the directory tree + lightweight import parsing
+  (TS/JS: relative `from`/`require`/dynamic-import; Python: dotted-relative
+  `from`/`import`). Bare/package specifiers are intentionally dropped — only
+  intra-repo edges.
+- **Bounded scoped walk:** one glob *per layer* (never `**/*`), capped by
+  `MAX_FILES` (5000), `MAX_FILE_BYTES` (512KB skip-for-parse), and
+  `READ_CONCURRENCY` (24). `IGNORED_DIRS` (node_modules, .git, dist, …) pruned in
+  the glob and again by a belt-and-suspenders path check.
+- **Determinism is the core invariant:** node id = `n_` + sha256(repo-relative
+  path) slice — content-independent, so the same file is the same node across runs
+  and scopes. Nodes sorted by id, edges sorted by `from+to`, layout assigned by
+  sorted path order. Identical disk state ⇒ byte-identical payload.
+- `normalizeScope`, `VIEW_DEPTH`, and `parseImports` are exported (reused by the
+  service's window math and by the tagger's context builder).
 
-### 2. Semantic tagger — agent-driven, async, two paths
-- Batch review: an agent/skill/subagent walks the codebase and writes tags/hues
-  into graph metadata, stored per node ID so semantics update without disturbing
-  structure.
-- Incremental on edit: inject system-prompt guidance so the dev agent tags files
-  it creates/edits. Prefer config-only first (AGENTS.md or config.instructions);
-  escalate to the experimental.chat.system.transform hook if needed.
-- The agent emits a tag payload via a plugin tool; it rides
-  session.next.tool.success.structured over SSE to the TUI. Alternatively hook
-  tool.execute.after filtered to edit/write to detect changed files and queue them.
+### 2. Semantic tagger — agent-driven, async, frugal
+`packages/opencode/src/codegraph/tagger.ts`
+- Given a scope's file nodes, infers **one architectural layer per file** with the
+  small/fast model (`provider.getSmallModel`, Haiku-class; honors `small_model`),
+  via `generateObject` with a fixed-enum schema, and writes `{ layer, hash }` to
+  the per-project store.
+- **The only place tokens are spent.** Two frugality rules: (1) *stale-only* —
+  a file is (re)tagged only if it has no entry or its content hash changed, so
+  re-displaying/navigating unchanged files costs nothing; (2) *minimal context* —
+  the model sees path + parsed imports + leading comment. Config
+  `codegraph.tagger.context: "medium"` additionally sends exported names + file
+  head for tuning.
+- **Soft failure:** any read/model/parse error leaves existing semantics intact
+  and publishes nothing, so the bar always keeps working.
+- Caps: `MAX_PER_PASS` 60 files, `TAG_BATCH` 30 per model call. Runs forked
+  (`forkDetach`) off the read path; an `inFlight` set dedupes concurrent passes
+  per `directory+scope`.
+- On success publishes `codegraph.invalidated` so the live view re-merges. The
+  stale-only guard is what prevents a tag→refetch→tag cycle (the next pass finds
+  matching hashes and publishes nothing).
 
 ### 3. Graph payload — the stable contract
+`packages/opencode/src/codegraph/payload.ts` (Effect `Schema`)
 
     { version,
-      nodes: [{ id, path, kind, size, layer, position }],
-      edges: [{ from, to, kind }],
-      semantics: { [nodeId]: { tags: string[], hue: string } } }
+      nodes:    [{ id, path, kind: "file"|"directory", size, position: { layer, index } }],
+      edges:    [{ from, to, kind: "import" }],
+      semantics:{ [nodeId]: { tags: string[], hue?: string, layer?: Layer } } }
 
-- position/layer computed deterministically by the extractor.
-- hue maps to the theme palette at render time (api.theme.current), respecting the
-  active theme.
-- semantics is separate from nodes so tags update asynchronously without touching
-  structure.
+- `position.layer` is **scope-relative** depth (0 = direct child of the scope);
+  `position.index` is the stable slot within a layer. Renderers map (layer, index)
+  to screen coords per orientation — the payload is orientation-agnostic.
+- `size` is bytes for files; **0 for directories** (collapsed nodes whose contents
+  are the *next* scope, so not walked at this layer).
+- `semantics` is keyed separately from `nodes` so it updates asynchronously
+  without touching structure. Adding the optional `layer` field was backward
+  compatible (older caches decode with an empty map) — **no version bump needed
+  for additive optional semantics fields.**
+- **Bump `PAYLOAD_VERSION` whenever the extractor's output shape/semantics change**
+  — `codegraph.ts` gates cache reads on an exact version match, so a stale cache
+  from an older extractor is never served. (v2 = single-layer walk replacing the
+  old recursive `**/*`; v3 = scope-relative window, cached per scope.)
 
-### 4. TUI renderer — plugin + a new core slot (fork)
-- Add codegraph_top: {} to TuiHostSlotMap; place
-  <TuiPluginRuntime.Slot name="codegraph_top" .../> above chat content in
-  routes/session/index.tsx; reserve height via the content-height math.
-- Renderer plugin fills the slot, reads payload via api.state / api.event.on(...),
-  draws nodes/edges with box-drawing chars in absolutely-positioned <box> children.
-- Pluggable layout strategy from day one: layout(payload, { width, height,
-  orientation }) with horizontal (top-bar) now and vertical (sidebar) stub. Moving
-  to a sidebar later = swap the <Slot/> location + select the vertical strategy;
-  payload/extractor/tagger untouched.
+### 4. TUI renderer — plugin + a core slot (fork)
+`feature-plugins/system/codegraph.tsx`, slot wired in `routes/session/index.tsx`
+- `codegraph_top` slot lives above chat content. `TOP_BAR_HEIGHT = 14`, fixed.
+  Toggle via the `session.codegraph.toggle` command (kv signal `"codegraph"`).
+  Hidden for subagent sessions (`parentID`) and terminals shorter than 20 rows.
+- Draws layer-0 children as bordered boxes with their layer-1 children beneath
+  (grouped by path prefix, capped at `MAX_CHILDREN` 4 with a `…` overflow tile).
+  **Kind is encoded by corner shape** (directories square, files rounded) so
+  border/background stay free; **hue is the painted layer color**, falling back to
+  structural colors (dirs accented, files muted) until tagged.
+- **Navigation (mouse-first):** click a directory box to re-root; `⟳` refresh,
+  `⌂` root, `◀` up, and a clickable breadcrumb walk back out. A legend row shows
+  the fixed layer vocabulary + a Directory swatch.
+- **Pluggable layout was the design intent** but only the horizontal strategy
+  exists today; (layer, index) in the payload is what a future vertical/sidebar
+  strategy would consume. Moving to a sidebar later = swap the `<Slot/>` location
+  + a vertical layout; payload/extractor/tagger untouched.
 
-## Build order
-1. Payload schema + structure extractor + Storage caching (no UI; verify via dump).
-2. New codegraph_top slot in core + renderer plugin (horizontal layout, structure
-   only, single hue).
-3. Incremental recompute on file events.
-4. Semantic layer: batch tagger + per-edit tagging instruction (config-first),
-   tags→hues mapping.
-5. Optional: full-screen "zoom" route for detail.
+### 3.5 Live update model (how the view stays current)
+`packages/opencode/src/codegraph/codegraph.ts` (the `CodeGraph` service)
+- **Recompute-on-display:** the TUI fetches with `refresh=true`, so every scope it
+  shows (navigation, manual `⟳`, live invalidation) is recomputed from disk. The
+  2-level walk is cheap and keeps a drilled-in view consistent with its parent.
+- **Visibility-gated invalidation:** the service subscribes to `Watcher.Updated` +
+  `FileSystem.Edited`; a changed file marks dirty (and publishes
+  `codegraph.invalidated`) only for **already-cached** scopes whose 2-level window
+  (`isWithinWindow`) contains it. A file in an unopened directory costs nothing.
+  Caches + the dirty set live per project directory, cleaned on instance disposal.
+- **Shell-mutation catch-all:** shell commands (rm, mv, git, scaffolding) mutate
+  the tree without firing `file.edited`, so the renderer also refetches on
+  `session.next.shell.ended` for its own session. Inert when the experimental
+  event system is off; manual `⟳` / navigation still cover it.
+- The structure cache stays pure: `finalize` merges semantics onto a *copy* at the
+  read boundary and schedules a background tag pass, so all read paths (memory,
+  disk, recompute) share one merge+tag site.
 
 ## ⚠️ Catastrophic failure mode (learned the hard way, step 2)
 
@@ -96,12 +184,12 @@ opencode tree (LSP, file watcher, snapshots → constant store updates) drives
 constant re-renders, so the same code there leaks at ~30MB/s. **A bug that
 reproduces only in busy directories is the tell.**
 
-Fix (now in feature-plugins/system/codegraph.tsx): never call a resource
-accessor unguarded in render. Check `resource.error` first and return a fallback
-*without* calling the accessor; route every read through a helper that
-short-circuits on error (e.g. `const nodes = () => graph.error ? [] :
-graph()?.nodes ?? []`). Keep the bar frame always mounted (fixed height) rather
-than gating it behind `<Show when={graph()...}>`.
+Fix (in feature-plugins/system/codegraph.tsx): never call a resource accessor
+unguarded in render. Check `resource.error` first and return a fallback *without*
+calling the accessor; route every read through a helper that short-circuits on
+error (the live code: `const nodes = () => graph.error ? [] : graph()?.nodes ??
+[]`, and `hueOf`/`summary` likewise). Keep the bar frame always mounted (fixed
+height) rather than gating it behind `<Show when={graph()...}>`.
 
 How it was localized (use this method for render/leak bugs): dewire the data
 path entirely → hardcode a static bar (stable + visible confirms slot/layout is
@@ -113,16 +201,172 @@ your own edits to the watched tree don't confound the memory reading.
 
 Two upstream contributors that made errors more likely, both fixed: (1) the
 extractor used to walk `**/*` and read every file (node_modules included),
-exhausting memory during compute — now single-layer with caps; (2) a stale
-durable cache from the old extractor was served because `PAYLOAD_VERSION` wasn't
-bumped — bump the version (or clear storage/codegraph) whenever the payload
-shape or extractor semantics change.
+exhausting memory during compute — now single-layer/scoped with caps; (2) a
+stale durable cache from the old extractor was served because `PAYLOAD_VERSION`
+wasn't bumped — bump the version (or clear storage/codegraph) whenever the
+payload shape or extractor semantics change.
+
+## Next features (planned) — steps 6–8
+
+Three capabilities come next: **edges** (6), **agent tracking** (7), and
+**planning representation** (8). They are deliberately scoped around two shared
+foundations so the work compounds instead of duplicating.
+
+### Findings that shape the design (verified)
+- **Plan mode is the `plan` agent** (`agent/agent.ts:142`): entered by an agent
+  switch, exited by the `plan_exit` tool → switch to `build` (`tool/plan.ts`).
+  Both transitions emit **`session.next.agent.switched`**
+  (`core/src/session/event.ts:41`, `data.agent` = `"plan"`/`"build"`). That single
+  event is the plan/build signal.
+- **Plans are freeform markdown** at `.opencode/plans/*.md` (`Session.plan(...)`);
+  there is **no structured representation of proposed file ops**, and plan mode
+  *denies* edits, so the agent emits **no planned-edit tool calls** — only
+  reads/greps/globs are observable. Proposed new files must be recovered by parsing
+  the plan markdown.
+- **Live agent actions** ride `session.next.tool.*` (`core/src/session/event.ts`):
+  `tool.called` = `{ callID, tool, input }` (file tools expose `input.filePath`),
+  `tool.success/failed` carry results + `time`. **Turn boundary** =
+  `session.next.prompted`. **Agent attribution** = resolve `sessionID` → session
+  `agent`/`parentID`. ⚠️ This family is gated behind
+  `OPENCODE_EXPERIMENTAL_EVENT_SYSTEM` (`effect/runtime-flags.ts:48`); the plugin
+  already leans on `session.next.shell.ended`, so absence degrades gracefully (no
+  glyphs). Non-experimental fallback (later): the always-on message-part stream in
+  `context/sync-v2.tsx` carries the same tool state.
+- **The extractor only resolves imports inside the window today** (`extract.ts`
+  `resolveImport` matches `knownFiles`), so cross-window imports are dropped.
+
+### Decisions locked in
+- **Edges = window + immediate dependency surface, not repo-wide.** Resolve a
+  file's relative imports; if a target falls outside the window, include *that*
+  file (or its directory) as a one-hop **boundary node** via bounded `fs.stat`
+  checks — never recurse, never glob the whole repo.
+- **Proposed-file paths come from a prompt instruction, not inference.** Add one
+  line to `session/prompt/plan-mode.txt` telling the agent to reference each new
+  file's **full repo-root-relative path at least once**; parse the plan markdown
+  for code-file paths. Chosen because its failure mode is *silent omission* (path
+  not drawn), never a hallucinated node.
+- **Provenance is in-memory now, contract-ready.** Define the activity/provenance
+  schema now; the TUI keeps a per-turn ring in memory for the live view. Durable
+  server-side persistence + the full timeline UI come later without reshaping data.
+
+### Dependency map / build order
+```
+  Foundation A: node-overlay render layer (glyph vocab + one hover-info line + setScope nav)
+        │ shared by ALL three
+        ├── Foundation B: activity substrate (events → per-turn, multi-agent; Provenance contract)
+        │        ├── [7] retrospective agent tracking
+        │        └── [8] planning: plan-mode reads (same data, plan-agent = prospective styling)
+        └── [6] edges (extractor boundary nodes + hover-highlight + link-out)   ← independent data
+  [8] also needs: plan-mode detection (agent.switched) + plan-overlay (md parse + prompt line)
+```
+Order: **A → (6 ‖ B) → 7 → 8.** 6 and B share no data and can run in parallel
+after A.
+
+### Foundation A — node-overlay render layer (shared, pure renderer) — DONE
+Implemented in `codegraph.tsx` + `codegraph/activity.ts` (data-free vocabulary,
+sibling to `semantics.ts`): `Action = read|edit|write|create`, `ACTION_GLYPH`
+(single-width geometric glyphs), `ACTION_LABEL`, and a `Style = actual|planned`
+axis. The renderer now has: a reactive **hover-info line** in the header
+(`hovered` signal; shows a node's path/size on `onMouseOver`, falls back to the
+summary), and an **`OverlayRow`** glyph slot on every tile fed by a single
+`overlaysFor(node)` accessor (returns `[]` today; planned overlays dim, actual
+ones use the producer's color). Steps 7/8 only fill `overlaysFor` + set `hovered`;
+no render-tree changes. No payload change.
+
+### Foundation B — activity substrate + Provenance contract (client) — DONE
+Contract added to `codegraph/activity.ts` (data-free, persistence-ready):
+`ActivityEntry = { path, action, agent, sessionID, callID, timestamp }`,
+`Turn = { promptedAt, entries[] }`, and `actionFromTool(tool)`. The reactive
+tracker lives in `feature-plugins/system/codegraph-activity.ts`
+(`createActivityTracker(api, sessionID)`): subscribes to `prompted` (→ new turn,
+own session only), `step.started`/`agent.switched` (→ current agent per session),
+and `tool.called` (read/edit/write → entry; `input.filePath` normalized to
+repo-relative). Keeps a `MAX_TURNS`-deep ring in memory; exposes
+`entriesFor(path)` (via a per-path memo), `current()`, `history()`, `agents()`.
+Graceful no-op when `OPENCODE_EXPERIMENTAL_EVENT_SYSTEM` is off.
+
+A **thin step-7 render rode along** so B is verifiable: `overlaysFor` now emits one
+glyph per distinct action on a node, colored per agent (`agentColor`, hashed
+status palette), and the hover line appends `<agent> <action> <relTime>`. Sub-agent
+activity is captured (entries carry `sessionID`) but not yet visually grouped.
+
+### [6] Edges
+- **Extractor (`extract.ts`, `payload.ts`):** for unresolved in-window relative
+  imports, resolve the one-hop neighbor on disk and emit it in a new optional
+  `boundaries: [{ id, path, kind }]` field (kept out of the layer grid); edges may
+  target boundary ids. **Bump `PAYLOAD_VERSION` → 4.** Add an `extract.test.ts`
+  case asserting one-hop boundary nodes appear but transitive/repo-wide ones don't.
+- **Renderer:** `id→node` map incl. boundaries; `onMouseOver` highlights in-window
+  importers/importees (hover line lists out-of-window targets); boundary targets
+  render as a compact affordance, click → `setScope(dir-of(boundary.path))`.
+  Literal drawn connector lines deferred (flexbox makes them costly in 14 rows).
+
+### [7] Agent tracking (retrospective) — basic version landed with B
+Working today: per-turn glyphs on touched nodes, agent-colored, hover shows
+agent/action/relative-time, reset on new prompt. **Remaining polish:** read vs
+edit/write visual emphasis (currently same weight), a multi-agent legend +
+sub-agent grouping under the spawner, and a richer (reactive) hover that updates
+while still pointed at a node.
+
+### [8] Planning representation
+1. **Detect plan mode** via B's current-agent tracking → switch the view to
+   planning styling.
+2. **Planned reads:** reuse B entries whose agent is `plan`, rendered with the
+   `planned` style axis.
+3. **Proposed files (plan-overlay):** parse the active plan markdown for
+   code-file paths (reuse `SOURCE_GLOB` extensions) → **dashed-border blocks** at
+   their tree location (+ dashed glyphs for planned edits to existing files).
+   Recommend producing this **server-side** in the codegraph service (it has FS +
+   project context + `Session.plan(...)` and already watches `file.edited`),
+   exposed as an additive optional payload field (no version bump) refreshed via
+   the existing invalidation path. Plus the one-line `plan-mode.txt` edit.
+
+### Critical files (steps 6–8)
+- `feature-plugins/system/codegraph.tsx` — Foundations A/B, render for 6/7/8.
+- `codegraph/extract.ts`, `codegraph/payload.ts` — boundary nodes + version bump (6).
+- `codegraph/activity.ts` (new) — glyph vocabulary + `ActivityEntry`/`Turn` types.
+- `codegraph/codegraph.ts` + small new module — plan-overlay producer (8).
+- `session/prompt/plan-mode.txt` — full-path instruction for new files (8).
+- HTTP/SDK regen if a field/endpoint is added (`httpapi/groups/codegraph.ts`,
+  `sdk/js/src/v2/gen/`).
+- Reference (no change): `core/src/session/event.ts`, `tool/plan.ts`,
+  `agent/agent.ts`, `context/sync-v2.tsx` (fallback source).
+
+### Verification (steps 6–8)
+- `bun typecheck` per package; extend `test/codegraph/extract.test.ts` for
+  boundary resolution.
+- **6:** in a repo with cross-dir imports, hover highlights neighbors + lists
+  out-of-window targets; clicking a link re-roots to the target's dir.
+- **7:** with `OPENCODE_EXPERIMENTAL_EVENT_SYSTEM=true`, have an agent read/edit a
+  few files → glyphs appear, hover shows agent + timestamp, new prompt resets the
+  set; confirm no-glyph graceful degrade with the flag off.
+- **8:** switch to the `plan` agent → planning styling; plan-mode reads show
+  prospective; after the agent writes a plan referencing a full-path new code file,
+  a dashed block appears; a path written without a full root-relative form is
+  simply omitted (no phantom node).
+- Memory guard (above): keep all resource/accessor reads guarded; watch RAM flat
+  in a busy tree.
 
 ## Open follow-ups (not blockers)
-- Edge extraction depth: import/require parsing first, or LSP-backed call/type
-  edges later (api.state.lsp()).
-- Tag vocabulary: fixed enum (predictable hues) vs free-form (needs hue policy).
-- Worktree/subsession behavior: hide the bar for child sessions like the sidebar?
+- **Edge extraction depth.** Regex import/require parsing today; LSP-backed
+  call/type edges later (`api.state.lsp()`). No re-export/alias resolution. (Step 6
+  adds one-hop boundary resolution but stays regex-based.)
+- **Directory size is always 0.** Collapsed dir nodes could carry a descendant
+  byte-sum if we want size-weighted layout, at the cost of a deeper walk.
+- **Durable provenance + timeline.** Step 7 keeps activity in memory; a later
+  server-side per-project provenance log (like the semantic store) + a timeline UI
+  would give cross-restart history. Contract is designed to allow it.
+- **Structured plan ops.** Step 8 recovers proposed files by parsing markdown; a
+  future core change could have the plan workflow emit structured ops directly.
+- **Per-edit self-tagging (the dropped step-4 path).** If the standalone tagger
+  proves too slow/costly, revisit injecting tagging guidance so the dev agent
+  tags files it edits (config-first via AGENTS.md, then the system-transform
+  hook). Extension points preserved below.
+- **Tag vocabulary growth.** Fixed enum today. Free-form tags or metrics would
+  extend the `Semantic` shape additively (optional fields, no version bump) and
+  need a hue policy for unknown tags.
+- **Full-screen zoom route (step 5, shelved).** A detail route for a single node /
+  subgraph; template at feature-plugins/system/diff-viewer.tsx.
 
 ## Frozen reference — verified extension points
 
@@ -135,65 +379,81 @@ dialogs (modals). opencode's own UI is built as internal "feature-plugins"
 (feature-plugins/) using the same public TuiPluginApi a third party gets.
 
 Mouse is first-class: `<box>`/`<text>` accept onMouseDown/Up/Over/Out/Move +
-onClick (MouseEvent with target+coords), used in ~32 files — nodes can be made
-clickable/hoverable (e.g. sidebar/files.tsx:22, routes/session/index.tsx:2011).
+onClick (MouseEvent with target+coords). The code-graph bar uses onMouseDown for
+drill-in/navigation; more examples at sidebar/files.tsx:22,
+routes/session/index.tsx:2011.
+
+Code-graph files (this feature):
+- Server: packages/opencode/src/codegraph/ — payload.ts (contract),
+  extract.ts (deterministic walk), codegraph.ts (service: cache + window math +
+  events), tagger.ts (semantic paint), semantic-store.ts, semantics.ts
+  (layer/hue vocabulary), event.ts (codegraph.invalidated), dump.ts (CLI verify).
+- HTTP: server/routes/instance/httpapi/groups/codegraph.ts (+ handlers/,
+  registered in server.ts and api.ts).
+- TUI: feature-plugins/system/codegraph.tsx; registered in
+  cli/cmd/tui/plugin/internal.ts; slot placed in routes/session/index.tsx:1155.
+- Tests: packages/opencode/test/codegraph/extract.test.ts.
 
 Slots:
-- Host slot map: packages/plugin/src/tui.ts:455 (TuiHostSlotMap)
-- Slot placement in session view: routes/session/index.tsx ~:1285; layout/size
-  math at routes/session/index.tsx:238-245
+- Host slot map: packages/plugin/src/tui.ts (TuiHostSlotMap — `codegraph_top`
+  added here).
+- Slot placement in session view: routes/session/index.tsx:1155 (gated by
+  `codegraphVisible`, :248); top-bar height/visibility math at :246-252.
 - Sidebar slot template: feature-plugins/sidebar/files.tsx:54
 - Full-screen route template: feature-plugins/system/diff-viewer.tsx:934
 - Sidebar container (fixed 42 cols, auto-hides narrow/subsession):
   routes/session/sidebar.tsx:29, routes/session/index.tsx:238-243
 
-Structured data channel (agent → TUI):
-- Schema: packages/core/src/tool-output.ts:18 (Structured = Record<String, Any>)
-- Producer: packages/opencode/src/session/processor.ts:480 (publishes
-  session.next.tool.success with structured)
-- Consumer (TUI store): cli/cmd/tui/context/sync-v2.tsx:191
-- Read on a part: part.state.structured
+Events (server → TUI):
+- codegraph.invalidated: defined packages/opencode/src/codegraph/event.ts;
+  registered by importing that module from the route group (before api.ts
+  snapshots the EventV2 registry into the SDK Event union). TUI subscribes via
+  `api.event.on("codegraph.invalidated", …)`.
+- File events that feed invalidation: file.edited
+  (packages/core/src/filesystem.ts:80), file.watcher.updated
+  (packages/core/src/filesystem/watcher.ts:24).
+- session.next.shell.ended (experimental) — used as the shell-mutation refetch.
 
-File events:
-- file.edited: packages/core/src/filesystem.ts:80
-- file.watcher.updated: packages/core/src/filesystem/watcher.ts:24
-- Tool publishes: packages/opencode/src/tool/write.ts:68,
-  packages/opencode/src/tool/edit.ts:111 and :155
-- Real watcher publishes: packages/core/src/filesystem/watcher.ts:94
+HTTP payload channel:
+- GET /codegraph?scope=&refresh= → CodeGraphPayload.Payload. Middleware:
+  InstanceContext + WorkspaceRouting + Authorization. Consumed in the TUI via
+  `api.client.codegraph.get(...)`. SDK types regenerate into
+  packages/sdk/js/src/v2/gen/.
 
-System-prompt injection:
+System-prompt injection (only if revisiting per-edit self-tagging):
 - Assembly: packages/opencode/src/session/prompt.ts:1438-1446 then
   packages/opencode/src/session/llm/request.ts:56-78
 - Hook experimental.chat.system.transform: invoked at
   session/llm/request.ts:69; type at packages/plugin/src/index.ts:291
   (mutable { system: string[] })
-- Message-transform hook: prompt.ts:1436; type plugin/src/index.ts:282
 - Config-based instructions (auto-loaded): AGENTS.md/CLAUDE.md at
   session/instruction.ts:62-66; config.instructions globbed/loaded at
   session/instruction.ts:133-167
 
-Tool hooks:
+Tool hooks (alternative changed-file detection):
 - tool.execute.before/after wrapping: packages/opencode/src/session/tools.ts:90
   and :105; type packages/plugin/src/index.ts:274 (filter input.tool ===
   "edit"|"write")
 
 Persistence:
 - Durable KV: packages/opencode/src/storage/storage.ts:55 (read/write/update/
-  remove/list, string[] keys); files under Global.Path.data/storage
-  (storage.ts:226, global.ts:20). Key by ctx.project.id for per-project stability.
-- Per-open-project in-memory state: InstanceState
-  (packages/opencode/src/effect/instance-state.ts), per-directory ScopedCache,
-  cleaned on disposal.
+  remove/list, string[] keys). Code-graph keys: structure caches under
+  ["codegraph", projectID, "structure", scopeKey]; semantics under
+  ["codegraph", projectID, "semantics"]. `storage.update` is atomic read-modify-
+  write under a write lock (used by semantic-store upsert so concurrent scope tag
+  passes don't clobber each other).
+- Per-open-project in-memory state: the service's `caches` Map keyed by directory;
+  cleaned via registerDisposer on instance disposal.
 
-Config & loading:
-- Config schema: packages/core/src/config.ts (instructions :88, skills :85,
-  references :91, plugins). JSONC supported.
-- Plugin tool contract: packages/plugin/src/tool.ts; registration
-  packages/opencode/src/tool/registry.ts:140-219 (plugin tools + filesystem
-  auto-discovery of tool/ or tools/ dirs).
-- TUI plugin API: packages/plugin/src/tui.ts:581 (TuiPluginApi); TUI plugin
-  runtime/loader: cli/cmd/tui/plugin/runtime.ts, internal list
-  cli/cmd/tui/plugin/internal.ts.
+Provider / model (tagger):
+- provider.defaultModel → getSmallModel(providerID) → getLanguage(small). Returns
+  undefined when no small model is available; the tagger then skips the pass.
+- Provider/Config are provided to the CodeGraph layer (see defaultLayer) so the
+  forked tagger keeps R = never, mirroring Agent.defaultLayer.
+
+Config:
+- Schema: packages/core/src/v1/config/config.ts — `codegraph.tagger.context`
+  ("minimal" | "medium"). JSONC supported.
 
 Module/style conventions: see AGENTS.md (flat exports + self-reexport, Effect v4
 rules, snake_case Drizzle, run bun typecheck from package dirs).

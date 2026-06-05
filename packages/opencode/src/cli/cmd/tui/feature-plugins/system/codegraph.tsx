@@ -2,6 +2,8 @@ import type { TuiPlugin, TuiPluginApi, TuiThemeCurrent } from "@opencode-ai/plug
 import type { InternalTuiPlugin } from "../../plugin/internal"
 import { createMemo, createResource, createSignal, For, onCleanup, Show } from "solid-js"
 import { LEGEND, DIRECTORY_HUE, DIRECTORY_LABEL } from "@/codegraph/semantics"
+import { ACTION_GLYPH, ACTION_LABEL, type Action, type Style } from "@/codegraph/activity"
+import { createActivityTracker } from "./codegraph-activity"
 
 const id = "internal:codegraph"
 
@@ -59,9 +61,28 @@ const SQUARE_CORNERS = {
 const ROUNDED_CORNERS = { ...SQUARE_CORNERS, topLeft: "╭", topRight: "╮", bottomLeft: "╰", bottomRight: "╯" }
 const cornersFor = (kind: GraphNode["kind"]) => (kind === "directory" ? SQUARE_CORNERS : ROUNDED_CORNERS)
 
+// An ephemeral overlay glyph drawn on a node tile (Foundation A). Later steps
+// fill these in: agent tracking (step 7) emits read/edit/write/create with an
+// agent color; planning (step 8) emits the same with style "planned". `color` is
+// resolved by the producer; the renderer only dims when style is "planned".
+type Overlay = { action: Action; color: TuiThemeCurrent["text"]; style: Style }
+
 function View(props: { api: TuiPluginApi; session_id: string }) {
   const theme = () => props.api.theme.current
   const [scope, setScope] = createSignal("")
+  // Foundation A hover-info line: what a node tile / link shows when pointed at.
+  // Cleared on mouse-out so the header falls back to the summary. Set as a plain
+  // string so any feature (node detail, edge target, …) can drive it uniformly.
+  const [hovered, setHovered] = createSignal<string | undefined>()
+
+  // Foundation B: per-turn agent activity, fed by session.next.* events. Empty
+  // unless the experimental event system is on (graceful no-op otherwise).
+  const activity = createActivityTracker(props.api, props.session_id)
+
+  // Map an agent name to a stable theme color so concurrent agents are
+  // distinguishable. Cycles the status palette by a hash of the name; step 8 may
+  // pin specific agents (e.g. plan → a fixed hue).
+  const agentColor = (agent: string) => themeColor(theme(), AGENT_PALETTE[hashString(agent) % AGENT_PALETTE.length])
 
   // Recompute on display (refresh=true): every scope we show — on navigation, on
   // the manual refresh button, and on a live invalidation event — is recomputed
@@ -105,6 +126,31 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     return g ? `${g.nodes.length} nodes · ${g.edges.length} edges` : "loading…"
   }
   const hueOf = (nodeID: string) => (graph.error ? undefined : graph()?.semantics[nodeID]?.hue)
+
+  // Overlay glyphs for a node tile: this turn's agent activity on the file. One
+  // glyph per distinct action, colored by the agent that most recently performed
+  // it. Reactive via the activity index; planned styling arrives with step 8.
+  const overlaysFor = (node: GraphNode): Overlay[] => {
+    const entries = activity.entriesFor(node.path)
+    if (entries.length === 0) return []
+    const overlays: Overlay[] = []
+    const seen = new Set<Action>()
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const e = entries[i]!
+      if (seen.has(e.action)) continue
+      seen.add(e.action)
+      overlays.unshift({ action: e.action, color: agentColor(e.agent), style: "actual" })
+    }
+    return overlays
+  }
+
+  // Hover text for a node: its path/size, plus the latest action on it this turn.
+  const hoverNode = (node: GraphNode) => {
+    const base = describeNode(node)
+    const entries = activity.entriesFor(node.path)
+    const latest = entries[entries.length - 1]
+    return latest ? `${base} · ${latest.agent} ${ACTION_LABEL[latest.action]} ${relTime(latest.timestamp)}` : base
+  }
 
   // Layer-0 nodes are the squares; layer-1 nodes hang under their parent (grouped
   // by path prefix). Memoized on the node set so it recomputes only on new data.
@@ -152,7 +198,11 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
         <text fg={theme().text}>
           <b>Code Graph</b>
         </text>
-        <text fg={theme().textMuted}>{summary()}</text>
+        {/* Hover-info line (Foundation A): a node's path/size while pointed at,
+            otherwise the node/edge count. Shared by all overlay features. */}
+        <text fg={hovered() ? theme().text : theme().textMuted} wrapMode="none">
+          {hovered() ?? summary()}
+        </text>
       </box>
 
       {/* Navigation row: refresh + root + up + breadcrumb. Always present so the
@@ -215,10 +265,15 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                 paddingRight={1}
                 flexShrink={0}
                 onMouseDown={() => item.node.kind === "directory" && setScope(item.node.path)}
+                onMouseOver={() => setHovered(hoverNode(item.node))}
+                onMouseOut={() => setHovered(undefined)}
               >
-                <text fg={hueColor(theme(), hueOf(item.node.id), item.node.kind)} wrapMode="none">
-                  {truncate(basename(item.node.path), MAX_LABEL)}
-                </text>
+                <box flexDirection="row" gap={1} flexShrink={0}>
+                  <text fg={hueColor(theme(), hueOf(item.node.id), item.node.kind)} wrapMode="none">
+                    {truncate(basename(item.node.path), MAX_LABEL)}
+                  </text>
+                  <OverlayRow overlays={() => overlaysFor(item.node)} theme={theme} />
+                </box>
               </box>
               <box flexDirection="row" gap={1} flexShrink={0}>
                 <For each={item.children}>
@@ -229,10 +284,15 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                       borderColor={theme().border}
                       flexShrink={0}
                       onMouseDown={() => child.kind === "directory" && setScope(child.path)}
+                      onMouseOver={() => setHovered(hoverNode(child))}
+                      onMouseOut={() => setHovered(undefined)}
                     >
-                      <text fg={hueColor(theme(), hueOf(child.id), child.kind)} wrapMode="none">
-                        {truncate(basename(child.path), MAX_CHILD_LABEL)}
-                      </text>
+                      <box flexDirection="row" gap={1} flexShrink={0}>
+                        <text fg={hueColor(theme(), hueOf(child.id), child.kind)} wrapMode="none">
+                          {truncate(basename(child.path), MAX_CHILD_LABEL)}
+                        </text>
+                        <OverlayRow overlays={() => overlaysFor(child)} theme={theme} />
+                      </box>
                     </box>
                   )}
                 </For>
@@ -250,6 +310,58 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
       </box>
     </box>
   )
+}
+
+// --- overlay layer (Foundation A) ------------------------------------------
+
+// Glyph strip drawn to the right of a node label. `overlays` and `theme` are
+// accessors so the strip stays reactive to live activity (step 7) and to theme
+// switches. Planned overlays are dimmed; actual ones use the producer's color
+// (e.g. the acting agent's). Renders nothing until a feature fills `overlaysFor`.
+function OverlayRow(props: { overlays: () => Overlay[]; theme: () => TuiThemeCurrent }) {
+  return (
+    <Show when={props.overlays().length > 0}>
+      <box flexDirection="row" flexShrink={0}>
+        <For each={props.overlays()}>
+          {(o) => (
+            <text fg={o.style === "planned" ? props.theme().textMuted : o.color} wrapMode="none">
+              {ACTION_GLYPH[o.action]}
+            </text>
+          )}
+        </For>
+      </box>
+    </Show>
+  )
+}
+
+// Hover-info text for a node: its full repo-relative path (plus size for files).
+function describeNode(node: GraphNode) {
+  if (node.kind === "directory") return node.path + "/"
+  return `${node.path} · ${formatBytes(node.size)}`
+}
+
+// Theme status keys cycled to give each agent a distinct, stable color.
+const AGENT_PALETTE = ["accent", "info", "success", "warning", "error"] as const
+
+function hashString(s: string) {
+  let h = 0
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0
+  return Math.abs(h)
+}
+
+// Compact "time since" for the hover line (e.g. "12s", "3m", "2h").
+function relTime(ts: number) {
+  const secs = Math.max(0, Math.round((Date.now() - ts) / 1000))
+  if (secs < 60) return `${secs}s ago`
+  const mins = Math.round(secs / 60)
+  if (mins < 60) return `${mins}m ago`
+  return `${Math.round(mins / 60)}h ago`
+}
+
+function formatBytes(n: number) {
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`
 }
 
 // --- helpers ---------------------------------------------------------------
