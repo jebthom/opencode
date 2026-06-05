@@ -32,14 +32,17 @@ type Orientation = "horizontal" | "vertical"
 type Cell = { node: GraphNode; label: string }
 type Layout = { columns: Cell[][] }
 
-const TOP_BAR_HEIGHT = 6
+const TOP_BAR_HEIGHT = 9
+const MOCK_CHILD_PREFIX = "tmp"
 
-// INCREMENT C (temporary diagnostic). Fetch + counts proven stable; now add the
-// per-node `For` rendering back, keeping the defensive read guard and the
-// always-visible frame. If memory climbs again in the opencode tree, the leak
-// is in the OpenTUI per-node render path (the nested `For`s / `layout` memo) and
-// not the fetch. Reads stay guarded so the resource error state can never throw
-// inside the render scope.
+// First graph visual (step 2, placeholder semantics). Each real node from the
+// extractor renders as a bordered square tagged with its filename; beneath it
+// hang 1–3 placeholder children drawn as labeled branches. The children and
+// their count are NOT real structure yet — they stand in for the eventual child
+// nodes so the bar reads as a graph. The child count is derived from the node id
+// (see childCount) rather than Math.random() so it stays stable across renders;
+// re-rolling every frame would thrash the reconciler (see PLAN.md failure mode).
+// Resource reads stay guarded (never call graph() in the error state).
 function View(props: { api: TuiPluginApi; session_id: string }) {
   const theme = () => props.api.theme.current
 
@@ -52,13 +55,21 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   )
 
   const nodes = () => (graph.error ? [] : (graph()?.nodes ?? []))
-  const layout = createMemo(() => computeLayout(nodes(), "horizontal"))
   const summary = () => {
     if (graph.error) return "fetch error"
     const g = graph()
     return g ? `${g.nodes.length} nodes · ${g.edges.length} edges` : "loading…"
   }
   const hueOf = (nodeID: string) => (graph.error ? undefined : graph()?.semantics[nodeID]?.hue)
+
+  // Real nodes paired with their placeholder children. Memoized on the node set
+  // so it recomputes only when the graph data actually changes.
+  const tree = createMemo(() =>
+    nodes().map((node) => ({
+      node,
+      children: Array.from({ length: childCount(node.id) }, (_, i) => `${MOCK_CHILD_PREFIX}-${i + 1}`),
+    })),
+  )
 
   return (
     <box
@@ -78,13 +89,18 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
         <text fg={theme().textMuted}>{summary()}</text>
       </box>
       <box flexDirection="row" gap={2} flexGrow={1}>
-        <For each={layout().columns}>
-          {(column) => (
-            <box flexDirection="column">
-              <For each={column}>
-                {(cell) => (
-                  <text fg={hueColor(theme(), hueOf(cell.node.id), cell.node.kind)} wrapMode="none">
-                    {cell.label}
+        <For each={tree()}>
+          {(item) => (
+            <box flexDirection="column" flexShrink={0}>
+              <box border borderColor={theme().border} paddingLeft={1} paddingRight={1} flexShrink={0}>
+                <text fg={hueColor(theme(), hueOf(item.node.id), item.node.kind)} wrapMode="none">
+                  {basename(item.node.path)}
+                </text>
+              </box>
+              <For each={item.children}>
+                {(child, i) => (
+                  <text fg={theme().textMuted} wrapMode="none">
+                    {(i() === item.children.length - 1 ? "└─ " : "├─ ") + child}
                   </text>
                 )}
               </For>
@@ -94,6 +110,21 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
       </box>
     </box>
   )
+}
+
+// Basename of a repo-relative path, truncated to the node-square tag width.
+function basename(p: string) {
+  const name = p.split("/").pop() ?? p
+  return name.length > MAX_LABEL ? name.slice(0, MAX_LABEL - 1) + "…" : name
+}
+
+// Placeholder child count in [1, 3], derived deterministically from the node id
+// so it never re-rolls between renders. Replace with real child structure when
+// the extractor emits nested nodes.
+function childCount(nodeID: string) {
+  let h = 0
+  for (let i = 0; i < nodeID.length; i++) h = (h * 31 + nodeID.charCodeAt(i)) | 0
+  return 1 + (Math.abs(h) % 3)
 }
 
 // --- pluggable layout strategy ---------------------------------------------

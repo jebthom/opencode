@@ -134,6 +134,10 @@ UI extension surfaces: routes (full-screen), slots (named injection points),
 dialogs (modals). opencode's own UI is built as internal "feature-plugins"
 (feature-plugins/) using the same public TuiPluginApi a third party gets.
 
+Mouse is first-class: `<box>`/`<text>` accept onMouseDown/Up/Over/Out/Move +
+onClick (MouseEvent with target+coords), used in ~32 files — nodes can be made
+clickable/hoverable (e.g. sidebar/files.tsx:22, routes/session/index.tsx:2011).
+
 Slots:
 - Host slot map: packages/plugin/src/tui.ts:455 (TuiHostSlotMap)
 - Slot placement in session view: routes/session/index.tsx ~:1285; layout/size
