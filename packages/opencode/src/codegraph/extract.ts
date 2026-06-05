@@ -133,16 +133,72 @@ export const extract = Effect.fn("CodeGraph.extract")(function* (
 
   const edges: CodeGraphPayload.Edge[] = []
   const seenEdges = new Set<string>()
+  const addEdge = (fromID: string, toID: string) => {
+    if (fromID === toID) return
+    const key = fromID + "|" + toID
+    if (seenEdges.has(key)) return
+    seenEdges.add(key)
+    edges.push({ from: fromID, to: toID, kind: "import" })
+  }
+
+  // Two passes over each in-window file's imports:
+  //   1. resolve against `knownFiles` → an in-window edge (as before);
+  //   2. for a *relative* spec that resolved to nothing in-window, record a probe
+  //      to resolve one hop on disk (step 6). Bare/package specs are dropped.
+  // Probes are deduped by their candidate base path (+ the importer language's
+  // extension set), so the same off-window target is stat-checked once however
+  // many in-window files import it.
+  const boundaryProbes = new Map<string, { base: string; exts: readonly string[] }>()
+  const pendingBoundaryEdges: { from: string; probeKey: string }[] = []
   for (const [f, content] of parsed) {
     if (!content) continue
     for (const spec of parseImports(f, content)) {
       const target = resolveImport(f, spec, knownFiles)
-      if (!target || target === f) continue
-      const key = f + "\u0000" + target
-      if (seenEdges.has(key)) continue
-      seenEdges.add(key)
-      edges.push({ from: nodeID(f), to: nodeID(target), kind: "import" })
+      if (target) {
+        addEdge(nodeID(f), nodeID(target))
+        continue
+      }
+      const t = importTargetBase(f, spec)
+      if (!t) continue // bare/package specifier — intentionally not an edge
+      const probeKey = t.base + "|" + t.exts.join(",")
+      boundaryProbes.set(probeKey, t)
+      pendingBoundaryEdges.push({ from: f, probeKey })
     }
+  }
+
+  // Resolve each probe to an existing file on disk — one hop only. We never read or
+  // parse the resolved file (no transitive edges) and never glob: just a bounded
+  // set of `fs.stat`s on the literal candidate paths. Targets that escape the repo
+  // root or land under an ignored dir are discarded.
+  const statIsFile = (rel: string) =>
+    fs.stat(path.join(root, rel)).pipe(
+      Effect.map((s) => s.type === "File"),
+      Effect.catch(() => Effect.succeed(false)),
+    )
+  const resolveOnDisk = (base: string, exts: readonly string[]) =>
+    Effect.gen(function* () {
+      for (const rel of diskCandidates(base, exts)) {
+        if (rel === "" || rel.startsWith("..") || isIgnoredPath(rel)) continue
+        if (yield* statIsFile(rel)) return rel
+      }
+      return undefined as string | undefined
+    })
+  const probeResults = yield* Effect.forEach(
+    [...boundaryProbes.entries()],
+    ([key, p]) => resolveOnDisk(p.base, p.exts).pipe(Effect.map((rel) => [key, rel] as const)),
+    { concurrency: READ_CONCURRENCY },
+  )
+  const resolvedProbe = new Map(probeResults)
+
+  const boundaries = new Map<string, CodeGraphPayload.Boundary>()
+  for (const { from, probeKey } of pendingBoundaryEdges) {
+    const rel = resolvedProbe.get(probeKey)
+    // A probe that resolved back into the window is already a normal edge via pass
+    // 1; skip so we never double-draw it as a boundary.
+    if (!rel || rel === from || knownFiles.has(rel)) continue
+    const bid = nodeID(rel)
+    boundaries.set(bid, { id: bid, path: rel, kind: "file" })
+    addEdge(nodeID(from), bid)
   }
 
   const positions = layout(relFiles, [...dirSet], scope)
@@ -167,10 +223,13 @@ export const extract = Effect.fn("CodeGraph.extract")(function* (
 
   edges.sort((a, b) => (a.from + a.to).localeCompare(b.from + b.to))
 
+  const boundaryList = [...boundaries.values()].toSorted((a, b) => a.id.localeCompare(b.id))
+
   return {
     version: CodeGraphPayload.PAYLOAD_VERSION,
     nodes,
     edges,
+    boundaries: boundaryList,
     semantics: {},
   } satisfies CodeGraphPayload.Payload
 })
@@ -224,7 +283,7 @@ function isIgnoredPath(rel: string) {
 }
 
 function emptyPayload(): CodeGraphPayload.Payload {
-  return { version: CodeGraphPayload.PAYLOAD_VERSION, nodes: [], edges: [], semantics: {} }
+  return { version: CodeGraphPayload.PAYLOAD_VERSION, nodes: [], edges: [], boundaries: [], semantics: {} }
 }
 
 // --- import parsing --------------------------------------------------------
@@ -253,39 +312,48 @@ export function parseImports(file: string, content: string) {
 
 const TS_EXTS = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"]
 
-// Resolve an import specifier to a known file node, or undefined for externals.
-// Only intra-repo relative (TS/JS) and dotted-relative (Python) imports become
-// edges; bare/package specifiers are intentionally dropped.
-function resolveImport(from: string, spec: string, known: Set<string>): string | undefined {
-  if (from.endsWith(".py")) return resolvePython(from, spec, known)
+// The on-disk base path (repo-relative, POSIX) a relative import points at, plus
+// the candidate extensions for the importer's language. `undefined` for bare or
+// package specifiers, which are never intra-repo edges. Shared by the in-window
+// resolver and the out-of-window boundary probe (step 6) so both agree on exactly
+// what a spec resolves to — the boundary pass is just the same math against disk.
+function importTargetBase(from: string, spec: string): { base: string; exts: readonly string[] } | undefined {
   if (!spec.startsWith(".")) return undefined
-  const base = toPosix(path.posix.join(posixDir(from), spec))
-  return matchWithExtensions(base, known, TS_EXTS)
-}
-
-function resolvePython(from: string, spec: string, known: Set<string>): string | undefined {
-  if (!spec.startsWith(".")) return undefined
-  // Leading dots = relative levels: one dot is the current package.
-  const dots = spec.match(/^\.+/)![0].length
-  const tail = spec.slice(dots).replace(/\./g, "/")
-  let dir = posixDir(from)
-  for (let i = 1; i < dots; i++) dir = posixDir(dir)
-  const base = toPosix(path.posix.join(dir, tail))
-  return matchWithExtensions(base, known, [".py"])
-}
-
-function matchWithExtensions(base: string, known: Set<string>, exts: string[]): string | undefined {
-  if (known.has(base)) return base
-  for (const ext of exts) {
-    if (known.has(base + ext)) return base + ext
+  if (from.endsWith(".py")) {
+    // Leading dots = relative levels: one dot is the current package.
+    const dots = spec.match(/^\.+/)![0].length
+    const tail = spec.slice(dots).replace(/\./g, "/")
+    let dir = posixDir(from)
+    for (let i = 1; i < dots; i++) dir = posixDir(dir)
+    return { base: toPosix(path.posix.join(dir, tail)), exts: [".py"] }
   }
-  for (const ext of exts) {
-    const index = toPosix(path.posix.join(base, "index" + ext))
-    if (known.has(index)) return index
-    const initFile = toPosix(path.posix.join(base, "__init__" + ext))
-    if (known.has(initFile)) return initFile
+  return { base: toPosix(path.posix.join(posixDir(from), spec)), exts: TS_EXTS }
+}
+
+// Resolve an import specifier to a known *in-window* file node, or undefined for
+// externals and out-of-window targets. Only intra-repo relative (TS/JS) and
+// dotted-relative (Python) imports become edges; bare/package specifiers dropped.
+function resolveImport(from: string, spec: string, known: Set<string>): string | undefined {
+  const t = importTargetBase(from, spec)
+  if (!t) return undefined
+  for (const rel of diskCandidates(t.base, t.exts)) {
+    if (known.has(rel)) return rel
   }
   return undefined
+}
+
+// Candidate repo-relative paths a base could resolve to, in match-priority order:
+// the base verbatim (an explicit-extension import), then base + each extension,
+// then a directory index / package __init__. The single source of truth for both
+// the in-window `known`-set lookup and the on-disk boundary stat probe.
+function diskCandidates(base: string, exts: readonly string[]): string[] {
+  const out = [base]
+  for (const ext of exts) out.push(base + ext)
+  for (const ext of exts) {
+    out.push(toPosix(path.posix.join(base, "index" + ext)))
+    out.push(toPosix(path.posix.join(base, "__init__" + ext)))
+  }
+  return out
 }
 
 // --- path helpers ----------------------------------------------------------

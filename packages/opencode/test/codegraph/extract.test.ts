@@ -34,10 +34,22 @@ const SAMPLE = {
 }
 
 const nodeByPath = (payload: CodeGraphPayload.Payload, p: string) => payload.nodes.find((n) => n.path === p)
+const boundaryByPath = (payload: CodeGraphPayload.Payload, p: string) =>
+  (payload.boundaries ?? []).find((b) => b.path === p)
 const edgeBetween = (payload: CodeGraphPayload.Payload, from: string, to: string) => {
   const f = nodeByPath(payload, from)
   const t = nodeByPath(payload, to)
   return payload.edges.find((e) => e.from === f?.id && e.to === t?.id)
+}
+
+// A scoped window (src) whose file reaches *out* of the window via a relative
+// import. lib/helper.ts is one hop outside src; lib/deep/more.ts is a second hop,
+// reachable only by parsing the boundary file — which step 6 must never do.
+const CROSS_DIR = {
+  "src/app.ts": `import { h } from "../lib/helper"\nimport { u } from "./util"\n`,
+  "src/util.ts": `export const u = 1\n`,
+  "lib/helper.ts": `import { m } from "./deep/more"\nexport const h = 1\n`,
+  "lib/deep/more.ts": `export const m = 1\n`,
 }
 
 describe("CodeGraph.extract", () => {
@@ -155,6 +167,46 @@ describe("CodeGraph.extract", () => {
       const first = yield* CodeGraphExtract.extract(dir)
       const second = yield* CodeGraphExtract.extract(dir)
       expect(JSON.stringify(second)).toBe(JSON.stringify(first))
+    }),
+  )
+
+  it.live("emits one-hop boundary nodes for out-of-window imports, but not transitive ones", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      yield* writeFiles(dir, CROSS_DIR)
+      const payload = yield* CodeGraphExtract.extract(dir, { scope: "src" })
+
+      // The window holds only src's files; lib/* is outside it.
+      expect(payload.nodes.map((n) => n.path).toSorted()).toEqual(["src/app.ts", "src/util.ts"])
+
+      // The one-hop import target appears as a boundary (not a placed node), and
+      // the edge from the importer points at it.
+      const helper = boundaryByPath(payload, "lib/helper.ts")
+      expect(helper).toBeDefined()
+      expect(helper!.kind).toBe("file")
+      expect(nodeByPath(payload, "lib/helper.ts")).toBeUndefined()
+      const appID = nodeByPath(payload, "src/app.ts")!.id
+      expect(payload.edges.find((e) => e.from === appID && e.to === helper!.id)).toBeDefined()
+
+      // The second hop (lib/helper.ts → lib/deep/more.ts) is never resolved: we
+      // don't parse the boundary file, so repo-wide/transitive targets stay out.
+      expect(boundaryByPath(payload, "lib/deep/more.ts")).toBeUndefined()
+      expect(nodeByPath(payload, "lib/deep/more.ts")).toBeUndefined()
+
+      // An in-window relative import is still a normal edge, never a boundary.
+      expect(edgeBetween(payload, "src/app.ts", "src/util.ts")).toBeDefined()
+      expect(boundaryByPath(payload, "src/util.ts")).toBeUndefined()
+    }),
+  )
+
+  it.live("emits no boundaries when every import resolves in-window", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      yield* writeFiles(dir, SAMPLE)
+      const payload = yield* CodeGraphExtract.extract(dir)
+
+      // SAMPLE's imports (./a, .util) all resolve inside the root window.
+      expect(payload.boundaries).toEqual([])
     }),
   )
 

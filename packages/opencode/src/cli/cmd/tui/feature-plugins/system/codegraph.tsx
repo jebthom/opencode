@@ -29,18 +29,30 @@ type GraphNode = {
 
 type GraphEdge = { from: string; to: string; kind: string }
 
+// An out-of-window one-hop import target (step 6). No position/size — it isn't
+// placed in the layer grid; the renderer draws it as a boundary tile under the
+// importing node. An edge's `to` may reference a boundary id.
+type GraphBoundary = { id: string; path: string; kind: "file" | "directory" }
+
 type Graph = {
   version: number
   nodes: GraphNode[]
   edges: GraphEdge[]
-  semantics: Record<string, { tags: readonly string[]; hue?: string }>
+  boundaries?: GraphBoundary[]
+  semantics: Record<string, { tags: readonly string[]; hue?: string; layer?: string }>
 }
 
 const TOP_BAR_HEIGHT = 14
 // Children drawn per node before collapsing the rest into a single "…" tile.
 const MAX_CHILDREN = 4
 const MAX_LABEL = 16
-const MAX_CHILD_LABEL = 8
+const MAX_CHILD_LABEL = 7
+// Fixed tile widths (step 6). Children and their containment drops share CHILD_W
+// so a `│` drop always centers over its child regardless of label length; boundary
+// tiles + their drops share TILE_W likewise. Fixed widths are what make the purely
+// visual connector edges align without per-tile column math.
+const CHILD_W = 11
+const TILE_W = 3
 
 // Kind is encoded by corner shape only, leaving border/background colors free
 // for the future semantic-painting layer: directories get square corners, files
@@ -126,6 +138,65 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     return g ? `${g.nodes.length} nodes · ${g.edges.length} edges` : "loading…"
   }
   const hueOf = (nodeID: string) => (graph.error ? undefined : graph()?.semantics[nodeID]?.hue)
+  const boundaries = () => (graph.error ? [] : (graph()?.boundaries ?? []))
+  const edgeList = () => (graph.error ? [] : (graph()?.edges ?? []))
+
+  // Which node tile the mouse is over, for the in-window import highlight. Kept
+  // separate from the `hovered` info-line string so the highlight survives when a
+  // boundary tile (not a node) drives the info line.
+  const [hoveredId, setHoveredId] = createSignal<string>()
+
+  // id → boundary, for the out-of-window targets an edge can point at.
+  const boundaryById = createMemo(() => new Map(boundaries().map((b) => [b.id, b] as const)))
+
+  // Per node: its out-of-window import targets (edges from the node to a boundary).
+  // Drives the boundary-tile strip and the hover line's "→ targets" list.
+  const boundariesFor = createMemo(() => {
+    const byId = boundaryById()
+    const m = new Map<string, GraphBoundary[]>()
+    for (const e of edgeList()) {
+      const b = byId.get(e.to)
+      if (!b) continue
+      const arr = m.get(e.from) ?? []
+      arr.push(b)
+      m.set(e.from, arr)
+    }
+    return m
+  })
+
+  // In-window adjacency (both directions) so hovering a node lights up everything
+  // it imports and everything that imports it. Boundary edges are excluded — those
+  // are surfaced as tiles, not highlights.
+  const adjacency = createMemo(() => {
+    const byId = boundaryById()
+    const m = new Map<string, Set<string>>()
+    const link = (a: string, b: string) => (m.get(a) ?? m.set(a, new Set()).get(a)!).add(b)
+    for (const e of edgeList()) {
+      if (byId.has(e.to)) continue
+      link(e.from, e.to)
+      link(e.to, e.from)
+    }
+    return m
+  })
+
+  // Border color for a node tile under the current hover: the hovered node itself
+  // gets the bright foreground; its in-window neighbors are tinted by *their own*
+  // layer hue (the dependency's semantics); everything else stays the plain border.
+  const borderColorFor = (node: GraphNode) => {
+    const hid = hoveredId()
+    if (!hid) return theme().border
+    if (node.id === hid) return theme().text
+    if (adjacency().get(hid)?.has(node.id)) return hueColor(theme(), hueOf(node.id), node.kind)
+    return theme().border
+  }
+  const enterNode = (node: GraphNode) => {
+    setHovered(hoverNode(node))
+    setHoveredId(node.id)
+  }
+  const leaveNode = () => {
+    setHovered(undefined)
+    setHoveredId(undefined)
+  }
 
   // Overlay glyphs for a node tile: this turn's agent activity on the file. One
   // glyph per distinct action, colored by the agent that most recently performed
@@ -147,9 +218,15 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   // Hover text for a node: its path/size, plus the latest action on it this turn.
   const hoverNode = (node: GraphNode) => {
     const base = describeNode(node)
+    // List out-of-window import targets so a dependency that left the window is
+    // still legible even though it can't be drawn as an in-window highlight.
+    const outs = boundariesFor().get(node.id) ?? []
+    const withOut = outs.length ? `${base} · →${outs.map((b) => basename(b.path)).join(" ")}` : base
     const entries = activity.entriesFor(node.path)
     const latest = entries[entries.length - 1]
-    return latest ? `${base} · ${latest.agent} ${ACTION_LABEL[latest.action]} ${relTime(latest.timestamp)}` : base
+    return latest
+      ? `${withOut} · ${latest.agent} ${ACTION_LABEL[latest.action]} ${relTime(latest.timestamp)}`
+      : withOut
   }
 
   // Layer-0 nodes are the squares; layer-1 nodes hang under their parent (grouped
@@ -255,57 +332,137 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
 
       <box flexDirection="row" gap={2} flexGrow={1}>
         <For each={tree()}>
-          {(item) => (
-            <box flexDirection="column" flexShrink={0} gap={0}>
-              <box
-                border
-                customBorderChars={cornersFor(item.node.kind)}
-                borderColor={theme().border}
-                paddingLeft={1}
-                paddingRight={1}
-                flexShrink={0}
-                onMouseDown={() => item.node.kind === "directory" && setScope(item.node.path)}
-                onMouseOver={() => setHovered(hoverNode(item.node))}
-                onMouseOut={() => setHovered(undefined)}
-              >
-                <box flexDirection="row" gap={1} flexShrink={0}>
-                  <text fg={hueColor(theme(), hueOf(item.node.id), item.node.kind)} wrapMode="none">
-                    {truncate(basename(item.node.path), MAX_LABEL)}
-                  </text>
-                  <OverlayRow overlays={() => overlaysFor(item.node)} theme={theme} />
+          {(item) => {
+            const bnds = boundariesFor().get(item.node.id) ?? []
+            const shownBnds = bnds.slice(0, MAX_CHILDREN)
+            const bndOverflow = bnds.length - MAX_CHILDREN
+            const hasChildren = item.children.length > 0 || item.overflow > 0
+            return (
+              <box flexDirection="column" flexShrink={0} gap={0}>
+                <box
+                  border
+                  customBorderChars={cornersFor(item.node.kind)}
+                  borderColor={borderColorFor(item.node)}
+                  paddingLeft={1}
+                  paddingRight={1}
+                  flexShrink={0}
+                  onMouseDown={() => item.node.kind === "directory" && setScope(item.node.path)}
+                  onMouseOver={() => enterNode(item.node)}
+                  onMouseOut={() => leaveNode()}
+                >
+                  <box flexDirection="row" gap={1} flexShrink={0}>
+                    <text fg={hueColor(theme(), hueOf(item.node.id), item.node.kind)} wrapMode="none">
+                      {truncate(basename(item.node.path), MAX_LABEL)}
+                    </text>
+                    <OverlayRow overlays={() => overlaysFor(item.node)} theme={theme} />
+                  </box>
                 </box>
-              </box>
-              <box flexDirection="row" gap={1} flexShrink={0}>
-                <For each={item.children}>
-                  {(child) => (
+
+                {/* Containment edge: a white │ drop centered over each child. The
+                    drops row mirrors the children row's fixed CHILD_W + gap, so each
+                    drop aligns to its child regardless of label length. */}
+                <Show when={hasChildren}>
+                  <box flexDirection="row" gap={1} height={1} flexShrink={0}>
+                    <For each={item.children}>
+                      {() => (
+                        <box width={CHILD_W} alignItems="center" flexShrink={0}>
+                          <text fg={theme().text} wrapMode="none">
+                            │
+                          </text>
+                        </box>
+                      )}
+                    </For>
+                    <Show when={item.overflow > 0}>
+                      <box width={CHILD_W} alignItems="center" flexShrink={0}>
+                        <text fg={theme().text} wrapMode="none">
+                          │
+                        </text>
+                      </box>
+                    </Show>
+                  </box>
+                </Show>
+
+                <box flexDirection="row" gap={1} flexShrink={0}>
+                  <For each={item.children}>
+                    {(child) => (
+                      <box
+                        width={CHILD_W}
+                        border
+                        customBorderChars={cornersFor(child.kind)}
+                        borderColor={borderColorFor(child)}
+                        flexShrink={0}
+                        onMouseDown={() => child.kind === "directory" && setScope(child.path)}
+                        onMouseOver={() => enterNode(child)}
+                        onMouseOut={() => leaveNode()}
+                      >
+                        <box flexDirection="row" gap={1} flexShrink={0}>
+                          <text fg={hueColor(theme(), hueOf(child.id), child.kind)} wrapMode="none">
+                            {truncate(basename(child.path), MAX_CHILD_LABEL)}
+                          </text>
+                          <OverlayRow overlays={() => overlaysFor(child)} theme={theme} />
+                        </box>
+                      </box>
+                    )}
+                  </For>
+                  <Show when={item.overflow > 0}>
                     <box
+                      width={CHILD_W}
                       border
-                      customBorderChars={cornersFor(child.kind)}
+                      customBorderChars={SQUARE_CORNERS}
                       borderColor={theme().border}
                       flexShrink={0}
-                      onMouseDown={() => child.kind === "directory" && setScope(child.path)}
-                      onMouseOver={() => setHovered(hoverNode(child))}
-                      onMouseOut={() => setHovered(undefined)}
                     >
-                      <box flexDirection="row" gap={1} flexShrink={0}>
-                        <text fg={hueColor(theme(), hueOf(child.id), child.kind)} wrapMode="none">
-                          {truncate(basename(child.path), MAX_CHILD_LABEL)}
-                        </text>
-                        <OverlayRow overlays={() => overlaysFor(child)} theme={theme} />
-                      </box>
+                      <text fg={theme().textMuted} wrapMode="none">
+                        …
+                      </text>
                     </box>
-                  )}
-                </For>
-                <Show when={item.overflow > 0}>
-                  <box border customBorderChars={SQUARE_CORNERS} borderColor={theme().border} flexShrink={0}>
-                    <text fg={theme().textMuted} wrapMode="none">
-                      …
-                    </text>
+                  </Show>
+                </box>
+
+                {/* Out-of-window imports (step 6): white │ drops into a row of
+                    boundary tiles, each a square colored by the target's layer hue.
+                    Click a tile to re-root at the target's directory. */}
+                <Show when={shownBnds.length > 0}>
+                  <box flexDirection="row" gap={1} height={1} flexShrink={0}>
+                    <For each={shownBnds}>
+                      {() => (
+                        <box width={TILE_W} alignItems="center" flexShrink={0}>
+                          <text fg={theme().text} wrapMode="none">
+                            │
+                          </text>
+                        </box>
+                      )}
+                    </For>
+                  </box>
+                  <box flexDirection="row" gap={1} flexShrink={0}>
+                    <For each={shownBnds}>
+                      {(b) => (
+                        <box
+                          width={TILE_W}
+                          alignItems="center"
+                          flexShrink={0}
+                          onMouseDown={() => setScope(posixDir(b.path))}
+                          onMouseOver={() => setHovered(b.path)}
+                          onMouseOut={() => setHovered(undefined)}
+                        >
+                          <text fg={hueColor(theme(), hueOf(b.id), "file")} wrapMode="none">
+                            ▪
+                          </text>
+                        </box>
+                      )}
+                    </For>
+                    <Show when={bndOverflow > 0}>
+                      <box width={TILE_W} alignItems="center" flexShrink={0}>
+                        <text fg={theme().textMuted} wrapMode="none">
+                          …
+                        </text>
+                      </box>
+                    </Show>
                   </box>
                 </Show>
               </box>
-            </box>
-          )}
+            )
+          }}
         </For>
       </box>
     </box>

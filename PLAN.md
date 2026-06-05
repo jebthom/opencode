@@ -8,11 +8,13 @@ Semantics are malleable and async — an agent attaches a layer/hue to each file
 over time. First idiom: a wide top-bar above the chat showing a 2-level window of
 the graph that the user can drill into.
 
-## Status (steps 1–4 done)
+## Status (steps 1–4, A, B, 6 done)
 
 Implemented and in place: deterministic structure extraction, a top-bar renderer
-with drill-down + mouse navigation, live recompute on file/shell events, and an
-async semantic tagger that paints files by architectural layer.
+with drill-down + mouse navigation, live recompute on file/shell events, an
+async semantic tagger that paints files by architectural layer, and the edge layer
+(step 6): containment connectors, hover dependency-highlights, and clickable
+out-of-window boundary tiles painted by their target's layer.
 
     [done] 1. Payload schema + structure extractor + Storage caching + `dump.ts`.
     [done] 2. `codegraph_top` core slot + renderer plugin (horizontal layout).
@@ -21,7 +23,7 @@ async semantic tagger that paints files by architectural layer.
     [done] 4. Semantic layer: async per-file tagger (small model) → layer → hue.
     [done] A. Foundation A: node-overlay render layer (glyphs + hover line).
     [done] B. Foundation B: activity substrate + provenance contract.
-    [next] 6. Edges: in-window highlights + immediate dependency-surface links.
+    [done] 6. Edges: containment connectors + hover highlights + boundary tiles.
     [wip ] 7. Agent tracking: basic glyphs/hover landed with B; polish remains.
     [next] 8. Planning representation: plan-mode overlay (dashed proposed files).
     [shelved] 5. Optional: full-screen "zoom" route for detail.
@@ -256,11 +258,11 @@ foundations so the work compounds instead of duplicating.
         ├── Foundation B: activity substrate (events → per-turn, multi-agent; Provenance contract)
         │        ├── [7] retrospective agent tracking
         │        └── [8] planning: plan-mode reads (same data, plan-agent = prospective styling)
-        └── [6] edges (extractor boundary nodes + hover-highlight + link-out)   ← independent data
+        └── [6] edges (extractor boundary nodes + hover-highlight + link-out)   ← DONE
   [8] also needs: plan-mode detection (agent.switched) + plan-overlay (md parse + prompt line)
 ```
-Order: **A → (6 ‖ B) → 7 → 8.** 6 and B share no data and can run in parallel
-after A.
+Order: **A → (6 ‖ B) → 7 → 8.** 6 and B shared no data and were built in parallel
+after A; **6 is done**, B/7 basic is done. Remaining: 7 polish, then 8.
 
 ### Foundation A — node-overlay render layer (shared, pure renderer) — DONE
 Implemented in `codegraph.tsx` + `codegraph/activity.ts` (data-free vocabulary,
@@ -290,16 +292,74 @@ glyph per distinct action on a node, colored per agent (`agentColor`, hashed
 status palette), and the hover line appends `<agent> <action> <relTime>`. Sub-agent
 activity is captured (entries carry `sessionID`) but not yet visually grouped.
 
-### [6] Edges
-- **Extractor (`extract.ts`, `payload.ts`):** for unresolved in-window relative
-  imports, resolve the one-hop neighbor on disk and emit it in a new optional
-  `boundaries: [{ id, path, kind }]` field (kept out of the layer grid); edges may
-  target boundary ids. **Bump `PAYLOAD_VERSION` → 4.** Add an `extract.test.ts`
-  case asserting one-hop boundary nodes appear but transitive/repo-wide ones don't.
-- **Renderer:** `id→node` map incl. boundaries; `onMouseOver` highlights in-window
-  importers/importees (hover line lists out-of-window targets); boundary targets
-  render as a compact affordance, click → `setScope(dir-of(boundary.path))`.
-  Literal drawn connector lines deferred (flexbox makes them costly in 14 rows).
+### [6] Edges — DONE
+Two edge *types*, split by what the flexbox top-bar can draw (a horizontal row of
+parent columns, children in a row beneath — no cell coordinates to route arbitrary
+lines, so only local/fixed geometry gets a literal connector). All three idioms
+below shipped and are verified in the TUI.
+
+- **Containment (directory → child):** a purely-visual white `│` drop per child in
+  a 1-row connector strip between a parent box and its children row. Children render
+  at a **fixed width** (`CHILD_W`; truncate label with `…`, full name on hover) so
+  every drop aligns to its child's center regardless of name length — the drop strip
+  reuses the same `CHILD_W`+gap `For`, so alignment is structural, not computed.
+- **Import (in-window):** *not* drawable as a literal line between arbitrary boxes
+  (deferred — costly in 14 rows). Represented by **hover-highlight**: a `hoveredId`
+  signal + a memoized `adjacency` map (both directions, boundary edges excluded);
+  hovering a node recolors the node itself (bright `text`) and its importers/
+  importees, each tinted by **its own** layer hue. Hover line lists out-of-window
+  targets (`→ a.ts b.ts`).
+- **Import (out-of-window / boundary):** each off-window relative import becomes a
+  **boundary tile** — a square glyph `▪` (distinct from the `◌◆●◈` action glyphs),
+  width `TILE_W`, beneath the importing node, joined by a white `│` drop, `fg` = the
+  target's layer hue. Click → `setScope(dir-of(boundary.path))`. Capped per node
+  with a `…` overflow, like child tiles.
+
+As built:
+- **Extractor (`extract.ts`):** a *second* import pass. Pass 1 resolves against the
+  in-window `knownFiles` (unchanged). Pass 2: a relative spec that didn't resolve
+  in-window is recorded as a probe (deduped by candidate base + ext set) and
+  resolved one hop on disk via bounded `fs.stat` over `diskCandidates` (base, then
+  `+ext`, then `index`/`__init__`). Guards enforce the depth bound: **never parse
+  the resolved file** (no transitive edges), never glob, drop targets that escape
+  the repo root (`..`) or hit an ignored dir, and skip a probe that resolved back
+  into the window (already a pass-1 edge). `resolveImport`/`importTargetBase`/
+  `diskCandidates` are the shared source of truth so in-window and on-disk
+  resolution agree. Boundaries sorted by id; edges (incl. boundary edges) sorted —
+  determinism preserved.
+- **Payload (`payload.ts`):** new optional `boundaries: [{ id, path, kind }]` (no
+  `position` — kept out of the layer grid); an `Edge.to` may reference a boundary
+  id. **`PAYLOAD_VERSION` → 4.** The extractor always emits `boundaries` (possibly
+  `[]`) for byte-stable output; the field is optional only so decoders tolerate its
+  absence. Also fixed `Semantic` to carry the `layer?` field added in step 4.
+- **Boundary coloring (`codegraph.ts`):** `finalize` derives hue for boundary ids
+  from the *same* semantic store as nodes (factored into one `applySemantic`), and
+  `scheduleTag` hands the tagger in-window files **plus** boundary `file` targets —
+  so an out-of-window dependency gets tagged on first view (keyed by stable id, so
+  the tag is reused when the file is later opened in-window), then `Invalidated`
+  fires for the viewed scope and the tile repaints. Additive — no version bump.
+- **Renderer (`codegraph.tsx`):** `boundaryById` / `boundariesFor` / `adjacency`
+  memos over guarded accessors (all reads short-circuit on `graph.error`, per the
+  catastrophic-leak rule); `borderColorFor` + `enterNode`/`leaveNode` drive the
+  hover highlight; fixed-width children + containment/boundary `│` drop strips.
+- **Tests (`extract.test.ts`):** one-hop boundary appears (not as a placed node) and
+  the second hop is excluded; in-window relative imports stay normal edges; a
+  no-boundary case asserts `boundaries: []`.
+
+**Known v1 limitations (tracked in Open follow-ups):**
+- **Boundary tiles render for layer-0 nodes only.** A nested file's off-window
+  imports surface via the hover line; drilling into its directory promotes it to
+  layer-0 and the tile appears. Per-child boundary strips were skipped to stay in
+  the 14-row budget.
+- **Incoming cross-window edges are invisible** (window-only parsing): hovering a
+  node shows what *it* imports out-of-window, not who imports *it* from outside.
+- Boundary coloring depends on the target being a `SOURCE_GLOB` file and a small
+  model being configured; both degrade silently to grey.
+
+**Not done (out of scope, handled separately):** SDK regen — `packages/sdk/js`
+`gen/` is produced out-of-band (`bun run build` → live OpenAPI dump) and is not
+hand-edited; the renderer casts `result.data`, so it's unaffected. Regenerate to
+pick up `boundaries` (and the still-missing `layer`).
 
 ### [7] Agent tracking (retrospective) — basic version landed with B
 Working today: per-turn glyphs on touched nodes, agent-colored, hover shows
@@ -325,7 +385,8 @@ while still pointed at a node.
 - `feature-plugins/system/codegraph.tsx` — Foundations A/B, render for 6/7/8.
 - `codegraph/extract.ts`, `codegraph/payload.ts` — boundary nodes + version bump (6).
 - `codegraph/activity.ts` (new) — glyph vocabulary + `ActivityEntry`/`Turn` types.
-- `codegraph/codegraph.ts` + small new module — plan-overlay producer (8).
+- `codegraph/codegraph.ts` — boundary semantic merge + tag boundary targets (6,
+  `finalize`/`scheduleTag`); + small new module for the plan-overlay producer (8).
 - `session/prompt/plan-mode.txt` — full-path instruction for new files (8).
 - HTTP/SDK regen if a field/endpoint is added (`httpapi/groups/codegraph.ts`,
   `sdk/js/src/v2/gen/`).
@@ -335,8 +396,10 @@ while still pointed at a node.
 ### Verification (steps 6–8)
 - `bun typecheck` per package; extend `test/codegraph/extract.test.ts` for
   boundary resolution.
-- **6:** in a repo with cross-dir imports, hover highlights neighbors + lists
-  out-of-window targets; clicking a link re-roots to the target's dir.
+- **6 (DONE, verified):** in a repo with cross-dir imports, hover highlights
+  neighbors + lists out-of-window targets; clicking a boundary tile re-roots to the
+  target's dir; the tile repaints in the target's layer hue once tagged. Note the
+  layer-0-only tile limitation: drill into a directory to see a nested file's tiles.
 - **7:** with `OPENCODE_EXPERIMENTAL_EVENT_SYSTEM=true`, have an agent read/edit a
   few files → glyphs appear, hover shows agent + timestamp, new prompt resets the
   set; confirm no-glyph graceful degrade with the flag off.
@@ -349,8 +412,19 @@ while still pointed at a node.
 
 ## Open follow-ups (not blockers)
 - **Edge extraction depth.** Regex import/require parsing today; LSP-backed
-  call/type edges later (`api.state.lsp()`). No re-export/alias resolution. (Step 6
-  adds one-hop boundary resolution but stays regex-based.)
+  call/type edges later (`api.state.lsp()`). No re-export/alias resolution. Step 6
+  added one-hop boundary resolution but stays regex-based and resolves only
+  *relative* specs (tsconfig path aliases / bare specifiers are still dropped).
+- **Boundary tiles are layer-0-only; incoming cross-window edges are invisible.**
+  Both fall out of window-only parsing (only in-window files are read). A richer
+  pass — per-child boundary strips, and parsing a thin ring *just outside* the
+  window to discover importers — would lift both, at a bounded cost.
+- **Connector lines for in-window imports.** Arbitrary node→node import lines stay
+  deferred (no cell coordinates in the 14-row flexbox); hover-highlight stands in.
+  A future vertical/sidebar layout could afford real routed edges.
+- **SDK regen for step 6.** `packages/sdk/js/gen/` still lacks `boundaries` and the
+  step-4 `layer` field; run `bun run build` in that package to refresh (renderer is
+  unaffected as it casts the response).
 - **Directory size is always 0.** Collapsed dir nodes could carry a descendant
   byte-sum if we want size-weighted layout, at the cost of a deeper walk.
 - **Durable provenance + timeline.** Step 7 keeps activity in memory; a later
