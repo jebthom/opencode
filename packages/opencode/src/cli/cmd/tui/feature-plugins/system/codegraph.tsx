@@ -1,6 +1,7 @@
 import type { TuiPlugin, TuiPluginApi, TuiThemeCurrent } from "@opencode-ai/plugin/tui"
 import type { InternalTuiPlugin } from "../../plugin/internal"
 import { createMemo, createResource, createSignal, For, onCleanup, Show } from "solid-js"
+import { LEGEND, DIRECTORY_HUE, DIRECTORY_LABEL } from "@/codegraph/semantics"
 
 const id = "internal:codegraph"
 
@@ -33,7 +34,7 @@ type Graph = {
   semantics: Record<string, { tags: readonly string[]; hue?: string }>
 }
 
-const TOP_BAR_HEIGHT = 13
+const TOP_BAR_HEIGHT = 14
 // Children drawn per node before collapsing the rest into a single "…" tile.
 const MAX_CHILDREN = 4
 const MAX_LABEL = 16
@@ -177,6 +178,31 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
         </Show>
       </box>
 
+      {/* Legend: the fixed architectural-layer vocabulary the async tagger paints
+          with. Stable row so the swatches don't move as nodes get (re)tagged. */}
+      <box flexDirection="row" gap={2} height={1} flexShrink={0}>
+        <For each={LEGEND}>
+          {(entry) => (
+            <box flexDirection="row" flexShrink={0}>
+              <text fg={themeColor(theme(), entry.hue)} wrapMode="none">
+                ■
+              </text>
+              <text fg={theme().textMuted} wrapMode="none">
+                {" " + entry.label}
+              </text>
+            </box>
+          )}
+        </For>
+        <box flexDirection="row" flexShrink={0}>
+          <text fg={themeColor(theme(), DIRECTORY_HUE)} wrapMode="none">
+            ■
+          </text>
+          <text fg={theme().textMuted} wrapMode="none">
+            {" " + DIRECTORY_LABEL}
+          </text>
+        </box>
+      </box>
+
       <box flexDirection="row" gap={2} flexGrow={1}>
         <For each={tree()}>
           {(item) => (
@@ -248,7 +274,12 @@ function truncate(s: string, max: number) {
 // files muted), so the bar is useful immediately.
 function hueColor(theme: TuiThemeCurrent, hue: string | undefined, kind: GraphNode["kind"]) {
   if (hue && hue in theme) return theme[hue as keyof TuiThemeCurrent] as TuiThemeCurrent["text"]
-  return kind === "directory" ? theme.accent : theme.textMuted
+  return kind === "directory" ? themeColor(theme, DIRECTORY_HUE) : theme.textMuted
+}
+
+// Resolve a named theme key (the layer hues) to a color, for the legend swatches.
+function themeColor(theme: TuiThemeCurrent, key: string) {
+  return key in theme ? (theme[key as keyof TuiThemeCurrent] as TuiThemeCurrent["text"]) : theme.textMuted
 }
 
 const tui: TuiPlugin = async (api) => {

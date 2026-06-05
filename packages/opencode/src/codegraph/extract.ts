@@ -237,7 +237,7 @@ const TS_DYNAMIC = /import\(\s*["']([^"']+)["']\s*\)/g
 const PY_FROM = /^\s*from\s+([.\w]+)\s+import\s+/gm
 const PY_IMPORT = /^\s*import\s+([.\w]+)/gm
 
-function parseImports(file: string, content: string) {
+export function parseImports(file: string, content: string) {
   const specs = new Set<string>()
   const ext = path.extname(file)
   if (ext === ".py") {

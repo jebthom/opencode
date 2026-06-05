@@ -1,4 +1,5 @@
 import { Schema } from "effect"
+import { LAYERS } from "./semantics"
 
 // The code-graph payload is the stable contract between the deterministic
 // structure extractor (server-side) and the TUI renderer. See PLAN.md.
@@ -50,12 +51,16 @@ export const Edge = Schema.Struct({
 })
 export type Edge = typeof Edge.Type
 
-// Async, agent-supplied semantics keyed by node id. Empty in step 1; populated
-// later by the semantic tagger. Kept separate from `nodes` so it can update
-// independently of structure.
+// Async, agent-supplied semantics keyed by node id. Empty until the semantic
+// tagger (step 4) fills it. Kept separate from `nodes` so it can update
+// independently of structure. `layer` is the inferred architectural layer (the
+// fixed CodeGraphSemantics vocabulary); `hue` is its theme-key color. Adding the
+// optional `layer` field is backward compatible — older structure caches store an
+// empty `semantics` map and still decode, so no PAYLOAD_VERSION bump is needed.
 export const Semantic = Schema.Struct({
   tags: Schema.Array(Schema.String),
   hue: Schema.optional(Schema.String),
+  layer: Schema.optional(Schema.Literals(LAYERS)),
 })
 export type Semantic = typeof Semantic.Type
 

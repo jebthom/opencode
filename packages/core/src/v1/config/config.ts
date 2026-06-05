@@ -181,6 +181,18 @@ export const Info = Schema.Struct({
       }),
     }),
   ),
+  codegraph: Schema.optional(
+    Schema.Struct({
+      tagger: Schema.optional(
+        Schema.Struct({
+          context: Schema.optional(Schema.Literals(["minimal", "medium"])).annotate({
+            description:
+              "How much per-file context the code-graph semantic tagger sends to the model. 'minimal' (default) uses path + imports + leading comment; 'medium' adds exported names and the file head.",
+          }),
+        }),
+      ),
+    }),
+  ).annotate({ description: "Code-graph visualization configuration." }),
 }).annotate({ identifier: "Config" })
 
 export type Info = DeepMutable<Schema.Schema.Type<typeof Info>>
