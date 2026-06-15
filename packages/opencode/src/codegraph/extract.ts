@@ -1,4 +1,4 @@
-import { Effect } from "effect"
+import { Effect, Option } from "effect"
 import path from "path"
 import { createHash } from "crypto"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -95,27 +95,34 @@ export const extract = Effect.fn("CodeGraph.extract")(function* (
         .filter((rel) => rel !== "" && !fileSet.has(rel) && !isIgnoredPath(rel)),
     ),
   ].slice(0, MAX_FILES)
+  // Capture birthtime alongside the kind/size stats we already make, so the layout
+  // can order siblings by creation time (append-only) without an extra syscall.
+  // Map of repo-relative path → birthtime millis (0 when the FS doesn't report one,
+  // e.g. a fresh clone — those tie and fall back to path order).
+  const birthtimes = new Map<string, number>()
   const candidateKinds = yield* Effect.forEach(
     candidates,
     (rel) =>
       fs.stat(path.join(root, rel)).pipe(
-        Effect.map((stat) => [rel, stat.type === "Directory"] as const),
-        Effect.catch(() => Effect.succeed([rel, false] as const)),
+        Effect.map((stat) => [rel, stat.type === "Directory", birthMillis(stat)] as const),
+        Effect.catch(() => Effect.succeed([rel, false, 0] as const)),
       ),
     { concurrency: READ_CONCURRENCY },
   )
+  for (const [rel, , birth] of candidateKinds) birthtimes.set(rel, birth)
   const dirSet = new Set(candidateKinds.filter(([, isDir]) => isDir).map(([rel]) => rel))
 
   const sizes = yield* Effect.forEach(
     relFiles,
     (f) =>
       fs.stat(path.join(root, f)).pipe(
-        Effect.map((stat) => [f, stat.type === "File" ? Number(stat.size) : 0] as const),
-        Effect.catch(() => Effect.succeed([f, 0] as const)),
+        Effect.map((stat) => [f, stat.type === "File" ? Number(stat.size) : 0, birthMillis(stat)] as const),
+        Effect.catch(() => Effect.succeed([f, 0, 0] as const)),
       ),
     { concurrency: READ_CONCURRENCY },
   )
-  const fileSizes = new Map(sizes)
+  const fileSizes = new Map(sizes.map(([f, size]) => [f, size] as const))
+  for (const [f, , birth] of sizes) birthtimes.set(f, birth)
 
   // Edges: parse imports per file and resolve to known file nodes. Files larger
   // than MAX_FILE_BYTES are skipped to avoid loading huge blobs into memory.
@@ -201,7 +208,7 @@ export const extract = Effect.fn("CodeGraph.extract")(function* (
     addEdge(nodeID(from), bid)
   }
 
-  const positions = layout(relFiles, [...dirSet], scope)
+  const positions = layout(relFiles, [...dirSet], scope, birthtimes)
 
   const nodes: CodeGraphPayload.Node[] = [
     ...[...dirSet].map((d) => ({
@@ -234,6 +241,60 @@ export const extract = Effect.fn("CodeGraph.extract")(function* (
   } satisfies CodeGraphPayload.Payload
 })
 
+// Whole-repo file enumeration — the deterministic walk used by the periodic sweep
+// (codegraph.ts) rather than the per-scope view of `extract`. It is deliberately
+// *not* windowed: a single recursive glob finds every non-ignored source file in
+// the repo, repo-relative + sorted + capped, each paired with its stable node id.
+// Unlike `extract` it parses no imports and computes no layout — the sweep only
+// needs file identities to hand to the tagger, and edges/positions are a per-scope
+// display concern computed lazily on navigation. Reuses the same ignore set, cap,
+// and id scheme so a file's identity matches whatever `extract` later produces for
+// it (tag once here, paint everywhere it appears in a window).
+export const listFiles = Effect.fn("CodeGraph.listFiles")(function* (root: string) {
+  const fs = yield* FSUtil.Service
+  const found = yield* fs.glob("**/" + SOURCE_GLOB, { cwd: root, include: "file", dot: false, ignore: IGNORE_GLOBS })
+  const rels = [
+    ...new Set(found.map((p) => toPosix(path.relative(root, path.isAbsolute(p) ? p : path.join(root, p))))),
+  ]
+    .filter((rel) => rel !== "" && !rel.startsWith("..") && !isIgnoredPath(rel))
+    .toSorted()
+    .slice(0, MAX_FILES)
+  return rels.map((rel) => ({ id: nodeID(rel), path: rel }))
+})
+
+// Full-depth source-file enumeration *under a scope*, with sizes — the recursive
+// subtree the windowed `extract` deliberately doesn't walk. Used by the service to
+// compute per-directory composition (bucketed by the async semantic store), so it
+// returns every descendant file's stable id, repo-relative path, and byte size.
+// Paths are repo-relative (so ids match `extract`'s) even though globbed under the
+// scope base. Reuses the same glob/ignore/cap/id scheme as `listFiles`.
+export const listSubtree = Effect.fn("CodeGraph.listSubtree")(function* (root: string, scopeRaw?: string) {
+  const fs = yield* FSUtil.Service
+  const scope = normalizeScope(scopeRaw ?? "")
+  const base = scope === "" ? root : path.join(root, scope)
+  const found = yield* fs.glob("**/" + SOURCE_GLOB, { cwd: base, include: "file", dot: false, ignore: IGNORE_GLOBS })
+  const rels = [
+    ...new Set(
+      found.map((p) => {
+        const relToBase = toPosix(path.relative(base, path.isAbsolute(p) ? p : path.join(base, p)))
+        return scope === "" ? relToBase : `${scope}/${relToBase}`
+      }),
+    ),
+  ]
+    .filter((rel) => rel !== "" && !rel.startsWith("..") && !isIgnoredPath(rel))
+    .toSorted()
+    .slice(0, MAX_FILES)
+  return yield* Effect.forEach(
+    rels,
+    (rel) =>
+      fs.stat(path.join(root, rel)).pipe(
+        Effect.map((stat) => ({ id: nodeID(rel), path: rel, size: stat.type === "File" ? Number(stat.size) : 0 })),
+        Effect.catch(() => Effect.succeed({ id: nodeID(rel), path: rel, size: 0 })),
+      ),
+    { concurrency: READ_CONCURRENCY },
+  )
+})
+
 // --- deterministic node identity ------------------------------------------
 
 // Content-independent: a stable hash of the repo-relative path. The same file
@@ -245,11 +306,15 @@ function nodeID(relPath: string) {
 // --- deterministic layout --------------------------------------------------
 
 // Layer = depth relative to the scope (a direct child of the scope is layer 0).
-// Index = stable position within a layer, assigned by sorted path order.
-// Orientation-agnostic; the renderer maps (layer, index) to screen coordinates.
-function layout(files: string[], dirs: string[], scope: string) {
+// Index = stable position within a layer, ordered by filesystem birthtime so a
+// newly-created sibling appends to the end of its row rather than reshuffling it
+// (the treemap renderer relies on this append-only order). Birthtime is
+// disk-derived, so the payload stays deterministic; equal/absent birthtimes
+// (e.g. a fresh clone) fall back to path order. Orientation-agnostic; the
+// renderer maps (layer, index) to screen coordinates.
+function layout(files: string[], dirs: string[], scope: string, birthtimes: Map<string, number>) {
   const scopeSegments = scope === "" ? 0 : scope.split("/").length
-  const all = [...dirs, ...files].toSorted()
+  const all = [...dirs, ...files]
   const byLayer = new Map<number, string[]>()
   for (const p of all) {
     const layer = p.split("/").length - scopeSegments - 1
@@ -257,11 +322,18 @@ function layout(files: string[], dirs: string[], scope: string) {
     bucket.push(p)
     byLayer.set(layer, bucket)
   }
+  const order = (a: string, b: string) => (birthtimes.get(a) ?? 0) - (birthtimes.get(b) ?? 0) || a.localeCompare(b)
   const positions = new Map<string, CodeGraphPayload.Position>()
   for (const [layer, members] of byLayer) {
-    members.toSorted().forEach((p, index) => positions.set(p, { layer, index }))
+    members.toSorted(order).forEach((p, index) => positions.set(p, { layer, index }))
   }
   return positions
+}
+
+// Birthtime in millis from an Effect FileSystem stat, or 0 when the platform
+// doesn't report one. Shared by the file and directory stat passes.
+function birthMillis(stat: { birthtime: Option.Option<Date> }) {
+  return Option.getOrElse(stat.birthtime, () => new Date(0)).getTime()
 }
 
 // --- scope + path helpers --------------------------------------------------

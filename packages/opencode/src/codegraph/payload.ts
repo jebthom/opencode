@@ -79,6 +79,26 @@ export const Semantic = Schema.Struct({
 })
 export type Semantic = typeof Semantic.Type
 
+// Recursive subtree composition for a directory node, used to paint the directory
+// as a treemap of architectural-layer colors. Derived (like `semantics`) at the
+// read boundary from the semantic store — never part of the deterministic
+// structure cache — so it carries both a file `count` and a `bytes` sum per layer
+// and lets the renderer pick which metric drives the treemap. Layers with zero
+// weight are omitted; `total*` are the sums across all present layers.
+export const LayerWeight = Schema.Struct({
+  layer: Schema.Literals(LAYERS),
+  count: Schema.Int,
+  bytes: Schema.Int,
+})
+export type LayerWeight = typeof LayerWeight.Type
+
+export const Composition = Schema.Struct({
+  weights: Schema.Array(LayerWeight),
+  totalCount: Schema.Int,
+  totalBytes: Schema.Int,
+})
+export type Composition = typeof Composition.Type
+
 export const Payload = Schema.Struct({
   version: Schema.Int,
   nodes: Schema.Array(Node),
@@ -88,6 +108,10 @@ export const Payload = Schema.Struct({
   // output byte-stable. The version bump already prevents serving older caches.
   boundaries: Schema.optional(Schema.Array(Boundary)),
   semantics: Schema.Record(Schema.String, Semantic),
+  // Per-directory subtree composition, keyed by directory node id. Optional and
+  // derived (merged in alongside `semantics` at the read boundary), so adding it is
+  // backward compatible with older structure caches — no PAYLOAD_VERSION bump.
+  composition: Schema.optional(Schema.Record(Schema.String, Composition)),
 })
 export type Payload = typeof Payload.Type
 

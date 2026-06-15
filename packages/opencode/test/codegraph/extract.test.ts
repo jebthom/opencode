@@ -223,3 +223,94 @@ describe("CodeGraph.extract", () => {
     }),
   )
 })
+
+describe("CodeGraph.listFiles", () => {
+  it.live("enumerates every source file in the repo, past the 2-level window", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      yield* writeFiles(dir, SAMPLE)
+      const files = yield* CodeGraphExtract.listFiles(dir)
+      const paths = files.map((f) => f.path)
+
+      // Unlike extract's window, the deep layer-2 file is included.
+      expect(paths).toContain("src/sub/too-deep.ts")
+      expect(paths).toContain("index.ts")
+      expect(paths).toContain("pkg/nested.py")
+      // Directories are not files, so they never appear here.
+      expect(paths).not.toContain("src")
+    }),
+  )
+
+  it.live("skips ignored directories", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      yield* writeFiles(dir, {
+        ...SAMPLE,
+        "node_modules/dep/index.js": `module.exports = {}\n`,
+        "dist/bundle.js": `export const x = 1\n`,
+      })
+      const files = yield* CodeGraphExtract.listFiles(dir)
+
+      expect(files.some((f) => f.path.includes("node_modules"))).toBe(false)
+      expect(files.some((f) => f.path.startsWith("dist/"))).toBe(false)
+    }),
+  )
+
+  it.live("assigns each file the same stable id extract would", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      yield* writeFiles(dir, SAMPLE)
+      const listed = yield* CodeGraphExtract.listFiles(dir)
+      const payload = yield* CodeGraphExtract.extract(dir)
+
+      // A file visible in both the root window and the full listing must carry an
+      // identical id, so a sweep-time tag is reused when the file is later viewed.
+      const indexListed = listed.find((f) => f.path === "index.ts")
+      const indexNode = nodeByPath(payload, "index.ts")
+      expect(indexListed?.id).toBe(indexNode?.id)
+    }),
+  )
+})
+
+describe("CodeGraph.listSubtree", () => {
+  it.live("enumerates the full subtree with sizes and stable ids", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      yield* writeFiles(dir, SAMPLE)
+      const files = yield* CodeGraphExtract.listSubtree(dir)
+      const byPath = new Map(files.map((f) => [f.path, f]))
+
+      // Full depth (past the 2-level window) with non-zero sizes for real files.
+      expect(byPath.has("src/sub/too-deep.ts")).toBe(true)
+      expect(byPath.get("index.ts")!.size).toBeGreaterThan(0)
+      // Ids match what extract assigns, so composition can be keyed off the window.
+      const payload = yield* CodeGraphExtract.extract(dir)
+      expect(byPath.get("index.ts")!.id).toBe(nodeByPath(payload, "index.ts")!.id)
+    }),
+  )
+
+  it.live("re-roots at a scope: paths stay repo-relative, only the subtree is walked", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      yield* writeFiles(dir, SAMPLE)
+      const files = yield* CodeGraphExtract.listSubtree(dir, "src")
+      const paths = files.map((f) => f.path).toSorted()
+
+      // Only src's subtree, repo-relative; nothing from siblings like pkg/ or root.
+      expect(paths).toEqual(["src/deep.ts", "src/sub/too-deep.ts"])
+    }),
+  )
+
+  it.live("skips ignored directories", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      yield* writeFiles(dir, {
+        ...SAMPLE,
+        "node_modules/dep/index.js": `module.exports = {}\n`,
+      })
+      const files = yield* CodeGraphExtract.listSubtree(dir)
+
+      expect(files.some((f) => f.path.includes("node_modules"))).toBe(false)
+    }),
+  )
+})
