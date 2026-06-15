@@ -347,8 +347,10 @@ export const defaultLayer = layer.pipe(
 // Per-directory subtree composition: for every directory node, tally its descendant
 // source files by tagged layer into a count + byte sum. A file under nested
 // directories counts toward each of its in-window ancestors (each directory reflects
-// its own full subtree). Untagged files are skipped — they paint as nothing until the
-// sweep tags them. Pure: a function of the window's directories, the subtree file set,
+// its own full subtree). Every descendant file also feeds the directory's `subtree*`
+// totals regardless of tagging, so a directory with no tagged files still reports its
+// real size (the renderer sizes its grey block from that rather than painting it
+// full-bleed). Pure: a function of the window's directories, the subtree file set,
 // and the semantic store.
 function computeComposition(
   nodes: CodeGraphPayload.Payload["nodes"],
@@ -357,28 +359,36 @@ function computeComposition(
 ): Record<string, CodeGraphPayload.Composition> {
   const dirs = nodes.filter((n) => n.kind === "directory").map((d) => ({ id: d.id, prefix: d.path + "/" }))
   if (dirs.length === 0) return {}
-  const acc = new Map<string, Map<SemanticLayer, { count: number; bytes: number }>>()
+  const tagged = new Map<string, Map<SemanticLayer, { count: number; bytes: number }>>()
+  const subtree = new Map<string, { count: number; bytes: number }>()
   for (const file of files) {
     const layer = store[file.id]?.layer
-    if (!layer) continue
     for (const dir of dirs) {
       if (!file.path.startsWith(dir.prefix)) continue
-      let byLayer = acc.get(dir.id)
-      if (!byLayer) acc.set(dir.id, (byLayer = new Map()))
+      const s = subtree.get(dir.id) ?? { count: 0, bytes: 0 }
+      s.count += 1
+      s.bytes += file.size
+      subtree.set(dir.id, s)
+      if (!layer) continue
+      let byLayer = tagged.get(dir.id)
+      if (!byLayer) tagged.set(dir.id, (byLayer = new Map()))
       const w = byLayer.get(layer) ?? { count: 0, bytes: 0 }
       w.count += 1
       w.bytes += file.size
       byLayer.set(layer, w)
     }
   }
+  // Emit an entry for every directory that has any descendant file, even when none
+  // are tagged (empty `weights`) — that's the grey case the renderer sizes by subtree.
   const result: Record<string, CodeGraphPayload.Composition> = {}
-  for (const [id, byLayer] of acc) {
-    // Emit weights in the fixed LAYERS order so the payload is stable and the
-    // renderer's color bands are consistent.
-    const weights = LAYERS.filter((l) => byLayer.has(l)).map((layer) => ({ layer, ...byLayer.get(layer)! }))
-    const totalCount = weights.reduce((s, w) => s + w.count, 0)
-    const totalBytes = weights.reduce((s, w) => s + w.bytes, 0)
-    result[id] = { weights, totalCount, totalBytes }
+  for (const [id, s] of subtree) {
+    const byLayer = tagged.get(id)
+    // Weights in the fixed LAYERS order so the payload is stable and the renderer's
+    // color bands are consistent.
+    const weights = byLayer ? LAYERS.filter((l) => byLayer.has(l)).map((layer) => ({ layer, ...byLayer.get(layer)! })) : []
+    const totalCount = weights.reduce((sum, w) => sum + w.count, 0)
+    const totalBytes = weights.reduce((sum, w) => sum + w.bytes, 0)
+    result[id] = { weights, totalCount, totalBytes, subtreeCount: s.count, subtreeBytes: s.bytes }
   }
   return result
 }

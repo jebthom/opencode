@@ -96,6 +96,13 @@ export const Composition = Schema.Struct({
   weights: Schema.Array(LayerWeight),
   totalCount: Schema.Int,
   totalBytes: Schema.Int,
+  // Totals over *every* descendant source file, tagged or not (`total*` count only
+  // the tagged files that make up `weights`). A fully-untagged directory therefore
+  // has empty `weights` and zero `total*` but non-zero `subtree*`, which lets the
+  // renderer size its grey "uncategorized" block by real size instead of painting it
+  // full-bleed.
+  subtreeCount: Schema.Int,
+  subtreeBytes: Schema.Int,
 })
 export type Composition = typeof Composition.Type
 
