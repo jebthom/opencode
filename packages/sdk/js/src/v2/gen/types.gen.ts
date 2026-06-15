@@ -1923,6 +1923,11 @@ export type Config = {
     mcp_timeout?: number
     policies?: Array<ConfigV2ExperimentalPolicy>
   }
+  codegraph?: {
+    tagger?: {
+      context?: "minimal" | "medium"
+    }
+  }
 }
 
 export type Model = {
@@ -4968,10 +4973,16 @@ export type CodegraphGetResponses = {
       to: string
       kind: "import"
     }>
+    boundaries?: Array<{
+      id: string
+      path: string
+      kind: "file" | "directory"
+    }>
     semantics: {
       [key: string]: {
         tags: Array<string>
         hue?: string
+        layer?: "interface" | "application" | "domain" | "data" | "infrastructure"
       }
     }
   }

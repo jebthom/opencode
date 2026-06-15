@@ -1,6 +1,7 @@
 import type { TuiPlugin, TuiPluginApi, TuiThemeCurrent } from "@opencode-ai/plugin/tui"
+import type { MouseEvent, ScrollBoxRenderable } from "@opentui/core"
 import type { InternalTuiPlugin } from "../../plugin/internal"
-import { createMemo, createResource, createSignal, For, onCleanup, Show } from "solid-js"
+import { createEffect, createMemo, createResource, createSignal, For, onCleanup, Show } from "solid-js"
 import { LEGEND, DIRECTORY_HUE, DIRECTORY_LABEL } from "@/codegraph/semantics"
 import { ACTION_GLYPH, ACTION_LABEL, type Action, type Style } from "@/codegraph/activity"
 import { createActivityTracker } from "./codegraph-activity"
@@ -42,7 +43,13 @@ type Graph = {
   semantics: Record<string, { tags: readonly string[]; hue?: string; layer?: string }>
 }
 
-const TOP_BAR_HEIGHT = 14
+// +1 row over the graph's own budget so the horizontal scrollbar lives below the
+// tiles without stealing a row of node detail.
+const TOP_BAR_HEIGHT = 15
+// Cells moved per wheel notch when we redirect a vertical wheel into horizontal
+// scroll. Tiles are ~CHILD_W wide, so 1 cell/notch (the raw terminal delta) feels
+// sluggish; a small multiplier makes the bar pan at a comfortable speed.
+const HSCROLL_STEP = 3
 // Children drawn per node before collapsing the rest into a single "…" tile.
 const MAX_CHILDREN = 4
 const MAX_LABEL = 16
@@ -82,6 +89,18 @@ type Overlay = { action: Action; color: TuiThemeCurrent["text"]; style: Style }
 function View(props: { api: TuiPluginApi; session_id: string }) {
   const theme = () => props.api.theme.current
   const [scope, setScope] = createSignal("")
+
+  // Layer-0 directories whose child row is expanded past MAX_CHILDREN to show all
+  // children (the unlimited horizontal strip makes this cheap). Keyed by node id.
+  // Reset on every scope change so navigating the tree always lands on the compact
+  // 4-children + "…" view; horizontal scrolling doesn't touch scope, so an expanded
+  // directory stays expanded while you pan.
+  const [expanded, setExpanded] = createSignal(new Set<string>())
+  createEffect(() => {
+    scope()
+    setExpanded(new Set<string>())
+  })
+  const expand = (id: string) => setExpanded((prev) => new Set(prev).add(id))
   // Foundation A hover-info line: what a node tile / link shows when pointed at.
   // Cleared on mouse-out so the header falls back to the summary. Set as a plain
   // string so any feature (node detail, edge target, …) can drive it uniformly.
@@ -242,10 +261,9 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
       byParent.set(posixDir(n.path), bucket)
     }
     for (const bucket of byParent.values()) bucket.sort((a, b) => a.position.index - b.position.index)
-    return layer0.map((node) => {
-      const children = byParent.get(node.path) ?? []
-      return { node, children: children.slice(0, MAX_CHILDREN), overflow: children.length - MAX_CHILDREN }
-    })
+    // Full child list per layer-0 node; how many actually render is decided at draw
+    // time from the per-directory expanded state (see the `shownChildren` accessor).
+    return layer0.map((node) => ({ node, children: byParent.get(node.path) ?? [] }))
   })
 
   const crumbs = () => {
@@ -258,6 +276,20 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     const s = scope()
     const i = s.lastIndexOf("/")
     return i === -1 ? "" : s.slice(0, i)
+  }
+
+  // The bar lays its tiles out in a single horizontal strip that overflows the
+  // viewport, so it scrolls sideways only. A native left/right wheel is handled by
+  // the scrollbox itself; here we redirect a vertical (up/down) wheel into the same
+  // horizontal motion so either gesture pans the strip. Shift+wheel is left alone —
+  // the scrollbox already remaps that to horizontal, and double-handling it would
+  // scroll twice as far.
+  let scroll: ScrollBoxRenderable | undefined
+  const onWheel = (event: MouseEvent) => {
+    const dir = event.scroll?.direction
+    if (!scroll || event.modifiers.shift || (dir !== "up" && dir !== "down")) return
+    const cells = (event.scroll?.delta ?? 1) * HSCROLL_STEP
+    scroll.scrollLeft += dir === "up" ? -cells : cells
   }
 
   return (
@@ -330,13 +362,38 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
         </box>
       </box>
 
-      <box flexDirection="row" gap={2} flexGrow={1}>
+      {/* Sideways-scrolling graph strip. The tiles lay out in a row that overflows
+          the viewport and pans horizontally; a thin themed scrollbar marks the
+          position and vertical-wheel panning is wired through onWheel above.
+
+          NB: the scrollbox's `scrollX`/`scrollY` are *constructor-only* options, but
+          the solid renderer builds every element with just `{ id }` and applies the
+          rest as property assignments — which those two lack setters for, so passing
+          them as props is silently inert. We instead configure the content box
+          directly (it's what `scrollX`/`scrollY` ultimately size): clear its maxWidth
+          so it can grow past the viewport (horizontal overflow → scroll), and pin
+          maxHeight to 100% so the band can't scroll vertically. */}
+      <scrollbox
+        ref={(r: ScrollBoxRenderable) => (scroll = r)}
+        flexGrow={1}
+        onMouseScroll={onWheel}
+        contentOptions={{ flexDirection: "row", gap: 2, maxWidth: undefined, maxHeight: "100%" }}
+        verticalScrollbarOptions={{ visible: false }}
+        horizontalScrollbarOptions={{
+          showArrows: false,
+          trackOptions: { foregroundColor: theme().textMuted, backgroundColor: theme().backgroundPanel },
+        }}
+      >
         <For each={tree()}>
           {(item) => {
             const bnds = boundariesFor().get(item.node.id) ?? []
             const shownBnds = bnds.slice(0, MAX_CHILDREN)
             const bndOverflow = bnds.length - MAX_CHILDREN
-            const hasChildren = item.children.length > 0 || item.overflow > 0
+            const hasChildren = item.children.length > 0
+            // Collapsed to MAX_CHILDREN until this directory is expanded via its "…"
+            // tile; reactive so clicking "…" grows the row (and the column) in place.
+            const shownChildren = () => (expanded().has(item.node.id) ? item.children : item.children.slice(0, MAX_CHILDREN))
+            const overflow = () => item.children.length - shownChildren().length
             return (
               <box flexDirection="column" flexShrink={0} gap={0}>
                 <box
@@ -363,7 +420,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                     drop aligns to its child regardless of label length. */}
                 <Show when={hasChildren}>
                   <box flexDirection="row" gap={1} height={1} flexShrink={0}>
-                    <For each={item.children}>
+                    <For each={shownChildren()}>
                       {() => (
                         <box width={CHILD_W} alignItems="center" flexShrink={0}>
                           <text fg={theme().text} wrapMode="none">
@@ -372,7 +429,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                         </box>
                       )}
                     </For>
-                    <Show when={item.overflow > 0}>
+                    <Show when={overflow() > 0}>
                       <box width={CHILD_W} alignItems="center" flexShrink={0}>
                         <text fg={theme().text} wrapMode="none">
                           │
@@ -383,7 +440,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                 </Show>
 
                 <box flexDirection="row" gap={1} flexShrink={0}>
-                  <For each={item.children}>
+                  <For each={shownChildren()}>
                     {(child) => (
                       <box
                         width={CHILD_W}
@@ -404,15 +461,22 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                       </box>
                     )}
                   </For>
-                  <Show when={item.overflow > 0}>
+                  {/* Click to expand this directory's row to all its children. The
+                      column (and so the parent's footprint) grows to fit; the strip
+                      scrolls if it runs past the viewport. No collapse affordance by
+                      design — navigating away resets every directory to compact. */}
+                  <Show when={overflow() > 0}>
                     <box
                       width={CHILD_W}
                       border
                       customBorderChars={SQUARE_CORNERS}
                       borderColor={theme().border}
                       flexShrink={0}
+                      onMouseDown={() => expand(item.node.id)}
+                      onMouseOver={() => setHovered(`+${overflow()} more in ${basename(item.node.path)}/`)}
+                      onMouseOut={() => setHovered(undefined)}
                     >
-                      <text fg={theme().textMuted} wrapMode="none">
+                      <text fg={theme().accent} wrapMode="none">
                         …
                       </text>
                     </box>
@@ -464,7 +528,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
             )
           }}
         </For>
-      </box>
+      </scrollbox>
     </box>
   )
 }
