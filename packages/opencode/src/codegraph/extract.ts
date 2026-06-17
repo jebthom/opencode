@@ -32,7 +32,7 @@ const IGNORED_DIR_SET = new Set(IGNORED_DIRS)
 
 // Hard caps so a pathological repo can never exhaust memory: cap the node count
 // and skip files too large to parse cheaply. Reads run with bounded concurrency.
-const MAX_FILES = 5000
+const MAX_FILES = 20000
 const MAX_FILE_BYTES = 512 * 1024
 const READ_CONCURRENCY = 24
 
@@ -258,6 +258,44 @@ export const listFiles = Effect.fn("CodeGraph.listFiles")(function* (root: strin
   ]
     .filter((rel) => rel !== "" && !rel.startsWith("..") && !isIgnoredPath(rel))
     .toSorted()
+    .slice(0, MAX_FILES)
+  return rels.map((rel) => ({ id: nodeID(rel), path: rel }))
+})
+
+// DFS pre-order comparator over repo-relative POSIX paths, derived purely from the
+// path strings (no extra syscalls). Walk segments pairwise; at the first differing
+// segment, a path that *ends* here (a file directly in this directory) sorts before
+// one that descends into a sibling subdir, otherwise compare the segments lexically.
+// The effect is that a directory's own files — and recursively its subtrees — emit
+// contiguously before the next sibling, so directories "light up" coherently as the
+// background tagger walks the repo from the root outward.
+export function dfsCompare(a: string, b: string): number {
+  const as = a.split("/")
+  const bs = b.split("/")
+  const n = Math.min(as.length, bs.length)
+  for (let i = 0; i < n; i++) {
+    if (as[i] === bs[i]) continue
+    const aLeaf = i === as.length - 1
+    const bLeaf = i === bs.length - 1
+    if (aLeaf !== bLeaf) return aLeaf ? -1 : 1
+    return as[i]! < bs[i]! ? -1 : 1
+  }
+  return as.length - bs.length
+}
+
+// Like `listFiles`, but ordered in DFS pre-order (see `dfsCompare`) so the
+// background tagger paints whole directories from the root outward rather than in
+// flat lexical order. The cap is applied *after* the DFS sort so the kept files are
+// the earliest-walked (root-most) ones. Same glob/ignore/cap/id scheme as `listFiles`
+// so a file's identity matches whatever `extract` later produces for it.
+export const listFilesDfs = Effect.fn("CodeGraph.listFilesDfs")(function* (root: string) {
+  const fs = yield* FSUtil.Service
+  const found = yield* fs.glob("**/" + SOURCE_GLOB, { cwd: root, include: "file", dot: false, ignore: IGNORE_GLOBS })
+  const rels = [
+    ...new Set(found.map((p) => toPosix(path.relative(root, path.isAbsolute(p) ? p : path.join(root, p))))),
+  ]
+    .filter((rel) => rel !== "" && !rel.startsWith("..") && !isIgnoredPath(rel))
+    .sort(dfsCompare)
     .slice(0, MAX_FILES)
   return rels.map((rel) => ({ id: nodeID(rel), path: rel }))
 })

@@ -5,33 +5,47 @@
 //
 // The structure of the graph is deterministic and the layer paint is async; this
 // vocabulary is a third, *ephemeral* overlay: small glyphs drawn on a node tile
-// to show what an agent did to a file (read/edit/write/create) and whether that
+// to show what an agent did to a file (read/create/edit) and whether that
 // action is real or merely proposed by a plan. Foundation A defines the
 // vocabulary and the render slot; the data that fills it arrives in later steps
 // (agent tracking = step 7, planning = step 8). Edges (step 6) reuse the same
 // hover-info line, not these glyphs.
 
-// One action category per file touch. `create` is a write to a path that has no
-// existing node (a brand-new file); everything else maps from the tool name.
-export const ACTIONS = ["read", "edit", "write", "create"] as const
+// One action category per file touch. `create` covers the write tool (whole-file
+// write, whether the file is new or overwritten); `read` and `edit` map straight
+// from their tools. Order is the display order of glyphs on a tile / in the legend.
+export const ACTIONS = ["read", "create", "edit"] as const
 export type Action = (typeof ACTIONS)[number]
 
-// Single-width BMP geometric glyphs (same Unicode block as the bar's existing
-// ■ / ◀ / ╭ chars, so they render in the same terminals). Ordered light→heavy by
-// how much the action changes the file.
-export const ACTION_GLYPH: Record<Action, string> = {
-  read: "◌", // outline — looked at, unchanged
-  edit: "◆", // filled diamond — modified in place
-  write: "●", // filled circle — rewritten
-  create: "◈", // diamond w/ center — newly created
+// Whether a glyph marks the node an agent acted on *directly* (`solid`) or an
+// ancestor *directory* that merely contains a touched file (`outline`). The same
+// action glyph propagates up the tree from the changed file to its parent,
+// grandparent, … each drawn in its outline form. Orthogonal to `Style` (actual vs
+// planned): a planned action and an actual one can each be solid or outline.
+export const FILLS = ["solid", "outline"] as const
+export type Fill = (typeof FILLS)[number]
+
+// One shape per action — read = circle, create = square, edit = diamond — with a
+// solid and an outline form each. Single-width BMP geometric glyphs from the same
+// Unicode block (U+25xx) as the bar's existing ■ / ◀ / ╭ chars, so every form
+// renders wherever those do. `solid` is the node actually touched; `outline` is a
+// containing directory (see Fill).
+export const ACTION_GLYPH: Record<Action, Record<Fill, string>> = {
+  read: { solid: "●", outline: "○" }, // circle — looked at
+  create: { solid: "■", outline: "□" }, // square — whole-file write / new file
+  edit: { solid: "◆", outline: "◇" }, // diamond — modified in place
+}
+
+// Resolve an action + fill to its glyph (convenience for renderers).
+export function glyphFor(action: Action, fill: Fill): string {
+  return ACTION_GLYPH[action][fill]
 }
 
 // Short human label for the hover-info line.
 export const ACTION_LABEL: Record<Action, string> = {
   read: "read",
-  edit: "edited",
-  write: "wrote",
   create: "created",
+  edit: "edited",
 }
 
 // Whether an overlay reflects something that has happened or something a plan
@@ -72,9 +86,8 @@ export interface Turn {
 }
 
 // Map a tool name to the file action it represents, or undefined for tools that
-// don't touch one specific file (bash, grep, glob, task, …). `create` vs `write`
-// can't be told from the tool name alone — it depends on whether the path already
-// has a node — so writes map to `write` and the renderer upgrades to `create`.
+// don't touch one specific file (bash, grep, glob, task, …). The `write` tool —
+// which both overwrites whole files and creates new ones — maps to `create`.
 export function actionFromTool(tool: string): Action | undefined {
   switch (tool) {
     case "read":
@@ -82,7 +95,7 @@ export function actionFromTool(tool: string): Action | undefined {
     case "edit":
       return "edit"
     case "write":
-      return "write"
+      return "create"
     default:
       return undefined
   }

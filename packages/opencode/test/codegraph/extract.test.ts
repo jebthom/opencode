@@ -272,6 +272,45 @@ describe("CodeGraph.listFiles", () => {
   )
 })
 
+describe("CodeGraph.dfsCompare", () => {
+  it.live("orders paths in DFS pre-order: a directory's files before its subtrees", () =>
+    Effect.sync(() => {
+      // src/a.ts must come before everything under src/sub/, and src/* before pkg/*.
+      const input = ["src/sub/deep.ts", "pkg/x.ts", "src/a.ts", "src/b.ts", "src/sub/also.ts"]
+      const sorted = [...input].sort(CodeGraphExtract.dfsCompare)
+      expect(sorted).toEqual(["pkg/x.ts", "src/a.ts", "src/b.ts", "src/sub/also.ts", "src/sub/deep.ts"])
+    }),
+  )
+
+  it.live("places a file in a directory before descending into a sibling subdir", () =>
+    Effect.sync(() => {
+      const sorted = ["src/z/inner.ts", "src/a.ts"].sort(CodeGraphExtract.dfsCompare)
+      expect(sorted).toEqual(["src/a.ts", "src/z/inner.ts"])
+    }),
+  )
+})
+
+describe("CodeGraph.listFilesDfs", () => {
+  it.live("enumerates the whole repo in DFS order with the same ids as listFiles", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      yield* writeFiles(dir, SAMPLE)
+      const dfs = yield* CodeGraphExtract.listFilesDfs(dir)
+      const flat = yield* CodeGraphExtract.listFiles(dir)
+
+      // Same set of files + identical stable ids — only the order differs.
+      expect(new Set(dfs.map((f) => f.path))).toEqual(new Set(flat.map((f) => f.path)))
+      const dfsById = new Map(dfs.map((f) => [f.path, f.id]))
+      for (const f of flat) expect(dfsById.get(f.path)).toBe(f.id)
+
+      // The deep layer-2 file is included, and src/deep.ts precedes src/sub/too-deep.ts.
+      const paths = dfs.map((f) => f.path)
+      expect(paths).toContain("src/sub/too-deep.ts")
+      expect(paths.indexOf("src/deep.ts")).toBeLessThan(paths.indexOf("src/sub/too-deep.ts"))
+    }),
+  )
+})
+
 describe("CodeGraph.listSubtree", () => {
   it.live("enumerates the full subtree with sizes and stable ids", () =>
     Effect.gen(function* () {

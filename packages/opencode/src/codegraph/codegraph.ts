@@ -1,4 +1,4 @@
-import { Effect, Layer, Context, Stream } from "effect"
+import { Effect, Layer, Context, Stream, Queue, Semaphore } from "effect"
 import path from "path"
 import { createHash } from "crypto"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
@@ -44,6 +44,20 @@ import { LAYER_HUE, LAYERS, type Layer as SemanticLayer } from "./semantics"
 
 const log = Log.create({ service: "codegraph" })
 
+// Shared concurrency gate across the foreground (per-scope window) and background
+// (whole-repo) taggers: at most this many model calls in flight at once, so the two
+// never collide on the API. The background loop holds a permit only for one batch
+// and releases it during its inter-batch pause, so a foreground tag always wins a
+// permit promptly — that's how the visible view stays prioritized.
+const TAG_CONCURRENCY = 1
+// Files handed to one background tagStale call; = MAX_PER_PASS in the tagger so each
+// call fully consumes the slice rather than leaving a remainder for the next pass.
+const BG_BATCH = 60
+// Pause between background batches, held *outside* the permit so a foreground tag
+// arriving mid-pause acquires immediately. Spaces requests to avoid rate-limit
+// bounceback when painting a large repo.
+const BG_BATCH_DELAY = "1000 millis"
+
 // Storage key: ["codegraph", <projectID>, "structure", <scopeKey>]. Per project
 // and per scope so each navigated directory keeps its own durable subgraph.
 function storageKey(projectID: string, scope: string) {
@@ -79,6 +93,13 @@ export const layer = Layer.effect(
     // keeps a clean R = never and `get`/`refresh` expose no extra requirements.
     const provider = yield* Provider.Service
     const config = yield* Config.Service
+
+    // Shared by the foreground and background taggers (see TAG_CONCURRENCY).
+    const tagGate = yield* Semaphore.make(TAG_CONCURRENCY)
+    // The layer-construction scope: background loops fork into it (not the per-get
+    // request scope) so they live for the service's lifetime and are interrupted
+    // when it's released, while keeping get()/refresh() at R = never.
+    const serviceScope = yield* Effect.scope
 
     const empty = {
       version: CodeGraphPayload.PAYLOAD_VERSION,
@@ -123,6 +144,9 @@ export const layer = Layer.effect(
     const off = registerDisposer(async (directory) => {
       caches.delete(directory)
       subtreeCache.delete(directory)
+      // The loop fiber itself is interrupted when the instance scope closes
+      // (forkScoped); drop the map entry so a later reopen can start a fresh one.
+      bgTaggers.delete(directory)
     })
     yield* Effect.addFinalizer(() => Effect.sync(off))
 
@@ -170,7 +194,8 @@ export const layer = Layer.effect(
         const key = directory + " " + scope
         if (inFlight.has(key)) return
         inFlight.add(key)
-        yield* CodeGraphTagger.tagStale({ storage, events, provider, config }, directory, projectID, scope, fileNodes).pipe(
+        yield* CodeGraphTagger.tagStale({ storage, events, provider, config }, directory, projectID, scope, fileNodes, "fg").pipe(
+          tagGate.withPermits(1),
           Effect.ensuring(Effect.sync(() => inFlight.delete(key))),
           Effect.forkDetach,
         )
@@ -201,43 +226,76 @@ export const layer = Layer.effect(
         return { ...structure, semantics, composition }
       })
 
-    // Whole-repo sweep (vs. the per-scope window of get/refresh). The deterministic
-    // walk enumerates every file in the repo and the tagger paints all of them —
-    // both still skipping work that's already current (clean scope / unchanged hash).
-    // Forked and deduped per directory: a sweep already running for a directory makes
-    // a new request a no-op rather than stacking a second whole-repo pass. `swept`
-    // tracks the one-time on-open trigger; turn-completion may sweep repeatedly.
-    const sweepInFlight = new Set<string>()
-    const swept = new Set<string>()
-    const sweep = (directory: string, projectID: string) =>
+    // Background whole-repo tagger (vs. the per-scope window of get/refresh). One
+    // self-rescheduling loop per directory walks every source file in DFS order
+    // (so directories light up from the root outward), painting BG_BATCH files per
+    // step under the shared gate with a pause between steps. When a full pass is
+    // done it parks until a file change / turn completion wakes it, then re-walks —
+    // picking up created/deleted files. The stale-hash skip in the tagger makes
+    // every re-walk cheap (unchanged files spend nothing). forkScoped binds the loop
+    // to the instance scope so it dies with the TUI; the bgTaggers map dedups starts
+    // and the dropping(1) wake queue coalesces a burst of changes into one rescan.
+    const bgTaggers = new Map<string, { readonly wake: Queue.Queue<void> }>()
+
+    const backgroundLoop = (directory: string, projectID: string, wake: Queue.Queue<void>) =>
       Effect.gen(function* () {
-        if (sweepInFlight.has(directory)) return
-        sweepInFlight.add(directory)
-        yield* Effect.gen(function* () {
-          const files = yield* CodeGraphExtract.listFiles(directory)
-          if (files.length === 0) return
-          // scope "" — the tag store is keyed by stable node id, so a file tagged by
-          // the sweep is reused in every window it later appears in. tagStale applies
-          // the content-hash skip + its own per-pass cap, keeping the pass frugal.
-          yield* CodeGraphTagger.tagStale({ storage, events, provider, config }, directory, projectID, "", files)
-        }).pipe(
-          Effect.catchCause((cause) => Effect.sync(() => log.error("sweep failed", { projectID, cause }))),
-          Effect.ensuring(Effect.sync(() => sweepInFlight.delete(directory))),
-          Effect.provide(FSUtil.defaultLayer),
-          Effect.forkDetach,
+        while (true) {
+          const files = yield* CodeGraphExtract.listFilesDfs(directory).pipe(
+            Effect.catchCause((cause) => {
+              log.error("background enumerate failed", { projectID, cause })
+              return Effect.succeed<ReadonlyArray<{ id: string; path: string }>>([])
+            }),
+            Effect.provide(FSUtil.defaultLayer),
+          )
+          // Always-written diagnostic so a bg loop that produces no request lines is
+          // still visible in the perf log (distinguishes "loop never ran" from
+          // "ran but every slice was already tagged / no model").
+          yield* CodeGraphTagger.appendPerfEvent(directory, "bg", "pass-start", { files: files.length })
+          for (let cursor = 0; cursor < files.length; cursor += BG_BATCH) {
+            const slice = files.slice(cursor, cursor + BG_BATCH)
+            // scope "" — the tag store is keyed by stable node id, so a file tagged
+            // here is reused in every window it later appears in. The permit is held
+            // only for the batch; the pause below runs without it so foreground wins.
+            yield* CodeGraphTagger.tagStale({ storage, events, provider, config }, directory, projectID, "", slice, "bg").pipe(
+              tagGate.withPermits(1),
+              Effect.catchCause((cause) =>
+                Effect.sync(() => log.error("background batch failed", { projectID, cause })),
+              ),
+            )
+            yield* Effect.sleep(BG_BATCH_DELAY)
+          }
+          yield* Queue.take(wake)
+        }
+      })
+
+    const startBackgroundTagger = (directory: string, projectID: string) =>
+      Effect.gen(function* () {
+        if (bgTaggers.has(directory)) return
+        const wake = yield* Queue.dropping<void>(1)
+        bgTaggers.set(directory, { wake })
+        yield* backgroundLoop(directory, projectID, wake).pipe(
+          Effect.catchCause((cause) => Effect.sync(() => log.error("background loop crashed", { projectID, cause }))),
+          (loop) => Effect.forkIn(loop, serviceScope),
         )
+      })
+
+    // Nudge a parked background loop to re-enumerate and re-walk. dropping(1) makes a
+    // burst of file events / repeated turn completions coalesce into a single rescan.
+    const wakeBackground = (directory: string) =>
+      Effect.gen(function* () {
+        const entry = bgTaggers.get(directory)
+        if (!entry) return
+        yield* Queue.offer(entry.wake, void 0).pipe(Effect.ignore)
       })
 
     const load = Effect.fn("CodeGraph.load")(function* (scope?: string) {
       const ctx = yield* InstanceState.context
       const container = containerFor(ctx.directory, ctx.project.id)
-      // On open (first get for this directory) kick off the whole-repo sweep so the
-      // tagger explores past the initially-viewed window. Once per directory; later
-      // sweeps ride turn completion (the session-status subscription below).
-      if (!swept.has(ctx.directory)) {
-        swept.add(ctx.directory)
-        yield* sweep(ctx.directory, ctx.project.id)
-      }
+      // On open (first get for this directory) start the background whole-repo tagger
+      // so semantics fill in past the initially-viewed window without the user having
+      // to navigate. Idempotent per directory; file changes / turn completion wake it
+      // to re-walk (the subscriptions below).
+      yield* startBackgroundTagger(ctx.directory, ctx.project.id)
       const norm = CodeGraphExtract.normalizeScope(scope ?? "")
 
       if (!container.dirty.has(norm)) {
@@ -261,6 +319,10 @@ export const layer = Layer.effect(
     const refresh = Effect.fn("CodeGraph.refresh")(function* (scope?: string) {
       const ctx = yield* InstanceState.context
       const container = containerFor(ctx.directory, ctx.project.id)
+      // The TUI fetches with refresh=true, so this — not load — is the path that
+      // actually runs on open; start the background tagger here too (idempotent per
+      // directory) or it would never kick off.
+      yield* startBackgroundTagger(ctx.directory, ctx.project.id)
       const norm = CodeGraphExtract.normalizeScope(scope ?? "")
       const payload = yield* compute(ctx.directory, ctx.project.id, norm)
       container.scopes.set(norm, payload)
@@ -289,6 +351,9 @@ export const layer = Layer.effect(
             .publish(CodeGraphEvent.Event.Invalidated, { scope }, location ? { location } : undefined)
             .pipe(Effect.ignore)
         }
+        // Wake the background tagger so the change is (re)tagged even when it falls
+        // outside every viewed window — the stale-hash skip keeps the re-walk cheap.
+        yield* wakeBackground(directory)
       })
 
     yield* Effect.forkScoped(
@@ -303,8 +368,8 @@ export const layer = Layer.effect(
     )
 
     // Turn completion: when a session goes idle (the agent returned from a building
-    // turn) re-sweep that session's repo so files created/changed during the turn get
-    // tagged. Gated on an existing cache so we only sweep repos whose graph is open —
+    // turn) wake the background tagger so files created/changed during the turn get
+    // tagged. Gated on an existing cache so we only touch repos whose graph is open —
     // an unopened project stays inert, matching the lazy-cache philosophy.
     const onSessionIdle = (location: EventV2.Payload["location"]) =>
       Effect.gen(function* () {
@@ -315,7 +380,7 @@ export const layer = Layer.effect(
         // Shell commands (rm/mv/scaffolding) mutate the tree without file events, so a
         // completed turn may have changed the file set — drop membership to rebuild it.
         subtreeCache.delete(directory)
-        yield* sweep(directory, container.projectID)
+        yield* wakeBackground(directory)
       })
     yield* Effect.forkScoped(
       events.subscribe(SessionStatus.Event.Status).pipe(

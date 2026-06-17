@@ -23,6 +23,10 @@ const MAX_TURNS = 50
 export interface ActivityTracker {
   // Entries for a repo-relative path within the current turn, oldest→newest.
   readonly entriesFor: (path: string) => ActivityEntry[]
+  // Entries on any *descendant* of a repo-relative directory path within the
+  // current turn, oldest→newest. Lets a directory tile show (in outline form) the
+  // actions performed on the files it contains, propagated up parents/grandparents.
+  readonly descendantsFor: (dir: string) => ActivityEntry[]
   // The current (latest) turn, or undefined before the first prompt.
   readonly current: () => Turn | undefined
   // The in-memory ring of recent turns, oldest→newest (future timeline source).
@@ -107,21 +111,31 @@ export function createActivityTracker(api: TuiPluginApi, sessionID: string): Act
   })
 
   // Per-path index of the current turn, recomputed only when activity changes so
-  // per-node lookups in the render loop stay O(1).
+  // per-node lookups in the render loop stay O(1). `exact` is keyed by the touched
+  // path; `descend` indexes every entry under each of its ancestor directories so a
+  // directory tile can show what happened to files nested anywhere beneath it.
   const index = createMemo(() => {
     const cur = turns().at(-1)
-    const map = new Map<string, ActivityEntry[]>()
+    const exact = new Map<string, ActivityEntry[]>()
+    const descend = new Map<string, ActivityEntry[]>()
+    const push = (map: Map<string, ActivityEntry[]>, key: string, e: ActivityEntry) => {
+      const list = map.get(key)
+      if (list) list.push(e)
+      else map.set(key, [e])
+    }
     if (cur)
       for (const e of cur.entries) {
-        const list = map.get(e.path)
-        if (list) list.push(e)
-        else map.set(e.path, [e])
+        push(exact, e.path, e)
+        // Index under each ancestor directory: "a/b/c.ts" → "a", "a/b".
+        const parts = e.path.split("/")
+        for (let i = 1; i < parts.length; i++) push(descend, parts.slice(0, i).join("/"), e)
       }
-    return map
+    return { exact, descend }
   })
 
   return {
-    entriesFor: (p) => index().get(p) ?? [],
+    entriesFor: (p) => index().exact.get(p) ?? [],
+    descendantsFor: (d) => index().descend.get(d) ?? [],
     current: () => turns().at(-1),
     history: () => turns(),
     agents: () => {

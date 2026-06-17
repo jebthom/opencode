@@ -1,6 +1,7 @@
-import { Effect, Schema } from "effect"
+import { Effect, Schedule, Schema } from "effect"
 import path from "path"
 import { createHash } from "crypto"
+import { appendFile, mkdir, writeFile } from "fs/promises"
 import { generateObject } from "ai"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import * as Log from "@opencode-ai/core/util/log"
@@ -35,6 +36,9 @@ const log = Log.create({ service: "codegraph.tagger" })
 // most this many stale files per pass, in chunks of this size per model call.
 const MAX_PER_PASS = 60
 const TAG_BATCH = 30
+// Rate-limit (429/overloaded) retries before a batch soft-fails to "tag nothing".
+// Spacing the background sweep avoids most bounceback; this catches the rest.
+const BG_MAX_RETRIES = 4
 const READ_CONCURRENCY = 24
 const MAX_FILE_BYTES = 512 * 1024
 const HEAD_LINES = 30
@@ -61,6 +65,10 @@ const TagResult = Schema.Struct({
   ),
 })
 
+// Which tagger drove a pass — recorded in the perf log so foreground (current view)
+// and background (whole-repo sweep) requests can be told apart after the fact.
+export type Origin = "fg" | "bg"
+
 // Tag any stale file node in `fileNodes` and persist the result. Requires only
 // FSUtil from context (provided at the fork site); all other services are passed
 // in so callers keep a clean `R = never` return type.
@@ -70,6 +78,7 @@ export const tagStale = Effect.fn("CodeGraph.tagStale")(function* (
   projectID: string,
   scope: string,
   fileNodes: ReadonlyArray<FileNode>,
+  origin: Origin,
 ) {
   if (fileNodes.length === 0) return
 
@@ -96,12 +105,16 @@ export const tagStale = Effect.fn("CodeGraph.tagStale")(function* (
     .filter((r) => store[r.node.id]?.hash !== r.hash)
     .slice(0, MAX_PER_PASS)
 
-  if (stale.length === 0) return
+  if (stale.length === 0) {
+    yield* appendPerfEvent(directory, origin, "skip", { reason: "no-stale", candidates: fileNodes.length })
+    return
+  }
 
   const context = yield* contextMode(deps.config)
   const language = yield* resolveLanguage(deps.provider)
   if (!language) {
     log.info("no small model available; skipping tag pass", { projectID, scope })
+    yield* appendPerfEvent(directory, origin, "skip", { reason: "no-language", stale: stale.length })
     return
   }
 
@@ -112,12 +125,13 @@ export const tagStale = Effect.fn("CodeGraph.tagStale")(function* (
   const tagged: CodeGraphSemanticStore.Store = {}
   for (const chunk of chunkArray(stale, TAG_BATCH)) {
     const blocks = chunk.map((r) => describe(r.node.path, r.content, context)).join("\n\n")
-    const assignments = yield* classify(language, blocks).pipe(
+    const assignments = yield* classifyWithRetry(language, blocks).pipe(
       Effect.catchCause((cause) => {
         log.error("classify failed", { projectID, scope, cause })
         return Effect.succeed<ReadonlyArray<{ path: string; layer: Layer }>>([])
       }),
     )
+    yield* appendPerfLog(directory, origin, blocks, assignments)
     for (const a of assignments) {
       const id = idByPath.get(a.path)
       const hash = hashByPath.get(a.path)
@@ -137,6 +151,64 @@ export const tagStale = Effect.fn("CodeGraph.tagStale")(function* (
   // (the next pass finds matching hashes and publishes nothing).
   yield* deps.events.publish(CodeGraphEvent.Event.Invalidated, { scope }).pipe(Effect.ignore)
 }, Effect.provide(FSUtil.defaultLayer))
+
+// --- perf log --------------------------------------------------------------
+
+// Deterministic, code-written (never agent-written) trace of every model request:
+// one JSON line per batch with the tagger identity (fg/bg), a timestamp, the exact
+// prompt input, and the structured output. Written under <repo>/perf so the two
+// taggers' API traffic can be inspected after the fact. Fresh per run and capped in
+// size (see writePerfLine), so it can't grow without bound. Serialized by the shared
+// tag gate (concurrency 1), so appends never interleave. Failure is swallowed —
+// logging must never break or slow tagging.
+function appendPerfLog(
+  directory: string,
+  origin: Origin,
+  input: string,
+  output: ReadonlyArray<{ path: string; layer: Layer }>,
+) {
+  return writePerfLine(directory, { tagger: origin, timestamp: new Date().toISOString(), input, output })
+}
+
+// Diagnostic counterpart to appendPerfLog: records lifecycle/skip events (pass
+// start, empty enumeration, no stale files, no small model) so a tagger that
+// produces no request lines can still be traced. Same file, distinguished by the
+// `event` field.
+export function appendPerfEvent(directory: string, origin: Origin, event: string, detail?: Record<string, unknown>) {
+  return writePerfLine(directory, { tagger: origin, timestamp: new Date().toISOString(), event, ...detail })
+}
+
+// Hard cap so the trace can never grow without bound. When a write would exceed it
+// the file is reset (a `log-reset` marker line precedes the new content). Old lines
+// are dropped rather than rotated — this is a debug trace, not durable history.
+const PERF_LOG_MAX_BYTES = 1024 * 1024
+// Per-file byte tally (process-local). An unset entry means we haven't written this
+// run yet, so the first write *truncates* — each run starts from a clean log.
+const perfLogBytes = new Map<string, number>()
+
+function writePerfLine(directory: string, record: Record<string, unknown>) {
+  return Effect.tryPromise(async () => {
+    const dir = path.join(directory, "perf")
+    await mkdir(dir, { recursive: true })
+    const file = path.join(dir, "tagger.log")
+    const line = JSON.stringify(record) + "\n"
+    const size = Buffer.byteLength(line)
+    const prior = perfLogBytes.get(file)
+    if (prior === undefined) {
+      // First write this run: start fresh (truncate any log left by a prior run).
+      await writeFile(file, line)
+      perfLogBytes.set(file, size)
+    } else if (prior + size > PERF_LOG_MAX_BYTES) {
+      // Cap reached: reset, dropping older lines so the file stays bounded.
+      const marker = JSON.stringify({ event: "log-reset", timestamp: new Date().toISOString() }) + "\n"
+      await writeFile(file, marker + line)
+      perfLogBytes.set(file, Buffer.byteLength(marker) + size)
+    } else {
+      await appendFile(file, line)
+      perfLogBytes.set(file, prior + size)
+    }
+  }).pipe(Effect.ignore)
+}
 
 // --- model -----------------------------------------------------------------
 
@@ -173,6 +245,35 @@ const classify = (language: Parameters<typeof generateObject>[0]["model"], block
       return result.files.filter((f): f is { path: string; layer: Layer } => CodeGraphSemantics.isLayer(f.layer))
     }),
   )
+
+// Retry a classify call on rate-limit / overload errors with exponential backoff +
+// jitter, capped at BG_MAX_RETRIES. Only retries bounceback (429/5xx/overloaded);
+// parse and other errors fall straight through to the soft-fail handler so a
+// genuinely bad batch never wedges the loop. Effect.tryPromise wraps the thrown SDK
+// error in an UnknownException whose `.error` holds the original.
+const classifyWithRetry = (language: Parameters<typeof generateObject>[0]["model"], blocks: string) =>
+  classify(language, blocks).pipe(
+    Effect.retry({
+      schedule: Schedule.exponential("500 millis").pipe(Schedule.jittered),
+      times: BG_MAX_RETRIES,
+      while: isRateLimitError,
+    }),
+  )
+
+function isRateLimitError(error: unknown): boolean {
+  const raw = (error as { error?: unknown })?.error ?? error
+  const status = (raw as { statusCode?: unknown; status?: unknown })?.statusCode ?? (raw as { status?: unknown })?.status
+  if (status === 429 || status === 503 || status === 529) return true
+  const message = (raw as { message?: unknown })?.message
+  if (typeof message !== "string") return false
+  const lower = message.toLowerCase()
+  return (
+    lower.includes("rate limit") ||
+    lower.includes("too many requests") ||
+    lower.includes("overloaded") ||
+    lower.includes("rate increased too quickly")
+  )
+}
 
 // --- per-file context ------------------------------------------------------
 

@@ -11,8 +11,9 @@ the graph that the user can drill into.
 ## Status (steps 1–4, A, B, 6 done)
 
 Implemented and in place: deterministic structure extraction, a top-bar renderer
-with drill-down + mouse navigation, live recompute on file/shell events, an
-async semantic tagger that paints files by architectural layer, and the edge layer
+with drill-down + mouse navigation, live recompute on file/shell events, a
+two-tier async semantic tagger (a foreground view tagger + a background whole-repo
+DFS sweep) that paints files by architectural layer, and the edge layer
 (step 6): containment connectors, hover dependency-highlights, and clickable
 out-of-window boundary tiles painted by their target's layer.
 
@@ -53,6 +54,36 @@ The next features (6–8) are scoped in "## Next features (planned)" below.
   original "inject guidance so the dev agent self-tags" idea was dropped in favor
   of a frugal standalone tagger (stale-only, minimal context, forked, soft fail).
   The prompt-injection extension points are still listed below if we revisit it.
+- **Two taggers now — foreground + background — sharing one gate.** The original
+  single forked tag pass became two drivers (`codegraph.ts`): a **foreground** pass
+  for the viewed window + one-hop boundary, and a **background** DFS loop that walks
+  the *whole repo from the root* (`listFilesDfs`) so semantics fill in without the
+  user navigating. They share a `Semaphore(1)` so the API is never hit concurrently;
+  the background loop releases the permit during a 1s inter-batch pause so the
+  foreground always wins it promptly. The background loop is started from
+  **`refresh()`** (the path the TUI actually uses — it always sends `refresh=true`),
+  not `load()`. Paced with 429/overload backoff. Details in §2.
+- **Hybrid treemap/graph idiom, not plain bordered boxes.** The renderer no longer
+  draws a directory as an empty bordered box: a directory is a *treemap block* whose
+  bordered grid of layer-colored cells encodes its subtree composition (per-layer
+  file count or bytes), and a layer-1 child directory paints a single-row
+  composition bar behind its name. This needed a server-side `composition` field on
+  the payload (per-directory recursive `{ layer, count, bytes }` weights + subtree
+  totals; additive, optional — no version bump) and `codegraph/treemap.ts`
+  (`allocateCells`/`buildGrid`/`coalesce`). Files stay tiles; kind is still corner
+  shape. See renderer section #4 — its "bordered boxes" prose is superseded by this.
+- **Scrollable top bar.** Layer-0 children render in an unbounded horizontal strip
+  inside a `scrollbox`; a directory's child grid can be expanded past
+  `MAX_CHILDREN` in place (the `…` overflow tile). Horizontal panning doesn't touch
+  `scope`, so an expanded directory stays expanded while you pan.
+- **Action glyphs propagate up the tree with a solid/outline fill axis (today).**
+  The overlay glyph for a file action is drawn *solid* on the file actually touched
+  and *outline* on every ancestor directory that contains it, so a parent/grandparent
+  shows what changed beneath it without drilling in. Three actions, one shape each —
+  read = circle, create = square, edit = diamond — each with a solid and outline
+  form (all single-width U+25xx geometric glyphs). The `write` tool (whole-file
+  write / new file) maps to `create`; a second legend row (beneath the layer
+  swatches) shows the solid+outline glyph pair per action. See Foundation A.
 
 ## Architecture: four separated concerns
 
@@ -73,9 +104,14 @@ low-commitment and reversible.
   `from`/`import`). Bare/package specifiers are intentionally dropped — only
   intra-repo edges.
 - **Bounded scoped walk:** one glob *per layer* (never `**/*`), capped by
-  `MAX_FILES` (5000), `MAX_FILE_BYTES` (512KB skip-for-parse), and
+  `MAX_FILES` (20000), `MAX_FILE_BYTES` (512KB skip-for-parse), and
   `READ_CONCURRENCY` (24). `IGNORED_DIRS` (node_modules, .git, dist, …) pruned in
   the glob and again by a belt-and-suspenders path check.
+- **Whole-repo enumerators for the background tagger:** `listFiles` (flat) and
+  `listFilesDfs` (DFS pre-order via a pure segment-aware `dfsCompare`, so a
+  directory's files emit contiguously before sibling subtrees). Same glob / ignore /
+  cap / node-id scheme as the scoped walk; the cap is applied *after* the DFS sort so
+  the kept files are the root-most ones.
 - **Determinism is the core invariant:** node id = `n_` + sha256(repo-relative
   path) slice — content-independent, so the same file is the same node across runs
   and scopes. Nodes sorted by id, edges sorted by `from+to`, layout assigned by
@@ -84,11 +120,13 @@ low-commitment and reversible.
   service's window math and by the tagger's context builder).
 
 ### 2. Semantic tagger — agent-driven, async, frugal
-`packages/opencode/src/codegraph/tagger.ts`
-- Given a scope's file nodes, infers **one architectural layer per file** with the
-  small/fast model (`provider.getSmallModel`, Haiku-class; honors `small_model`),
-  via `generateObject` with a fixed-enum schema, and writes `{ layer, hash }` to
-  the per-project store.
+The pass lives in `packages/opencode/src/codegraph/tagger.ts`; the two **drivers**
+that feed it live in `codegraph.ts`.
+- `tagStale(deps, dir, projectID, scope, fileNodes, origin)` infers **one
+  architectural layer per file** with the small/fast model (`provider.getSmallModel`,
+  Haiku-class; honors `small_model`), via `generateObject` with a fixed-enum schema,
+  and writes `{ layer, hash }` to the per-project store. `origin` (`"fg"`/`"bg"`)
+  only tags the perf trace.
 - **The only place tokens are spent.** Two frugality rules: (1) *stale-only* —
   a file is (re)tagged only if it has no entry or its content hash changed, so
   re-displaying/navigating unchanged files costs nothing; (2) *minimal context* —
@@ -96,13 +134,45 @@ low-commitment and reversible.
   `codegraph.tagger.context: "medium"` additionally sends exported names + file
   head for tuning.
 - **Soft failure:** any read/model/parse error leaves existing semantics intact
-  and publishes nothing, so the bar always keeps working.
-- Caps: `MAX_PER_PASS` 60 files, `TAG_BATCH` 30 per model call. Runs forked
-  (`forkDetach`) off the read path; an `inFlight` set dedupes concurrent passes
-  per `directory+scope`.
-- On success publishes `codegraph.invalidated` so the live view re-merges. The
-  stale-only guard is what prevents a tag→refetch→tag cycle (the next pass finds
-  matching hashes and publishes nothing).
+  and publishes nothing, so the bar always keeps working. Rate-limit/overload
+  (429/5xx) errors are retried around the model call with exponential + jittered
+  backoff (`BG_MAX_RETRIES` 4); on exhaustion the batch soft-fails (tags nothing).
+- Caps: `MAX_PER_PASS` 60 files read per pass, `TAG_BATCH` 30 per model call (≈low-
+  thousands of input tokens — minimal context keeps a 30-file request small).
+- **Two concurrent drivers, one shared gate** (`tagGate = Semaphore(1)`, so the two
+  never hit the API at once and never double-tag — collision is otherwise free since
+  both write the same node-id-keyed store, so whichever reaches a file first wins and
+  the other no-ops on the matching hash):
+  - **Foreground** (`scheduleTag`, origin `"fg"`) — tags the viewed window's files +
+    one-hop boundary targets. Forked `forkDetach` off the read path (`finalize`); an
+    `inFlight` set dedupes concurrent passes per `directory+scope`.
+  - **Background** (`startBackgroundTagger`/`backgroundLoop`, origin `"bg"`) — a
+    self-rescheduling per-directory loop that DFS-walks the **whole repo from the
+    root** (`listFilesDfs`) in `BG_BATCH` (60) slices, so semantics fill in past the
+    viewed window without the user navigating. After a model batch it sleeps
+    `BG_BATCH_DELAY` (1s) **outside** the permit (this is the foreground-priority
+    mechanism *and* the rate-limit spacing). When a full pass tags nothing new it
+    parks on a coalescing `dropping(1)` **wake** queue; file changes / turn
+    completion offer to that queue to re-walk. **No persisted cursor** — the
+    content-hash store IS its "done" memory, so each pass restarts from the root and
+    cheaply skips already-tagged slices (disk read + hash, zero tokens); the
+    in-memory cursor resets per pass. Forked `forkIn(serviceScope)` so it lives for
+    the service's lifetime (same scope as the file-event subscriptions) and is
+    interrupted on instance disposal; `bgTaggers` map dedupes starts.
+  - **Started from `refresh()`**, not just `load()` — the TUI always fetches
+    `refresh=true` (→ `refresh()`), so kicking the loop off only in `load()` (which
+    the TUI never calls) left it dead while the foreground, driven from the shared
+    `finalize`, worked. Start is idempotent per directory.
+- On success publishes `codegraph.invalidated` so the live view re-merges. A bg batch
+  that tags files therefore triggers a TUI refetch → a (usually no-stale, no-token)
+  foreground pass; that coupling is by design (the view repaints as bg colors it in).
+  The stale-only guard prevents a tag→refetch→tag cycle (the next pass finds matching
+  hashes and publishes nothing).
+- **Deterministic perf trace** (`<repo>/perf/tagger.log`, written in code, never by
+  the agent): one JSON line per model batch — `{ tagger, timestamp, input, output }`
+  — plus `event` lines (`pass-start` with file count, `skip` with `no-stale`/
+  `no-language` reason) so a driver that produces no batches is still traceable.
+  Appends are race-free because `tagGate` serializes the two drivers.
 
 ### 3. Graph payload — the stable contract
 `packages/opencode/src/codegraph/payload.ts` (Effect `Schema`)
@@ -159,8 +229,10 @@ low-commitment and reversible.
   `session.next.shell.ended` for its own session. Inert when the experimental
   event system is off; manual `⟳` / navigation still cover it.
 - The structure cache stays pure: `finalize` merges semantics onto a *copy* at the
-  read boundary and schedules a background tag pass, so all read paths (memory,
-  disk, recompute) share one merge+tag site.
+  read boundary and schedules the **foreground** tag pass, so all read paths (memory,
+  disk, recompute) share one merge+tag site. The **background** whole-repo DFS loop is
+  a separate driver started (idempotently) from `load`/`refresh` and runs on its own
+  fiber regardless of navigation (see §2).
 
 ## ⚠️ Catastrophic failure mode (learned the hard way, step 2)
 
@@ -266,14 +338,23 @@ after A; **6 is done**, B/7 basic is done. Remaining: 7 polish, then 8.
 
 ### Foundation A — node-overlay render layer (shared, pure renderer) — DONE
 Implemented in `codegraph.tsx` + `codegraph/activity.ts` (data-free vocabulary,
-sibling to `semantics.ts`): `Action = read|edit|write|create`, `ACTION_GLYPH`
-(single-width geometric glyphs), `ACTION_LABEL`, and a `Style = actual|planned`
-axis. The renderer now has: a reactive **hover-info line** in the header
-(`hovered` signal; shows a node's path/size on `onMouseOver`, falls back to the
-summary), and an **`OverlayRow`** glyph slot on every tile fed by a single
-`overlaysFor(node)` accessor (returns `[]` today; planned overlays dim, actual
-ones use the producer's color). Steps 7/8 only fill `overlaysFor` + set `hovered`;
-no render-tree changes. No payload change.
+sibling to `semantics.ts`): `Action = read|create|edit`, `ACTION_GLYPH`, a
+`Style = actual|planned` axis, and a `Fill = solid|outline` axis. **`ACTION_GLYPH`
+is now one shape per action with two fills** — read = circle (`●`/`○`), create =
+square (`■`/`□`), edit = diamond (`◆`/`◇`); all single-width U+25xx geometric
+glyphs, so solid and outline forms render in the same terminals. (`create` covers
+the `write` tool — whole-file write or new file; `actionFromTool` maps `write` →
+`create`.) **Solid marks the node an agent acted on directly; outline marks an
+ancestor directory that contains a touched file** — the glyph propagates up the
+tree. The renderer has: a reactive **hover-info line** in the header (`hovered`
+signal; shows a node's path/size on `onMouseOver`, falls back to the summary), and
+an **`OverlayRow`** glyph slot on every tile (file tiles, layer-0 dir blocks, and
+layer-1 child dir tiles) fed by a single `overlaysFor(node)` accessor — a file
+emits solid glyphs for its own actions; a directory emits outline glyphs for any
+action on a descendant (a direct/solid action wins over a containment/outline one
+for the same action). Planned overlays dim; actual ones use the producer's color.
+Step 8 only fills `overlaysFor` with `style: "planned"` + sets `hovered`; no
+render-tree changes. No payload change.
 
 ### Foundation B — activity substrate + Provenance contract (client) — DONE
 Contract added to `codegraph/activity.ts` (data-free, persistence-ready):
@@ -287,10 +368,14 @@ repo-relative). Keeps a `MAX_TURNS`-deep ring in memory; exposes
 `entriesFor(path)` (via a per-path memo), `current()`, `history()`, `agents()`.
 Graceful no-op when `OPENCODE_EXPERIMENTAL_EVENT_SYSTEM` is off.
 
-A **thin step-7 render rode along** so B is verifiable: `overlaysFor` now emits one
+A **thin step-7 render rode along** so B is verifiable: `overlaysFor` emits one
 glyph per distinct action on a node, colored per agent (`agentColor`, hashed
-status palette), and the hover line appends `<agent> <action> <relTime>`. Sub-agent
-activity is captured (entries carry `sessionID`) but not yet visually grouped.
+status palette), and the hover line appends `<agent> <action> <relTime>`. The
+tracker indexes each entry under both its exact path and every ancestor directory
+(`descendantsFor`), so a directory tile shows the **outline** form of the glyphs
+for actions on files anywhere beneath it (propagated up to parents/grandparents);
+the touched file itself shows the **solid** form. Sub-agent activity is captured
+(entries carry `sessionID`) but not yet visually grouped.
 
 ### [6] Edges — DONE
 Two edge *types*, split by what the flexbox top-bar can draw (a horizontal row of
@@ -363,10 +448,12 @@ pick up `boundaries` (and the still-missing `layer`).
 
 ### [7] Agent tracking (retrospective) — basic version landed with B
 Working today: per-turn glyphs on touched nodes, agent-colored, hover shows
-agent/action/relative-time, reset on new prompt. **Remaining polish:** read vs
-edit/write visual emphasis (currently same weight), a multi-agent legend +
-sub-agent grouping under the spawner, and a richer (reactive) hover that updates
-while still pointed at a node.
+agent/action/relative-time, reset on new prompt. Each action has its own shape
+(read = circle, create = square, edit = diamond, shown in the legend), and the
+glyph propagates up the directory tree — solid on the touched file, outline on its
+containing directories. **Remaining polish:** a multi-agent legend (agent colors)
++ sub-agent grouping under the spawner, and a richer
+(reactive) hover that updates while still pointed at a node.
 
 ### [8] Planning representation
 1. **Detect plan mode** via B's current-agent tracking → switch the view to
@@ -438,7 +525,16 @@ while still pointed at a node.
   hook). Extension points preserved below.
 - **Tag vocabulary growth.** Fixed enum today. Free-form tags or metrics would
   extend the `Semantic` shape additively (optional fields, no version bump) and
-  need a hue policy for unknown tags.
+  need a hue policy for unknown tags. The two-tagger substrate (foreground view +
+  background whole-repo sweep) is the intended base for *user-defined* tags later.
+- **Background sweep re-walk cost.** The background loop restarts from the root each
+  pass and re-reads+re-hashes already-tagged files (no tokens, but disk I/O) before
+  reaching new work. Two optional tightenings if it matters on a large mostly-tagged
+  repo: a **skip-ahead cursor** (remember the furthest fully-tagged index in a
+  generation so a wake doesn't re-hash everything) and a **wake-scoped re-walk** (on a
+  file-change wake, walk only the changed subtree; turn-idle still does a full sweep).
+  Also: the per-bg-batch invalidation drives a TUI refetch (a no-token foreground
+  pass + scope recompute) — debounceable if the refetch storm ever shows up.
 - **Full-screen zoom route (step 5, shelved).** A detail route for a single node /
   subgraph; template at feature-plugins/system/diff-viewer.tsx.
 
