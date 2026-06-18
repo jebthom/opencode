@@ -36,6 +36,11 @@ export interface TagCollection {
   readonly prompt: string
   readonly tags: ReadonlyArray<TagDef>
   readonly scope: CollectionScope
+  // Optional repo-relative directories the `/tag` flow surfaced as most relevant.
+  // The background tagger front-loads files under these (in DFS order) before the
+  // rest of the repo, so the targeted area lights up first — it never *restricts*
+  // the sweep, which always covers the whole repo.
+  readonly directories?: ReadonlyArray<string>
 }
 
 // --- palettes --------------------------------------------------------------
@@ -134,9 +139,23 @@ export const ARCHITECTURE: TagCollection = {
   })),
 }
 
-// All built-in (globally-defined) collections. Kept as a list so more defaults can
-// be added later without touching the store.
+// All built-in (globally-defined) collections — the protected group. Built-ins are
+// immutable: they cannot be edited, have their tags merged, or be deleted (the
+// create/edit/merge/delete flows and the UI all refuse them via `isBuiltinCollection`
+// / `BUILTIN_COLLECTION_IDS`). Architecture is the sole member today; add more here and
+// they inherit the same protection automatically — no other code needs to change.
 export const BUILTIN_COLLECTIONS: ReadonlyArray<TagCollection> = [ARCHITECTURE]
+
+// The ids of the protected built-in group — for callers that only have an id (e.g. the
+// renderer deciding whether to show a delete control).
+export const BUILTIN_COLLECTION_IDS: ReadonlySet<string> = new Set(BUILTIN_COLLECTIONS.map((c) => c.id))
+
+// Whether a collection belongs to the protected built-in group. Built-ins carry global
+// scope (the marker every BUILTIN_COLLECTIONS member sets); user collections are always
+// "project". This is the single source of truth for "is this collection immutable?".
+export function isBuiltinCollection(collection: Pick<TagCollection, "scope">): boolean {
+  return collection.scope === "global"
+}
 
 // --- helpers ---------------------------------------------------------------
 

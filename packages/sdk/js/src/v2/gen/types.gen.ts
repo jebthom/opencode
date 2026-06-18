@@ -5049,6 +5049,47 @@ export type CodegraphCycleCollectionResponses = {
 export type CodegraphCycleCollectionResponse =
   CodegraphCycleCollectionResponses[keyof CodegraphCycleCollectionResponses]
 
+export type CodegraphDeleteCollectionData = {
+  body?: never
+  path?: never
+  query: {
+    directory?: string
+    workspace?: string
+    collection: string
+  }
+  url: "/codegraph/collection/delete"
+}
+
+export type CodegraphDeleteCollectionErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type CodegraphDeleteCollectionError = CodegraphDeleteCollectionErrors[keyof CodegraphDeleteCollectionErrors]
+
+export type CodegraphDeleteCollectionResponses = {
+  /**
+   * The outcome and the now-active tag collection
+   */
+  200: {
+    status: "ok" | "not-found" | "builtin"
+    active?: {
+      id: string
+      name: string
+      legend: Array<{
+        tag: string
+        label: string
+        color: string
+      }>
+    }
+  }
+}
+
+export type CodegraphDeleteCollectionResponse =
+  CodegraphDeleteCollectionResponses[keyof CodegraphDeleteCollectionResponses]
+
 export type ConfigGetData = {
   body?: never
   path?: never

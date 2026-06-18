@@ -87,4 +87,32 @@ export const upsert = (
       Effect.ignore,
     )
 
+// Deterministically fold one tag into another for a collection: rewrite every entry
+// tagged `from` to `into`, leaving the content hash untouched (the file's content
+// didn't change, only its label). Costs no tokens — the combine is a pure rewrite of
+// the stored map. A no-op when the doc doesn't exist yet.
+export const mergeTag = (
+  storage: Storage.Interface,
+  projectID: string,
+  collectionID: string,
+  from: string,
+  into: string,
+): Effect.Effect<void> =>
+  storage
+    .update<Store>(key(projectID, collectionID), (draft) => {
+      for (const [id, entry] of Object.entries(draft)) {
+        if (entry.tag === from) draft[id] = { tag: into, hash: entry.hash }
+      }
+    })
+    .pipe(Effect.ignore)
+
+// Drop every tag for a collection, forcing a from-scratch re-tag on the next sweep.
+// Used when a *structural* edit (tags added/removed/redefined, or the prompt changed)
+// invalidates the previously-inferred tags.
+export const clear = (
+  storage: Storage.Interface,
+  projectID: string,
+  collectionID: string,
+): Effect.Effect<void> => storage.write(key(projectID, collectionID), {} as Store).pipe(Effect.ignore)
+
 export * as CodeGraphSemanticStore from "./semantic-store"

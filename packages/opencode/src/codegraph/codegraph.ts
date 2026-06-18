@@ -20,7 +20,7 @@ import { CodeGraphEvent } from "./event"
 import { CodeGraphSemanticStore } from "./semantic-store"
 import { CodeGraphTagger } from "./tagger"
 import { CodeGraphCollectionStore } from "./collection-store"
-import { type TagCollection, type PaletteId, legend as collectionLegend, NONE_TAG, NONE_HUE } from "./collections"
+import { type TagCollection, type PaletteId, legend as collectionLegend, NONE_TAG, NONE_HUE, ARCHITECTURE_ID, isBuiltinCollection } from "./collections"
 
 // Server-side code-graph service (PLAN.md steps 1 + 2.5). Owns the deterministic
 // payload, but unlike step 1 the graph is a *2-level window* rooted at a scope
@@ -78,7 +78,37 @@ export interface CreateCollectionInput {
   readonly palette: PaletteId
   readonly prompt: string
   readonly tags: ReadonlyArray<{ readonly label: string; readonly description: string }>
+  // Optional repo-relative directories the tagger front-loads (see TagCollection).
+  readonly directories?: ReadonlyArray<string>
 }
+
+export interface EditCollectionInput {
+  // Id or name of the collection to edit (must be a user/project collection).
+  readonly collection: string
+  readonly name?: string
+  readonly description?: string
+  readonly palette?: PaletteId
+  readonly prompt?: string
+  // The complete desired tag list (like create). Tags keep their id — and thus their
+  // existing tagged files — when an id or label matches; new labels mint new tags.
+  readonly tags?: ReadonlyArray<{ readonly id?: string; readonly label: string; readonly description: string }>
+  readonly directories?: ReadonlyArray<string>
+}
+
+// Outcome of an edit/merge/delete: a resolved collection or why it was refused. The
+// built-in (global) collections are immutable, so they refuse with "builtin".
+export type CollectionMutation =
+  | { readonly status: "ok"; readonly collection: TagCollection; readonly structural: boolean }
+  | { readonly status: "not-found" }
+  | { readonly status: "builtin" }
+  | { readonly status: "unknown-tag"; readonly tag: string }
+
+// Outcome of a delete: the now-active collection (after falling back to Architecture
+// when the deleted one was active) or why it was refused.
+export type DeleteOutcome =
+  | { readonly status: "ok"; readonly active: CodeGraphPayload.CollectionInfo }
+  | { readonly status: "not-found" }
+  | { readonly status: "builtin" }
 
 export interface Interface {
   // Cached payload for `scope` (default repo root); computes + persists on a miss
@@ -99,6 +129,16 @@ export interface Interface {
   // user-defined), wrapping at the ends, and re-paint. Returns the newly-active
   // collection's info. Drives the top-bar's ◀/▶ arrows.
   readonly cycleCollection: (direction: "next" | "prev") => Effect.Effect<CodeGraphPayload.CollectionInfo>
+  // Edit a user collection in place. A structural change (tags added/removed/redefined
+  // or prompt changed) clears that collection's tags so the sweep re-tags from scratch;
+  // a cosmetic change (name/label/palette/directories) just re-paints. Built-ins refuse.
+  readonly editCollection: (input: EditCollectionInput) => Effect.Effect<CollectionMutation>
+  // Deterministically fold one tag into another for a user collection (no re-tag, no
+  // tokens): drops `from` and re-labels its files as `into`. Both id or label.
+  readonly mergeTags: (collection: string, from: string, into: string) => Effect.Effect<CollectionMutation>
+  // Delete a user collection (and its tags), falling back to the built-in active
+  // collection when the deleted one was active. Not exposed to the tagging agent.
+  readonly deleteCollection: (idOrName: string) => Effect.Effect<DeleteOutcome>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/CodeGraph") {}
@@ -279,6 +319,11 @@ export const layer = Layer.effect(
     // to the instance scope so it dies with the TUI; the bgTaggers map dedups starts
     // and the dropping(1) wake queue coalesces a burst of changes into one rescan.
     const bgTaggers = new Map<string, { readonly wake: Queue.Queue<void> }>()
+    // Per-directory counter bumped whenever the active collection changes
+    // (onCollectionChanged). The bg loop snapshots it at pass start and abandons an
+    // in-flight sweep when it changes, so a freshly-selected collection starts filling
+    // in immediately instead of waiting for the previous collection's sweep to finish.
+    const collectionEpoch = new Map<string, number>()
 
     const backgroundLoop = (directory: string, projectID: string, wake: Queue.Queue<void>) =>
       Effect.gen(function* () {
@@ -287,6 +332,7 @@ export const layer = Layer.effect(
           // re-walks the repo tagging for the *new* collection; cached entries make a
           // re-walk of an already-tagged collection free.
           const collection = yield* CodeGraphCollectionStore.getActive(storage, projectID)
+          const epoch = collectionEpoch.get(directory) ?? 0
           const files = yield* CodeGraphExtract.listFilesDfs(directory).pipe(
             Effect.catchCause((cause) => {
               log.error("background enumerate failed", { projectID, cause })
@@ -294,12 +340,18 @@ export const layer = Layer.effect(
             }),
             Effect.provide(FSUtil.defaultLayer),
           )
+          // Front-load the collection's relevant directories (if any): tag files under
+          // them first, in their existing DFS order, then the rest of the repo. The
+          // sweep still covers everything; this only changes the order so the targeted
+          // area lights up first. Already-tagged files in the tail are stale-skipped.
+          const ordered = orderByDirectories(files, collection.directories)
           // Always-written diagnostic so a bg loop that produces no request lines is
           // still visible in the perf log (distinguishes "loop never ran" from
           // "ran but every slice was already tagged / no model").
-          yield* CodeGraphTagger.appendPerfEvent(directory, "bg", "pass-start", { files: files.length, collection: collection.id })
-          for (let cursor = 0; cursor < files.length; cursor += BG_BATCH) {
-            const slice = files.slice(cursor, cursor + BG_BATCH)
+          yield* CodeGraphTagger.appendPerfEvent(directory, "bg", "pass-start", { files: ordered.length, collection: collection.id })
+          let interrupted = false
+          for (let cursor = 0; cursor < ordered.length; cursor += BG_BATCH) {
+            const slice = ordered.slice(cursor, cursor + BG_BATCH)
             // scope "" — the tag store is keyed by stable node id, so a file tagged
             // here is reused in every window it later appears in. The permit is held
             // only for the batch; the pause below runs without it so foreground wins.
@@ -310,8 +362,18 @@ export const layer = Layer.effect(
               ),
             )
             yield* Effect.sleep(BG_BATCH_DELAY)
+            // Abandon the rest of this sweep when the active collection changed under
+            // us, so the new collection takes over without finishing the old one.
+            if ((collectionEpoch.get(directory) ?? 0) !== epoch) {
+              interrupted = true
+              break
+            }
           }
-          yield* Queue.take(wake)
+          // On interruption, drain the switch's own wake signal and re-loop immediately
+          // (the next pass re-reads the now-active collection). Otherwise park until a
+          // file change / turn completion / collection switch wakes us.
+          if (interrupted) yield* Queue.poll(wake)
+          else yield* Queue.take(wake)
         }
       })
 
@@ -450,6 +512,9 @@ export const layer = Layer.effect(
             yield* events.publish(CodeGraphEvent.Event.Invalidated, { scope }).pipe(Effect.ignore)
           }
         }
+        // Bump the epoch so an in-flight background sweep abandons the old collection
+        // and restarts for the new one (the wake below re-runs the parked loop).
+        collectionEpoch.set(directory, (collectionEpoch.get(directory) ?? 0) + 1)
         yield* wakeBackground(directory)
       })
 
@@ -497,6 +562,73 @@ export const layer = Layer.effect(
       return { id: next.id, name: next.name, legend: collectionLegend(next) }
     })
 
+    // Resolve a collection by id or (case-insensitive) name. Used by edit/merge/delete
+    // to find the target and refuse the immutable built-ins.
+    const resolveCollection = (all: ReadonlyArray<TagCollection>, idOrName: string) => {
+      const needle = idOrName.toLowerCase()
+      return all.find((c) => c.id === idOrName || c.name.toLowerCase() === needle)
+    }
+
+    const editCollection = Effect.fn("CodeGraph.editCollection")(function* (input: EditCollectionInput) {
+      const ctx = yield* InstanceState.context
+      const all = yield* CodeGraphCollectionStore.list(storage, ctx.project.id)
+      const found = resolveCollection(all, input.collection)
+      if (!found) return { status: "not-found" } as const
+      if (isBuiltinCollection(found)) return { status: "builtin" } as const
+      const result = yield* CodeGraphCollectionStore.update(storage, ctx.project.id, found.id, {
+        name: input.name,
+        description: input.description,
+        palette: input.palette,
+        prompt: input.prompt,
+        tags: input.tags,
+        directories: input.directories,
+      })
+      if (!result) return { status: "not-found" } as const
+      // Structural edits invalidate the inferred tags — clear them so the sweep
+      // re-tags from scratch. Cosmetic edits keep the tags and just re-paint.
+      if (result.structural) yield* CodeGraphSemanticStore.clear(storage, ctx.project.id, found.id)
+      yield* onCollectionChanged(ctx.directory)
+      return { status: "ok", collection: result.collection, structural: result.structural } as const
+    })
+
+    const mergeTags = Effect.fn("CodeGraph.mergeTags")(function* (collection: string, from: string, into: string) {
+      const ctx = yield* InstanceState.context
+      const all = yield* CodeGraphCollectionStore.list(storage, ctx.project.id)
+      const found = resolveCollection(all, collection)
+      if (!found) return { status: "not-found" } as const
+      if (isBuiltinCollection(found)) return { status: "builtin" } as const
+      // Accept either a tag id or its (case-insensitive) label for both ends.
+      const resolveTag = (ref: string) =>
+        found.tags.find((t) => t.id === ref || t.label.toLowerCase() === ref.toLowerCase())?.id
+      const fromId = resolveTag(from)
+      const intoId = resolveTag(into)
+      if (!fromId) return { status: "unknown-tag", tag: from } as const
+      if (!intoId) return { status: "unknown-tag", tag: into } as const
+      const updated = yield* CodeGraphCollectionStore.mergeTags(storage, ctx.project.id, found.id, fromId, intoId)
+      if (!updated) return { status: "not-found" } as const
+      yield* CodeGraphSemanticStore.mergeTag(storage, ctx.project.id, found.id, fromId, intoId)
+      yield* onCollectionChanged(ctx.directory)
+      return { status: "ok", collection: updated, structural: false } as const
+    })
+
+    const deleteCollection = Effect.fn("CodeGraph.deleteCollection")(function* (idOrName: string) {
+      const ctx = yield* InstanceState.context
+      const all = yield* CodeGraphCollectionStore.list(storage, ctx.project.id)
+      const found = resolveCollection(all, idOrName)
+      if (!found) return { status: "not-found" } as const
+      if (isBuiltinCollection(found)) return { status: "builtin" } as const
+      const activeId = yield* CodeGraphCollectionStore.getActiveId(storage, ctx.project.id)
+      yield* CodeGraphCollectionStore.remove(storage, ctx.project.id, found.id)
+      yield* CodeGraphSemanticStore.clear(storage, ctx.project.id, found.id)
+      if (activeId === found.id) yield* CodeGraphCollectionStore.setActive(storage, ctx.project.id, ARCHITECTURE_ID)
+      yield* onCollectionChanged(ctx.directory)
+      const active = yield* CodeGraphCollectionStore.getActive(storage, ctx.project.id)
+      return {
+        status: "ok",
+        active: { id: active.id, name: active.name, legend: collectionLegend(active) },
+      } as const
+    })
+
     return Service.of({
       get: (scope) => load(scope),
       refresh: (scope) => refresh(scope),
@@ -505,6 +637,9 @@ export const layer = Layer.effect(
       createCollection: (input) => createCollection(input),
       selectCollection: (idOrName) => selectCollection(idOrName),
       cycleCollection: (direction) => cycleCollection(direction),
+      editCollection: (input) => editCollection(input),
+      mergeTags: (collection, from, into) => mergeTags(collection, from, into),
+      deleteCollection: (idOrName) => deleteCollection(idOrName),
     })
   }),
 )
@@ -518,6 +653,22 @@ export const defaultLayer = layer.pipe(
   Layer.provide(Provider.defaultLayer),
   Layer.provide(Config.defaultLayer),
 )
+
+// Reorder the enumerated files so any under the collection's relevant directories
+// come first (keeping each group's existing DFS order), then the rest of the repo.
+// Returns the input unchanged when no directories are set. The targeted dirs are
+// repo-relative with no leading/trailing slashes (normalized at create/edit time);
+// a file matches when its path equals a dir or sits under it.
+function orderByDirectories(
+  files: ReadonlyArray<{ id: string; path: string }>,
+  directories: ReadonlyArray<string> | undefined,
+): ReadonlyArray<{ id: string; path: string }> {
+  if (!directories?.length) return files
+  const isPriority = (rel: string) => directories.some((d) => rel === d || rel.startsWith(d + "/"))
+  const priority = files.filter((f) => isPriority(f.path))
+  if (priority.length === 0 || priority.length === files.length) return files
+  return [...priority, ...files.filter((f) => !isPriority(f.path))]
+}
 
 // --- composition -----------------------------------------------------------
 

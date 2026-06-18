@@ -20,6 +20,16 @@ export const codegraphHandlers = HttpApiBuilder.group(InstanceHttpApi, "codegrap
       return yield* codegraph.cycleCollection(ctx.query.direction)
     })
 
-    return handlers.handle("get", get).handle("cycleCollection", cycleCollection)
+    const deleteCollection = Effect.fn("CodeGraphHttpApi.deleteCollection")(function* (ctx: {
+      query: { collection: string }
+    }) {
+      const result = yield* codegraph.deleteCollection(ctx.query.collection)
+      return result.status === "ok" ? { status: "ok" as const, active: result.active } : { status: result.status }
+    })
+
+    return handlers
+      .handle("get", get)
+      .handle("cycleCollection", cycleCollection)
+      .handle("deleteCollection", deleteCollection)
   }),
 )

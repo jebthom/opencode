@@ -51,6 +51,7 @@ import { useToast } from "../../ui/toast"
 import { useKV } from "../../context/kv"
 import { createFadeIn } from "../../util/signal"
 import { DialogSkill } from "../dialog-skill"
+import { DialogConfirm } from "@tui/ui/dialog-confirm"
 import {
   confirmWorkspaceFileChanges,
   openWorkspaceSelect,
@@ -633,6 +634,55 @@ export function Prompt(props: PromptProps) {
               void warpSession(selection)
             },
           })
+        },
+      },
+      {
+        // Deterministic, agent-free delete of the active code-graph tag collection.
+        // Mirrors the top-bar ✕; the server refuses built-ins (status "builtin").
+        title: "Delete tag collection",
+        desc: "Delete the active code-graph tag collection",
+        name: "codegraph.tag.delete",
+        category: "Session",
+        slashName: "tag-delete",
+        slashAliases: ["untag"],
+        run: async () => {
+          const active = await sdk.client.codegraph
+            .get({})
+            .then((r) => r.data?.collection)
+            .catch(() => undefined)
+          if (!active) {
+            toast.show({
+              title: "No tag collection",
+              message: "Open the code graph and pick a collection first.",
+              variant: "error",
+            })
+            return
+          }
+          const ok = await DialogConfirm.show(
+            dialog,
+            "Delete tag collection",
+            `Delete "${active.name}"? This removes the collection and its tags.`,
+          )
+          if (!ok) return
+          const result = await sdk.client.codegraph
+            .deleteCollection({ collection: active.id })
+            .then((r) => r.data)
+            .catch(() => undefined)
+          if (result?.status === "ok") {
+            toast.show({
+              title: "Deleted tag collection",
+              message: `Removed "${active.name}"; now showing "${result.active?.name ?? "Architecture"}".`,
+              variant: "success",
+            })
+          } else if (result?.status === "builtin") {
+            toast.show({
+              title: "Built-in collection",
+              message: `"${active.name}" is built-in and can't be deleted.`,
+              variant: "error",
+            })
+          } else {
+            toast.show({ title: "Delete failed", message: `Couldn't delete "${active.name}".`, variant: "error" })
+          }
         },
       },
     ].map((entry) => ({

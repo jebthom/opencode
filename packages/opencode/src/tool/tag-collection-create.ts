@@ -26,7 +26,13 @@ export const Parameters = Schema.Struct({
         description: "Definition the tagging model uses to decide whether a file belongs to this tag.",
       }),
     }),
-  ).annotate({ description: `The collection's tags. Between 1 and ${MAX_TAGS} (the palette size).` }),
+  ).annotate({
+    description: `The collection's tags. Between 1 and ${MAX_TAGS} (the palette size). Do NOT include a catch-all/"other"/"misc"/"none" tag — a universal "Other" bucket is added automatically for files matching no tag.`,
+  }),
+  directories: Schema.optional(Schema.Array(Schema.String)).annotate({
+    description:
+      "Optional repo-relative directories (no leading slash) most relevant to this collection — e.g. those surfaced while exploring. The tagger paints these first, then the rest of the repo; it never restricts the sweep. Omit when there's no obvious focus area.",
+  }),
 })
 
 export const TagCollectionCreateTool = Tool.define(
@@ -58,6 +64,7 @@ export const TagCollectionCreateTool = Tool.define(
             palette: params.palette,
             prompt: params.prompt,
             tags: params.tags.map((t) => ({ label: t.label, description: t.description })),
+            directories: params.directories,
           })
 
           return {

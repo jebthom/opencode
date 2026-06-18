@@ -218,6 +218,8 @@ export const layer = Layer.effect(
                 tag_collection_list: "allow",
                 tag_collection_create: "allow",
                 tag_collection_select: "allow",
+                tag_collection_merge_tags: "allow",
+                tag_collection_edit: "allow",
                 external_directory: readonlyExternalDirectory,
               }),
               user,

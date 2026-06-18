@@ -16,6 +16,8 @@ import { SkillTool } from "./skill"
 import { TagCollectionListTool } from "./tag-collection-list"
 import { TagCollectionCreateTool } from "./tag-collection-create"
 import { TagCollectionSelectTool } from "./tag-collection-select"
+import { TagCollectionMergeTagsTool } from "./tag-collection-merge-tags"
+import { TagCollectionEditTool } from "./tag-collection-edit"
 import { CodeGraph } from "@/codegraph/codegraph"
 import * as Tool from "./tool"
 import { Config } from "@/config/config"
@@ -139,6 +141,8 @@ export const layer: Layer.Layer<
     const tagList = yield* TagCollectionListTool
     const tagCreate = yield* TagCollectionCreateTool
     const tagSelect = yield* TagCollectionSelectTool
+    const tagMergeTags = yield* TagCollectionMergeTagsTool
+    const tagEdit = yield* TagCollectionEditTool
     const agent = yield* Agent.Service
 
     const state = yield* InstanceState.make<State>(
@@ -249,6 +253,8 @@ export const layer: Layer.Layer<
           tagList: Tool.init(tagList),
           tagCreate: Tool.init(tagCreate),
           tagSelect: Tool.init(tagSelect),
+          tagMergeTags: Tool.init(tagMergeTags),
+          tagEdit: Tool.init(tagEdit),
         })
 
         return {
@@ -271,6 +277,8 @@ export const layer: Layer.Layer<
             tool.tagList,
             tool.tagCreate,
             tool.tagSelect,
+            tool.tagMergeTags,
+            tool.tagEdit,
             ...(flags.experimentalLspTool ? [tool.lsp] : []),
             ...(flags.experimentalPlanMode && flags.client === "cli" ? [tool.plan] : []),
           ],

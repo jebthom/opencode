@@ -28,6 +28,21 @@ const CycleCollectionQuery = Schema.Struct({
   direction: Schema.Literals(["next", "prev"]),
 })
 
+// Delete a user-defined tag collection by id or name. Drives the top-bar ✕ control
+// and the `/tag-delete` command — both deterministic, never routed through the agent.
+// Built-in collections are immutable, so the result reports why a delete was refused.
+const DeleteCollectionQuery = Schema.Struct({
+  ...WorkspaceRoutingQueryFields,
+  collection: Schema.String,
+})
+
+// Outcome: "ok" with the now-active collection (Architecture when the deleted one was
+// active), or a refusal ("not-found" / "builtin").
+const DeleteCollectionResult = Schema.Struct({
+  status: Schema.Literals(["ok", "not-found", "builtin"]),
+  active: Schema.optional(CodeGraphPayload.CollectionInfo),
+})
+
 export const CodeGraphApi = HttpApi.make("codegraph")
   .add(
     HttpApiGroup.make("codegraph")
@@ -52,6 +67,18 @@ export const CodeGraphApi = HttpApi.make("codegraph")
             identifier: "codegraph.cycleCollection",
             summary: "Cycle active tag collection",
             description: "Switch the active code-graph tag collection to the next or previous one, wrapping at the ends.",
+          }),
+        ),
+      )
+      .add(
+        HttpApiEndpoint.get("deleteCollection", `${root}/collection/delete`, {
+          query: DeleteCollectionQuery,
+          success: described(DeleteCollectionResult, "The outcome and the now-active tag collection"),
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "codegraph.deleteCollection",
+            summary: "Delete a tag collection",
+            description: "Delete a user-defined code-graph tag collection by id or name. Built-in collections are immutable.",
           }),
         ),
       )

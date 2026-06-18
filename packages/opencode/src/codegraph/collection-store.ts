@@ -73,6 +73,8 @@ export interface CreateInput {
   readonly palette: PaletteId
   readonly prompt: string
   readonly tags: ReadonlyArray<{ readonly id?: string; readonly label: string; readonly description: string }>
+  // Optional repo-relative directories the tagger front-loads (see TagCollection).
+  readonly directories?: ReadonlyArray<string>
 }
 
 // Mint a unique project collection id: name slug + a short content hash so two
@@ -120,6 +122,7 @@ export const create = (
       prompt: input.prompt,
       tags: withColors,
       scope: "project",
+      ...(input.directories?.length ? { directories: normalizeDirectories(input.directories) } : {}),
     }
 
     yield* storage
@@ -129,6 +132,145 @@ export const create = (
       .pipe(Effect.catch(() => storage.write(collectionsKey(projectID), { [collection.id]: collection })), Effect.ignore)
 
     return collection
+  })
+
+// Trim, drop empties, and strip leading/trailing slashes so directory prefixes match
+// the repo-relative paths the tagger walks (which never start with "/").
+function normalizeDirectories(dirs: ReadonlyArray<string>): string[] {
+  const seen = new Set<string>()
+  for (const raw of dirs) {
+    const d = raw.trim().replace(/^\/+|\/+$/g, "")
+    if (d) seen.add(d)
+  }
+  return [...seen]
+}
+
+// Assign tag ids + palette colours, carrying an existing tag's id forward so its
+// stored semantics survive an edit. A raw tag keeps its id when one is given and
+// matches an existing tag, else when its label matches an existing tag's label;
+// otherwise a fresh unique slug id is minted. Colours follow palette order.
+function resolveTags(
+  palette: PaletteId,
+  rawTags: ReadonlyArray<{ readonly id?: string; readonly label: string; readonly description: string }>,
+  existing: ReadonlyArray<TagDef> = [],
+): TagDef[] {
+  const byId = new Map(existing.map((t) => [t.id, t]))
+  const byLabel = new Map(existing.map((t) => [t.label.toLowerCase(), t]))
+  const seen = new Set<string>()
+  return assignColors(
+    palette,
+    rawTags.map((t) => {
+      const carried = (t.id && byId.get(t.id)) || byLabel.get(t.label.toLowerCase())
+      let id = t.id?.trim() || carried?.id || slugify(t.label)
+      let n = 2
+      while (seen.has(id)) id = `${slugify(t.label)}-${n++}`
+      seen.add(id)
+      return { id, label: t.label, description: t.description }
+    }),
+  )
+}
+
+export interface UpdateInput {
+  readonly name?: string
+  readonly description?: string
+  readonly palette?: PaletteId
+  readonly prompt?: string
+  readonly tags?: ReadonlyArray<{ readonly id?: string; readonly label: string; readonly description: string }>
+  readonly directories?: ReadonlyArray<string>
+}
+
+export interface UpdateResult {
+  readonly collection: TagCollection
+  // Whether the edit changed how files are classified (tags added/removed, a tag's
+  // definition changed, or the prompt changed) — the caller re-tags from scratch.
+  // Cosmetic changes (name, label text, palette, directories) leave tags intact.
+  readonly structural: boolean
+}
+
+// Update an existing *user* collection in place (built-ins live in code and are not
+// in the project doc, so they're untouched). Returns the updated collection plus a
+// flag telling the caller whether the previously-inferred tags are now invalid.
+// Returns undefined when the id isn't a project collection.
+export const update = (
+  storage: Storage.Interface,
+  projectID: string,
+  id: string,
+  input: UpdateInput,
+): Effect.Effect<UpdateResult | undefined> =>
+  Effect.gen(function* () {
+    const project = yield* readProject(storage, projectID)
+    const prev = project[id]
+    if (!prev) return undefined
+
+    const palette = input.palette ?? prev.palette ?? "pastel"
+    const tags = input.tags ? resolveTags(palette, input.tags, prev.tags) : prev.tags
+    if (tags.length === 0) return yield* Effect.die(new Error("a collection needs at least one tag"))
+    if (tags.length > MAX_TAGS)
+      return yield* Effect.die(new Error(`a collection can have at most ${MAX_TAGS} tags (palette size)`))
+    // Re-colour when the palette changed but the tag set didn't (so colours track the
+    // new palette); when tags changed, resolveTags already coloured them.
+    const coloured = !input.tags && input.palette ? assignColors(palette, tags) : tags
+
+    const prompt = input.prompt ?? prev.prompt
+    const prevById = new Map(prev.tags.map((t) => [t.id, t]))
+    const tagsAddedOrRemoved =
+      coloured.length !== prev.tags.length || coloured.some((t) => !prevById.has(t.id))
+    const definitionChanged = coloured.some((t) => prevById.get(t.id) && prevById.get(t.id)!.description !== t.description)
+    const structural = tagsAddedOrRemoved || definitionChanged || prompt !== prev.prompt
+
+    const directories = input.directories ? normalizeDirectories(input.directories) : prev.directories
+    const next: TagCollection = {
+      ...prev,
+      name: input.name ?? prev.name,
+      description: input.description ?? prev.description,
+      palette,
+      prompt,
+      tags: coloured,
+      ...(directories?.length ? { directories } : {}),
+    }
+
+    yield* storage.update<StoredCollections>(collectionsKey(projectID), (draft) => {
+      draft[id] = next
+    }).pipe(Effect.ignore)
+
+    return { collection: next, structural }
+  })
+
+// Deterministically combine two tags of a *user* collection: drop `from` from the
+// tag list (keeping `into` and all other tags with their existing ids/colours). The
+// caller folds the stored semantics (CodeGraphSemanticStore.mergeTag) so no re-tag is
+// needed. Returns the updated collection, or undefined when the id/tags don't resolve.
+export const mergeTags = (
+  storage: Storage.Interface,
+  projectID: string,
+  id: string,
+  from: string,
+  into: string,
+): Effect.Effect<TagCollection | undefined> =>
+  Effect.gen(function* () {
+    const project = yield* readProject(storage, projectID)
+    const prev = project[id]
+    if (!prev) return undefined
+    if (from === into) return prev
+    if (!prev.tags.some((t) => t.id === from) || !prev.tags.some((t) => t.id === into)) return undefined
+    const next: TagCollection = { ...prev, tags: prev.tags.filter((t) => t.id !== from) }
+    yield* storage.update<StoredCollections>(collectionsKey(projectID), (draft) => {
+      draft[id] = next
+    }).pipe(Effect.ignore)
+    return next
+  })
+
+// Remove a *user* collection from the project doc. Returns true when something was
+// removed (built-ins aren't in the doc, so they return false). The caller resets the
+// active pointer and clears the collection's semantics.
+export const remove = (storage: Storage.Interface, projectID: string, id: string): Effect.Effect<boolean> =>
+  Effect.gen(function* () {
+    const project = yield* readProject(storage, projectID)
+    if (!project[id]) return false
+    yield* storage.update<StoredCollections>(collectionsKey(projectID), (draft) => {
+      delete draft[id]
+    }).pipe(Effect.ignore)
+    return true
   })
 
 // Convenience for the tools: a tiny summary of every palette for the agent to pick

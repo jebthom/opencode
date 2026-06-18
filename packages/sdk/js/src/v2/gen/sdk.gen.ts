@@ -17,6 +17,8 @@ import type {
   AuthSetResponses,
   CodegraphCycleCollectionErrors,
   CodegraphCycleCollectionResponses,
+  CodegraphDeleteCollectionErrors,
+  CodegraphDeleteCollectionResponses,
   CodegraphGetErrors,
   CodegraphGetResponses,
   CommandListErrors,
@@ -723,6 +725,42 @@ export class Codegraph extends HeyApiClient {
       ThrowOnError
     >({
       url: "/codegraph/collection/cycle",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Delete a tag collection
+   *
+   * Delete a user-defined code-graph tag collection by id or name. Built-in collections are immutable.
+   */
+  public deleteCollection<ThrowOnError extends boolean = false>(
+    parameters: {
+      directory?: string
+      workspace?: string
+      collection: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "query", key: "collection" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      CodegraphDeleteCollectionResponses,
+      CodegraphDeleteCollectionErrors,
+      ThrowOnError
+    >({
+      url: "/codegraph/collection/delete",
       ...options,
       ...params,
     })
