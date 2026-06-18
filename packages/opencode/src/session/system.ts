@@ -15,6 +15,8 @@ import type { Provider } from "@/provider/provider"
 import type { Agent } from "@/agent/agent"
 import { Permission } from "@/permission"
 import { Skill } from "@/skill"
+import { Storage } from "@/storage/storage"
+import { CodeGraphCollectionStore } from "@/codegraph/collection-store"
 
 export function provider(model: Provider.Model) {
   if (model.api.id.includes("gpt-4") || model.api.id.includes("o1") || model.api.id.includes("o3"))
@@ -35,6 +37,7 @@ export function provider(model: Provider.Model) {
 export interface Interface {
   readonly environment: (model: Provider.Model) => Effect.Effect<string[]>
   readonly skills: (agent: Agent.Info) => Effect.Effect<string | undefined>
+  readonly tagging: (agent: Agent.Info) => Effect.Effect<string | undefined>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SystemPrompt") {}
@@ -43,6 +46,7 @@ export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const skill = yield* Skill.Service
+    const storage = yield* Storage.Service
 
     return Service.of({
       environment: Effect.fn("SystemPrompt.environment")(function* (model: Provider.Model) {
@@ -75,10 +79,57 @@ export const layer = Layer.effect(
           Skill.fmt(list, { verbose: true }),
         ].join("\n")
       }),
+
+      // Lightweight awareness of the code-graph tagging system for the primary
+      // build/plan agents, so they can use it as an occasional two-way visual
+      // channel with the user. Gated by exact agent name: the hidden primaries
+      // (compaction/title/summary) and the `tag` agent itself (which owns the
+      // authoritative schema-design instructions) must not receive this.
+      tagging: Effect.fn("SystemPrompt.tagging")(function* (agent: Agent.Info) {
+        if (agent.name !== "build" && agent.name !== "plan") return
+
+        const ctx = yield* InstanceState.context
+        const all = yield* CodeGraphCollectionStore.list(storage, ctx.project.id)
+        const active = yield* CodeGraphCollectionStore.getActive(storage, ctx.project.id)
+        const others = all.filter((c) => c.id !== active.id).map((c) => c.name)
+
+        return [
+          "<code-graph-tagging>",
+          "The code-graph view paints every file and directory in this repo by an active tag",
+          "collection (a small semantic vocabulary). The user sees this view, so a tag collection",
+          "is a two-way visual channel between you and them.",
+          `Active collection: "${active.name}" — tags: ${active.tags.map((t) => t.label).join(", ")}.`,
+          ...(others.length ? [`Other collections: ${others.join(", ")}.`] : []),
+          "",
+          "When the user EXPLICITLY drives the tagging — e.g. they ran /tag, they approved a schema",
+          "the tag agent just proposed, or they asked you to create or switch to a specific",
+          "collection — just fulfill it directly and normally: call tag_collection_create (which",
+          "activates the new collection and switches the view) or tag_collection_select. Do NOT",
+          "route an explicit user request through a subagent, and do NOT pass activate:false.",
+          "",
+          "Separately, you may OPPORTUNISTICALLY introduce a collection on your own initiative — but",
+          "SPARINGLY, since defining one re-tags the repo and costs tokens. Never spam new",
+          "collections (at most one per feature or question). Consider it only when:",
+          "- You are about to build or plan a LARGE multi-file feature: a feature-spread collection",
+          "  lets the user watch the feature paint across the codebase as you create the files.",
+          "- The user asks a spatial/spread question (\"which files touch X\", \"how far does Y reach\")",
+          "  and has NOT used /tag — a collection answers it visually.",
+          "Prefer an existing collection: if one above already fits, do not create a new one.",
+          "Never switch the active collection (tag_collection_select) without asking the user first —",
+          "switching changes what they are viewing.",
+          "For this opportunistic path, delegate to the tag agent via the task tool (subagent_type",
+          "\"tag\"). In the task prompt, describe the feature/question and state that this is a",
+          "NON-INTERACTIVE subagent invocation: it should design AND create the collection directly",
+          "(no waiting for approval) with activate:false so the user's current view is undisturbed,",
+          "then report the collection name and tags. Afterwards tell the user the collection exists",
+          "and ask whether to switch to it (it paints once active).",
+          "</code-graph-tagging>",
+        ].join("\n")
+      }),
     })
   }),
 )
 
-export const defaultLayer = layer.pipe(Layer.provide(Skill.defaultLayer))
+export const defaultLayer = layer.pipe(Layer.provide(Skill.defaultLayer), Layer.provide(Storage.defaultLayer))
 
 export * as SystemPrompt from "./system"

@@ -4,6 +4,7 @@ import type { Agent } from "../../src/agent/agent"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { Skill } from "../../src/skill"
 import { Permission } from "../../src/permission"
+import { Storage } from "../../src/storage/storage"
 import { SystemPrompt } from "../../src/session/system"
 import { testEffect } from "../lib/effect"
 
@@ -40,6 +41,20 @@ const build: Agent.Info = {
   options: {},
 }
 
+// Minimal Storage stub — the `tagging` method captures Storage at layer build
+// time, but the assertions below only exercise `skills` and the non-build/plan
+// `tagging` gate (which returns before touching storage), so the bodies are unused.
+const storageStub = Layer.succeed(
+  Storage.Service,
+  Storage.Service.of({
+    remove: () => Effect.void,
+    read: (() => Effect.fail(new Error("not implemented"))) as unknown as Storage.Interface["read"],
+    update: (() => Effect.fail(new Error("not implemented"))) as unknown as Storage.Interface["update"],
+    write: () => Effect.void,
+    list: () => Effect.succeed([]),
+  }),
+)
+
 const it = testEffect(
   SystemPrompt.layer.pipe(
     Layer.provide(
@@ -58,6 +73,7 @@ const it = testEffect(
         }),
       ),
     ),
+    Layer.provide(storageStub),
   ),
 )
 
@@ -79,6 +95,22 @@ describe("session.system", () => {
       expect(middle).toBeGreaterThan(alpha)
       expect(zeta).toBeGreaterThan(middle)
       expect(output).not.toContain("manual-skill")
+    }),
+  )
+
+  it.effect("tagging is gated to the build/plan agents", () =>
+    Effect.gen(function* () {
+      const prompt = yield* SystemPrompt.Service
+      const tag: Agent.Info = { name: "tag", mode: "all", permission: Permission.fromConfig({ "*": "allow" }), options: {} }
+      const explore: Agent.Info = {
+        name: "explore",
+        mode: "subagent",
+        permission: Permission.fromConfig({ "*": "allow" }),
+        options: {},
+      }
+      // Non-build/plan agents return before touching storage — no data needed.
+      expect(yield* prompt.tagging(tag)).toBeUndefined()
+      expect(yield* prompt.tagging(explore)).toBeUndefined()
     }),
   )
 })

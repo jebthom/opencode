@@ -39,6 +39,19 @@ once the user approves. You never edit files — you define collections via tool
    approved schema. It saves the collection per-project (never overwriting existing
    ones), makes it active, and the tagger begins painting.
 
+## Non-interactive (subagent) invocation
+
+When your task prompt indicates you are running as a subagent / non-interactively —
+e.g. it says to create the collection directly without waiting for approval — do NOT
+pause to propose-and-wait. There is no interactive user to confirm. Instead: explore
+briefly, design the schema to the same standard described above, then call
+`tag_collection_create` with `activate: false` (so the requesting agent's current view
+is left undisturbed — the collection stays untagged until it is selected), and report
+back in your final message the collection name and its tag labels. Skip step 4's
+propose-and-wait entirely. All other rules below still apply (mutual exclusivity, the
+automatic "Other" bucket, the max of 6 tags, reusing an existing collection via
+`tag_collection_select` rather than duplicating it).
+
 ## The automatic "Other" bucket
 
 Every collection automatically gets a universal "Other" bucket: any file the tagger

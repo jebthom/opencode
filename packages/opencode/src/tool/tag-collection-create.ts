@@ -33,6 +33,10 @@ export const Parameters = Schema.Struct({
     description:
       "Optional repo-relative directories (no leading slash) most relevant to this collection — e.g. those surfaced while exploring. The tagger paints these first, then the rest of the repo; it never restricts the sweep. Omit when there's no obvious focus area.",
   }),
+  activate: Schema.optional(Schema.Boolean).annotate({
+    description:
+      "Whether to make this the active collection. Defaults to true: the code graph switches to it and the tagger begins painting. Pass false to create without changing what the user is currently viewing — the collection is persisted but stays untagged until it is selected. Use false when creating a collection opportunistically (not at the user's explicit request) so their current view is undisturbed.",
+  }),
 })
 
 export const TagCollectionCreateTool = Tool.define(
@@ -65,17 +69,23 @@ export const TagCollectionCreateTool = Tool.define(
             prompt: params.prompt,
             tags: params.tags.map((t) => ({ label: t.label, description: t.description })),
             directories: params.directories,
+            activate: params.activate,
           })
 
+          const activated = params.activate !== false
           return {
             title: `Created collection: ${created.name}`,
             metadata: {},
             output: [
-              `Created and activated collection "${created.name}" (id: ${created.id}, palette: ${created.palette}).`,
+              activated
+                ? `Created and activated collection "${created.name}" (id: ${created.id}, palette: ${created.palette}).`
+                : `Created collection "${created.name}" (id: ${created.id}, palette: ${created.palette}) without activating it — the user's current view is unchanged.`,
               "Tags:",
               ...created.tags.map((t) => `- ${t.label} [${t.id}] ${t.color}: ${t.description}`),
               "",
-              "The code graph will re-paint with this collection and tagging will run in the background.",
+              activated
+                ? "The code graph will re-paint with this collection and tagging will run in the background."
+                : "The collection stays untagged until it is selected; it will paint once the user switches to it.",
             ].join("\n"),
           }
         }),

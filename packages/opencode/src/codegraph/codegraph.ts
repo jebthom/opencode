@@ -80,6 +80,11 @@ export interface CreateCollectionInput {
   readonly tags: ReadonlyArray<{ readonly label: string; readonly description: string }>
   // Optional repo-relative directories the tagger front-loads (see TagCollection).
   readonly directories?: ReadonlyArray<string>
+  // Whether to make the new collection active (switching the viewed collection and
+  // starting the tagger on it). Defaults to true — the interactive /tag behaviour.
+  // Pass false to create without disturbing the user's current view (the new
+  // collection then stays untagged until it is selected).
+  readonly activate?: boolean
 }
 
 export interface EditCollectionInput {
@@ -531,8 +536,14 @@ export const layer = Layer.effect(
     const createCollection = Effect.fn("CodeGraph.createCollection")(function* (input: CreateCollectionInput) {
       const ctx = yield* InstanceState.context
       const collection = yield* CodeGraphCollectionStore.create(storage, ctx.project.id, input)
-      yield* CodeGraphCollectionStore.setActive(storage, ctx.project.id, collection.id)
-      yield* onCollectionChanged(ctx.directory)
+      // Default: activate the new collection (switch the view, start the tagger on
+      // it). When activate is false the collection is only persisted — the active
+      // collection and its in-flight sweep are left untouched, so the user's current
+      // view is undisturbed (the new one paints later if/when it is selected).
+      if (input.activate !== false) {
+        yield* CodeGraphCollectionStore.setActive(storage, ctx.project.id, collection.id)
+        yield* onCollectionChanged(ctx.directory)
+      }
       return collection
     })
 
