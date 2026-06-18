@@ -1,0 +1,7 @@
+Design or switch the code-graph tag collection based on this request:
+
+$ARGUMENTS
+
+If the request names or describes an existing collection, switch to it. Otherwise
+explore as needed, then propose a tag collection (name, 1–6 tags with definitions, a
+palette, and the tagging prompt) and wait for my approval before creating it.

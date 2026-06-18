@@ -28,6 +28,9 @@ out-of-window boundary tiles painted by their target's layer.
     [wip ] 7. Agent tracking: basic glyphs/hover landed with B; polish remains.
     [next] 8. Planning representation: plan-mode overlay (dashed proposed files).
     [shelved] 5. Optional: full-screen "zoom" route for detail.
+    [done] C. Tag collections: the fixed architectural-layer vocabulary became one
+              built-in of a user-defined collection system — define/switch vocabularies
+              via the `/tag` agent, and click ◀/▶ in the top bar to cycle the active one.
 
 The next features (6–8) are scoped in "## Next features (planned)" below.
 
@@ -38,18 +41,28 @@ The next features (6–8) are scoped in "## Next features (planned)" below.
   re-roots the view. Keeps the walk and the render bounded on large repos.
   `PAYLOAD_VERSION` is now **3** for this scope-relative shape.
 - **Semantics live in a separate per-project store, not in the structure cache.**
-  The store (`semantic-store.ts`) is keyed by node id and holds only
-  `{ layer, hash }`. `hue`/`tags` are *derived* from `layer` at the read boundary
-  (`LAYER_HUE`), so palette/vocabulary changes need no re-tag. Structure caches
-  are never mutated by the paint.
+  The store (`semantic-store.ts`) is keyed by node id and holds only `{ tag, hash }`
+  — and is now **namespaced per collection id** (one doc per project *and*
+  collection), so switching the active collection never overwrites another's work.
+  `hue`/`tags` are *derived* from `tag` at the read boundary (the active collection's
+  legend), so palette/vocabulary changes need no re-tag. Structure caches are never
+  mutated by the paint. (The pre-collections single-collection doc — `{ layer, hash }`
+  — is read-through beneath the architecture collection's namespaced doc so existing
+  tags aren't lost or re-tagged. See "Tag collections" below.)
 - **HTTP API, not the structured-tool SSE channel.** The TUI reads the payload
   via `GET /codegraph?scope=&refresh=`. The tagger writes to the store and
   publishes a `codegraph.invalidated` event; the renderer refetches on it. The
   `session.next.tool.success.structured` channel from the original sketch was not
   used.
-- **Fixed layer vocabulary (resolves the "fixed vs free-form tags" follow-up).**
-  Five layers — interface / application / domain / data / infrastructure — each
-  mapped to a distinct *status* theme hue. See `semantics.ts`.
+- **~~Fixed layer vocabulary~~ → user-defined tag collections (the flip).** The
+  original "fixed vs free-form tags" follow-up was first resolved as a *fixed* five-
+  layer vocabulary (interface / application / domain / data / infrastructure, each a
+  *status* theme hue, in `semantics.ts`). That is now just **one built-in collection**
+  (`ARCHITECTURE`) of a general user-defined tag-collection system: any number of
+  named vocabularies per project, created/switched via the `/tag` agent and cycled
+  from the top bar. The architecture layers keep their theme-role hues; user
+  collections draw fixed-hex categorical palettes. Full design in "Tag collections"
+  below; `PAYLOAD_VERSION` is now **5** for the free-form-tag payload.
 - **A dedicated small-model tagger, not system-prompt injection.** Step 4's
   original "inject guidance so the dev agent self-tags" idea was dropped in favor
   of a frugal standalone tagger (stale-only, minimal context, forked, soft fail).
@@ -84,6 +97,111 @@ The next features (6–8) are scoped in "## Next features (planned)" below.
   form (all single-width U+25xx geometric glyphs). The `write` tool (whole-file
   write / new file) maps to `create`; a second legend row (beneath the layer
   swatches) shows the solid+outline glyph pair per action. See Foundation A.
+
+## Tag collections (user-defined vocabularies)
+
+The semantic layer is no longer a single hard-coded vocabulary. A **tag collection**
+is a named set of semantic tags (each `{ id, label, description, color }`) plus the
+prompt handed to the tagging model. The old architectural layers are now the built-in
+`ARCHITECTURE` collection; users define their own per project via `/tag`. The renderer
+carries no hard-coded vocabulary — it paints from whatever the active collection's
+legend says.
+
+### Data model — `codegraph/collections.ts` (pure, dependency-free)
+Deliberately no Effect/Schema/crypto so it imports cleanly into both the server tagger
+and the TUI bundle. Holds the `TagCollection`/`TagDef` types and pure helpers:
+- **Palettes.** Four predefined *categorical* (qualitative) palettes — `pastel`,
+  `dark`, `bright`, `earthy` — six fixed-hex colours each, so `MAX_TAGS = 6`.
+  Distinctiveness across palettes is the point (can't survive remapping onto theme
+  roles), so user-collection colours are literal hex; `assignColors` pairs tags to
+  palette colours by index.
+- **The built-in `ARCHITECTURE` collection** mirrors `semantics.ts` LAYERS, but its
+  colours stay *theme-role keys* (`LAYER_HUE`) so it remains theme-adaptive. Scope
+  `global`; lives in code (`BUILTIN_COLLECTIONS`), not the store.
+- **`NONE_TAG` ("none") escape.** A universal "fits none of this collection's tags"
+  tag the model may assign so a narrow collection greys unrelated files instead of
+  force-fitting. It is *not* a user tag (never in `tags`/legend, no palette colour) but
+  *is* stored with a hash so those files aren't re-tagged every sweep. Two greys tell
+  it apart from genuinely untagged/non-code files (`NONE_HUE`=`textMuted` "Other";
+  `UNTAGGED_HUE`=`border` "Non-code").
+- **`buildSystemPrompt(collection)`** assembles the tagger's system prompt (role
+  sentence + enumerated tag definitions + the `none` escape + fixed echo/format rules);
+  **`tagEnumIds`** is the closed structured-output enum. `slugify`/`legend` round it out.
+
+### Storage — `codegraph/collection-store.ts` (Effect, durable, per-project)
+- User collections persist under `["codegraph", projectID, "collections"]`; the active
+  pointer under `["codegraph", projectID, "active-collection"]` (defaults to
+  `ARCHITECTURE_ID` when unset, and falls back to it if a stored id no longer resolves).
+- **Strictly additive.** `create` always mints a fresh id (`slugify(name)` + short
+  content hash) and never mutates/removes an existing collection — each collection's
+  tag results cost tokens and must never be lost. Tag ids are de-duped within a
+  collection; colours assigned from the chosen palette; `> MAX_TAGS` is rejected.
+- `list` returns built-ins first, then the project's; `get`/`getActive`/`setActive`
+  resolve and flip the pointer.
+
+### The `/tag` flow (mirrors plan mode)
+- **Agent** (`agent/agent.ts`, prompt `agent/prompt/tag.txt`): a read-only "tag
+  designer". Permissions allow only explore tools (grep/glob/list/read/bash/webfetch/
+  websearch) + the three tag-collection tools; everything else denied. It explores,
+  proposes a schema in chat, and waits for approval before persisting — it never edits
+  files.
+- **Command** `/tag` (`command/index.ts`, template `command/template/tag.txt`): scopes
+  the turn to the `tag` agent and runs *in the session* (not a subtask) so the user can
+  approve the proposed schema before it's created.
+- **Tools** (`tool/registry.ts` registers all three, adding `CodeGraph.Service` to the
+  tool layer's requirements):
+  - `tag_collection_list` — built-ins + user collections, the active one, and palettes.
+  - `tag_collection_create` — persist an approved schema (name, description, palette,
+    prompt, 1–6 tags), make it active, kick off tagging. Additive only.
+  - `tag_collection_select` — switch the active collection by id or name.
+
+### Server wiring — `codegraph.ts`
+The service gained `collections()`, `activeCollection()`, `createCollection(input)`,
+`selectCollection(idOrName)`, and `cycleCollection(direction)`. All switch paths
+(`createCollection`/`selectCollection`/`cycleCollection`) call **`setActive` +
+`onCollectionChanged`**, which marks every cached scope dirty, publishes
+`codegraph.invalidated` (so live views refetch and re-`finalize` against the new
+collection), and **wakes the background tagger** to fill the new collection in beyond
+the viewed window.
+- **`finalize`** now reads the *active* collection, reads its (namespaced) store, and
+  paints `semantics`/`composition` + a `collection` legend onto the payload from it.
+  `scheduleTag` and `backgroundLoop` re-read the active collection each pass and pass
+  it to `tagStale`; the in-flight dedupe key includes the collection id so a freshly-
+  switched collection isn't deduped against the previous one's in-flight pass.
+- **No re-tag / no invalidation of existing tags on switch.** Because the store is
+  per-collection and the tagger keeps its stale-hash skip, switching to an already-
+  tagged collection is a pure repaint (zero tokens); switching to one with untagged
+  files tags only *those* files. Switching back is free.
+
+### Payload — `payload.ts` `PAYLOAD_VERSION = 5`
+Semantics generalized from the fixed-layer enum to free-form tags: `Semantic.layer`
+is gone (the tag lives in `tags[0]`), composition `weights` are keyed by a free-form
+`tag`, and the payload carries the active `CollectionInfo` (`{ id, name, legend }`).
+The renderer's `colorByTag`/`tagColor`/`resolveColor` accept both literal hex (user
+palettes) and theme-role keys (architecture), so the paint path is uniform.
+
+### Top-bar: cycle the active collection (◀/▶)
+`feature-plugins/system/codegraph.tsx` — the active collection name in the legend row
+is flanked by ◀/▶ arrows that step (and **loop**) through all collections one-by-one,
+the click-driven sibling of `/tag`. A new server endpoint
+`GET /codegraph/collection/cycle?direction=next|prev` (group + handler under
+`server/routes/instance/httpapi/`) does the wraparound server-side (`cycleCollection`:
+`(idx ± 1) mod len`) — the TUI doesn't need the collection list. The click is fire-and-
+forget (no `throwOnError`); the repaint rides the same `codegraph.invalidated` event
+the `/tag` switch already uses. **The SDK is generated** (`packages/sdk/js` →
+`bun run build`, which runs `bun dev generate` + hey-api), so adding the endpoint
+required regenerating `sdk.gen.ts`/`types.gen.ts`.
+
+### Key files (tag collections)
+- `codegraph/collections.ts` — pure data model, palettes, `NONE_TAG`, prompt builder.
+- `codegraph/collection-store.ts` — durable per-project store + active pointer.
+- `codegraph/semantic-store.ts` — now namespaced per collection id (legacy read-through).
+- `tool/tag-collection-{list,create,select}.ts` — the `/tag` tools.
+- `agent/prompt/tag.txt`, `command/template/tag.txt` — the `tag` agent + `/tag` command.
+- `server/routes/instance/httpapi/{groups,handlers}/codegraph.ts` — `cycleCollection`.
+- `cli/.../system/codegraph.tsx` — the ◀/▶ cycle arrows.
+- `test/codegraph/collections.test.ts` — pure-module coverage (palettes, legend, enum,
+  none-escape, slugify) + payload-v5 decode.
 
 ## Architecture: four separated concerns
 
@@ -122,11 +240,14 @@ low-commitment and reversible.
 ### 2. Semantic tagger — agent-driven, async, frugal
 The pass lives in `packages/opencode/src/codegraph/tagger.ts`; the two **drivers**
 that feed it live in `codegraph.ts`.
-- `tagStale(deps, dir, projectID, scope, fileNodes, origin)` infers **one
-  architectural layer per file** with the small/fast model (`provider.getSmallModel`,
-  Haiku-class; honors `small_model`), via `generateObject` with a fixed-enum schema,
-  and writes `{ layer, hash }` to the per-project store. `origin` (`"fg"`/`"bg"`)
-  only tags the perf trace.
+- `tagStale(deps, dir, projectID, scope, fileNodes, origin, collection)` infers **one
+  tag per file** from the active `collection`'s vocabulary with the small/fast model
+  (`provider.getSmallModel`, Haiku-class; honors `small_model`), via `generateObject`
+  whose enum is `tagEnumIds(collection)` (the collection's tags + the `none` escape)
+  and whose system prompt is `buildSystemPrompt(collection)`. Writes `{ tag, hash }` to
+  the per-project, **per-collection** store. `origin` (`"fg"`/`"bg"`) only tags the
+  perf trace. (Was a fixed architectural-layer enum writing `{ layer, hash }`; see
+  "Tag collections" above.)
 - **The only place tokens are spent.** Two frugality rules: (1) *stale-only* —
   a file is (re)tagged only if it has no entry or its content hash changed, so
   re-displaying/navigating unchanged files costs nothing; (2) *minimal context* —

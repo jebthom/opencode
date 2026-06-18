@@ -19,7 +19,8 @@ import { CodeGraphExtract } from "./extract"
 import { CodeGraphEvent } from "./event"
 import { CodeGraphSemanticStore } from "./semantic-store"
 import { CodeGraphTagger } from "./tagger"
-import { LAYER_HUE, LAYERS, type Layer as SemanticLayer } from "./semantics"
+import { CodeGraphCollectionStore } from "./collection-store"
+import { type TagCollection, type PaletteId, legend as collectionLegend, NONE_TAG, NONE_HUE } from "./collections"
 
 // Server-side code-graph service (PLAN.md steps 1 + 2.5). Owns the deterministic
 // payload, but unlike step 1 the graph is a *2-level window* rooted at a scope
@@ -71,12 +72,33 @@ interface DirCache {
   readonly dirty: Set<string>
 }
 
+export interface CreateCollectionInput {
+  readonly name: string
+  readonly description: string
+  readonly palette: PaletteId
+  readonly prompt: string
+  readonly tags: ReadonlyArray<{ readonly label: string; readonly description: string }>
+}
+
 export interface Interface {
   // Cached payload for `scope` (default repo root); computes + persists on a miss
   // or when the scope has been marked dirty by a file change in its window.
   readonly get: (scope?: string) => Effect.Effect<CodeGraphPayload.Payload>
   // Recompute `scope` from disk, persist, and refresh the in-memory copy.
   readonly refresh: (scope?: string) => Effect.Effect<CodeGraphPayload.Payload>
+  // Built-in + project-defined tag collections, and the active one.
+  readonly collections: () => Effect.Effect<TagCollection[]>
+  readonly activeCollection: () => Effect.Effect<TagCollection>
+  // Define a new per-project collection (additive — never overwrites), make it
+  // active, and kick off tagging.
+  readonly createCollection: (input: CreateCollectionInput) => Effect.Effect<TagCollection>
+  // Switch the active collection by id or name; re-paints from cache and tags any
+  // not-yet-tagged files. Returns the resolved collection, or undefined if unknown.
+  readonly selectCollection: (idOrName: string) => Effect.Effect<TagCollection | undefined>
+  // Step one collection forward ("next") or back ("prev") in the list (built-ins +
+  // user-defined), wrapping at the ends, and re-paint. Returns the newly-active
+  // collection's info. Drives the top-bar's ◀/▶ arrows.
+  readonly cycleCollection: (direction: "next" | "prev") => Effect.Effect<CodeGraphPayload.CollectionInfo>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/CodeGraph") {}
@@ -180,6 +202,7 @@ export const layer = Layer.effect(
       scope: string,
       nodes: CodeGraphPayload.Payload["nodes"],
       boundaries: readonly CodeGraphPayload.Boundary[],
+      collection: TagCollection,
     ) =>
       Effect.gen(function* () {
         // Tag in-window files *and* the one-hop boundary targets (step 6): a
@@ -191,10 +214,20 @@ export const layer = Layer.effect(
           (n) => ({ id: n.id, path: n.path }),
         )
         if (fileNodes.length === 0) return
-        const key = directory + " " + scope
+        // Key by collection too: a foreground pass for a freshly-switched collection
+        // must not be deduped against an in-flight pass for the previous one.
+        const key = directory + " " + scope + " " + collection.id
         if (inFlight.has(key)) return
         inFlight.add(key)
-        yield* CodeGraphTagger.tagStale({ storage, events, provider, config }, directory, projectID, scope, fileNodes, "fg").pipe(
+        yield* CodeGraphTagger.tagStale(
+          { storage, events, provider, config },
+          directory,
+          projectID,
+          scope,
+          fileNodes,
+          "fg",
+          collection,
+        ).pipe(
           tagGate.withPermits(1),
           Effect.ensuring(Effect.sync(() => inFlight.delete(key))),
           Effect.forkDetach,
@@ -203,27 +236,37 @@ export const layer = Layer.effect(
 
     const finalize = (ctx: InstanceContext, scope: string, structure: CodeGraphPayload.Payload) =>
       Effect.gen(function* () {
-        const store = yield* CodeGraphSemanticStore.read(storage, ctx.project.id)
+        // Paint with the *active* collection: its tag store, its legend (tag → colour),
+        // and its name travel out on the payload so the renderer needs no hard-coded
+        // vocabulary. Switching collections re-paints from that collection's own
+        // (cached) store — no other collection's work is touched.
+        const collection = yield* CodeGraphCollectionStore.getActive(storage, ctx.project.id)
+        const store = yield* CodeGraphSemanticStore.read(storage, ctx.project.id, collection.id)
+        const colorByTag = new Map(collection.tags.map((t) => [t.id, t.color]))
         const semantics: Record<string, CodeGraphPayload.Semantic> = {}
-        // The store holds only the semantic (layer); hue and tags are derived here,
-        // so palette/vocabulary changes apply without a re-tag. Boundaries (step 6)
-        // are painted from the same store so an out-of-window tile shows its
-        // target's layer hue once that target has been tagged.
+        // The store holds only the semantic (tag); hue/tags are derived here, so
+        // palette/vocabulary changes apply without a re-tag. Boundaries (step 6) are
+        // painted from the same store so an out-of-window tile shows its target's hue
+        // once that target has been tagged.
         const applySemantic = (id: string) => {
           const entry = store[id]
-          if (entry) semantics[id] = { tags: [entry.layer], hue: LAYER_HUE[entry.layer], layer: entry.layer }
+          if (entry) semantics[id] = { tags: [entry.tag], hue: entry.tag === NONE_TAG ? NONE_HUE : colorByTag.get(entry.tag) }
         }
         for (const node of structure.nodes) applySemantic(node.id)
         for (const boundary of structure.boundaries ?? []) applySemantic(boundary.id)
-        // Paint each in-window directory as its subtree's layer composition: bucket
-        // every descendant source file (full depth, from the cached membership) by its
-        // tagged layer, summing both a file count and a byte sum so the renderer can
-        // pick either metric. Derived here alongside `semantics` so the structure cache
-        // stays pure and untagged.
+        // Paint each in-window directory as its subtree's tag composition: bucket every
+        // descendant source file (full depth, from the cached membership) by its tagged
+        // tag, summing both a file count and a byte sum so the renderer can pick either
+        // metric. Derived here alongside `semantics` so the structure cache stays pure.
         const subtree = yield* subtreeFor(ctx.directory)
-        const composition = computeComposition(structure.nodes, subtree, store)
-        yield* scheduleTag(ctx.directory, ctx.project.id, scope, structure.nodes, structure.boundaries ?? [])
-        return { ...structure, semantics, composition }
+        const composition = computeComposition(structure.nodes, subtree, store, collection)
+        yield* scheduleTag(ctx.directory, ctx.project.id, scope, structure.nodes, structure.boundaries ?? [], collection)
+        const collectionInfo: CodeGraphPayload.CollectionInfo = {
+          id: collection.id,
+          name: collection.name,
+          legend: collectionLegend(collection),
+        }
+        return { ...structure, semantics, composition, collection: collectionInfo }
       })
 
     // Background whole-repo tagger (vs. the per-scope window of get/refresh). One
@@ -240,6 +283,10 @@ export const layer = Layer.effect(
     const backgroundLoop = (directory: string, projectID: string, wake: Queue.Queue<void>) =>
       Effect.gen(function* () {
         while (true) {
+          // Re-read the active collection each pass so a switch (which wakes this loop)
+          // re-walks the repo tagging for the *new* collection; cached entries make a
+          // re-walk of an already-tagged collection free.
+          const collection = yield* CodeGraphCollectionStore.getActive(storage, projectID)
           const files = yield* CodeGraphExtract.listFilesDfs(directory).pipe(
             Effect.catchCause((cause) => {
               log.error("background enumerate failed", { projectID, cause })
@@ -250,13 +297,13 @@ export const layer = Layer.effect(
           // Always-written diagnostic so a bg loop that produces no request lines is
           // still visible in the perf log (distinguishes "loop never ran" from
           // "ran but every slice was already tagged / no model").
-          yield* CodeGraphTagger.appendPerfEvent(directory, "bg", "pass-start", { files: files.length })
+          yield* CodeGraphTagger.appendPerfEvent(directory, "bg", "pass-start", { files: files.length, collection: collection.id })
           for (let cursor = 0; cursor < files.length; cursor += BG_BATCH) {
             const slice = files.slice(cursor, cursor + BG_BATCH)
             // scope "" — the tag store is keyed by stable node id, so a file tagged
             // here is reused in every window it later appears in. The permit is held
             // only for the batch; the pause below runs without it so foreground wins.
-            yield* CodeGraphTagger.tagStale({ storage, events, provider, config }, directory, projectID, "", slice, "bg").pipe(
+            yield* CodeGraphTagger.tagStale({ storage, events, provider, config }, directory, projectID, "", slice, "bg", collection).pipe(
               tagGate.withPermits(1),
               Effect.catchCause((cause) =>
                 Effect.sync(() => log.error("background batch failed", { projectID, cause })),
@@ -390,9 +437,74 @@ export const layer = Layer.effect(
       ),
     )
 
+    // Re-paint every viewed scope after the active collection changes: mark each
+    // cached scope dirty so the next get re-runs finalize with the new collection, and
+    // publish an invalidation so the live view refetches. The bg tagger is woken so the
+    // new collection also fills in beyond the viewed window.
+    const onCollectionChanged = (directory: string) =>
+      Effect.gen(function* () {
+        const container = caches.get(directory)
+        if (container) {
+          for (const scope of container.scopes.keys()) {
+            container.dirty.add(scope)
+            yield* events.publish(CodeGraphEvent.Event.Invalidated, { scope }).pipe(Effect.ignore)
+          }
+        }
+        yield* wakeBackground(directory)
+      })
+
+    const collections = Effect.fn("CodeGraph.collections")(function* () {
+      const ctx = yield* InstanceState.context
+      return yield* CodeGraphCollectionStore.list(storage, ctx.project.id)
+    })
+
+    const activeCollection = Effect.fn("CodeGraph.activeCollection")(function* () {
+      const ctx = yield* InstanceState.context
+      return yield* CodeGraphCollectionStore.getActive(storage, ctx.project.id)
+    })
+
+    const createCollection = Effect.fn("CodeGraph.createCollection")(function* (input: CreateCollectionInput) {
+      const ctx = yield* InstanceState.context
+      const collection = yield* CodeGraphCollectionStore.create(storage, ctx.project.id, input)
+      yield* CodeGraphCollectionStore.setActive(storage, ctx.project.id, collection.id)
+      yield* onCollectionChanged(ctx.directory)
+      return collection
+    })
+
+    const selectCollection = Effect.fn("CodeGraph.selectCollection")(function* (idOrName: string) {
+      const ctx = yield* InstanceState.context
+      const all = yield* CodeGraphCollectionStore.list(storage, ctx.project.id)
+      const needle = idOrName.toLowerCase()
+      const found = all.find((c) => c.id === idOrName || c.name.toLowerCase() === needle)
+      if (!found) return undefined
+      yield* CodeGraphCollectionStore.setActive(storage, ctx.project.id, found.id)
+      yield* onCollectionChanged(ctx.directory)
+      return found
+    })
+
+    const cycleCollection = Effect.fn("CodeGraph.cycleCollection")(function* (direction: "next" | "prev") {
+      const ctx = yield* InstanceState.context
+      const all = yield* CodeGraphCollectionStore.list(storage, ctx.project.id)
+      const activeId = yield* CodeGraphCollectionStore.getActiveId(storage, ctx.project.id)
+      const idx = all.findIndex((c) => c.id === activeId)
+      const len = all.length
+      // Wrap at both ends so the arrows loop through the list rather than stopping.
+      // An unresolved active id (-1) starts from the head so a click still moves.
+      const base = idx === -1 ? 0 : idx
+      const next = all[(base + (direction === "next" ? 1 : len - 1)) % len]!
+      yield* CodeGraphCollectionStore.setActive(storage, ctx.project.id, next.id)
+      yield* onCollectionChanged(ctx.directory)
+      return { id: next.id, name: next.name, legend: collectionLegend(next) }
+    })
+
     return Service.of({
       get: (scope) => load(scope),
       refresh: (scope) => refresh(scope),
+      collections: () => collections(),
+      activeCollection: () => activeCollection(),
+      createCollection: (input) => createCollection(input),
+      selectCollection: (idOrName) => selectCollection(idOrName),
+      cycleCollection: (direction) => cycleCollection(direction),
     })
   }),
 )
@@ -421,36 +533,38 @@ function computeComposition(
   nodes: CodeGraphPayload.Payload["nodes"],
   files: ReadonlyArray<{ id: string; path: string; size: number }>,
   store: CodeGraphSemanticStore.Store,
+  collection: TagCollection,
 ): Record<string, CodeGraphPayload.Composition> {
   const dirs = nodes.filter((n) => n.kind === "directory").map((d) => ({ id: d.id, prefix: d.path + "/" }))
   if (dirs.length === 0) return {}
-  const tagged = new Map<string, Map<SemanticLayer, { count: number; bytes: number }>>()
+  const tagged = new Map<string, Map<string, { count: number; bytes: number }>>()
   const subtree = new Map<string, { count: number; bytes: number }>()
   for (const file of files) {
-    const layer = store[file.id]?.layer
+    const tag = store[file.id]?.tag
     for (const dir of dirs) {
       if (!file.path.startsWith(dir.prefix)) continue
       const s = subtree.get(dir.id) ?? { count: 0, bytes: 0 }
       s.count += 1
       s.bytes += file.size
       subtree.set(dir.id, s)
-      if (!layer) continue
-      let byLayer = tagged.get(dir.id)
-      if (!byLayer) tagged.set(dir.id, (byLayer = new Map()))
-      const w = byLayer.get(layer) ?? { count: 0, bytes: 0 }
+      if (!tag) continue
+      let byTag = tagged.get(dir.id)
+      if (!byTag) tagged.set(dir.id, (byTag = new Map()))
+      const w = byTag.get(tag) ?? { count: 0, bytes: 0 }
       w.count += 1
       w.bytes += file.size
-      byLayer.set(layer, w)
+      byTag.set(tag, w)
     }
   }
   // Emit an entry for every directory that has any descendant file, even when none
   // are tagged (empty `weights`) — that's the grey case the renderer sizes by subtree.
+  const order = [...collection.tags.map((t) => t.id), NONE_TAG]
   const result: Record<string, CodeGraphPayload.Composition> = {}
   for (const [id, s] of subtree) {
-    const byLayer = tagged.get(id)
-    // Weights in the fixed LAYERS order so the payload is stable and the renderer's
-    // color bands are consistent.
-    const weights = byLayer ? LAYERS.filter((l) => byLayer.has(l)).map((layer) => ({ layer, ...byLayer.get(layer)! })) : []
+    const byTag = tagged.get(id)
+    // Weights in the collection's tag order so the payload is stable and the
+    // renderer's colour bands are consistent.
+    const weights = byTag ? order.filter((t) => byTag.has(t)).map((tag) => ({ tag, ...byTag.get(tag)! })) : []
     const totalCount = weights.reduce((sum, w) => sum + w.count, 0)
     const totalBytes = weights.reduce((sum, w) => sum + w.bytes, 0)
     result[id] = { weights, totalCount, totalBytes, subtreeCount: s.count, subtreeBytes: s.bytes }

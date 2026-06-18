@@ -15,6 +15,8 @@ import type {
   AuthRemoveResponses,
   AuthSetErrors,
   AuthSetResponses,
+  CodegraphCycleCollectionErrors,
+  CodegraphCycleCollectionResponses,
   CodegraphGetErrors,
   CodegraphGetResponses,
   CommandListErrors,
@@ -685,6 +687,42 @@ export class Codegraph extends HeyApiClient {
     )
     return (options?.client ?? this.client).get<CodegraphGetResponses, CodegraphGetErrors, ThrowOnError>({
       url: "/codegraph",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Cycle active tag collection
+   *
+   * Switch the active code-graph tag collection to the next or previous one, wrapping at the ends.
+   */
+  public cycleCollection<ThrowOnError extends boolean = false>(
+    parameters: {
+      directory?: string
+      workspace?: string
+      direction: "next" | "prev"
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "query", key: "direction" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      CodegraphCycleCollectionResponses,
+      CodegraphCycleCollectionErrors,
+      ThrowOnError
+    >({
+      url: "/codegraph/collection/cycle",
       ...options,
       ...params,
     })

@@ -11,7 +11,7 @@ import type { Provider } from "@/provider/provider"
 import type { Config } from "@/config/config"
 import { CodeGraphSemanticStore } from "./semantic-store"
 import { CodeGraphEvent } from "./event"
-import { CodeGraphSemantics, LAYERS, LAYER_DESCRIPTION, type Layer } from "./semantics"
+import { type TagCollection, isAssignableTag, tagEnumIds, buildSystemPrompt } from "./collections"
 import { CodeGraphExtract } from "./extract"
 
 // Semantic tagger (PLAN.md step 4). Given the file nodes of a viewed scope, it
@@ -56,14 +56,20 @@ export interface Deps {
   readonly config: Config.Interface
 }
 
-const TagResult = Schema.Struct({
-  files: Schema.Array(
-    Schema.Struct({
-      path: Schema.String,
-      layer: Schema.Literals(LAYERS),
-    }),
-  ),
-})
+// Built per-pass from the active collection's tag ids: the model must echo one of
+// the collection's tags for each file. `Schema.Literals` over the collection ids
+// constrains the structured output to valid tags.
+function buildTagSchema(collection: TagCollection) {
+  // Includes the NONE_TAG escape so the model can opt a file out of every tag.
+  return Schema.Struct({
+    files: Schema.Array(
+      Schema.Struct({
+        path: Schema.String,
+        tag: Schema.Literals(tagEnumIds(collection)),
+      }),
+    ),
+  })
+}
 
 // Which tagger drove a pass — recorded in the perf log so foreground (current view)
 // and background (whole-repo sweep) requests can be told apart after the fact.
@@ -79,10 +85,11 @@ export const tagStale = Effect.fn("CodeGraph.tagStale")(function* (
   scope: string,
   fileNodes: ReadonlyArray<FileNode>,
   origin: Origin,
+  collection: TagCollection,
 ) {
   if (fileNodes.length === 0) return
 
-  const store = yield* CodeGraphSemanticStore.read(deps.storage, projectID)
+  const store = yield* CodeGraphSemanticStore.read(deps.storage, projectID, collection.id)
 
   // Read + hash each candidate, keeping only those whose content changed (or were
   // never tagged). Files we can't read are simply skipped.
@@ -118,6 +125,9 @@ export const tagStale = Effect.fn("CodeGraph.tagStale")(function* (
     return
   }
 
+  const tagSchema = buildTagSchema(collection)
+  const system = buildSystemPrompt(collection)
+
   // Path → its hash so we can record freshness on whatever the model returns.
   const hashByPath = new Map(stale.map((r) => [r.node.path, r.hash]))
   const idByPath = new Map(stale.map((r) => [r.node.path, r.node.id]))
@@ -125,26 +135,26 @@ export const tagStale = Effect.fn("CodeGraph.tagStale")(function* (
   const tagged: CodeGraphSemanticStore.Store = {}
   for (const chunk of chunkArray(stale, TAG_BATCH)) {
     const blocks = chunk.map((r) => describe(r.node.path, r.content, context)).join("\n\n")
-    const assignments = yield* classifyWithRetry(language, blocks).pipe(
+    const assignments = yield* classifyWithRetry(language, blocks, tagSchema, system, collection).pipe(
       Effect.catchCause((cause) => {
         log.error("classify failed", { projectID, scope, cause })
-        return Effect.succeed<ReadonlyArray<{ path: string; layer: Layer }>>([])
+        return Effect.succeed<ReadonlyArray<{ path: string; tag: string }>>([])
       }),
     )
-    yield* appendPerfLog(directory, origin, blocks, assignments)
+    yield* appendPerfLog(directory, origin, collection.id, blocks, assignments)
     for (const a of assignments) {
       const id = idByPath.get(a.path)
       const hash = hashByPath.get(a.path)
       if (!id || !hash) continue
-      tagged[id] = { layer: a.layer, hash }
+      tagged[id] = { tag: a.tag, hash }
     }
   }
 
   const count = Object.keys(tagged).length
   if (count === 0) return
 
-  yield* CodeGraphSemanticStore.upsert(deps.storage, projectID, tagged)
-  log.info("tagged", { projectID, scope, count })
+  yield* CodeGraphSemanticStore.upsert(deps.storage, projectID, collection.id, tagged)
+  log.info("tagged", { projectID, scope, collection: collection.id, count })
 
   // Only now that something actually changed do we nudge the live view to refetch
   // and re-merge — the guard that keeps a tag→refetch→tag cycle from forming
@@ -164,10 +174,11 @@ export const tagStale = Effect.fn("CodeGraph.tagStale")(function* (
 function appendPerfLog(
   directory: string,
   origin: Origin,
+  collection: string,
   input: string,
-  output: ReadonlyArray<{ path: string; layer: Layer }>,
+  output: ReadonlyArray<{ path: string; tag: string }>,
 ) {
-  return writePerfLine(directory, { tagger: origin, timestamp: new Date().toISOString(), input, output })
+  return writePerfLine(directory, { tagger: origin, collection, timestamp: new Date().toISOString(), input, output })
 }
 
 // Diagnostic counterpart to appendPerfLog: records lifecycle/skip events (pass
@@ -222,27 +233,27 @@ function resolveLanguage(provider: Provider.Interface) {
   }).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
 }
 
-const SYSTEM = [
-  "You assign each source file to exactly one architectural layer of a codebase.",
-  "Layers:",
-  ...LAYERS.map((l) => `- ${l}: ${LAYER_DESCRIPTION[l]}`),
-  "Infer the layer from the file path, its imports, and its leading comment.",
-  "Return one entry per input file, echoing its exact path.",
-].join("\n")
+type TagSchema = ReturnType<typeof buildTagSchema>
 
-const classify = (language: Parameters<typeof generateObject>[0]["model"], blocks: string) =>
+const classify = (
+  language: Parameters<typeof generateObject>[0]["model"],
+  blocks: string,
+  tagSchema: TagSchema,
+  system: string,
+  collection: TagCollection,
+) =>
   Effect.tryPromise(() =>
     generateObject({
       model: language,
       temperature: 0,
-      schema: Object.assign(Schema.toStandardSchemaV1(TagResult), Schema.toStandardJSONSchemaV1(TagResult)),
+      schema: Object.assign(Schema.toStandardSchemaV1(tagSchema), Schema.toStandardJSONSchemaV1(tagSchema)),
       messages: [
-        { role: "system", content: SYSTEM },
+        { role: "system", content: system },
         { role: "user", content: `Classify these files:\n\n${blocks}` },
       ],
     }).then((r) => {
-      const result = r.object as typeof TagResult.Type
-      return result.files.filter((f): f is { path: string; layer: Layer } => CodeGraphSemantics.isLayer(f.layer))
+      const result = r.object as typeof tagSchema.Type
+      return result.files.filter((f): f is { path: string; tag: string } => isAssignableTag(collection, f.tag))
     }),
   )
 
@@ -251,8 +262,14 @@ const classify = (language: Parameters<typeof generateObject>[0]["model"], block
 // parse and other errors fall straight through to the soft-fail handler so a
 // genuinely bad batch never wedges the loop. Effect.tryPromise wraps the thrown SDK
 // error in an UnknownException whose `.error` holds the original.
-const classifyWithRetry = (language: Parameters<typeof generateObject>[0]["model"], blocks: string) =>
-  classify(language, blocks).pipe(
+const classifyWithRetry = (
+  language: Parameters<typeof generateObject>[0]["model"],
+  blocks: string,
+  tagSchema: TagSchema,
+  system: string,
+  collection: TagCollection,
+) =>
+  classify(language, blocks, tagSchema, system, collection).pipe(
     Effect.retry({
       schedule: Schedule.exponential("500 millis").pipe(Schedule.jittered),
       times: BG_MAX_RETRIES,

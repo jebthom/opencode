@@ -1,5 +1,4 @@
 import { Schema } from "effect"
-import { LAYERS } from "./semantics"
 
 // The code-graph payload is the stable contract between the deterministic
 // structure extractor (server-side) and the TUI renderer. See PLAN.md.
@@ -19,7 +18,11 @@ import { LAYERS } from "./semantics"
 // - 4: edges (step 6) gained out-of-window `boundaries` — one-hop import targets
 //   resolved on disk beyond the window. Edges may now target a boundary id, so a
 //   v3 cache (no boundaries, edges window-internal only) describes a thinner graph.
-export const PAYLOAD_VERSION = 4
+// - 5: semantics generalized from the fixed architectural-layer enum to arbitrary
+//   tag-collection tags. `Semantic.layer` is gone (tag lives in `tags[0]`),
+//   composition weights are keyed by a free-form `tag`, and the payload now carries
+//   the active `collection` legend. A v4 cache describes a single-collection graph.
+export const PAYLOAD_VERSION = 5
 
 export const NodeKind = Schema.Literals(["file", "directory"])
 export type NodeKind = typeof NodeKind.Type
@@ -68,32 +71,47 @@ export type Boundary = typeof Boundary.Type
 
 // Async, agent-supplied semantics keyed by node id. Empty until the semantic
 // tagger (step 4) fills it. Kept separate from `nodes` so it can update
-// independently of structure. `layer` is the inferred architectural layer (the
-// fixed CodeGraphSemantics vocabulary); `hue` is its theme-key color. Adding the
-// optional `layer` field is backward compatible — older structure caches store an
-// empty `semantics` map and still decode, so no PAYLOAD_VERSION bump is needed.
+// independently of structure. `tags[0]` is the inferred tag (a tag id from the
+// active collection); `hue` is its resolved colour (hex or theme-key) from the
+// collection legend, applied at the read boundary so the palette can change without
+// a re-tag.
 export const Semantic = Schema.Struct({
   tags: Schema.Array(Schema.String),
   hue: Schema.optional(Schema.String),
-  layer: Schema.optional(Schema.Literals(LAYERS)),
 })
 export type Semantic = typeof Semantic.Type
 
+// The active tag collection's legend, carried on the payload so the renderer paints
+// tags → colours and draws the swatch row without any hard-coded vocabulary.
+export const LegendEntry = Schema.Struct({
+  tag: Schema.String,
+  label: Schema.String,
+  color: Schema.String,
+})
+export type LegendEntry = typeof LegendEntry.Type
+
+export const CollectionInfo = Schema.Struct({
+  id: Schema.String,
+  name: Schema.String,
+  legend: Schema.Array(LegendEntry),
+})
+export type CollectionInfo = typeof CollectionInfo.Type
+
 // Recursive subtree composition for a directory node, used to paint the directory
-// as a treemap of architectural-layer colors. Derived (like `semantics`) at the
-// read boundary from the semantic store — never part of the deterministic
-// structure cache — so it carries both a file `count` and a `bytes` sum per layer
-// and lets the renderer pick which metric drives the treemap. Layers with zero
-// weight are omitted; `total*` are the sums across all present layers.
-export const LayerWeight = Schema.Struct({
-  layer: Schema.Literals(LAYERS),
+// as a treemap of tag colors. Derived (like `semantics`) at the read boundary from
+// the semantic store — never part of the deterministic structure cache — so it
+// carries both a file `count` and a `bytes` sum per tag and lets the renderer pick
+// which metric drives the treemap. Tags with zero weight are omitted; `total*` are
+// the sums across all present tags.
+export const TagWeight = Schema.Struct({
+  tag: Schema.String,
   count: Schema.Int,
   bytes: Schema.Int,
 })
-export type LayerWeight = typeof LayerWeight.Type
+export type TagWeight = typeof TagWeight.Type
 
 export const Composition = Schema.Struct({
-  weights: Schema.Array(LayerWeight),
+  weights: Schema.Array(TagWeight),
   totalCount: Schema.Int,
   totalBytes: Schema.Int,
   // Totals over *every* descendant source file, tagged or not (`total*` count only
@@ -119,6 +137,9 @@ export const Payload = Schema.Struct({
   // derived (merged in alongside `semantics` at the read boundary), so adding it is
   // backward compatible with older structure caches — no PAYLOAD_VERSION bump.
   composition: Schema.optional(Schema.Record(Schema.String, Composition)),
+  // The active tag collection + its legend, merged in at the read boundary. Optional
+  // so older/empty payloads still decode; the renderer falls back to no legend.
+  collection: Schema.optional(CollectionInfo),
 })
 export type Payload = typeof Payload.Type
 

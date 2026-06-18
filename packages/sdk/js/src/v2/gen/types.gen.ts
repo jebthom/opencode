@@ -66,6 +66,8 @@ export type Event =
   | EventTuiSessionSelect2
   | EventMcpToolsChanged
   | EventMcpBrowserOpenFailed
+  | EventSessionStatus
+  | EventSessionIdle
   | EventCodegraphInvalidated
   | EventCommandExecuted
   | EventProjectDirectoriesUpdated
@@ -73,8 +75,6 @@ export type Event =
   | EventQuestionAsked
   | EventQuestionReplied
   | EventQuestionRejected
-  | EventSessionStatus
-  | EventSessionIdle
   | EventSessionCompacted
   | EventTodoUpdated
   | EventVcsBranchUpdated
@@ -632,6 +632,28 @@ export type Pty = {
   pid: number
 }
 
+export type SessionStatus =
+  | {
+      type: "idle"
+    }
+  | {
+      type: "retry"
+      attempt: number
+      message: string
+      action?: {
+        reason: string
+        provider: string
+        title: string
+        message: string
+        label: string
+        link?: string
+      }
+      next: number
+    }
+  | {
+      type: "busy"
+    }
+
 export type QuestionOption = {
   /**
    * Display text (1-5 words, concise)
@@ -666,28 +688,6 @@ export type QuestionTool = {
 }
 
 export type QuestionAnswer = Array<string>
-
-export type SessionStatus =
-  | {
-      type: "idle"
-    }
-  | {
-      type: "retry"
-      attempt: number
-      message: string
-      action?: {
-        reason: string
-        provider: string
-        title: string
-        message: string
-        label: string
-        link?: string
-      }
-      next: number
-    }
-  | {
-      type: "busy"
-    }
 
 export type Todo = {
   /**
@@ -1323,6 +1323,21 @@ export type GlobalEvent = {
       }
     | {
         id: string
+        type: "session.status"
+        properties: {
+          sessionID: string
+          status: SessionStatus
+        }
+      }
+    | {
+        id: string
+        type: "session.idle"
+        properties: {
+          sessionID: string
+        }
+      }
+    | {
+        id: string
         type: "codegraph.invalidated"
         properties: {
           scope: string
@@ -1400,21 +1415,6 @@ export type GlobalEvent = {
         properties: {
           sessionID: string
           requestID: string
-        }
-      }
-    | {
-        id: string
-        type: "session.status"
-        properties: {
-          sessionID: string
-          status: SessionStatus
-        }
-      }
-    | {
-        id: string
-        type: "session.idle"
-        properties: {
-          sessionID: string
         }
       }
     | {
@@ -4455,6 +4455,23 @@ export type EventMcpBrowserOpenFailed = {
   }
 }
 
+export type EventSessionStatus = {
+  id: string
+  type: "session.status"
+  properties: {
+    sessionID: string
+    status: SessionStatus
+  }
+}
+
+export type EventSessionIdle = {
+  id: string
+  type: "session.idle"
+  properties: {
+    sessionID: string
+  }
+}
+
 export type EventCodegraphInvalidated = {
   id: string
   type: "codegraph.invalidated"
@@ -4540,23 +4557,6 @@ export type EventQuestionRejected = {
   properties: {
     sessionID: string
     requestID: string
-  }
-}
-
-export type EventSessionStatus = {
-  id: string
-  type: "session.status"
-  properties: {
-    sessionID: string
-    status: SessionStatus
-  }
-}
-
-export type EventSessionIdle = {
-  id: string
-  type: "session.idle"
-  properties: {
-    sessionID: string
   }
 }
 
@@ -4982,13 +4982,72 @@ export type CodegraphGetResponses = {
       [key: string]: {
         tags: Array<string>
         hue?: string
-        layer?: "interface" | "application" | "domain" | "data" | "infrastructure"
       }
+    }
+    composition?: {
+      [key: string]: {
+        weights: Array<{
+          tag: string
+          count: number
+          bytes: number
+        }>
+        totalCount: number
+        totalBytes: number
+        subtreeCount: number
+        subtreeBytes: number
+      }
+    }
+    collection?: {
+      id: string
+      name: string
+      legend: Array<{
+        tag: string
+        label: string
+        color: string
+      }>
     }
   }
 }
 
 export type CodegraphGetResponse = CodegraphGetResponses[keyof CodegraphGetResponses]
+
+export type CodegraphCycleCollectionData = {
+  body?: never
+  path?: never
+  query: {
+    directory?: string
+    workspace?: string
+    direction: "next" | "prev"
+  }
+  url: "/codegraph/collection/cycle"
+}
+
+export type CodegraphCycleCollectionErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type CodegraphCycleCollectionError = CodegraphCycleCollectionErrors[keyof CodegraphCycleCollectionErrors]
+
+export type CodegraphCycleCollectionResponses = {
+  /**
+   * The newly-active tag collection
+   */
+  200: {
+    id: string
+    name: string
+    legend: Array<{
+      tag: string
+      label: string
+      color: string
+    }>
+  }
+}
+
+export type CodegraphCycleCollectionResponse =
+  CodegraphCycleCollectionResponses[keyof CodegraphCycleCollectionResponses]
 
 export type ConfigGetData = {
   body?: never

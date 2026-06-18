@@ -14,6 +14,12 @@ export const codegraphHandlers = HttpApiBuilder.group(InstanceHttpApi, "codegrap
       return yield* codegraph.get(ctx.query.scope)
     })
 
-    return handlers.handle("get", get)
+    const cycleCollection = Effect.fn("CodeGraphHttpApi.cycleCollection")(function* (ctx: {
+      query: { direction: "next" | "prev" }
+    }) {
+      return yield* codegraph.cycleCollection(ctx.query.direction)
+    })
+
+    return handlers.handle("get", get).handle("cycleCollection", cycleCollection)
   }),
 )

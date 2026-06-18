@@ -11,6 +11,7 @@ import { ProviderTransform } from "@/provider/transform"
 import PROMPT_GENERATE from "./generate.txt"
 import PROMPT_COMPACTION from "./prompt/compaction.txt"
 import PROMPT_EXPLORE from "./prompt/explore.txt"
+import PROMPT_TAG from "./prompt/tag.txt"
 import PROMPT_SUMMARY from "./prompt/summary.txt"
 import PROMPT_TITLE from "./prompt/title.txt"
 import { Permission } from "@/permission"
@@ -197,6 +198,33 @@ export const layer = Layer.effect(
             prompt: PROMPT_EXPLORE,
             options: {},
             mode: "subagent",
+            native: true,
+          },
+          tag: {
+            name: "tag",
+            description:
+              "Designs code-graph tag collections: explores read-only, proposes a tag schema (name, tags + definitions, palette, prompt), and persists it with the tag-collection tools. Entered via the /tag command.",
+            permission: Permission.merge(
+              defaults,
+              Permission.fromConfig({
+                "*": "deny",
+                grep: "allow",
+                glob: "allow",
+                list: "allow",
+                bash: "allow",
+                read: "allow",
+                webfetch: "allow",
+                websearch: "allow",
+                tag_collection_list: "allow",
+                tag_collection_create: "allow",
+                tag_collection_select: "allow",
+                external_directory: readonlyExternalDirectory,
+              }),
+              user,
+            ),
+            prompt: PROMPT_TAG,
+            options: {},
+            mode: "all",
             native: true,
           },
           compaction: {

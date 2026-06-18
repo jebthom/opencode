@@ -13,6 +13,10 @@ import { WebFetchTool } from "./webfetch"
 import { WriteTool } from "./write"
 import { InvalidTool } from "./invalid"
 import { SkillTool } from "./skill"
+import { TagCollectionListTool } from "./tag-collection-list"
+import { TagCollectionCreateTool } from "./tag-collection-create"
+import { TagCollectionSelectTool } from "./tag-collection-select"
+import { CodeGraph } from "@/codegraph/codegraph"
 import * as Tool from "./tool"
 import { Config } from "@/config/config"
 import { type ToolContext as PluginToolContext, type ToolDefinition } from "@opencode-ai/plugin"
@@ -105,6 +109,7 @@ export const layer: Layer.Layer<
   | Truncate.Service
   | RuntimeFlags.Service
   | Database.Service
+  | CodeGraph.Service
 > = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -131,6 +136,9 @@ export const layer: Layer.Layer<
     const greptool = yield* GrepTool
     const patchtool = yield* ApplyPatchTool
     const skilltool = yield* SkillTool
+    const tagList = yield* TagCollectionListTool
+    const tagCreate = yield* TagCollectionCreateTool
+    const tagSelect = yield* TagCollectionSelectTool
     const agent = yield* Agent.Service
 
     const state = yield* InstanceState.make<State>(
@@ -238,6 +246,9 @@ export const layer: Layer.Layer<
           question: Tool.init(question),
           lsp: Tool.init(lsptool),
           plan: Tool.init(plan),
+          tagList: Tool.init(tagList),
+          tagCreate: Tool.init(tagCreate),
+          tagSelect: Tool.init(tagSelect),
         })
 
         return {
@@ -257,6 +268,9 @@ export const layer: Layer.Layer<
             tool.search,
             tool.skill,
             tool.patch,
+            tool.tagList,
+            tool.tagCreate,
+            tool.tagSelect,
             ...(flags.experimentalLspTool ? [tool.lsp] : []),
             ...(flags.experimentalPlanMode && flags.client === "cli" ? [tool.plan] : []),
           ],
@@ -387,6 +401,9 @@ export const defaultLayer = Layer.suspend(() =>
       Layer.provide(CrossSpawnSpawner.defaultLayer),
       Layer.provide(Ripgrep.defaultLayer),
       Layer.provide(Truncate.defaultLayer),
+      // Shared via the common memoMap with the httpapi server's CodeGraph, so the
+      // tag-collection tools mutate the same instance that serves the TUI view.
+      Layer.provide(CodeGraph.defaultLayer),
     )
     .pipe(Layer.provide(Database.defaultLayer), Layer.provide(RuntimeFlags.defaultLayer)),
 )

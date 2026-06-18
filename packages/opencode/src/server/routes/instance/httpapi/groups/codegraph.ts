@@ -20,6 +20,14 @@ const CodeGraphQuery = Schema.Struct({
   refresh: Schema.optional(Schema.Literals(["true", "false"])),
 })
 
+// Step the active tag collection one forward/back in the list, wrapping at the
+// ends. Drives the top-bar ◀/▶ arrows; repaint rides the codegraph.invalidated
+// event the switch publishes, so this just returns the newly-active collection.
+const CycleCollectionQuery = Schema.Struct({
+  ...WorkspaceRoutingQueryFields,
+  direction: Schema.Literals(["next", "prev"]),
+})
+
 export const CodeGraphApi = HttpApi.make("codegraph")
   .add(
     HttpApiGroup.make("codegraph")
@@ -32,6 +40,18 @@ export const CodeGraphApi = HttpApi.make("codegraph")
             identifier: "codegraph.get",
             summary: "Get code graph",
             description: "Retrieve the deterministic code-graph payload for the active instance.",
+          }),
+        ),
+      )
+      .add(
+        HttpApiEndpoint.get("cycleCollection", `${root}/collection/cycle`, {
+          query: CycleCollectionQuery,
+          success: described(CodeGraphPayload.CollectionInfo, "The newly-active tag collection"),
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "codegraph.cycleCollection",
+            summary: "Cycle active tag collection",
+            description: "Switch the active code-graph tag collection to the next or previous one, wrapping at the ends.",
           }),
         ),
       )
