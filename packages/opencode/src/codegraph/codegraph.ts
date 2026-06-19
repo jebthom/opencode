@@ -20,7 +20,9 @@ import { CodeGraphEvent } from "./event"
 import { CodeGraphSemanticStore } from "./semantic-store"
 import { CodeGraphTagger } from "./tagger"
 import { CodeGraphCollectionStore } from "./collection-store"
-import { type TagCollection, type PaletteId, legend as collectionLegend, NONE_TAG, NONE_HUE, ARCHITECTURE_ID, isBuiltinCollection } from "./collections"
+import { CodeGraphDeterministic } from "./deterministic"
+import { Git } from "@/git"
+import { type TagCollection, type PaletteId, legend as collectionLegend, NONE_TAG, NONE_HUE, ARCHITECTURE_ID, isBuiltinCollection, isDeterministic } from "./collections"
 
 // Server-side code-graph service (PLAN.md steps 1 + 2.5). Owns the deterministic
 // payload, but unlike step 1 the graph is a *2-level window* rooted at a scope
@@ -160,6 +162,9 @@ export const layer = Layer.effect(
     // keeps a clean R = never and `get`/`refresh` expose no extra requirements.
     const provider = yield* Provider.Service
     const config = yield* Config.Service
+    // Drives the deterministic "Changed since last commit" built-in (git status). Like
+    // Provider/Config it's self-provided in defaultLayer so the layer stays R = never.
+    const git = yield* Git.Service
 
     // Shared by the foreground and background taggers (see TAG_CONCURRENCY).
     const tagGate = yield* Semaphore.make(TAG_CONCURRENCY)
@@ -192,7 +197,7 @@ export const layer = Layer.effect(
     // refreshes every fetch (so finalize runs constantly) but the file set only changes
     // when files change — we drop the entry from the same file-event / turn-completion
     // subscriptions that already fire below, so it rebuilds lazily on the next read.
-    const subtreeCache = new Map<string, ReadonlyArray<{ id: string; path: string; size: number }>>()
+    const subtreeCache = new Map<string, ReadonlyArray<CodeGraphDeterministic.SubtreeFile>>()
     const subtreeFor = (directory: string) =>
       Effect.gen(function* () {
         const cached = subtreeCache.get(directory)
@@ -200,7 +205,7 @@ export const layer = Layer.effect(
         const files = yield* CodeGraphExtract.listSubtree(directory, "").pipe(
           Effect.catch((cause) => {
             log.error("listSubtree failed", { directory, cause })
-            return Effect.succeed([] as ReadonlyArray<{ id: string; path: string; size: number }>)
+            return Effect.succeed([] as ReadonlyArray<CodeGraphDeterministic.SubtreeFile>)
           }),
           Effect.provide(FSUtil.defaultLayer),
         )
@@ -208,9 +213,56 @@ export const layer = Layer.effect(
         return files
       })
 
+    // Working-tree change set for the deterministic "Changed since last commit" built-in,
+    // cached per directory because the TUI refetches constantly (so finalize runs often)
+    // but git state only moves when files change. Dropped from the same file-event /
+    // turn-completion hooks that invalidate subtreeCache below, so it rebuilds lazily.
+    const gitStatusCache = new Map<string, CodeGraphDeterministic.GitChanged>()
+    const gitChangedFor = (directory: string) =>
+      Effect.gen(function* () {
+        const cached = gitStatusCache.get(directory)
+        if (cached) return cached
+        const items = yield* git.status(directory)
+        const prefix = yield* git.prefix(directory)
+        const resolved: CodeGraphDeterministic.GitChanged = { prefix, changed: new Set(items.map((i) => i.file)) }
+        gitStatusCache.set(directory, resolved)
+        return resolved
+      })
+
+    // Whether the directory is a git work tree, cached because it almost never changes
+    // (only `git init`). Cleared on turn completion (an agent may have run `git init`) and
+    // on disposal. Gates the git-changed built-in's availability below.
+    const isRepoCache = new Map<string, boolean>()
+    const isRepoFor = (directory: string) =>
+      Effect.gen(function* () {
+        const cached = isRepoCache.get(directory)
+        if (cached !== undefined) return cached
+        const repo = yield* git.isRepo(directory)
+        isRepoCache.set(directory, repo)
+        return repo
+      })
+
+    // A deterministic built-in can have an environmental prerequisite: git-changed needs a
+    // git work tree. A collection whose prerequisite isn't met is hidden everywhere a
+    // collection is chosen or listed (collections()/cycle/select), so the user can never
+    // land on a meaningless view — git-changed simply doesn't exist in a non-git folder.
+    const isAvailable = (collection: TagCollection, directory: string): Effect.Effect<boolean> =>
+      collection.deterministic === "git-changed" ? isRepoFor(directory) : Effect.succeed(true)
+
+    // The active+listed collections minus any whose prerequisite is unmet for this directory.
+    const listAvailable = (directory: string, projectID: string) =>
+      Effect.gen(function* () {
+        const all = yield* CodeGraphCollectionStore.list(storage, projectID)
+        const keep: TagCollection[] = []
+        for (const collection of all) if (yield* isAvailable(collection, directory)) keep.push(collection)
+        return keep
+      })
+
     const off = registerDisposer(async (directory) => {
       caches.delete(directory)
       subtreeCache.delete(directory)
+      gitStatusCache.delete(directory)
+      isRepoCache.delete(directory)
       // The loop fiber itself is interrupted when the instance scope closes
       // (forkScoped); drop the map entry so a later reopen can start a fresh one.
       bgTaggers.delete(directory)
@@ -286,7 +338,19 @@ export const layer = Layer.effect(
         // vocabulary. Switching collections re-paints from that collection's own
         // (cached) store — no other collection's work is touched.
         const collection = yield* CodeGraphCollectionStore.getActive(storage, ctx.project.id)
-        const store = yield* CodeGraphSemanticStore.read(storage, ctx.project.id, collection.id)
+        // Whole-repo membership (full depth), needed both for directory composition and —
+        // for the deterministic built-ins — as the file set whose tags we synthesize.
+        const subtree = yield* subtreeFor(ctx.directory)
+        // Deterministic built-ins (git-changed / mtime-buckets) compute their tags from the
+        // repo instead of reading the persisted store: no tagger, no tokens, always fresh.
+        const det = isDeterministic(collection)
+        const store = det
+          ? CodeGraphDeterministic.computeStore(
+              collection.deterministic!,
+              subtree,
+              collection.deterministic === "git-changed" ? yield* gitChangedFor(ctx.directory) : undefined,
+            )
+          : yield* CodeGraphSemanticStore.read(storage, ctx.project.id, collection.id)
         const colorByTag = new Map(collection.tags.map((t) => [t.id, t.color]))
         const semantics: Record<string, CodeGraphPayload.Semantic> = {}
         // The store holds only the semantic (tag); hue/tags are derived here, so
@@ -303,9 +367,11 @@ export const layer = Layer.effect(
         // descendant source file (full depth, from the cached membership) by its tagged
         // tag, summing both a file count and a byte sum so the renderer can pick either
         // metric. Derived here alongside `semantics` so the structure cache stays pure.
-        const subtree = yield* subtreeFor(ctx.directory)
         const composition = computeComposition(structure.nodes, subtree, store, collection)
-        yield* scheduleTag(ctx.directory, ctx.project.id, scope, structure.nodes, structure.boundaries ?? [], collection)
+        // Deterministic collections are fully painted above; only semantic ones schedule
+        // the foreground tagger for the in-window files + boundary targets.
+        if (!det)
+          yield* scheduleTag(ctx.directory, ctx.project.id, scope, structure.nodes, structure.boundaries ?? [], collection)
         const collectionInfo: CodeGraphPayload.CollectionInfo = {
           id: collection.id,
           name: collection.name,
@@ -337,6 +403,14 @@ export const layer = Layer.effect(
           // re-walks the repo tagging for the *new* collection; cached entries make a
           // re-walk of an already-tagged collection free.
           const collection = yield* CodeGraphCollectionStore.getActive(storage, projectID)
+          // Deterministic built-ins are painted synchronously in finalize — there's nothing
+          // for the whole-repo sweep to do. Park until a collection switch (or file change)
+          // wakes us; the next pass re-reads the active collection and resumes the sweep if
+          // it's switched back to a semantic one.
+          if (isDeterministic(collection)) {
+            yield* Queue.take(wake)
+            continue
+          }
           const epoch = collectionEpoch.get(directory) ?? 0
           const files = yield* CodeGraphExtract.listFilesDfs(directory).pipe(
             Effect.catchCause((cause) => {
@@ -456,8 +530,10 @@ export const layer = Layer.effect(
         const rel = toRepoRelative(directory, absFile)
         if (rel === undefined) return
         // A changed file may have a new size or be new/removed, so the cached subtree
-        // membership (and thus composition) is stale — rebuild it on the next read.
+        // membership (and thus composition) is stale — rebuild it on the next read. The
+        // git change set is likewise stale (the edit may have changed what's modified).
         subtreeCache.delete(directory)
+        gitStatusCache.delete(directory)
         for (const scope of container.scopes.keys()) {
           if (!isWithinWindow(scope, rel)) continue
           container.dirty.add(scope)
@@ -493,7 +569,11 @@ export const layer = Layer.effect(
         if (!container) return
         // Shell commands (rm/mv/scaffolding) mutate the tree without file events, so a
         // completed turn may have changed the file set — drop membership to rebuild it.
+        // A turn may also have staged/committed/edited files, so the git set is stale too,
+        // and a `git init` during the turn can flip the repo gate — drop both.
         subtreeCache.delete(directory)
+        gitStatusCache.delete(directory)
+        isRepoCache.delete(directory)
         yield* wakeBackground(directory)
       })
     yield* Effect.forkScoped(
@@ -525,7 +605,8 @@ export const layer = Layer.effect(
 
     const collections = Effect.fn("CodeGraph.collections")(function* () {
       const ctx = yield* InstanceState.context
-      return yield* CodeGraphCollectionStore.list(storage, ctx.project.id)
+      // Hide deterministic built-ins whose prerequisite is unmet (git-changed off-git).
+      return yield* listAvailable(ctx.directory, ctx.project.id)
     })
 
     const activeCollection = Effect.fn("CodeGraph.activeCollection")(function* () {
@@ -549,7 +630,10 @@ export const layer = Layer.effect(
 
     const selectCollection = Effect.fn("CodeGraph.selectCollection")(function* (idOrName: string) {
       const ctx = yield* InstanceState.context
-      const all = yield* CodeGraphCollectionStore.list(storage, ctx.project.id)
+      // Resolve only against *available* collections so an unavailable built-in (e.g.
+      // git-changed in a non-git folder) reports as unknown rather than activating a
+      // collection that can't paint anything meaningful.
+      const all = yield* listAvailable(ctx.directory, ctx.project.id)
       const needle = idOrName.toLowerCase()
       const found = all.find((c) => c.id === idOrName || c.name.toLowerCase() === needle)
       if (!found) return undefined
@@ -560,7 +644,9 @@ export const layer = Layer.effect(
 
     const cycleCollection = Effect.fn("CodeGraph.cycleCollection")(function* (direction: "next" | "prev") {
       const ctx = yield* InstanceState.context
-      const all = yield* CodeGraphCollectionStore.list(storage, ctx.project.id)
+      // Cycle only through available collections so the arrows skip a hidden built-in
+      // (e.g. git-changed in a non-git folder) instead of landing the user on it.
+      const all = yield* listAvailable(ctx.directory, ctx.project.id)
       const activeId = yield* CodeGraphCollectionStore.getActiveId(storage, ctx.project.id)
       const idx = all.findIndex((c) => c.id === activeId)
       const len = all.length
@@ -663,6 +749,8 @@ export const defaultLayer = layer.pipe(
   // small model and read the context flag.
   Layer.provide(Provider.defaultLayer),
   Layer.provide(Config.defaultLayer),
+  // Self-provided so the layer stays R = never; drives the git-changed built-in.
+  Layer.provide(Git.defaultLayer),
 )
 
 // Reorder the enumerated files so any under the collection's relevant directories

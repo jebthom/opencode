@@ -326,8 +326,13 @@ export const listSubtree = Effect.fn("CodeGraph.listSubtree")(function* (root: s
     rels,
     (rel) =>
       fs.stat(path.join(root, rel)).pipe(
-        Effect.map((stat) => ({ id: nodeID(rel), path: rel, size: stat.type === "File" ? Number(stat.size) : 0 })),
-        Effect.catch(() => Effect.succeed({ id: nodeID(rel), path: rel, size: 0 })),
+        Effect.map((stat) => ({
+          id: nodeID(rel),
+          path: rel,
+          size: stat.type === "File" ? Number(stat.size) : 0,
+          mtime: mtimeMillis(stat),
+        })),
+        Effect.catch(() => Effect.succeed({ id: nodeID(rel), path: rel, size: 0, mtime: 0 })),
       ),
     { concurrency: READ_CONCURRENCY },
   )
@@ -372,6 +377,13 @@ function layout(files: string[], dirs: string[], scope: string, birthtimes: Map<
 // doesn't report one. Shared by the file and directory stat passes.
 function birthMillis(stat: { birthtime: Option.Option<Date> }) {
   return Option.getOrElse(stat.birthtime, () => new Date(0)).getTime()
+}
+
+// Last-modification time in millis from an Effect FileSystem stat, or 0 when the
+// platform doesn't report one. Used by the deterministic edit-recency collection to
+// bucket files by when they were last locally edited (carried on listSubtree).
+function mtimeMillis(stat: { mtime: Option.Option<Date> }) {
+  return Option.getOrElse(stat.mtime, () => new Date(0)).getTime()
 }
 
 // --- scope + path helpers --------------------------------------------------

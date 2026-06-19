@@ -74,6 +74,7 @@ export interface Options {
 export interface Interface {
   readonly run: (args: string[], opts: Options) => Effect.Effect<Result>
   readonly branch: (cwd: string) => Effect.Effect<string | undefined>
+  readonly isRepo: (cwd: string) => Effect.Effect<boolean>
   readonly prefix: (cwd: string) => Effect.Effect<string>
   readonly defaultBranch: (cwd: string) => Effect.Effect<Base | undefined>
   readonly hasHead: (cwd: string) => Effect.Effect<boolean>
@@ -165,6 +166,11 @@ export const layer = Layer.effect(
       if (result.exitCode !== 0) return
       const text = out(result)
       return text || undefined
+    })
+
+    const isRepo = Effect.fn("Git.isRepo")(function* (cwd: string) {
+      const result = yield* run(["rev-parse", "--is-inside-work-tree"], { cwd })
+      return result.exitCode === 0 && out(result) === "true"
     })
 
     const prefix = Effect.fn("Git.prefix")(function* (cwd: string) {
@@ -325,6 +331,7 @@ export const layer = Layer.effect(
     return Service.of({
       run,
       branch,
+      isRepo,
       prefix,
       defaultBranch,
       hasHead,

@@ -6,7 +6,14 @@ import {
   MAX_TAGS,
   ARCHITECTURE,
   ARCHITECTURE_ID,
+  BUILTIN_COLLECTIONS,
+  GIT_CHANGED,
+  MTIME_RECENCY,
+  RECENCY_TAG_IDS,
   assignColors,
+  bucketIndex,
+  isBuiltinCollection,
+  isDeterministic,
   isValidTag,
   isAssignableTag,
   tagEnumIds,
@@ -84,6 +91,41 @@ describe("codegraph collections", () => {
     expect(slugify("Auth Flow!")).toBe("auth-flow")
     expect(slugify("  --weird__Name  ")).toBe("weird-name")
     expect(slugify("")).toBe("collection")
+  })
+})
+
+describe("codegraph deterministic built-ins", () => {
+  test("git-changed and edit-recency are global, immutable, deterministic built-ins", () => {
+    for (const c of [GIT_CHANGED, MTIME_RECENCY]) {
+      expect(BUILTIN_COLLECTIONS).toContain(c)
+      expect(c.scope).toBe("global")
+      expect(isBuiltinCollection(c)).toBe(true)
+      expect(isDeterministic(c)).toBe(true)
+    }
+    // The semantic built-in stays non-deterministic (still tagger-driven).
+    expect(isDeterministic(ARCHITECTURE)).toBe(false)
+  })
+
+  test("git-changed has changed/unchanged; edit-recency has the six ordinal recency tags", () => {
+    expect(GIT_CHANGED.tags.map((t) => t.id)).toEqual(["changed", "unchanged"])
+    expect(MTIME_RECENCY.tags.map((t) => t.id)).toEqual([...RECENCY_TAG_IDS])
+    expect(RECENCY_TAG_IDS.length).toBe(6)
+    // Recency colours are concrete hex (an ordinal ramp), not theme roles.
+    for (const t of MTIME_RECENCY.tags) expect(t.color).toMatch(/^#[0-9A-Fa-f]{6}$/)
+  })
+
+  test("bucketIndex splits [min,max] into equal time spans, clamping the top edge", () => {
+    // Range 0..600 over 6 buckets → width 100; values land in their span, max clamps to 5.
+    expect(bucketIndex(0, 0, 600)).toBe(0)
+    expect(bucketIndex(50, 0, 600)).toBe(0)
+    expect(bucketIndex(150, 0, 600)).toBe(1)
+    expect(bucketIndex(550, 0, 600)).toBe(5)
+    expect(bucketIndex(600, 0, 600)).toBe(5)
+  })
+
+  test("bucketIndex collapses a degenerate range (all-equal / single file) to bucket 0", () => {
+    expect(bucketIndex(1000, 1000, 1000)).toBe(0)
+    expect(bucketIndex(5, 10, 0)).toBe(0)
   })
 })
 

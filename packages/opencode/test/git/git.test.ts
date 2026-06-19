@@ -47,6 +47,16 @@ describe("Git", () => {
     }),
   )
 
+  it.live("isRepo() distinguishes a git work tree from a plain directory", () =>
+    Effect.gen(function* () {
+      const git = yield* Git.Service
+      const repo = yield* scopedTmpdir({ git: true })
+      expect(yield* git.isRepo(repo.path)).toBe(true)
+      const plain = yield* scopedTmpdir()
+      expect(yield* git.isRepo(plain.path)).toBe(false)
+    }),
+  )
+
   it.live("defaultBranch() uses init.defaultBranch when available", () =>
     Effect.gen(function* () {
       const tmp = yield* scopedTmpdir({ git: true })

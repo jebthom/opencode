@@ -24,6 +24,13 @@ export interface TagDef {
 
 export type CollectionScope = "global" | "project"
 
+// A built-in collection whose tags are computed *deterministically* from the repo
+// (git state / filesystem mtime) instead of by the LLM tagger. The server branches on
+// this in `finalize` to synthesize the tag store directly; the tagger and background
+// sweep are skipped entirely (no tokens, always fresh). Absent on every semantic
+// collection (architecture + all user collections).
+export type DeterministicKind = "git-changed" | "mtime-buckets"
+
 export interface TagCollection {
   readonly id: string
   readonly name: string
@@ -41,6 +48,9 @@ export interface TagCollection {
   // rest of the repo, so the targeted area lights up first — it never *restricts*
   // the sweep, which always covers the whole repo.
   readonly directories?: ReadonlyArray<string>
+  // Present only on the deterministic built-ins (see DeterministicKind). When set, the
+  // server computes this collection's tags from the repo rather than running the tagger.
+  readonly deterministic?: DeterministicKind
 }
 
 // --- palettes --------------------------------------------------------------
@@ -139,12 +149,73 @@ export const ARCHITECTURE: TagCollection = {
   })),
 }
 
+// --- built-in deterministic collections ------------------------------------
+
+// "Changed since last commit": a two-tag collection painted from `git status` rather
+// than the model. "changed" covers any working-tree change git reports (modified,
+// staged, AND untracked/new files); everything else is "unchanged" and recedes to a
+// muted theme grey so the changes pop. Colours: a fixed warm hex for changed, a
+// theme-role key for unchanged (resolveColor accepts both).
+export const GIT_CHANGED_ID = "git-changed"
+
+export const GIT_CHANGED: TagCollection = {
+  id: GIT_CHANGED_ID,
+  name: "Changed since last commit",
+  description: "Highlights files with uncommitted working-tree changes (modified, staged, or new) against the rest.",
+  prompt: "",
+  scope: "global",
+  deterministic: "git-changed",
+  tags: [
+    { id: "changed", label: "Changed", description: "File has uncommitted working-tree changes.", color: "#F2A53A" },
+    { id: "unchanged", label: "Unchanged", description: "File matches the last commit.", color: "textMuted" },
+  ],
+}
+
+// "Edit recency": six ordinal buckets by local filesystem mtime, split into equal time
+// spans across the repo's oldest→newest range. Ordered oldest (index 0) → newest, with a
+// cool→warm spectrum so the most recently edited files glow warm (red) — a heat map of
+// where work is happening. Equal spans (not quantiles) is deliberate: when most files
+// share a checkout mtime, the bulk all land in bucket 0 (one colour) and only recent
+// edits climb into the warm end.
+export const MTIME_RECENCY_ID = "edit-recency"
+
+// Tag ids in oldest→newest order; the single source of truth for index↔id mapping shared
+// with the deterministic compute. Colours run cool→warm so newest = red.
+export const RECENCY_TAG_IDS = ["recency-0", "recency-1", "recency-2", "recency-3", "recency-4", "recency-5"] as const
+const RECENCY_COLORS = ["#4E5BA6", "#3AAFA9", "#59A14F", "#EDC948", "#F28E2B", "#E15759"] as const
+const RECENCY_LABELS = ["Oldest", "Older", "Mid-age", "Recent", "Newer", "Newest"] as const
+
+export const MTIME_RECENCY: TagCollection = {
+  id: MTIME_RECENCY_ID,
+  name: "Edit recency",
+  description: "Buckets files into six bands by last local edit time, oldest (cool) to newest (warm).",
+  prompt: "",
+  scope: "global",
+  deterministic: "mtime-buckets",
+  tags: RECENCY_TAG_IDS.map((id, i) => ({
+    id,
+    label: RECENCY_LABELS[i]!,
+    description: `Edit-time band ${i + 1} of ${RECENCY_TAG_IDS.length} (${RECENCY_LABELS[i]!.toLowerCase()}).`,
+    color: RECENCY_COLORS[i]!,
+  })),
+}
+
+// Map a file's mtime to a bucket index over the [min, max] range, split into `count`
+// equal time spans. Pure + total: a degenerate range (max <= min, e.g. every file shares
+// one mtime, or a single file) collapses to bucket 0, which is exactly the "everything is
+// one colour" case. The top edge (mtime === max) clamps into the last bucket.
+export function bucketIndex(mtime: number, min: number, max: number, count = RECENCY_TAG_IDS.length): number {
+  if (max <= min) return 0
+  return Math.min(count - 1, Math.floor(((mtime - min) / (max - min)) * count))
+}
+
 // All built-in (globally-defined) collections — the protected group. Built-ins are
 // immutable: they cannot be edited, have their tags merged, or be deleted (the
 // create/edit/merge/delete flows and the UI all refuse them via `isBuiltinCollection`
-// / `BUILTIN_COLLECTION_IDS`). Architecture is the sole member today; add more here and
-// they inherit the same protection automatically — no other code needs to change.
-export const BUILTIN_COLLECTIONS: ReadonlyArray<TagCollection> = [ARCHITECTURE]
+// / `BUILTIN_COLLECTION_IDS`). They inherit that protection automatically from their
+// global scope — no other code needs to change to add one. The two deterministic ones
+// additionally carry a `deterministic` kind so the server paints them without the tagger.
+export const BUILTIN_COLLECTIONS: ReadonlyArray<TagCollection> = [ARCHITECTURE, GIT_CHANGED, MTIME_RECENCY]
 
 // The ids of the protected built-in group — for callers that only have an id (e.g. the
 // renderer deciding whether to show a delete control).
@@ -155,6 +226,13 @@ export const BUILTIN_COLLECTION_IDS: ReadonlySet<string> = new Set(BUILTIN_COLLE
 // "project". This is the single source of truth for "is this collection immutable?".
 export function isBuiltinCollection(collection: Pick<TagCollection, "scope">): boolean {
   return collection.scope === "global"
+}
+
+// Whether a collection's tags are computed deterministically from the repo (git/mtime)
+// rather than by the tagger. Drives the server's `finalize` branch and lets the
+// background sweep skip these collections entirely.
+export function isDeterministic(collection: Pick<TagCollection, "deterministic">): boolean {
+  return collection.deterministic !== undefined
 }
 
 // --- helpers ---------------------------------------------------------------
