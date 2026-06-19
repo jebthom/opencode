@@ -1,6 +1,7 @@
 import type { TuiPlugin, TuiPluginApi, TuiThemeCurrent } from "@opencode-ai/plugin/tui"
 import type { MouseEvent, ScrollBoxRenderable } from "@opentui/core"
 import { RGBA } from "@opentui/core"
+import { useTerminalDimensions } from "@opentui/solid"
 import type { InternalTuiPlugin } from "../../plugin/internal"
 import { createEffect, createMemo, createResource, createSignal, For, onCleanup, Show } from "solid-js"
 import { DIRECTORY_HUE } from "@/codegraph/semantics"
@@ -69,19 +70,33 @@ type Graph = {
 // borderless column beneath (see the COLUMN_* constants below). Defaults to "grid" so
 // the current view is preserved; flip the constant (or set OPENCODE_CODEGRAPH_LAYOUT=column)
 // to try the alternative.
-const CODEGRAPH_LAYOUT: "grid" | "column" = process.env["OPENCODE_CODEGRAPH_LAYOUT"] === "column" ? "column" : "grid"
+const CODEGRAPH_LAYOUT: "grid" | "column" = process.env["OPENCODE_CODEGRAPH_LAYOUT"] === "grid" ? "grid" : "column"
 
 // +1 row over the graph's own budget so the horizontal scrollbar lives below the
 // tiles without stealing a row of node detail. A directory header is a label row over
 // an up-to-MAX_ROWS treemap *wrapped in a border* (so it's a legible box even when
 // empty), over an up-to-CHILD_ROWS-tall child grid; bump this further if MAX_ROWS or
-// CHILD_ROWS grows. Column mode stacks a taller block over a single child column, so it
-// runs a little taller (children past the bottom edge are clipped by the scrollbox).
-const TOP_BAR_HEIGHT = CODEGRAPH_LAYOUT === "column" ? 24 : 20
+// CHILD_ROWS grows. Column mode used to run taller to fit more of its single child column
+// before it clipped, but now that list scrolls in place (COLUMN_CHILD_WINDOW + the ↑/↓
+// "+N" markers), so this is the base height for both layouts. Column mode then adds one
+// row *only when the horizontal scrollbar is actually showing* (see scrollbarVisible): the
+// column fills the whole height, so the scrollbar would otherwise paint over the last child
+// / bottom "+N" marker — but when the bar fits without scrolling, that row is reclaimed.
+const TOP_BAR_HEIGHT = 20
+// Inter-column gap in the scroll strip (the scrollbox's contentOptions gap) and the bar's
+// own horizontal padding — both feed the content-width vs viewport-width test that decides
+// whether the horizontal scrollbar shows. Keep in sync with the JSX that uses them.
+const SCROLL_GAP = 2
+const BAR_PADDING_X = 2
 // Cells moved per wheel notch when we redirect a vertical wheel into horizontal
 // scroll. Tiles are ~CHILD_W wide, so 1 cell/notch (the raw terminal delta) feels
 // sluggish; a small multiplier makes the bar pan at a comfortable speed.
 const HSCROLL_STEP = 3
+// How often (ms) to poll-refresh the view for changes nothing tells us about — files
+// created/deleted in the user's IDE outside opencode emit no event the bar can see, so
+// they'd otherwise only surface on navigation or a manual ⟳. Recompute is a cheap scoped
+// walk, so a low-frequency poll keeps the view honest without meaningful cost.
+const REFRESH_POLL_MS = 5000
 // Children are drawn in a compact CHILD_COLS×CHILD_ROWS grid (filled left→right,
 // top→bottom) rather than one long row, so a directory stays glanceable. MAX_CHILDREN
 // is the grid's capacity; a directory with more than that collapses its extras into a
@@ -141,6 +156,14 @@ function treemapColsFor(tiles: number) {
 const COLUMN_COLS_MIN = 3 // → 8 terminal cols outer
 const COLUMN_COLS_MAX = 6 // → 14 terminal cols outer
 const COLUMN_ROWS = 6
+// Visible child rows in a column before the list scrolls in place. Derived from the base
+// budget so it tracks the constants it depends on: TOP_BAR_HEIGHT less the outer bottom
+// border (1), the four header rows (title / nav / legend / actions), and the layer-0 block
+// above the list (label 1 + border 2 + COLUMN_ROWS). The scrollbar row isn't subtracted
+// here — it's added to the bar height only when the scrollbar shows, so the window stays
+// fixed. A list longer than this captures the wheel and pages in place; a shorter one lets
+// the wheel bubble out to the sideways pan.
+const COLUMN_CHILD_WINDOW = TOP_BAR_HEIGHT - 1 - 4 - (1 + 2 + COLUMN_ROWS)
 // When a layer has fewer than this many items there's plenty of horizontal room, so every
 // block is drawn at max width instead of being shrunk by size (the fill still scales, so
 // byte size stays legible). Tune to taste.
@@ -194,6 +217,9 @@ type Overlay = { action: Action; color: TuiThemeCurrent["text"]; style: Style; f
 
 function View(props: { api: TuiPluginApi; session_id: string }) {
   const theme = () => props.api.theme.current
+  // Reactive terminal size: column mode reclaims the reserved scrollbar row when the strip
+  // fits the viewport (see scrollbarVisible / barHeight below).
+  const dimensions = useTerminalDimensions()
   const [scope, setScope] = createSignal("")
 
   // Layer-0 directories whose child row is expanded past MAX_CHILDREN to show all
@@ -202,9 +228,16 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   // 4-children + "…" view; horizontal scrolling doesn't touch scope, so an expanded
   // directory stays expanded while you pan.
   const [expanded, setExpanded] = createSignal(new Set<string>())
+  // Column mode (CODEGRAPH_LAYOUT === "column"): per-layer-0 vertical scroll offset for
+  // a child list taller than COLUMN_CHILD_WINDOW. Keyed by node id; a wheel over the list
+  // shifts the visible window row-by-row in place rather than panning the bar sideways
+  // (see onChildScroll). Reset on scope change like `expanded` so navigation always lands
+  // at the top of each list; panning doesn't touch scope, so an offset survives a pan.
+  const [childOffset, setChildOffset] = createSignal(new Map<string, number>())
   createEffect(() => {
     scope()
     setExpanded(new Set<string>())
+    setChildOffset(new Map<string, number>())
   })
   const expand = (id: string) => setExpanded((prev) => new Set(prev).add(id))
   // Foundation A hover-info line: what a node tile / link shows when pointed at.
@@ -264,6 +297,27 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     if (event.properties.sessionID === props.session_id) refetch()
   })
   onCleanup(() => offShell())
+
+  // A turn boundary — the shown session, or a sub-agent (build/plan) it spawned, going
+  // idle — is when shell-driven tree mutations that emit no file.edited (most notably
+  // `rm`) have settled, so we recompute then. session.status is a core event (unlike the
+  // experimental session.next.* family), so this fires even with the experimental event
+  // system off, and a fresh user prompt flips the session busy→idle again, covering the
+  // "user's turn begins" case too. Recompute is cheap, so an unconditional refetch is fine.
+  const offIdle = props.api.event.on("session.status", (event) => {
+    if (event.properties.status.type !== "idle") return
+    const sid = event.properties.sessionID
+    if (sid === props.session_id || props.api.state.session.get(sid)?.parentID === props.session_id) refetch()
+  })
+  onCleanup(() => offIdle())
+
+  // Catch-all for changes nothing tells us about (manual IDE edits, external tools): a
+  // low-frequency poll. Skipped while a fetch is already in flight so a slow walk can't
+  // stack up refetches.
+  const poll = setInterval(() => {
+    if (!graph.loading) refetch()
+  }, REFRESH_POLL_MS)
+  onCleanup(() => clearInterval(poll))
 
   // Guarded reads — never call the resource accessor in its error state (the
   // documented render→catch→re-render leak, PLAN.md). The frame stays mounted.
@@ -484,6 +538,34 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     return layer0.map((node) => ({ node, children: byParent.get(node.path) ?? [] }))
   })
 
+  // One layer-0 column's terminal-width footprint (column mode), the single source shared by
+  // the render below and the content-width sum that decides whether the horizontal scrollbar
+  // shows. Directories take their size-scaled block width; files the fixed/sparse file width
+  // — mirroring the cols()/fileW() the render uses, so the two never drift.
+  const columnWidth = (node: GraphNode) =>
+    node.kind === "directory"
+      ? columnOuterW(columnColsFor(subtreeOf(node.id), maxDirSubtree0(), tree().length))
+      : tree().length < COLUMN_FEW_THRESHOLD
+        ? columnOuterW(COLUMN_COLS_MAX)
+        : COLUMN_FILE_W
+
+  // Whether the strip overflows the viewport horizontally — i.e. whether OpenTUI will draw
+  // the horizontal scrollbar on the scrollbox's bottom row. Computed from data + terminal
+  // width rather than read off the renderable (no per-frame polling, no layout-timing race):
+  // the strip's width is the sum of the column footprints plus the inter-column gaps, and the
+  // viewport is the full-width bar less its own horizontal padding. Column mode only.
+  const contentWidth = createMemo(() => {
+    const items = tree()
+    if (items.length === 0) return 0
+    return items.reduce((sum, it) => sum + columnWidth(it.node), 0) + SCROLL_GAP * (items.length - 1)
+  })
+  const scrollbarVisible = createMemo(
+    () => CODEGRAPH_LAYOUT === "column" && contentWidth() > dimensions().width - BAR_PADDING_X * 2,
+  )
+  // Bar height: the base budget, plus the one reserved scrollbar row only while the scrollbar
+  // is actually showing — so a strip that fits gives the row back to the conversation below.
+  const barHeight = () => TOP_BAR_HEIGHT + (scrollbarVisible() ? 1 : 0)
+
   const crumbs = () => {
     const s = scope()
     if (s === "") return []
@@ -513,11 +595,11 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   return (
     <box
       flexShrink={0}
-      height={TOP_BAR_HEIGHT}
+      height={barHeight()}
       flexDirection="column"
       backgroundColor={theme().backgroundPanel}
-      paddingLeft={2}
-      paddingRight={2}
+      paddingLeft={BAR_PADDING_X}
+      paddingRight={BAR_PADDING_X}
       border={["bottom"]}
       borderColor={theme().border}
     >
@@ -565,7 +647,8 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
             <text fg={theme().accent} onMouseDown={() => cycleCollection("prev")} wrapMode="none">
               ◀
             </text>
-            <text fg={theme().accent} wrapMode="none">
+            {/* Clicking the name advances like ▶, giving the forward step a bigger hit area. */}
+            <text fg={theme().accent} onMouseDown={() => cycleCollection("next")} wrapMode="none">
               {activeName()}
             </text>
             <text fg={theme().accent} onMouseDown={() => cycleCollection("next")} wrapMode="none">
@@ -651,7 +734,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
         ref={(r: ScrollBoxRenderable) => (scroll = r)}
         flexGrow={1}
         onMouseScroll={onWheel}
-        contentOptions={{ flexDirection: "row", gap: 2, maxWidth: undefined, maxHeight: "100%" }}
+        contentOptions={{ flexDirection: "row", gap: SCROLL_GAP, maxWidth: undefined, maxHeight: "100%" }}
         verticalScrollbarOptions={{ visible: false }}
         horizontalScrollbarOptions={{
           showArrows: false,
@@ -666,10 +749,43 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
             // past the bottom edge are clipped by the scrollbox.
             if (CODEGRAPH_LAYOUT === "column") {
               const cols = () => columnColsFor(subtreeOf(item.node.id), maxDirSubtree0(), tree().length)
-              const outerW = () => columnOuterW(cols())
-              // Layer-0 files carry no fill, so they follow the same width policy directly:
-              // max width when the layer is sparse, the fixed narrow COLUMN_FILE_W otherwise.
-              const fileW = () => (tree().length < COLUMN_FEW_THRESHOLD ? columnOuterW(COLUMN_COLS_MAX) : COLUMN_FILE_W)
+              // The column footprint comes from the shared columnWidth (kept under the outerW
+              // / fileW names the markup already uses): for a directory it's the size-scaled
+              // block width columnOuterW(cols()), for a file the fixed/sparse file width. Both
+              // resolve item.node by kind, matching the Show that gates where each is used.
+              const outerW = () => columnWidth(item.node)
+              const fileW = () => columnWidth(item.node)
+              // In-place vertical scroll for a child list taller than the window. When the
+              // list overflows, a wheel over it pages the visible slice instead of panning
+              // the bar; a "+N" marker stands in for the children hidden above / below. A
+              // non-overflowing list keeps offset 0, shows everything, and lets the wheel
+              // bubble out to the sideways pan (see onChildScroll).
+              const total = item.children.length
+              const overflow = total > COLUMN_CHILD_WINDOW
+              // Largest offset that still fills the window: at the bottom a top marker eats
+              // one row, so the last page shows COLUMN_CHILD_WINDOW-1 children ending on the
+              // final child. Clamped so a refetch that shrinks the list can't strand it.
+              const maxOffset = Math.max(0, total - COLUMN_CHILD_WINDOW + 1)
+              const offset = () => (overflow ? Math.min(childOffset().get(item.node.id) ?? 0, maxOffset) : 0)
+              // A top marker costs a row when scrolled; the rest hold children, less one more
+              // for a bottom marker whenever the remaining children don't all fit.
+              const aboveHidden = () => offset()
+              const capacity = () => COLUMN_CHILD_WINDOW - (offset() > 0 ? 1 : 0)
+              const childrenShown = () => {
+                const remaining = total - offset()
+                return remaining <= capacity() ? remaining : capacity() - 1
+              }
+              const visibleChildren = () => item.children.slice(offset(), offset() + childrenShown())
+              const belowHidden = () => total - (offset() + childrenShown())
+              const onChildScroll = (event: MouseEvent) => {
+                const dir = event.scroll?.direction
+                if (dir !== "up" && dir !== "down") return
+                if (!overflow) return // let the wheel bubble out to the horizontal pan
+                event.stopPropagation()
+                const step = event.scroll?.delta ?? 1
+                const next = Math.max(0, Math.min(maxOffset, offset() + (dir === "down" ? step : -step)))
+                setChildOffset(new Map(childOffset()).set(item.node.id, next))
+              }
               return (
                 <box flexDirection="column" flexShrink={0}>
                   <Show
@@ -710,39 +826,66 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                       onLeave={() => leaveNode()}
                     />
                   </Show>
-                  <box flexDirection="column" flexShrink={0}>
-                    <For each={item.children}>
-                      {(cell) => (
-                        <box
-                          width={outerW()}
-                          flexShrink={0}
-                          onMouseDown={() => (cell.kind === "directory" ? setScope(cell.path) : undefined)}
-                          onMouseOver={() => enterNode(cell)}
-                          onMouseOut={() => leaveNode()}
-                        >
-                          <Show
-                            when={cell.kind === "directory"}
-                            fallback={
+                  <box flexDirection="column" flexShrink={0} onMouseScroll={onChildScroll}>
+                    {/* "↑ +N" stand-in for children scrolled off the top of the window: the
+                        arrow points to where the hidden children are, the count says how
+                        many. Same idea (pointing down) at the bottom for children below. */}
+                    <Show when={aboveHidden() > 0}>
+                      <box width={outerW()} height={1} flexShrink={0}>
+                        <text fg={theme().textMuted} wrapMode="none">
+                          {"↑ +" + aboveHidden()}
+                        </text>
+                      </box>
+                    </Show>
+                    <For each={visibleChildren()}>
+                      {(cell) => {
+                        // Agent-action glyphs (read/create/edit) ride the end of the row, as
+                        // they do on the grid layout's ChildDirTile/FileTile. The name bar
+                        // shrinks by the glyph count so the composition fill stays put and the
+                        // glyphs sit flush at the right edge of the column's footprint.
+                        const overlays = () => overlaysFor(cell)
+                        const nameWidth = () => Math.max(0, outerW() - overlays().length)
+                        return (
+                          <box
+                            width={outerW()}
+                            flexDirection="row"
+                            flexShrink={0}
+                            onMouseDown={() => (cell.kind === "directory" ? setScope(cell.path) : undefined)}
+                            onMouseOver={() => enterNode(cell)}
+                            onMouseOut={() => leaveNode()}
+                          >
+                            <Show
+                              when={cell.kind === "directory"}
+                              fallback={
+                                <NameRow
+                                  name={truncate(basename(cell.path), nameWidth())}
+                                  width={nameWidth()}
+                                  colors={() => fileRowColors(cell.id, nameWidth())}
+                                  textColor={() => fileFg(cell.id)}
+                                  theme={theme}
+                                />
+                              }
+                            >
                               <NameRow
-                                name={truncate(basename(cell.path), outerW())}
-                                width={outerW()}
-                                colors={() => fileRowColors(cell.id, outerW())}
-                                textColor={() => fileFg(cell.id)}
+                                name={truncate(basename(cell.path), nameWidth())}
+                                width={nameWidth()}
+                                colors={() => childDirColors(cell.id, nameWidth())}
+                                textColor={() => theme().background}
                                 theme={theme}
                               />
-                            }
-                          >
-                            <NameRow
-                              name={truncate(basename(cell.path), outerW())}
-                              width={outerW()}
-                              colors={() => childDirColors(cell.id, outerW())}
-                              textColor={() => theme().background}
-                              theme={theme}
-                            />
-                          </Show>
-                        </box>
-                      )}
+                            </Show>
+                            <OverlayRow overlays={overlays} theme={theme} />
+                          </box>
+                        )
+                      }}
                     </For>
+                    <Show when={belowHidden() > 0}>
+                      <box width={outerW()} height={1} flexShrink={0}>
+                        <text fg={theme().textMuted} wrapMode="none">
+                          {"↓ +" + belowHidden()}
+                        </text>
+                      </box>
+                    </Show>
                   </box>
                 </box>
               )

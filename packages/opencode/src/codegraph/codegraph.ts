@@ -313,7 +313,7 @@ export const layer = Layer.effect(
         if (fileNodes.length === 0) return
         // Key by collection too: a foreground pass for a freshly-switched collection
         // must not be deduped against an in-flight pass for the previous one.
-        const key = directory + " " + scope + " " + collection.id
+        const key = JSON.stringify([directory, scope, collection.id])
         if (inFlight.has(key)) return
         inFlight.add(key)
         yield* CodeGraphTagger.tagStale(
@@ -512,6 +512,19 @@ export const layer = Layer.effect(
       // directory) or it would never kick off.
       yield* startBackgroundTagger(ctx.directory, ctx.project.id)
       const norm = CodeGraphExtract.normalizeScope(scope ?? "")
+      // A deterministic built-in (mtime / git-changed) paints from live disk state that
+      // finalize reads via subtreeCache / gitStatusCache. Those caches otherwise only drop on
+      // a file event or turn completion, so a manual IDE edit while one is already on screen
+      // stays stale until the next turn. refresh is the path every TUI fetch takes — the
+      // turn-end refetch, the manual ⟳, and the periodic poll — so dropping the inputs here
+      // recomputes them fresh on each, picking up watcher-missed changes. The whole-repo walk
+      // + git status are cheap, and this only fires while a deterministic collection is the
+      // active view; semantic collections read the persisted tag store and keep their caches.
+      const active = yield* CodeGraphCollectionStore.getActive(storage, ctx.project.id)
+      if (isDeterministic(active)) {
+        subtreeCache.delete(ctx.directory)
+        gitStatusCache.delete(ctx.directory)
+      }
       const payload = yield* compute(ctx.directory, ctx.project.id, norm)
       container.scopes.set(norm, payload)
       container.dirty.delete(norm)
