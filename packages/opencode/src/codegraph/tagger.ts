@@ -33,9 +33,22 @@ import { CodeGraphExtract } from "./extract"
 const log = Log.create({ service: "codegraph.tagger" })
 
 // Caps so a large window can never blow up a prompt or a single request: read at
-// most this many stale files per pass, in chunks of this size per model call.
-const MAX_PER_PASS = 60
+// most this many stale files per pass, binned into dir-coherent groups of at most
+// TAG_BATCH files and classified with up to TAG_FANOUT model calls in flight.
+const MAX_PER_PASS = 960
+// Max files per directory bin: a directory with more is split into same-dir chunks
+// of this size (see splitDirs). Each chunk is one model call.
 const TAG_BATCH = 30
+// Default number of dir-bins classified concurrently within a single pass. The perf
+// sweep (perf/tagger-eval.ts) proved dirsplit fastest with no throttling, and on a
+// ~2400-file repo at minimal context a sweep uses only ~26% req / ~20% output-token
+// rate limit at peak — total work is fixed and fits in one 60s window, so that peak
+// doesn't rise with worker count. 64 is the knee: it saturates small/foreground passes
+// (bottlenecked by bin count + the per-call latency floor, not workers) and nearly
+// matches wider settings on the big sweep without the burst-529 tail that can make
+// e.g. 96-wide occasionally *slower*. Overridable per-tier via config
+// (codegraph.tagger.concurrency, clamped 1-128 to leave headroom for experimentation).
+const TAG_FANOUT = 64
 // Rate-limit (429/overloaded) retries before a batch soft-fails to "tag nothing".
 // Spacing the background sweep avoids most bounceback; this catches the rest.
 const BG_MAX_RETRIES = 4
@@ -132,15 +145,30 @@ export const tagStale = Effect.fn("CodeGraph.tagStale")(function* (
   const hashByPath = new Map(stale.map((r) => [r.node.path, r.hash]))
   const idByPath = new Map(stale.map((r) => [r.node.path, r.node.id]))
 
+  // Dir-coherent binning (perf/tagger-eval.ts "dirsplit"): one bin per directory,
+  // big dirs split into same-dir chunks of TAG_BATCH — maximally coherent prompts.
+  // Bins are classified up to `fanout`-wide; a single failed bin soft-fails to "tag
+  // nothing" (catch inside the worker) without interrupting its siblings.
+  const bins = splitDirs(stale, TAG_BATCH)
+  const fanout = yield* taggerConcurrency(deps.config)
+  const classifyBin = (bin: typeof stale) =>
+    Effect.gen(function* () {
+      const blocks = bin.map((r) => describe(r.node.path, r.content, context)).join("\n\n")
+      const assignments = yield* classifyWithRetry(language, blocks, tagSchema, system, collection).pipe(
+        Effect.catchCause((cause) => {
+          log.error("classify failed", { projectID, scope, cause })
+          return Effect.succeed<ReadonlyArray<{ path: string; tag: string }>>([])
+        }),
+      )
+      return { blocks, assignments }
+    })
+  const results = yield* Effect.forEach(bins, classifyBin, { concurrency: fanout })
+
+  // Sequential post-pass: the perf log's byte counter (writePerfLine) and the tagged
+  // store are written here, not inside the concurrent workers, so the 16-wide fan-out
+  // never races the counter or interleaves appends.
   const tagged: CodeGraphSemanticStore.Store = {}
-  for (const chunk of chunkArray(stale, TAG_BATCH)) {
-    const blocks = chunk.map((r) => describe(r.node.path, r.content, context)).join("\n\n")
-    const assignments = yield* classifyWithRetry(language, blocks, tagSchema, system, collection).pipe(
-      Effect.catchCause((cause) => {
-        log.error("classify failed", { projectID, scope, cause })
-        return Effect.succeed<ReadonlyArray<{ path: string; tag: string }>>([])
-      }),
-    )
+  for (const { blocks, assignments } of results) {
     yield* appendPerfLog(directory, origin, collection.id, blocks, assignments)
     for (const a of assignments) {
       const id = idByPath.get(a.path)
@@ -168,9 +196,10 @@ export const tagStale = Effect.fn("CodeGraph.tagStale")(function* (
 // one JSON line per batch with the tagger identity (fg/bg), a timestamp, the exact
 // prompt input, and the structured output. Written under <repo>/perf so the two
 // taggers' API traffic can be inspected after the fact. Fresh per run and capped in
-// size (see writePerfLine), so it can't grow without bound. Serialized by the shared
-// tag gate (concurrency 1), so appends never interleave. Failure is swallowed —
-// logging must never break or slow tagging.
+// size (see writePerfLine), so it can't grow without bound. Written from the
+// sequential post-pass in tagStale (not the concurrent classify fan-out), so appends
+// never interleave and the byte counter never races. Failure is swallowed — logging
+// must never break or slow tagging.
 function appendPerfLog(
   directory: string,
   origin: Origin,
@@ -301,6 +330,19 @@ function contextMode(config: Config.Interface) {
   )
 }
 
+// How many dir-bins to classify concurrently within a pass. Honors the config
+// override (clamped to a sane range) and falls back to TAG_FANOUT on read failure.
+function taggerConcurrency(config: Config.Interface) {
+  return config.get().pipe(
+    Effect.map((cfg) => clamp(cfg.codegraph?.tagger?.concurrency ?? TAG_FANOUT, 1, 128)),
+    Effect.catchCause(() => Effect.succeed(TAG_FANOUT)),
+  )
+}
+
+function clamp(n: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, Math.trunc(n)))
+}
+
 // Compact textual context for one file. `minimal` = path + imports + leading
 // comment; `medium` additionally includes exported names and the file head.
 function describe(rel: string, content: string, mode: "minimal" | "medium"): string {
@@ -364,10 +406,32 @@ function hashContent(content: string): string {
   return createHash("sha256").update(content).digest("hex").slice(0, 16)
 }
 
-function chunkArray<T>(items: ReadonlyArray<T>, size: number): T[][] {
-  const out: T[][] = []
-  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size))
-  return out
+// Immediate parent directory of a repo-relative POSIX path; "" for a root-level file.
+function posixDir(p: string): string {
+  const i = p.lastIndexOf("/")
+  return i === -1 ? "" : p.slice(0, i)
+}
+
+// "dirsplit" binning (perf/tagger-eval.ts winner): one bin per immediate directory,
+// never merging across directories; a directory with more than `maxFiles` files is
+// split into ceil(n/maxFiles) same-directory chunks. Every bin is thus files from a
+// single directory — coherent prompts — and the union of bins is exactly the input.
+export function splitDirs<T extends { readonly node: FileNode }>(records: ReadonlyArray<T>, maxFiles: number): T[][] {
+  const byDir = new Map<string, T[]>()
+  for (const r of records) {
+    const d = posixDir(r.node.path)
+    const bucket = byDir.get(d) ?? []
+    bucket.push(r)
+    byDir.set(d, bucket)
+  }
+  const bins: T[][] = []
+  for (const dirFiles of byDir.values()) {
+    const sorted = [...dirFiles].sort((a, b) =>
+      a.node.path < b.node.path ? -1 : a.node.path > b.node.path ? 1 : 0,
+    )
+    for (let i = 0; i < sorted.length; i += maxFiles) bins.push(sorted.slice(i, i + maxFiles))
+  }
+  return bins
 }
 
 export * as CodeGraphTagger from "./tagger"

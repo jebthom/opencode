@@ -48,18 +48,22 @@ import { type TagCollection, type PaletteId, legend as collectionLegend, NONE_TA
 const log = Log.create({ service: "codegraph" })
 
 // Shared concurrency gate across the foreground (per-scope window) and background
-// (whole-repo) taggers: at most this many model calls in flight at once, so the two
-// never collide on the API. The background loop holds a permit only for one batch
-// and releases it during its inter-batch pause, so a foreground tag always wins a
-// permit promptly — that's how the visible view stays prioritized.
+// (whole-repo) taggers: at most this many tagger *passes* in flight at once, so the
+// two never collide on the API. Each pass internally fans its dir-bins out up to
+// TAG_FANOUT-wide (see tagger.ts); the gate serializes whole passes, not individual
+// model calls. The background loop holds a permit only for one batch and releases it
+// during its inter-batch pause, so a foreground tag always wins a permit promptly —
+// that's how the visible view stays prioritized.
 const TAG_CONCURRENCY = 1
-// Files handed to one background tagStale call; = MAX_PER_PASS in the tagger so each
-// call fully consumes the slice rather than leaving a remainder for the next pass.
-const BG_BATCH = 60
+// Files handed to one background tagStale call; must equal MAX_PER_PASS in the tagger
+// so each call fully consumes the slice (a smaller MAX_PER_PASS would silently drop the
+// slice's tail). Sized so the pass has ~2x as many dir-bins as workers — enough
+// oversubscription to keep the TAG_FANOUT-wide pool busy through uneven bin latencies.
+const BG_BATCH = 960
 // Pause between background batches, held *outside* the permit so a foreground tag
-// arriving mid-pause acquires immediately. Spaces requests to avoid rate-limit
-// bounceback when painting a large repo.
-const BG_BATCH_DELAY = "1000 millis"
+// arriving mid-pause acquires immediately. Short because each batch already self-spaces
+// via its concurrent calls; just enough to yield the gate between waves.
+const BG_BATCH_DELAY = "250 millis"
 
 // Storage key: ["codegraph", <projectID>, "structure", <scopeKey>]. Per project
 // and per scope so each navigated directory keeps its own durable subgraph.

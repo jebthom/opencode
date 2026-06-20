@@ -189,6 +189,10 @@ export const Info = Schema.Struct({
             description:
               "How much per-file context the code-graph semantic tagger sends to the model. 'minimal' (default) uses path + imports + leading comment; 'medium' adds exported names and the file head.",
           }),
+          concurrency: Schema.optional(Schema.Int).annotate({
+            description:
+              "Max concurrent model calls the code-graph tagger runs per pass (dir-coherent bins, default 64, clamped 1-128). Lower it on small API tiers to avoid rate-limit bounceback.",
+          }),
         }),
       ),
     }),
