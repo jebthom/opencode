@@ -17,6 +17,14 @@ DFS sweep) that paints files by architectural layer, and the edge layer
 (step 6): containment connectors, hover dependency-highlights, and clickable
 out-of-window boundary tiles painted by their target's layer.
 
+Since then the tag-collection system grew three ways (all detailed under "Tag
+collections" below): **deterministic built-in collections** (git-changed +
+edit-recency, computed from the repo with no model call), a **two-way agent
+channel** (the build/plan agents are made aware of tagging and can create a
+collection via the `tag` subagent to paint a feature/answer for the user), and an
+alternative **column layout** for the renderer (now the default; set
+`OPENCODE_CODEGRAPH_LAYOUT=grid` to revert).
+
     [done] 1. Payload schema + structure extractor + Storage caching + `dump.ts`.
     [done] 2. `codegraph_top` core slot + renderer plugin (horizontal layout).
     [done] 2.5 Scoped 2-level window + drill-down navigation (mouse).
@@ -31,6 +39,9 @@ out-of-window boundary tiles painted by their target's layer.
     [done] C. Tag collections: the fixed architectural-layer vocabulary became one
               built-in of a user-defined collection system — define/switch vocabularies
               via the `/tag` agent, and click ◀/▶ in the top bar to cycle the active one.
+              Now also: two deterministic built-ins (git-changed, edit-recency) painted
+              without the tagger, and a two-way channel letting build/plan introduce a
+              collection on their own initiative via the `tag` subagent.
 
 The next features (6–8) are scoped in "## Next features (planned)" below.
 
@@ -89,6 +100,20 @@ The next features (6–8) are scoped in "## Next features (planned)" below.
   inside a `scrollbox`; a directory's child grid can be expanded past
   `MAX_CHILDREN` in place (the `…` overflow tile). Horizontal panning doesn't touch
   `scope`, so an expanded directory stays expanded while you pan.
+- **Two render layouts behind one constant (`CODEGRAPH_LAYOUT`).** The original
+  wide treemap-block-over-child-*grid* idiom above is now the `"grid"` layout; a
+  newer `"column"` layout (the default; set `OPENCODE_CODEGRAPH_LAYOUT=grid` to
+  revert) draws each layer-0 directory as a narrow size-scaled treemap block over a
+  single borderless **column** of its children — one 1-row composition bar per child
+  (`NameRow`), no child grid, no containment drops. A child list taller than
+  `COLUMN_CHILD_WINDOW` scrolls *in place* (a wheel over it pages the visible slice;
+  `↑ +N` / `↓ +N` markers stand in for the children scrolled off each end) instead of
+  panning the bar sideways. Block *width* encodes directory size (sqrt-scaled between
+  `COLUMN_COLS_MIN..MAX`, or max width when the layer is sparse); `TOP_BAR_HEIGHT` is
+  now **20**, and column mode reclaims the reserved horizontal-scrollbar row whenever
+  the strip fits the viewport (`scrollbarVisible` → `barHeight`). Action glyphs ride
+  the end of each child row here too (the `OverlayRow` after the name bar), matching
+  the grid layout's `ChildDirTile`/`FileTile`.
 - **Action glyphs propagate up the tree with a solid/outline fill axis (today).**
   The overlay glyph for a file action is drawn *solid* on the file actually touched
   and *outline* on every ancestor directory that contains it, so a parent/grandparent
@@ -155,6 +180,68 @@ and the TUI bundle. Holds the `TagCollection`/`TagDef` types and pure helpers:
     prompt, 1–6 tags), make it active, kick off tagging. Additive only.
   - `tag_collection_select` — switch the active collection by id or name.
 
+### Two-way agent channel (build/plan ↔ user via tagging)
+The collection view is treated as a **two-way visual channel**: the user sees the
+active collection paint the repo, so the primary agents can use a collection to *show*
+the user something (a feature spreading across files, the answer to a "which files
+touch X" question).
+- **System-prompt awareness.** `SystemPrompt.tagging(agent)` (`session/system.ts`,
+  assembled into the system block in `session/prompt.ts`) injects a
+  `<code-graph-tagging>` block **only for the `build` and `plan` agents** (gated by exact
+  name, so hidden primaries — compaction/title/summary — and the `tag` agent itself never
+  get it). It states the active collection + its tags (and the names of the others), and
+  the rules: fulfil an **explicit** user tag request directly (`tag_collection_create`
+  activates + switches, or `tag_collection_select`); **opportunistically** introduce a
+  collection only sparingly (re-tagging costs tokens — at most one per feature/question,
+  prefer an existing one, never switch the active collection without asking).
+- **Subagent invocation.** For the opportunistic path the primary delegates to the `tag`
+  agent via the **task tool** (`subagent_type: "tag"`) with a non-interactive prompt:
+  `agent/prompt/tag.txt` gained a "Non-interactive (subagent) invocation" section telling
+  it to design *and* create the collection directly (no propose-and-wait) with
+  `activate: false`, then report the name + tags. The primary then tells the user it
+  exists and asks whether to switch.
+- **`activate` flag.** `tag_collection_create` gained an optional `activate` (default
+  true). `false` persists the collection without changing the active pointer/view — it
+  stays untagged until selected — so an opportunistic create never disturbs what the user
+  is currently looking at. Threaded through to `collection-store.create`.
+
+### Deterministic built-in collections (no model, computed from the repo)
+Two built-ins are painted **deterministically** from the repo instead of by the LLM
+tagger, so they cost no tokens and are always fresh:
+- **`GIT_CHANGED` ("Changed since last commit")** — two tags from `git status`:
+  `changed` (any working-tree change git reports — modified, staged, *or* untracked/new)
+  vs `unchanged` (a muted theme grey so changes pop). Has an environmental prerequisite:
+  it needs a git work tree.
+- **`MTIME_RECENCY` ("Edit recency")** — six ordinal buckets (`RECENCY_TAG_IDS`,
+  cool→warm so newest = red) by local filesystem mtime, split into **equal time spans**
+  (not quantiles) across the repo's oldest→newest range via `bucketIndex`. A repo where
+  every file shares a checkout mtime collapses to bucket 0 (one colour); only real edits
+  climb into the warm end.
+
+How they're wired:
+- **Data model (`collections.ts`).** A `TagCollection` may carry an optional
+  `deterministic: DeterministicKind` (`"git-changed" | "mtime-buckets"`); `isDeterministic`
+  tests it. Both live in `BUILTIN_COLLECTIONS` (so they inherit built-in immutability from
+  their `global` scope). They still declare normal `tags` (ids/labels/colours), so the
+  legend + composition painting are unchanged — only the *source* of each file's tag
+  differs.
+- **Compute (`deterministic.ts`).** `computeStore(kind, subtree, git)` synthesizes the
+  same `{ nodeId → { tag, hash } }` shape the tagger persists, directly from a
+  `SubtreeFile[]` (id/path/size/**mtime**, now carried by `extract.ts listSubtree`) and a
+  pre-resolved `GitChanged` set. `hash` is left empty — these are recomputed from scratch
+  every read, never persisted.
+- **`finalize` branch (`codegraph.ts`).** When the active collection is deterministic,
+  `finalize` builds the store via `computeStore` (git status resolved by `gitChangedFor`,
+  using the new `Git.isRepo`/`Git.prefix`) instead of reading the semantic store, and
+  **skips `scheduleTag`**; the background sweep also no-ops for these. The whole-repo
+  membership (`subtreeFor`/`subtreeCache`) and git status (`gitChangedFor`/
+  `gitStatusCache`) are cached and dropped on the same file-event / turn-completion hooks
+  as the structure cache, plus on the `refresh` path while a deterministic collection is
+  active, so a manual IDE edit is picked up.
+- **Availability gating.** `isAvailable` hides `git-changed` in a non-git folder
+  (`isRepoFor` → `Git.isRepo`), so `collections()`/cycle/select never land the user on a
+  collection that can't paint anything.
+
 ### Server wiring — `codegraph.ts`
 The service gained `collections()`, `activeCollection()`, `createCollection(input)`,
 `selectCollection(idOrName)`, and `cycleCollection(direction)`. All switch paths
@@ -193,15 +280,24 @@ the `/tag` switch already uses. **The SDK is generated** (`packages/sdk/js` →
 required regenerating `sdk.gen.ts`/`types.gen.ts`.
 
 ### Key files (tag collections)
-- `codegraph/collections.ts` — pure data model, palettes, `NONE_TAG`, prompt builder.
+- `codegraph/collections.ts` — pure data model, palettes, `NONE_TAG`, prompt builder,
+  the two deterministic built-ins (`GIT_CHANGED`/`MTIME_RECENCY`) + `bucketIndex`/
+  `isDeterministic`.
+- `codegraph/deterministic.ts` — pure `computeStore` for the git/mtime built-ins.
 - `codegraph/collection-store.ts` — durable per-project store + active pointer.
 - `codegraph/semantic-store.ts` — now namespaced per collection id (legacy read-through).
-- `tool/tag-collection-{list,create,select}.ts` — the `/tag` tools.
-- `agent/prompt/tag.txt`, `command/template/tag.txt` — the `tag` agent + `/tag` command.
+- `tool/tag-collection-{list,create,select}.ts` — the `/tag` tools (`create` has the
+  `activate` flag).
+- `agent/prompt/tag.txt`, `command/template/tag.txt` — the `tag` agent (incl. the
+  non-interactive subagent section) + `/tag` command.
+- `session/system.ts` (`SystemPrompt.tagging`) + `session/prompt.ts` — the build/plan
+  two-way tagging awareness block.
+- `git/index.ts` — `Git.isRepo` (availability gate) + `Git.prefix` (path bridging).
 - `server/routes/instance/httpapi/{groups,handlers}/codegraph.ts` — `cycleCollection`.
-- `cli/.../system/codegraph.tsx` — the ◀/▶ cycle arrows.
+- `cli/.../system/codegraph.tsx` — the ◀/▶ cycle arrows; grid + column layouts.
 - `test/codegraph/collections.test.ts` — pure-module coverage (palettes, legend, enum,
-  none-escape, slugify) + payload-v5 decode.
+  none-escape, slugify) + payload-v5 decode; `test/codegraph/deterministic.test.ts` —
+  git-changed / mtime-bucket compute.
 
 ## Architecture: four separated concerns
 
@@ -319,9 +415,10 @@ that feed it live in `codegraph.ts`.
 
 ### 4. TUI renderer — plugin + a core slot (fork)
 `feature-plugins/system/codegraph.tsx`, slot wired in `routes/session/index.tsx`
-- `codegraph_top` slot lives above chat content. `TOP_BAR_HEIGHT = 14`, fixed.
-  Toggle via the `session.codegraph.toggle` command (kv signal `"codegraph"`).
-  Hidden for subagent sessions (`parentID`) and terminals shorter than 20 rows.
+- `codegraph_top` slot lives above chat content. `TOP_BAR_HEIGHT = 20` (column mode
+  adds one row only while the horizontal scrollbar shows — see the `CODEGRAPH_LAYOUT`
+  bullet under "What diverged"). Toggle via the `session.codegraph.toggle` command (kv
+  signal `"codegraph"`). Hidden for subagent sessions (`parentID`) and short terminals.
 - Draws layer-0 children as bordered boxes with their layer-1 children beneath
   (grouped by path prefix, capped at `MAX_CHILDREN` 4 with a `…` overflow tile).
   **Kind is encoded by corner shape** (directories square, files rounded) so
@@ -676,9 +773,11 @@ routes/session/index.tsx:2011.
 
 Code-graph files (this feature):
 - Server: packages/opencode/src/codegraph/ — payload.ts (contract),
-  extract.ts (deterministic walk), codegraph.ts (service: cache + window math +
-  events), tagger.ts (semantic paint), semantic-store.ts, semantics.ts
-  (layer/hue vocabulary), event.ts (codegraph.invalidated), dump.ts (CLI verify).
+  extract.ts (deterministic walk, carries file mtime), codegraph.ts (service: cache +
+  window math + events), tagger.ts (semantic paint), semantic-store.ts, semantics.ts
+  (layer/hue vocabulary), collections.ts + collection-store.ts (tag-collection model +
+  store), deterministic.ts (git/mtime built-in compute), event.ts
+  (codegraph.invalidated), dump.ts (CLI verify).
 - HTTP: server/routes/instance/httpapi/groups/codegraph.ts (+ handlers/,
   registered in server.ts and api.ts).
 - TUI: feature-plugins/system/codegraph.tsx; registered in
