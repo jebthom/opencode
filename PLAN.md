@@ -1,4 +1,4 @@
-# Refract
+# Aperture
 
 A persistent, fast, high-altitude **View** of the repository that an agent
 paints with user-defined **Lenses** (each a set of **Facets**) during planning,
@@ -9,19 +9,19 @@ over time. The first idiom is a wide top-bar above the chat showing a 2-level
 window of the View that the user can drill into.
 
 A recent large speedup of Facet painting changed how people will engage with
-Refract: Lenses are now cheap enough to **define-and-explore live** rather than
+Aperture: Lenses are now cheap enough to **define-and-explore live** rather than
 wait on a slow background paint. This shifts the final sprint to two archetypal
 workflows — **Sensemaking** (understand an existing repo) and **Building**
 (create a new feature) — and the work below is organized around them.
 
 ## Vocabulary
 
-The project was previously "codegraph". It is now **Refract**, with renamed
+The project was previously "codegraph". It is now **Aperture**, with renamed
 domain terms throughout:
 
 | Old | New |
 | --- | --- |
-| codegraph (feature, dir `codegraph/`, `CodeGraph.Service`, slot `codegraph_top`, env `OPENCODE_CODEGRAPH_LAYOUT`, route `/codegraph*`, event `codegraph.invalidated`, config `codegraph.*`) | **Refract** / **View** |
+| codegraph (feature, dir `codegraph/`, `CodeGraph.Service`, slot `codegraph_top`, env `OPENCODE_CODEGRAPH_LAYOUT`, route `/codegraph*`, event `codegraph.invalidated`, config `codegraph.*`) | **Aperture** / **View** |
 | tag collection / `TagCollection` / "collection" | **Lens** |
 | tag (a semantic category) / `TagDef` | **Facet** |
 | the graph / top-bar visualization | **View** |
@@ -48,7 +48,7 @@ Rename decisions (recorded here, executed as Task 0):
 The sprint leads with the rename, then is framed by the two workflows. Each
 workflow lists a short example dialogue, then the concrete tasks it requires.
 
-### Task 0 — Rename refactor (Refract / View / Lens / Facet, clean break)
+### Task 0 — Rename refactor (Aperture / View / Lens / Facet, clean break)
 
 Mechanical except for the project-scope Lens storage move. Touch points
 (inventoried):
@@ -215,7 +215,7 @@ call/type edges, path-alias resolution), and background-sweep re-walk cost
 
 ## ⚠️ Catastrophic failure mode (learned the hard way)
 
-Symptom: Refract runs fine for a while, then RAM climbs without bound
+Symptom: Aperture runs fine for a while, then RAM climbs without bound
 (~30MB/s, seen via VmmemWSL) while completely idle — no prompting, no
 navigation. The top bar never paints. CPU is busy.
 
@@ -267,7 +267,7 @@ Mouse is first-class: `<box>`/`<text>` accept onMouseDown/Up/Over/Out/Move +
 onClick. The View bar uses onMouseDown for drill-in/navigation; more examples at
 `sidebar/files.tsx`, `routes/session/index.tsx`.
 
-Refract files (current names; renamed under Task 0):
+Aperture files (current names; renamed under Task 0):
 - Server: `packages/opencode/src/codegraph/` — `payload.ts` (contract),
   `extract.ts` (deterministic walk, carries file mtime), `codegraph.ts` (service:
   cache + window math + events + painter drivers), `tagger.ts` (Facet paint),
@@ -316,7 +316,7 @@ Persistence:
 Provider / model (painter):
 - `provider.defaultModel` → `getSmallModel(providerID)` → `getLanguage(small)`.
   Returns undefined when no small model is available; the painter then skips the
-  pass. Provider/Config are provided to the Refract layer (forked painter keeps
+  pass. Provider/Config are provided to the Aperture layer (forked painter keeps
   R = never, mirroring `Agent.defaultLayer`).
 
 Config:
