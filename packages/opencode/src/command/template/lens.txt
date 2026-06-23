@@ -1,0 +1,7 @@
+Design or switch the Aperture Lens based on this request:
+
+$ARGUMENTS
+
+If the request names or describes an existing Lens, switch to it. Otherwise
+explore as needed, then propose a Lens (name, 1–6 facets with definitions, a
+palette, and the painter prompt) and wait for my approval before creating it.

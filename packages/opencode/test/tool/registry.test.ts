@@ -6,7 +6,7 @@ import { Effect, Layer, Result, Schema } from "effect"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Database } from "@opencode-ai/core/database/database"
 import { ToolRegistry } from "@/tool/registry"
-import { CodeGraph } from "@/codegraph/codegraph"
+import { Aperture } from "@/aperture/aperture"
 import { Tool } from "@/tool/tool"
 import { disposeAllInstances, TestInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
@@ -68,7 +68,7 @@ const registryLayer = (opts: RegistryLayerOptions = {}) =>
       Layer.provide(EventV2Bridge.defaultLayer),
       Layer.provide(FetchHttpClient.layer),
       Layer.provide(Format.defaultLayer),
-      Layer.provide(Layer.mergeAll(node, Database.defaultLayer, CodeGraph.defaultLayer)),
+      Layer.provide(Layer.mergeAll(node, Database.defaultLayer, Aperture.defaultLayer)),
       Layer.provide(Ripgrep.defaultLayer),
       Layer.provide(Truncate.defaultLayer),
     )

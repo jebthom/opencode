@@ -472,7 +472,7 @@ export type TuiHostSlotMap = {
   }
   home_bottom: {}
   home_footer: {}
-  codegraph_top: {
+  aperture_top: {
     session_id: string
   }
   sidebar_title: {

@@ -3,8 +3,8 @@ import { Effect, Layer } from "effect"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import path from "path"
-import { CodeGraphExtract } from "@/codegraph/extract"
-import { CodeGraphPayload } from "@/codegraph/payload"
+import { ApertureExtract } from "@/aperture/extract"
+import { AperturePayload } from "@/aperture/payload"
 import { testEffect } from "../lib/effect"
 import { tmpdirScoped } from "../fixture/fixture"
 
@@ -33,10 +33,10 @@ const SAMPLE = {
   "src/sub/too-deep.ts": `export const tooDeep = 1\n`,
 }
 
-const nodeByPath = (payload: CodeGraphPayload.Payload, p: string) => payload.nodes.find((n) => n.path === p)
-const boundaryByPath = (payload: CodeGraphPayload.Payload, p: string) =>
+const nodeByPath = (payload: AperturePayload.Payload, p: string) => payload.nodes.find((n) => n.path === p)
+const boundaryByPath = (payload: AperturePayload.Payload, p: string) =>
   (payload.boundaries ?? []).find((b) => b.path === p)
-const edgeBetween = (payload: CodeGraphPayload.Payload, from: string, to: string) => {
+const edgeBetween = (payload: AperturePayload.Payload, from: string, to: string) => {
   const f = nodeByPath(payload, from)
   const t = nodeByPath(payload, to)
   return payload.edges.find((e) => e.from === f?.id && e.to === t?.id)
@@ -52,14 +52,14 @@ const CROSS_DIR = {
   "lib/deep/more.ts": `export const m = 1\n`,
 }
 
-describe("CodeGraph.extract", () => {
+describe("Aperture.extract", () => {
   it.live("produces nodes for the scope's children and grandchildren", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped()
       yield* writeFiles(dir, SAMPLE)
-      const payload = yield* CodeGraphExtract.extract(dir)
+      const payload = yield* ApertureExtract.extract(dir)
 
-      expect(payload.version).toBe(CodeGraphPayload.PAYLOAD_VERSION)
+      expect(payload.version).toBe(AperturePayload.PAYLOAD_VERSION)
       const paths = payload.nodes.map((n) => n.path).toSorted()
       // Layer 0 (top-level files + dirs) and layer 1 (their children). The
       // collapsed grandchild dir src/sub appears, but nothing at layer 2.
@@ -85,7 +85,7 @@ describe("CodeGraph.extract", () => {
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped()
       yield* writeFiles(dir, SAMPLE)
-      const payload = yield* CodeGraphExtract.extract(dir)
+      const payload = yield* ApertureExtract.extract(dir)
 
       // src/sub is shown as a collapsed node; its contents are not walked.
       expect(nodeByPath(payload, "src/sub/too-deep.ts")).toBeUndefined()
@@ -96,7 +96,7 @@ describe("CodeGraph.extract", () => {
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped()
       yield* writeFiles(dir, SAMPLE)
-      const payload = yield* CodeGraphExtract.extract(dir)
+      const payload = yield* ApertureExtract.extract(dir)
 
       expect(edgeBetween(payload, "index.ts", "a.ts")).toBeDefined()
       // "lodash" is external — no node, no edge.
@@ -108,7 +108,7 @@ describe("CodeGraph.extract", () => {
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped()
       yield* writeFiles(dir, SAMPLE)
-      const payload = yield* CodeGraphExtract.extract(dir)
+      const payload = yield* ApertureExtract.extract(dir)
 
       expect(edgeBetween(payload, "main.py", "util.py")).toBeDefined()
     }),
@@ -118,7 +118,7 @@ describe("CodeGraph.extract", () => {
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped()
       yield* writeFiles(dir, SAMPLE)
-      const payload = yield* CodeGraphExtract.extract(dir)
+      const payload = yield* ApertureExtract.extract(dir)
 
       expect(nodeByPath(payload, "index.ts")!.position.layer).toBe(0)
       expect(nodeByPath(payload, "src")!.position.layer).toBe(0)
@@ -131,7 +131,7 @@ describe("CodeGraph.extract", () => {
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped()
       yield* writeFiles(dir, SAMPLE)
-      const payload = yield* CodeGraphExtract.extract(dir, { scope: "src" })
+      const payload = yield* ApertureExtract.extract(dir, { scope: "src" })
 
       const paths = payload.nodes.map((n) => n.path).toSorted()
       // The window now slides to src: its direct children src/deep.ts and src/sub
@@ -143,7 +143,7 @@ describe("CodeGraph.extract", () => {
       expect(nodeByPath(payload, "src/sub/too-deep.ts")!.position.layer).toBe(1)
 
       // A file's id is stable whether seen from the root or from a sub-scope.
-      const root = yield* CodeGraphExtract.extract(dir)
+      const root = yield* ApertureExtract.extract(dir)
       expect(nodeByPath(payload, "src/deep.ts")!.id).toBe(nodeByPath(root, "src/deep.ts")!.id)
     }),
   )
@@ -152,7 +152,7 @@ describe("CodeGraph.extract", () => {
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped()
       yield* writeFiles(dir, SAMPLE)
-      const payload = yield* CodeGraphExtract.extract(dir, { scope: "does/not/exist" })
+      const payload = yield* ApertureExtract.extract(dir, { scope: "does/not/exist" })
 
       expect(payload.nodes).toEqual([])
       expect(payload.edges).toEqual([])
@@ -164,8 +164,8 @@ describe("CodeGraph.extract", () => {
       const dir = yield* tmpdirScoped()
       yield* writeFiles(dir, SAMPLE)
 
-      const first = yield* CodeGraphExtract.extract(dir)
-      const second = yield* CodeGraphExtract.extract(dir)
+      const first = yield* ApertureExtract.extract(dir)
+      const second = yield* ApertureExtract.extract(dir)
       expect(JSON.stringify(second)).toBe(JSON.stringify(first))
     }),
   )
@@ -174,7 +174,7 @@ describe("CodeGraph.extract", () => {
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped()
       yield* writeFiles(dir, CROSS_DIR)
-      const payload = yield* CodeGraphExtract.extract(dir, { scope: "src" })
+      const payload = yield* ApertureExtract.extract(dir, { scope: "src" })
 
       // The window holds only src's files; lib/* is outside it.
       expect(payload.nodes.map((n) => n.path).toSorted()).toEqual(["src/app.ts", "src/util.ts"])
@@ -203,7 +203,7 @@ describe("CodeGraph.extract", () => {
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped()
       yield* writeFiles(dir, SAMPLE)
-      const payload = yield* CodeGraphExtract.extract(dir)
+      const payload = yield* ApertureExtract.extract(dir)
 
       // SAMPLE's imports (./a, .util) all resolve inside the root window.
       expect(payload.boundaries).toEqual([])
@@ -217,19 +217,19 @@ describe("CodeGraph.extract", () => {
         ...SAMPLE,
         "node_modules/dep/index.js": `module.exports = {}\n`,
       })
-      const payload = yield* CodeGraphExtract.extract(dir)
+      const payload = yield* ApertureExtract.extract(dir)
 
       expect(payload.nodes.some((n) => n.path.includes("node_modules"))).toBe(false)
     }),
   )
 })
 
-describe("CodeGraph.listFiles", () => {
+describe("Aperture.listFiles", () => {
   it.live("enumerates every source file in the repo, past the 2-level window", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped()
       yield* writeFiles(dir, SAMPLE)
-      const files = yield* CodeGraphExtract.listFiles(dir)
+      const files = yield* ApertureExtract.listFiles(dir)
       const paths = files.map((f) => f.path)
 
       // Unlike extract's window, the deep layer-2 file is included.
@@ -249,7 +249,7 @@ describe("CodeGraph.listFiles", () => {
         "node_modules/dep/index.js": `module.exports = {}\n`,
         "dist/bundle.js": `export const x = 1\n`,
       })
-      const files = yield* CodeGraphExtract.listFiles(dir)
+      const files = yield* ApertureExtract.listFiles(dir)
 
       expect(files.some((f) => f.path.includes("node_modules"))).toBe(false)
       expect(files.some((f) => f.path.startsWith("dist/"))).toBe(false)
@@ -260,8 +260,8 @@ describe("CodeGraph.listFiles", () => {
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped()
       yield* writeFiles(dir, SAMPLE)
-      const listed = yield* CodeGraphExtract.listFiles(dir)
-      const payload = yield* CodeGraphExtract.extract(dir)
+      const listed = yield* ApertureExtract.listFiles(dir)
+      const payload = yield* ApertureExtract.extract(dir)
 
       // A file visible in both the root window and the full listing must carry an
       // identical id, so a sweep-time tag is reused when the file is later viewed.
@@ -272,31 +272,31 @@ describe("CodeGraph.listFiles", () => {
   )
 })
 
-describe("CodeGraph.dfsCompare", () => {
+describe("Aperture.dfsCompare", () => {
   it.live("orders paths in DFS pre-order: a directory's files before its subtrees", () =>
     Effect.sync(() => {
       // src/a.ts must come before everything under src/sub/, and src/* before pkg/*.
       const input = ["src/sub/deep.ts", "pkg/x.ts", "src/a.ts", "src/b.ts", "src/sub/also.ts"]
-      const sorted = [...input].sort(CodeGraphExtract.dfsCompare)
+      const sorted = [...input].sort(ApertureExtract.dfsCompare)
       expect(sorted).toEqual(["pkg/x.ts", "src/a.ts", "src/b.ts", "src/sub/also.ts", "src/sub/deep.ts"])
     }),
   )
 
   it.live("places a file in a directory before descending into a sibling subdir", () =>
     Effect.sync(() => {
-      const sorted = ["src/z/inner.ts", "src/a.ts"].sort(CodeGraphExtract.dfsCompare)
+      const sorted = ["src/z/inner.ts", "src/a.ts"].sort(ApertureExtract.dfsCompare)
       expect(sorted).toEqual(["src/a.ts", "src/z/inner.ts"])
     }),
   )
 })
 
-describe("CodeGraph.listFilesDfs", () => {
+describe("Aperture.listFilesDfs", () => {
   it.live("enumerates the whole repo in DFS order with the same ids as listFiles", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped()
       yield* writeFiles(dir, SAMPLE)
-      const dfs = yield* CodeGraphExtract.listFilesDfs(dir)
-      const flat = yield* CodeGraphExtract.listFiles(dir)
+      const dfs = yield* ApertureExtract.listFilesDfs(dir)
+      const flat = yield* ApertureExtract.listFiles(dir)
 
       // Same set of files + identical stable ids — only the order differs.
       expect(new Set(dfs.map((f) => f.path))).toEqual(new Set(flat.map((f) => f.path)))
@@ -311,19 +311,19 @@ describe("CodeGraph.listFilesDfs", () => {
   )
 })
 
-describe("CodeGraph.listSubtree", () => {
+describe("Aperture.listSubtree", () => {
   it.live("enumerates the full subtree with sizes and stable ids", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped()
       yield* writeFiles(dir, SAMPLE)
-      const files = yield* CodeGraphExtract.listSubtree(dir)
+      const files = yield* ApertureExtract.listSubtree(dir)
       const byPath = new Map(files.map((f) => [f.path, f]))
 
       // Full depth (past the 2-level window) with non-zero sizes for real files.
       expect(byPath.has("src/sub/too-deep.ts")).toBe(true)
       expect(byPath.get("index.ts")!.size).toBeGreaterThan(0)
       // Ids match what extract assigns, so composition can be keyed off the window.
-      const payload = yield* CodeGraphExtract.extract(dir)
+      const payload = yield* ApertureExtract.extract(dir)
       expect(byPath.get("index.ts")!.id).toBe(nodeByPath(payload, "index.ts")!.id)
     }),
   )
@@ -332,7 +332,7 @@ describe("CodeGraph.listSubtree", () => {
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped()
       yield* writeFiles(dir, SAMPLE)
-      const files = yield* CodeGraphExtract.listSubtree(dir, "src")
+      const files = yield* ApertureExtract.listSubtree(dir, "src")
       const paths = files.map((f) => f.path).toSorted()
 
       // Only src's subtree, repo-relative; nothing from siblings like pkg/ or root.
@@ -347,7 +347,7 @@ describe("CodeGraph.listSubtree", () => {
         ...SAMPLE,
         "node_modules/dep/index.js": `module.exports = {}\n`,
       })
-      const files = yield* CodeGraphExtract.listSubtree(dir)
+      const files = yield* ApertureExtract.listSubtree(dir)
 
       expect(files.some((f) => f.path.includes("node_modules"))).toBe(false)
     }),

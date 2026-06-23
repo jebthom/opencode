@@ -1,4 +1,4 @@
-// Shared glyph vocabulary for the code-graph node-overlay layer (PLAN.md
+// Shared glyph vocabulary for the Aperture node-overlay layer (PLAN.md
 // Foundation A). Deliberately dependency-free (no Effect/Schema) so it is safe to
 // import from both server-side producers and the TUI renderer without dragging
 // server code into the TUI bundle — same posture as semantics.ts.
@@ -63,10 +63,10 @@ export function isAction(value: unknown): value is Action {
 // --- provenance contract (PLAN.md Foundation B) ----------------------------
 // The seam for agent tracking (step 7) and planned reads (step 8). Kept here,
 // data-free, so it can be reused if/when provenance is persisted server-side; for
-// now the TUI holds it in memory (see codegraph-activity.ts).
+// now the TUI holds it in memory (see aperture-activity.ts).
 
 // One recorded action an agent took on a file. `path` is repo-relative and
-// matches CodeGraphPayload `node.path`. `sessionID` distinguishes concurrent
+// matches AperturePayload `node.path`. `sessionID` distinguishes concurrent
 // agents (a sub-agent carries its own id under a parent); `agent` is its name.
 export interface ActivityEntry {
   readonly path: string
@@ -101,4 +101,4 @@ export function actionFromTool(tool: string): Action | undefined {
   }
 }
 
-export * as CodeGraphActivity from "./activity"
+export * as ApertureActivity from "./activity"

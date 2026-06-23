@@ -85,7 +85,7 @@ Example dialogue:
 
 Tasks:
 - **A1 — Paint + explore in parallel.** When a sensemaking question warrants a
-  new Lens, the agent kicks off Facet painting (the tagger) **and** exploration
+  new Lens, the agent kicks off Facet painting (the painter) **and** exploration
   concurrently, so the Lens fills in while explore runs (today it paints, then
   explores serially).
 - **A2 — A new way of organizing Lenses.** *[OPEN DESIGN QUESTION — logged, to be
@@ -102,7 +102,7 @@ Tasks:
 - **A5 — On-demand function-level Facets (drill-in sub-file resolution).** The one
   non-trivial task. Design already sketched in
   `docs/codegraph-subfile-resolution.md` — drill-in-gated, line-delimited extents
-  (no parsing), top priority on the single-permit tagger
+  (no parsing), top priority on the single-permit painter
   (`drill-in > foreground view > background sweep`), painting-not-reading. Follow
   that doc rather than restating it here.
 
@@ -136,15 +136,15 @@ narrative is dropped — this is the catalog of what exists).
   nodes/edges/layout so identical disk state ⇒ byte-identical payload; whole-repo
   DFS enumerator (`listFilesDfs`) for the background painter; relative-import
   parsing (TS/JS + Python), intra-repo edges only.
-- **Facet tagger** (`tagger.ts` + drivers in `codegraph.ts`) — small/fast-model
+- **Facet painter** (`painter.ts` + drivers in `aperture.ts`) — small/fast-model
   painter assigning one Facet per file from the active Lens's vocabulary via
   structured output. Two drivers (**foreground** viewed-window + boundary,
   **background** whole-repo DFS sweep) share one `Semaphore(1)` so the API is
   never hit concurrently; frugality (stale-only by content hash, minimal
   context); soft-fail leaves existing Facets intact; 429/overload backoff;
-  deterministic per-batch perf trace (`perf/tagger.log`).
-- **Lens system** (`collections.ts`, `collection-store.ts`) — data model
-  (categorical palettes, `MAX_TAGS = 6`, the `none` escape Facet, system-prompt
+  deterministic per-batch perf trace (`perf/painter.log`).
+- **Lens system** (`lenses.ts`, `lens-store.ts`) — data model
+  (categorical palettes, `MAX_FACETS = 6`, the `none` escape Facet, system-prompt
   builder, closed enum); durable per-project store + active pointer;
   additive-only creates (fresh id per Lens, existing results never mutated/lost);
   `/lens` agent + command + tools (list / create / select / edit / merge / delete).
@@ -154,34 +154,34 @@ narrative is dropped — this is the catalog of what exists).
   call (zero tokens, always fresh); availability-gated (git Lens hidden outside a
   work tree).
 - **Two-way agent channel** (`session/system.ts`, `session/prompt.ts`) — a
-  tagging-awareness block injected for the `build`/`plan` agents only; lets a
+  Aperture-awareness block injected for the `build`/`plan` agents only; lets a
   primary agent *show* the user something by introducing/switching a Lens; the
   opportunistic path delegates to the lens subagent and uses an `activate` flag so
   it doesn't disturb the current view.
-- **Renderer — top-bar View** (`feature-plugins/system/codegraph.tsx`) — `grid`
+- **Renderer — top-bar View** (`feature-plugins/system/aperture.tsx`) — `grid`
   and `column` layouts (column default), treemap composition blocks encoding
   subtree make-up, scrollable bar, kind-by-corner-shape, hue paint with
   structural fallback, mouse navigation + breadcrumb, legend with ◀/▶ Lens
-  cycle. Lives above chat in the `codegraph_top` slot; hidden for subagent
+  cycle. Lives above chat in the `aperture_top` slot; hidden for subagent
   sessions / short terminals.
-- **Edges** (`extract.ts`, `payload.ts`, `codegraph.tsx`) — containment
+- **Edges** (`extract.ts`, `payload.ts`, `aperture.tsx`) — containment
   connectors (parent→child drops), in-window import **hover-highlight**
   (adjacency map, neighbors tinted by their own hue), and one-hop **boundary
   tiles** for off-window relative imports (bounded `fs.stat` resolution, click to
   re-root). Follow-ups parked.
-- **Activity / agent tracking (basic)** (`activity.ts`, `codegraph-activity.ts`)
+- **Activity / agent tracking (basic)** (`activity.ts`, `aperture-activity.ts`)
   — per-turn action glyphs (read=circle, create=square, edit=diamond),
   agent-colored, solid on the touched file and outline propagated up its
   directories; hover shows agent/action/relative-time; resets per prompt.
   Graceful no-op when the experimental event system is off. Polish parked.
-- **Live update model** (`codegraph.ts`) — recompute-on-display (TUI always
+- **Live update model** (`aperture.ts`) — recompute-on-display (TUI always
   fetches `refresh=true`), visibility-gated invalidation (only cached scopes
   whose window contains a changed file), shell-mutation catch-all refetch.
-- **Wiring** — HTTP payload channel `GET /codegraph` + Lens cycle/delete
-  endpoints; the `codegraph.invalidated` event (server → TUI); SDK gen; durable
+- **Wiring** — HTTP payload channel `GET /aperture` + Lens cycle/delete
+  endpoints; the `aperture.invalidated` event (server → TUI); SDK gen; durable
   KV layout (structure caches, Lens store namespaced per Lens id). Payload is the
   stable contract — bump `PAYLOAD_VERSION` whenever the extractor's output shape
-  changes (currently 5).
+  changes (currently 6).
 
 ### Architecture: four separated concerns
 
@@ -234,7 +234,7 @@ re-rendering. A small/idle directory produces little store churn; the opencode
 tree (LSP, watcher, snapshots) drives constant re-renders, so the same code there
 leaks fast. **A bug that reproduces only in busy directories is the tell.**
 
-Fix (in `feature-plugins/system/codegraph.tsx`): never call a resource accessor
+Fix (in `feature-plugins/system/aperture.tsx`): never call a resource accessor
 unguarded in render. Check `resource.error` first and return a fallback *without*
 calling the accessor; route every read through a helper that short-circuits on
 error (`const nodes = () => graph.error ? [] : graph()?.nodes ?? []`, and
@@ -267,49 +267,49 @@ Mouse is first-class: `<box>`/`<text>` accept onMouseDown/Up/Over/Out/Move +
 onClick. The View bar uses onMouseDown for drill-in/navigation; more examples at
 `sidebar/files.tsx`, `routes/session/index.tsx`.
 
-Aperture files (current names; renamed under Task 0):
-- Server: `packages/opencode/src/codegraph/` — `payload.ts` (contract),
-  `extract.ts` (deterministic walk, carries file mtime), `codegraph.ts` (service:
-  cache + window math + events + painter drivers), `tagger.ts` (Facet paint),
+Aperture files (post Task 0 rename):
+- Server: `packages/opencode/src/aperture/` — `payload.ts` (contract),
+  `extract.ts` (deterministic walk, carries file mtime), `aperture.ts` (service:
+  cache + window math + events + painter drivers), `painter.ts` (Facet paint),
   `semantic-store.ts`, `semantics.ts` (built-in layer hue vocabulary),
-  `collections.ts` + `collection-store.ts` (Lens model + store),
+  `lenses.ts` + `lens-store.ts` (Lens model + store),
   `deterministic.ts` (git/mtime built-in compute), `event.ts`
-  (`codegraph.invalidated`), `dump.ts` (CLI verify).
-- HTTP: `server/routes/instance/httpapi/groups/codegraph.ts` (+ `handlers/`,
+  (`aperture.invalidated`), `dump.ts` (CLI verify).
+- HTTP: `server/routes/instance/httpapi/groups/aperture.ts` (+ `handlers/`,
   registered in `server.ts` and `api.ts`).
-- TUI: `feature-plugins/system/codegraph.tsx` (+ `codegraph-activity.ts`);
+- TUI: `feature-plugins/system/aperture.tsx` (+ `aperture-activity.ts`);
   registered in `cli/cmd/tui/plugin/internal.ts`; slot placed in
   `routes/session/index.tsx`.
-- Tests: `packages/opencode/test/codegraph/`.
+- Tests: `packages/opencode/test/aperture/`.
 
 Slots:
-- Host slot map: `packages/plugin/src/tui.ts` (`TuiHostSlotMap` — `codegraph_top`).
+- Host slot map: `packages/plugin/src/tui.ts` (`TuiHostSlotMap` — `aperture_top`).
 - Slot placement / top-bar height + visibility math: `routes/session/index.tsx`.
 - Sidebar slot template: `feature-plugins/sidebar/files.tsx`.
 - Full-screen route template: `feature-plugins/system/diff-viewer.tsx`.
 
 Events (server → TUI):
-- `codegraph.invalidated`: defined in `codegraph/event.ts`; registered by
+- `aperture.invalidated`: defined in `aperture/event.ts`; registered by
   importing that module from the route group (before `api.ts` snapshots the
   EventV2 registry into the SDK union). TUI subscribes via
-  `api.event.on("codegraph.invalidated", …)`.
+  `api.event.on("aperture.invalidated", …)`.
 - File events feeding invalidation: `file.edited` (`packages/core/src/filesystem.ts`),
   `file.watcher.updated` (`packages/core/src/filesystem/watcher.ts`).
 - `session.next.shell.ended` (experimental) — the shell-mutation refetch.
 
 HTTP payload channel:
-- `GET /codegraph?scope=&refresh=` → `CodeGraphPayload.Payload`. Middleware:
+- `GET /aperture?scope=&refresh=` → `AperturePayload.Payload`. Middleware:
   InstanceContext + WorkspaceRouting + Authorization. Consumed via
-  `api.client.codegraph.get(...)`. SDK types regenerate into
+  `api.client.aperture.get(...)`. SDK types regenerate into
   `packages/sdk/js/src/v2/gen/`.
 
 Persistence:
 - Durable KV: `packages/opencode/src/storage/storage.ts` (string[] keys).
-  Current keys: structure caches under `["codegraph", projectID, "structure",
-  scopeKey]`; Lenses under `["codegraph", projectID, "collections"]`; active
-  pointer under `["codegraph", projectID, "active-collection"]`; Facet results
+  Current keys: structure caches under `["aperture", projectID, "structure",
+  scopeKey]`; Lenses under `["aperture", projectID, "lenses"]`; active
+  pointer under `["aperture", projectID, "active-lens"]`; Facet results
   namespaced per Lens id. `storage.update` is atomic read-modify-write under a
-  write lock. **Task 0 moves Lens persistence into the project directory.**
+  write lock. **(A3 still moves Lens persistence into the project directory.)**
 - Per-open-project in-memory state: the service's `caches` Map keyed by
   directory; cleaned via `registerDisposer` on instance disposal.
 
@@ -320,8 +320,8 @@ Provider / model (painter):
   R = never, mirroring `Agent.defaultLayer`).
 
 Config:
-- Schema: `packages/core/src/v1/config/config.ts` — `codegraph.tagger.context`
-  ("minimal" | "medium") and `codegraph.tagger.concurrency`. JSONC supported.
+- Schema: `packages/core/src/v1/config/config.ts` — `aperture.painter.context`
+  ("minimal" | "medium") and `aperture.painter.concurrency`. JSONC supported.
 
 Module/style conventions: see `AGENTS.md` (flat exports + self-reexport, Effect
 v4 rules, snake_case Drizzle, run `bun typecheck` from package dirs).

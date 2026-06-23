@@ -4,23 +4,23 @@ import { RGBA } from "@opentui/core"
 import { useTerminalDimensions } from "@opentui/solid"
 import type { InternalTuiPlugin } from "../../plugin/internal"
 import { createEffect, createMemo, createResource, createSignal, For, onCleanup, Show } from "solid-js"
-import { DIRECTORY_HUE } from "@/codegraph/semantics"
-import { NONE_TAG, NONE_HUE, NONE_LABEL, UNTAGGED_HUE, UNTAGGED_LABEL, BUILTIN_COLLECTION_IDS } from "@/codegraph/collections"
-import { allocateCells, buildGrid, coalesce } from "@/codegraph/treemap"
-import { ACTION_GLYPH, ACTION_LABEL, ACTIONS, type Action, type ActivityEntry, type Fill, type Style } from "@/codegraph/activity"
-import { createActivityTracker } from "./codegraph-activity"
+import { DIRECTORY_HUE } from "@/aperture/semantics"
+import { NONE_FACET, NONE_HUE, NONE_LABEL, UNTAGGED_HUE, UNTAGGED_LABEL, BUILTIN_LENS_IDS } from "@/aperture/lenses"
+import { allocateCells, buildGrid, coalesce } from "@/aperture/treemap"
+import { ACTION_GLYPH, ACTION_LABEL, ACTIONS, type Action, type ActivityEntry, type Fill, type Style } from "@/aperture/activity"
+import { createActivityTracker } from "./aperture-activity"
 
-const id = "internal:codegraph"
+const id = "internal:aperture"
 
 // Step 2.5 renderer (PLAN.md): a persistent top-bar that draws a 2-level window
-// of the deterministic code graph and lets the user drill into directories.
+// of the deterministic Aperture view and lets the user drill into directories.
 //
 // The bar is rooted at a `scope` (a repo-relative directory, "" = repo root). It
 // shows the scope's direct children as bordered boxes (layer 0) and their
 // children as smaller boxes (layer 1). Clicking a directory box re-roots the
 // view at it; a root button, an up button, and a clickable breadcrumb walk back
-// out. Data is fetched per scope from api.client.codegraph.get({ scope }); when
-// the server reports a file change inside the viewed scope (codegraph.invalidated)
+// out. Data is fetched per scope from api.client.aperture.get({ scope }); when
+// the server reports a file change inside the viewed scope (aperture.invalidated)
 // we refetch just that scope, so the visible view stays live without recomputing
 // graphs nobody is looking at.
 
@@ -37,12 +37,12 @@ type GraphEdge = { from: string; to: string; kind: string }
 // Per-directory recursive subtree composition (server-merged, see payload.ts). The
 // treemap paints a directory from these per-layer weights; `count` and `bytes` are
 // both carried so TREEMAP_METRIC can switch which one drives cell area.
-type TagWeight = { tag: string; count: number; bytes: number }
-// `total*` cover only the tagged files in `weights`; `subtree*` cover every descendant
-// file. A fully-untagged directory has zero `total*` but non-zero `subtree*`, so its
+type FacetWeight = { facet: string; count: number; bytes: number }
+// `total*` cover only the painted files in `weights`; `subtree*` cover every descendant
+// file. A fully-unpainted directory has zero `total*` but non-zero `subtree*`, so its
 // grey block can still be sized by real size (see TreemapBlock's grey branch).
 type Composition = {
-  weights: readonly TagWeight[]
+  weights: readonly FacetWeight[]
   totalCount: number
   totalBytes: number
   subtreeCount: number
@@ -59,18 +59,18 @@ type Graph = {
   nodes: GraphNode[]
   edges: GraphEdge[]
   boundaries?: GraphBoundary[]
-  semantics: Record<string, { tags: readonly string[]; hue?: string }>
+  semantics: Record<string, { facets: readonly string[]; hue?: string }>
   composition?: Record<string, Composition>
-  // The active tag collection + legend (tag → label + colour), merged in server-side.
-  collection?: { id: string; name: string; legend: readonly { tag: string; label: string; color: string }[] }
+  // The active Lens + legend (facet → label + colour), merged in server-side.
+  lens?: { id: string; name: string; legend: readonly { facet: string; label: string; color: string }[] }
 }
 
 // Layout mode for the top bar. "grid" = the current wide block-over-child-grid
 // layout; "column" = a narrow top-layer treemap with children stacked as a single
 // borderless column beneath (see the COLUMN_* constants below). Defaults to "grid" so
-// the current view is preserved; flip the constant (or set OPENCODE_CODEGRAPH_LAYOUT=column)
+// the current view is preserved; flip the constant (or set OPENCODE_APERTURE_LAYOUT=column)
 // to try the alternative.
-const CODEGRAPH_LAYOUT: "grid" | "column" = process.env["OPENCODE_CODEGRAPH_LAYOUT"] === "grid" ? "grid" : "column"
+const APERTURE_LAYOUT: "grid" | "column" = process.env["OPENCODE_APERTURE_LAYOUT"] === "grid" ? "grid" : "column"
 
 // +1 row over the graph's own budget so the horizontal scrollbar lives below the
 // tiles without stealing a row of node detail. A directory header is a label row over
@@ -147,7 +147,7 @@ function treemapColsFor(tiles: number) {
   return Math.max(1, Math.min(TREEMAP_MAX_COLS, Math.floor((footprint - 2) / CELL_W)))
 }
 
-// --- column-mode dimensions (CODEGRAPH_LAYOUT === "column") -----------------
+// --- column-mode dimensions (APERTURE_LAYOUT === "column") -----------------
 // A block's *width* encodes the directory's size: it scales between COLUMN_COLS_MIN and
 // COLUMN_COLS_MAX treemap cells (each CELL_W terminal cols wide) by sqrt(subtree /
 // biggest-sibling) — the same scaling the grid treemap uses for cell count. At CELL_W=2
@@ -228,7 +228,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   // 4-children + "…" view; horizontal scrolling doesn't touch scope, so an expanded
   // directory stays expanded while you pan.
   const [expanded, setExpanded] = createSignal(new Set<string>())
-  // Column mode (CODEGRAPH_LAYOUT === "column"): per-layer-0 vertical scroll offset for
+  // Column mode (APERTURE_LAYOUT === "column"): per-layer-0 vertical scroll offset for
   // a child list taller than COLUMN_CHILD_WINDOW. Keyed by node id; a wheel over the list
   // shifts the visible window row-by-row in place rather than panning the bar sideways
   // (see onChildScroll). Reset on scope change like `expanded` so navigation always lands
@@ -263,7 +263,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   const [graph, { refetch }] = createResource(
     () => ({ directory: props.api.state.path.directory, scope: scope() }),
     async (key) => {
-      const result = await props.api.client.codegraph.get(
+      const result = await props.api.client.aperture.get(
         { scope: key.scope, refresh: "true" },
         { throwOnError: true },
       )
@@ -271,19 +271,19 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     },
   )
 
-  // Step the active tag collection one forward/back, wrapping at the ends. The
-  // server flips the active collection and publishes codegraph.invalidated for the
+  // Step the active Lens one forward/back, wrapping at the ends. The
+  // server flips the active Lens and publishes aperture.invalidated for the
   // viewed scope, which the subscription below turns into a refetch — so the repaint
-  // rides the same path a `/tag`-driven switch already uses.
-  const cycleCollection = (direction: "next" | "prev") => {
-    // Fire-and-forget: the repaint arrives via codegraph.invalidated, so we don't
+  // rides the same path a `/lens`-driven switch already uses.
+  const cycleLens = (direction: "next" | "prev") => {
+    // Fire-and-forget: the repaint arrives via aperture.invalidated, so we don't
     // throwOnError (an unhandled rejection on a click) — a failed switch just
-    // leaves the current collection painted.
-    void props.api.client.codegraph.cycleCollection({ direction })
+    // leaves the current Lens painted.
+    void props.api.client.aperture.cycleLens({ direction })
   }
 
   // Live update: refetch only when the change is inside the scope we're showing.
-  const off = props.api.event.on("codegraph.invalidated", (event) => {
+  const off = props.api.event.on("aperture.invalidated", (event) => {
     if (event.properties.scope === scope()) refetch()
   })
   onCleanup(() => off())
@@ -328,43 +328,43 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     return g ? `${g.nodes.length} nodes · ${g.edges.length} edges` : "loading…"
   }
   const hueOf = (nodeID: string) => (graph.error ? undefined : graph()?.semantics[nodeID]?.hue)
-  // The active collection's legend (tag → label + colour) drives the swatch row and the
-  // tag → colour map used to paint nodes/composition — no hard-coded vocabulary.
-  const legendEntries = () => (graph.error ? [] : (graph()?.collection?.legend ?? []))
-  const activeName = () => (graph.error ? "" : (graph()?.collection?.name ?? ""))
-  const activeId = () => (graph.error ? "" : (graph()?.collection?.id ?? ""))
-  // Built-in collections (the protected group, e.g. Architecture) are immutable — no
+  // The active Lens's legend (facet → label + colour) drives the swatch row and the
+  // facet → colour map used to paint nodes/composition — no hard-coded vocabulary.
+  const legendEntries = () => (graph.error ? [] : (graph()?.lens?.legend ?? []))
+  const activeName = () => (graph.error ? "" : (graph()?.lens?.name ?? ""))
+  const activeId = () => (graph.error ? "" : (graph()?.lens?.id ?? ""))
+  // Built-in Lenses (the protected group, e.g. Architecture) are immutable — no
   // delete affordance for them. Gated on the group so new built-ins are covered too.
-  const canDeleteActive = () => activeId() !== "" && !BUILTIN_COLLECTION_IDS.has(activeId())
+  const canDeleteActive = () => activeId() !== "" && !BUILTIN_LENS_IDS.has(activeId())
 
-  // Delete the active collection via the ✕ control. Two-step: the first click arms a
+  // Delete the active Lens via the ✕ control. Two-step: the first click arms a
   // "confirm?" state, the second performs the delete. Fire-and-forget — the repaint
-  // (and the fall-back to Architecture) rides codegraph.invalidated like a cycle.
+  // (and the fall-back to Architecture) rides aperture.invalidated like a cycle.
   const [confirmingDelete, setConfirmingDelete] = createSignal(false)
-  const deleteActiveCollection = () => {
+  const deleteActiveLens = () => {
     if (!canDeleteActive()) return
     if (!confirmingDelete()) {
       setConfirmingDelete(true)
       return
     }
     setConfirmingDelete(false)
-    void props.api.client.codegraph.deleteCollection({ collection: activeId() })
+    void props.api.client.aperture.deleteLens({ lens: activeId() })
   }
-  // Disarm the confirm if the active collection changes out from under us.
+  // Disarm the confirm if the active Lens changes out from under us.
   createEffect(() => {
     activeId()
     setConfirmingDelete(false)
   })
-  const colorByTag = createMemo(() => new Map(legendEntries().map((e) => [e.tag, e.color])))
-  // A tag id → colour: the NONE_TAG escape paints the "Other" grey; a real tag paints
+  const colorByFacet = createMemo(() => new Map(legendEntries().map((e) => [e.facet, e.color])))
+  // A facet id → colour: the NONE_FACET escape paints the "Other" grey; a real facet paints
   // its legend colour (hex palette or theme role).
-  const tagColor = (key: string): TuiThemeCurrent["text"] =>
-    key === NONE_TAG ? resolveColor(theme(), NONE_HUE) : resolveColor(theme(), colorByTag().get(key))
+  const facetColor = (key: string): TuiThemeCurrent["text"] =>
+    key === NONE_FACET ? resolveColor(theme(), NONE_HUE) : resolveColor(theme(), colorByFacet().get(key))
   // Resolve a treemap cell key to a colour: the grey sentinel → the dimmer non-code
-  // grey; a tag id (incl. NONE_TAG) → its tag colour; null padding → the panel bg.
+  // grey; a facet id (incl. NONE_FACET) → its facet colour; null padding → the panel bg.
   const colorFor = (key: string | null): TuiThemeCurrent["text"] => {
     if (key === GREY_CELL) return resolveColor(theme(), UNTAGGED_HUE)
-    if (key) return tagColor(key)
+    if (key) return facetColor(key)
     return theme().backgroundPanel
   }
   const boundaries = () => (graph.error ? [] : (graph()?.boundaries ?? []))
@@ -560,7 +560,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     return items.reduce((sum, it) => sum + columnWidth(it.node), 0) + SCROLL_GAP * (items.length - 1)
   })
   const scrollbarVisible = createMemo(
-    () => CODEGRAPH_LAYOUT === "column" && contentWidth() > dimensions().width - BAR_PADDING_X * 2,
+    () => APERTURE_LAYOUT === "column" && contentWidth() > dimensions().width - BAR_PADDING_X * 2,
   )
   // Bar height: the base budget, plus the one reserved scrollbar row only while the scrollbar
   // is actually showing — so a strip that fits gives the row back to the conversation below.
@@ -605,7 +605,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     >
       <box flexDirection="row" justifyContent="space-between">
         <text fg={theme().text}>
-          <b>Code Graph</b>
+          <b>Aperture</b>
         </text>
         {/* Hover-info line (Foundation A): a node's path/size while pointed at,
             otherwise the node/edge count. Shared by all overlay features. */}
@@ -637,21 +637,21 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
         </Show>
       </box>
 
-      {/* Legend: the fixed architectural-layer vocabulary the async tagger paints
+      {/* Legend: the fixed architectural-layer vocabulary the async painter paints
           with. Stable row so the swatches don't move as nodes get (re)tagged. */}
       <box flexDirection="row" gap={2} height={1} flexShrink={0}>
-        {/* Active collection name flanked by ◀/▶ arrows that step (and loop)
-            through the available collections, the click-driven sibling of /tag. */}
+        {/* Active Lens name flanked by ◀/▶ arrows that step (and loop)
+            through the available Lenses, the click-driven sibling of /lens. */}
         <Show when={activeName()}>
           <box flexDirection="row" gap={1} flexShrink={0}>
-            <text fg={theme().accent} onMouseDown={() => cycleCollection("prev")} wrapMode="none">
+            <text fg={theme().accent} onMouseDown={() => cycleLens("prev")} wrapMode="none">
               ◀
             </text>
             {/* Clicking the name advances like ▶, giving the forward step a bigger hit area. */}
-            <text fg={theme().accent} onMouseDown={() => cycleCollection("next")} wrapMode="none">
+            <text fg={theme().accent} onMouseDown={() => cycleLens("next")} wrapMode="none">
               {activeName()}
             </text>
-            <text fg={theme().accent} onMouseDown={() => cycleCollection("next")} wrapMode="none">
+            <text fg={theme().accent} onMouseDown={() => cycleLens("next")} wrapMode="none">
               ▶
             </text>
             {/* Delete the active (user) collection: click to arm, click again to
@@ -659,7 +659,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
             <Show when={canDeleteActive()}>
               <text
                 fg={confirmingDelete() ? theme().error : theme().textMuted}
-                onMouseDown={() => deleteActiveCollection()}
+                onMouseDown={() => deleteActiveLens()}
                 wrapMode="none"
               >
                 {confirmingDelete() ? "✕ confirm?" : "✕"}
@@ -679,7 +679,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
             </box>
           )}
         </For>
-        {/* "Other": code the tagger judged unrelated to this collection (NONE_TAG). */}
+        {/* "Other": code the painter judged unrelated to this Lens (NONE_FACET). */}
         <box flexDirection="row" flexShrink={0}>
           <text fg={resolveColor(theme(), NONE_HUE)} wrapMode="none">
             ■
@@ -688,7 +688,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
             {" " + NONE_LABEL}
           </text>
         </box>
-        {/* The dimmer grey: a subtree with nothing the tagger sees as code (specs,
+        {/* The dimmer grey: a subtree with nothing the painter sees as code (specs,
             fixtures, assets, …) or not yet swept. */}
         <box flexDirection="row" flexShrink={0}>
           <text fg={resolveColor(theme(), UNTAGGED_HUE)} wrapMode="none">
@@ -747,7 +747,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
             // size-scaled treemap block; its children hang beneath as a single borderless
             // column of 1-row composition bars (no drops, no grid, no separators). Children
             // past the bottom edge are clipped by the scrollbox.
-            if (CODEGRAPH_LAYOUT === "column") {
+            if (APERTURE_LAYOUT === "column") {
               const cols = () => columnColsFor(subtreeOf(item.node.id), maxDirSubtree0(), tree().length)
               // The column footprint comes from the shared columnWidth (kept under the outerW
               // / fileW names the markup already uses): for a directory it's the size-scaled
@@ -1392,7 +1392,7 @@ function truncate(s: string, max: number) {
 function metricTotal(c: Composition) {
   return TREEMAP_METRIC === "bytes" ? c.totalBytes : c.totalCount
 }
-function metricValue(w: TagWeight) {
+function metricValue(w: FacetWeight) {
   return TREEMAP_METRIC === "bytes" ? w.bytes : w.count
 }
 // The whole-subtree size (all descendant files, tagged or not), used as the denominator
@@ -1408,7 +1408,7 @@ function metricSubtree(c: Composition) {
 // the background sweep fills in — instead of a few tagged files painting a whole
 // directory. Returns [] only when the directory has no descendant source files at all.
 function compositionBands(c: Composition): { key: string; value: number }[] {
-  const bands = c.weights.map((w) => ({ key: w.tag, value: metricValue(w) }))
+  const bands = c.weights.map((w) => ({ key: w.facet, value: metricValue(w) }))
   const remainder = metricSubtree(c) - metricTotal(c)
   if (remainder > 0) bands.push({ key: GREY_CELL, value: remainder })
   return bands
@@ -1447,7 +1447,7 @@ const tui: TuiPlugin = async (api) => {
   api.slots.register({
     order: 500,
     slots: {
-      codegraph_top(_ctx, props) {
+      aperture_top(_ctx, props) {
         return <View api={api} session_id={props.session_id} />
       },
     },

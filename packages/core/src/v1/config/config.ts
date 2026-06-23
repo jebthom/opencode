@@ -181,22 +181,22 @@ export const Info = Schema.Struct({
       }),
     }),
   ),
-  codegraph: Schema.optional(
+  aperture: Schema.optional(
     Schema.Struct({
-      tagger: Schema.optional(
+      painter: Schema.optional(
         Schema.Struct({
           context: Schema.optional(Schema.Literals(["minimal", "medium"])).annotate({
             description:
-              "How much per-file context the code-graph semantic tagger sends to the model. 'minimal' (default) uses path + imports + leading comment; 'medium' adds exported names and the file head.",
+              "How much per-file context the Aperture semantic painter sends to the model. 'minimal' (default) uses path + imports + leading comment; 'medium' adds exported names and the file head.",
           }),
           concurrency: Schema.optional(Schema.Int).annotate({
             description:
-              "Max concurrent model calls the code-graph tagger runs per pass (dir-coherent bins, default 64, clamped 1-128). Lower it on small API tiers to avoid rate-limit bounceback.",
+              "Max concurrent model calls the Aperture painter runs per pass (dir-coherent bins, default 64, clamped 1-128). Lower it on small API tiers to avoid rate-limit bounceback.",
           }),
         }),
       ),
     }),
-  ).annotate({ description: "Code-graph visualization configuration." }),
+  ).annotate({ description: "Aperture visualization configuration." }),
 }).annotate({ identifier: "Config" })
 
 export type Info = DeepMutable<Schema.Schema.Type<typeof Info>>

@@ -1,12 +1,12 @@
-// Architectural-layer vocabulary for the code-graph semantic layer (PLAN.md
+// Architectural-layer vocabulary for the Aperture semantic layer (PLAN.md
 // step 4). Deliberately dependency-free (no Effect/Schema) so it is safe to
-// import from both the server-side tagger/payload and the TUI renderer without
+// import from both the server-side painter/payload and the TUI renderer without
 // dragging server code into the TUI bundle.
 //
 // The structure of the graph is deterministic; this is the *paint*. Each file
-// node is tagged with one fixed layer, and `LAYER_HUE` maps that layer to a
+// node is painted with one fixed layer, and `LAYER_HUE` maps that layer to a
 // named theme color. The renderer already resolves a node's `hue` against the
-// active theme (codegraph.tsx `hueColor`), so painting a node is just a matter
+// active theme (aperture.tsx `hueColor`), so painting a node is just a matter
 // of storing the layer's theme-key here — no renderer-side color logic.
 
 // Fixed enum → predictable, stable hues and a legend that never reflows. Ordered
@@ -43,7 +43,7 @@ export const LAYER_LABEL: Record<Layer, string> = {
   infrastructure: "Infra",
 }
 
-// One-line guidance handed to the tagger model so it can place a file without
+// One-line guidance handed to the painter model so it can place a file without
 // reading much of it. Kept terse — the model gets path + comments + imports too.
 export const LAYER_DESCRIPTION: Record<Layer, string> = {
   interface: "user-facing surface: UI, TUI, CLI, HTTP routes, rendering, input handling",
@@ -65,4 +65,4 @@ export function isLayer(value: unknown): value is Layer {
   return typeof value === "string" && (LAYERS as readonly string[]).includes(value)
 }
 
-export * as CodeGraphSemantics from "./semantics"
+export * as ApertureSemantics from "./semantics"

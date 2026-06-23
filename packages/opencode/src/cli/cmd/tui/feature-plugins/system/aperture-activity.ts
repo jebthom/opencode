@@ -1,7 +1,7 @@
 import { createMemo, createSignal, onCleanup } from "solid-js"
 import path from "path"
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
-import { CodeGraphActivity, type ActivityEntry, type Turn } from "@/codegraph/activity"
+import { ApertureActivity, type ActivityEntry, type Turn } from "@/aperture/activity"
 
 // Foundation B (PLAN.md): the in-memory activity substrate. Subscribes to the
 // live agent-action events and accumulates, per user turn, which files were
@@ -65,7 +65,7 @@ export function createActivityTracker(api: TuiPluginApi, sessionID: string): Act
       return [...base.slice(0, -1), updated]
     })
 
-  // Repo-relative POSIX path matching CodeGraphPayload node.path, or undefined for
+  // Repo-relative POSIX path matching AperturePayload node.path, or undefined for
   // a file outside the project (tool inputs may be absolute or cwd-relative).
   const toRel = (filePath: string | undefined): string | undefined => {
     if (!filePath) return undefined
@@ -90,7 +90,7 @@ export function createActivityTracker(api: TuiPluginApi, sessionID: string): Act
   })
   const offTool = api.event.on("session.next.tool.called", (event) => {
     const p = event.properties
-    const action = CodeGraphActivity.actionFromTool(p.tool)
+    const action = ApertureActivity.actionFromTool(p.tool)
     if (!action) return
     const rel = toRel(p.input.filePath as string | undefined)
     if (!rel) return
@@ -145,4 +145,4 @@ export function createActivityTracker(api: TuiPluginApi, sessionID: string): Act
   }
 }
 
-export * as CodeGraphActivityTracker from "./codegraph-activity"
+export * as ApertureActivityTracker from "./aperture-activity"

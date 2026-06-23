@@ -1,4 +1,4 @@
-// Pure treemap-grid math for the code-graph renderer. Dependency-free (no Solid/
+// Pure treemap-grid math for the Aperture renderer. Dependency-free (no Solid/
 // OpenTUI/theme) so it can be unit-tested and imported by the TUI without dragging
 // render code into tests. The renderer feeds these per-layer weights + a cell budget
 // and draws the returned grid; nothing here knows about colors or terminals.
@@ -67,4 +67,4 @@ export function coalesce<T>(row: ReadonlyArray<T | null>): { value: T | null; le
   return runs
 }
 
-export * as CodeGraphTreemap from "./treemap"
+export * as ApertureTreemap from "./treemap"

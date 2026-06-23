@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test"
-import { splitDirs } from "@/codegraph/tagger"
+import { splitDirs } from "@/aperture/painter"
 
-// Records mirror the tagger's stale shape; splitDirs only reads `node.path`.
+// Records mirror the painter's stale shape; splitDirs only reads `node.path`.
 const rec = (path: string) => ({ node: { id: path, path } })
 const recs = (...paths: string[]) => paths.map(rec)
 

@@ -11,7 +11,7 @@ import { ProviderTransform } from "@/provider/transform"
 import PROMPT_GENERATE from "./generate.txt"
 import PROMPT_COMPACTION from "./prompt/compaction.txt"
 import PROMPT_EXPLORE from "./prompt/explore.txt"
-import PROMPT_TAG from "./prompt/tag.txt"
+import PROMPT_LENS from "./prompt/lens.txt"
 import PROMPT_SUMMARY from "./prompt/summary.txt"
 import PROMPT_TITLE from "./prompt/title.txt"
 import { Permission } from "@/permission"
@@ -200,10 +200,10 @@ export const layer = Layer.effect(
             mode: "subagent",
             native: true,
           },
-          tag: {
-            name: "tag",
+          lens: {
+            name: "lens",
             description:
-              "Designs code-graph tag collections: explores read-only, proposes a tag schema (name, tags + definitions, palette, prompt), and persists it with the tag-collection tools. Entered via the /tag command.",
+              "Designs Aperture Lenses: explores read-only, proposes a facet schema (name, facets + definitions, palette, prompt), and persists it with the lens tools. Entered via the /lens command.",
             permission: Permission.merge(
               defaults,
               Permission.fromConfig({
@@ -215,16 +215,16 @@ export const layer = Layer.effect(
                 read: "allow",
                 webfetch: "allow",
                 websearch: "allow",
-                tag_collection_list: "allow",
-                tag_collection_create: "allow",
-                tag_collection_select: "allow",
-                tag_collection_merge_tags: "allow",
-                tag_collection_edit: "allow",
+                lens_list: "allow",
+                lens_create: "allow",
+                lens_select: "allow",
+                lens_merge_facets: "allow",
+                lens_edit: "allow",
                 external_directory: readonlyExternalDirectory,
               }),
               user,
             ),
-            prompt: PROMPT_TAG,
+            prompt: PROMPT_LENS,
             options: {},
             mode: "all",
             native: true,

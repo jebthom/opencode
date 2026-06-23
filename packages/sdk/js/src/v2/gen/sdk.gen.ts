@@ -4,6 +4,12 @@ import { client } from "./client.gen.js"
 import { buildClientParams, type Client, type Options as Options2, type TDataShape } from "./client/index.js"
 import type {
   AgentPartInput,
+  ApertureCycleLensErrors,
+  ApertureCycleLensResponses,
+  ApertureDeleteLensErrors,
+  ApertureDeleteLensResponses,
+  ApertureGetErrors,
+  ApertureGetResponses,
   AppAgentsErrors,
   AppAgentsResponses,
   AppLogErrors,
@@ -15,12 +21,6 @@ import type {
   AuthRemoveResponses,
   AuthSetErrors,
   AuthSetResponses,
-  CodegraphCycleCollectionErrors,
-  CodegraphCycleCollectionResponses,
-  CodegraphDeleteCollectionErrors,
-  CodegraphDeleteCollectionResponses,
-  CodegraphGetErrors,
-  CodegraphGetResponses,
   CommandListErrors,
   CommandListResponses,
   Config as Config3,
@@ -659,11 +659,11 @@ export class Event extends HeyApiClient {
   }
 }
 
-export class Codegraph extends HeyApiClient {
+export class Aperture extends HeyApiClient {
   /**
-   * Get code graph
+   * Get Aperture view
    *
-   * Retrieve the deterministic code-graph payload for the active instance.
+   * Retrieve the deterministic Aperture payload for the active instance.
    */
   public get<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -687,19 +687,19 @@ export class Codegraph extends HeyApiClient {
         },
       ],
     )
-    return (options?.client ?? this.client).get<CodegraphGetResponses, CodegraphGetErrors, ThrowOnError>({
-      url: "/codegraph",
+    return (options?.client ?? this.client).get<ApertureGetResponses, ApertureGetErrors, ThrowOnError>({
+      url: "/aperture",
       ...options,
       ...params,
     })
   }
 
   /**
-   * Cycle active tag collection
+   * Cycle active Lens
    *
-   * Switch the active code-graph tag collection to the next or previous one, wrapping at the ends.
+   * Switch the active Aperture Lens to the next or previous one, wrapping at the ends.
    */
-  public cycleCollection<ThrowOnError extends boolean = false>(
+  public cycleLens<ThrowOnError extends boolean = false>(
     parameters: {
       directory?: string
       workspace?: string
@@ -719,27 +719,23 @@ export class Codegraph extends HeyApiClient {
         },
       ],
     )
-    return (options?.client ?? this.client).get<
-      CodegraphCycleCollectionResponses,
-      CodegraphCycleCollectionErrors,
-      ThrowOnError
-    >({
-      url: "/codegraph/collection/cycle",
+    return (options?.client ?? this.client).get<ApertureCycleLensResponses, ApertureCycleLensErrors, ThrowOnError>({
+      url: "/aperture/lens/cycle",
       ...options,
       ...params,
     })
   }
 
   /**
-   * Delete a tag collection
+   * Delete a Lens
    *
-   * Delete a user-defined code-graph tag collection by id or name. Built-in collections are immutable.
+   * Delete a user-defined Aperture Lens by id or name. Built-in Lenses are immutable.
    */
-  public deleteCollection<ThrowOnError extends boolean = false>(
+  public deleteLens<ThrowOnError extends boolean = false>(
     parameters: {
       directory?: string
       workspace?: string
-      collection: string
+      lens: string
     },
     options?: Options<never, ThrowOnError>,
   ) {
@@ -750,17 +746,13 @@ export class Codegraph extends HeyApiClient {
           args: [
             { in: "query", key: "directory" },
             { in: "query", key: "workspace" },
-            { in: "query", key: "collection" },
+            { in: "query", key: "lens" },
           ],
         },
       ],
     )
-    return (options?.client ?? this.client).get<
-      CodegraphDeleteCollectionResponses,
-      CodegraphDeleteCollectionErrors,
-      ThrowOnError
-    >({
-      url: "/codegraph/collection/delete",
+    return (options?.client ?? this.client).get<ApertureDeleteLensResponses, ApertureDeleteLensErrors, ThrowOnError>({
+      url: "/aperture/lens/delete",
       ...options,
       ...params,
     })
@@ -5606,9 +5598,9 @@ export class OpencodeClient extends HeyApiClient {
     return (this._event ??= new Event({ client: this.client }))
   }
 
-  private _codegraph?: Codegraph
-  get codegraph(): Codegraph {
-    return (this._codegraph ??= new Codegraph({ client: this.client }))
+  private _aperture?: Aperture
+  get aperture(): Aperture {
+    return (this._aperture ??= new Aperture({ client: this.client }))
   }
 
   private _config?: Config2

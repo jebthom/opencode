@@ -637,46 +637,46 @@ export function Prompt(props: PromptProps) {
         },
       },
       {
-        // Deterministic, agent-free delete of the active code-graph tag collection.
+        // Deterministic, agent-free delete of the active Aperture Lens.
         // Mirrors the top-bar ✕; the server refuses built-ins (status "builtin").
-        title: "Delete tag collection",
-        desc: "Delete the active code-graph tag collection",
-        name: "codegraph.tag.delete",
+        title: "Delete Lens",
+        desc: "Delete the active Aperture Lens",
+        name: "aperture.lens.delete",
         category: "Session",
-        slashName: "tag-delete",
-        slashAliases: ["untag"],
+        slashName: "lens-delete",
+        slashAliases: ["unlens"],
         run: async () => {
-          const active = await sdk.client.codegraph
+          const active = await sdk.client.aperture
             .get({})
-            .then((r) => r.data?.collection)
+            .then((r) => r.data?.lens)
             .catch(() => undefined)
           if (!active) {
             toast.show({
-              title: "No tag collection",
-              message: "Open the code graph and pick a collection first.",
+              title: "No Lens",
+              message: "Open Aperture and pick a Lens first.",
               variant: "error",
             })
             return
           }
           const ok = await DialogConfirm.show(
             dialog,
-            "Delete tag collection",
-            `Delete "${active.name}"? This removes the collection and its tags.`,
+            "Delete Lens",
+            `Delete "${active.name}"? This removes the Lens and its facets.`,
           )
           if (!ok) return
-          const result = await sdk.client.codegraph
-            .deleteCollection({ collection: active.id })
+          const result = await sdk.client.aperture
+            .deleteLens({ lens: active.id })
             .then((r) => r.data)
             .catch(() => undefined)
           if (result?.status === "ok") {
             toast.show({
-              title: "Deleted tag collection",
+              title: "Deleted Lens",
               message: `Removed "${active.name}"; now showing "${result.active?.name ?? "Architecture"}".`,
               variant: "success",
             })
           } else if (result?.status === "builtin") {
             toast.show({
-              title: "Built-in collection",
+              title: "Built-in Lens",
               message: `"${active.name}" is built-in and can't be deleted.`,
               variant: "error",
             })

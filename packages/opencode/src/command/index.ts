@@ -9,7 +9,7 @@ import { Skill } from "../skill"
 import { EventV2 } from "@opencode-ai/core/event"
 import PROMPT_INITIALIZE from "./template/initialize.txt"
 import PROMPT_REVIEW from "./template/review.txt"
-import PROMPT_TAG from "./template/tag.txt"
+import PROMPT_LENS from "./template/lens.txt"
 
 type State = {
   commands: Record<string, Info>
@@ -54,7 +54,7 @@ export function hints(template: string) {
 export const Default = {
   INIT: "init",
   REVIEW: "review",
-  TAG: "tag",
+  LENS: "lens",
 } as const
 
 export interface Interface {
@@ -95,18 +95,18 @@ export const layer = Layer.effect(
         subtask: true,
         hints: hints(PROMPT_REVIEW),
       }
-      commands[Default.TAG] = {
-        name: Default.TAG,
-        description: "define or switch the code-graph tag collection",
+      commands[Default.LENS] = {
+        name: Default.LENS,
+        description: "define or switch the Aperture Lens",
         source: "command",
-        // Scopes the turn to the read-only `tag` agent (schema-design tools only),
+        // Scopes the turn to the read-only `lens` agent (schema-design tools only),
         // mirroring plan mode. Runs in the session (not a subtask) so the user can
         // approve the proposed schema before it is created.
-        agent: "tag",
+        agent: "lens",
         get template() {
-          return PROMPT_TAG
+          return PROMPT_LENS
         },
-        hints: hints(PROMPT_TAG),
+        hints: hints(PROMPT_LENS),
       }
 
       for (const [name, command] of Object.entries(cfg.command ?? {})) {

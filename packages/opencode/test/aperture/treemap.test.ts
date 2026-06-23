@@ -1,7 +1,7 @@
 import { describe, it, expect } from "bun:test"
-import { allocateCells, buildGrid, coalesce } from "@/codegraph/treemap"
+import { allocateCells, buildGrid, coalesce } from "@/aperture/treemap"
 
-describe("CodeGraphTreemap.allocateCells", () => {
+describe("ApertureTreemap.allocateCells", () => {
   it("splits cells proportionally and sums to exactly the budget", () => {
     const alloc = allocateCells(
       [
@@ -65,7 +65,7 @@ describe("CodeGraphTreemap.allocateCells", () => {
   })
 })
 
-describe("CodeGraphTreemap.buildGrid", () => {
+describe("ApertureTreemap.buildGrid", () => {
   it("bottom-aligns: the footing row is full, partial cells land on top", () => {
     // 5 cells, 3 rows → 2 cols. Bottom row fills first (2), middle next (2), top
     // gets the remainder (1) on the left with a null pad on the right.
@@ -88,7 +88,7 @@ describe("CodeGraphTreemap.buildGrid", () => {
   })
 })
 
-describe("CodeGraphTreemap.coalesce", () => {
+describe("ApertureTreemap.coalesce", () => {
   it("collapses contiguous same-value runs, including null padding", () => {
     expect(coalesce(["a", "a", "b", null, null])).toEqual([
       { value: "a", len: 2 },

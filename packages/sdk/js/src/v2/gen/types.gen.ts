@@ -68,7 +68,7 @@ export type Event =
   | EventMcpBrowserOpenFailed
   | EventSessionStatus
   | EventSessionIdle
-  | EventCodegraphInvalidated
+  | EventApertureInvalidated
   | EventCommandExecuted
   | EventProjectDirectoriesUpdated
   | EventProjectUpdated
@@ -1338,7 +1338,7 @@ export type GlobalEvent = {
       }
     | {
         id: string
-        type: "codegraph.invalidated"
+        type: "aperture.invalidated"
         properties: {
           scope: string
         }
@@ -1923,9 +1923,10 @@ export type Config = {
     mcp_timeout?: number
     policies?: Array<ConfigV2ExperimentalPolicy>
   }
-  codegraph?: {
-    tagger?: {
+  aperture?: {
+    painter?: {
       context?: "minimal" | "medium"
+      concurrency?: number
     }
   }
 }
@@ -4472,9 +4473,9 @@ export type EventSessionIdle = {
   }
 }
 
-export type EventCodegraphInvalidated = {
+export type EventApertureInvalidated = {
   id: string
-  type: "codegraph.invalidated"
+  type: "aperture.invalidated"
   properties: {
     scope: string
   }
@@ -4931,7 +4932,7 @@ export type EventSubscribeResponses = {
 
 export type EventSubscribeResponse = EventSubscribeResponses[keyof EventSubscribeResponses]
 
-export type CodegraphGetData = {
+export type ApertureGetData = {
   body?: never
   path?: never
   query?: {
@@ -4940,21 +4941,21 @@ export type CodegraphGetData = {
     scope?: string
     refresh?: "true" | "false"
   }
-  url: "/codegraph"
+  url: "/aperture"
 }
 
-export type CodegraphGetErrors = {
+export type ApertureGetErrors = {
   /**
    * Bad request
    */
   400: BadRequestError
 }
 
-export type CodegraphGetError = CodegraphGetErrors[keyof CodegraphGetErrors]
+export type ApertureGetError = ApertureGetErrors[keyof ApertureGetErrors]
 
-export type CodegraphGetResponses = {
+export type ApertureGetResponses = {
   /**
-   * The deterministic code-graph payload
+   * The deterministic Aperture payload
    */
   200: {
     version: number
@@ -4980,14 +4981,14 @@ export type CodegraphGetResponses = {
     }>
     semantics: {
       [key: string]: {
-        tags: Array<string>
+        facets: Array<string>
         hue?: string
       }
     }
     composition?: {
       [key: string]: {
         weights: Array<{
-          tag: string
+          facet: string
           count: number
           bytes: number
         }>
@@ -4997,11 +4998,11 @@ export type CodegraphGetResponses = {
         subtreeBytes: number
       }
     }
-    collection?: {
+    lens?: {
       id: string
       name: string
       legend: Array<{
-        tag: string
+        facet: string
         label: string
         color: string
       }>
@@ -5009,9 +5010,9 @@ export type CodegraphGetResponses = {
   }
 }
 
-export type CodegraphGetResponse = CodegraphGetResponses[keyof CodegraphGetResponses]
+export type ApertureGetResponse = ApertureGetResponses[keyof ApertureGetResponses]
 
-export type CodegraphCycleCollectionData = {
+export type ApertureCycleLensData = {
   body?: never
   path?: never
   query: {
@@ -5019,59 +5020,58 @@ export type CodegraphCycleCollectionData = {
     workspace?: string
     direction: "next" | "prev"
   }
-  url: "/codegraph/collection/cycle"
+  url: "/aperture/lens/cycle"
 }
 
-export type CodegraphCycleCollectionErrors = {
+export type ApertureCycleLensErrors = {
   /**
    * Bad request
    */
   400: BadRequestError
 }
 
-export type CodegraphCycleCollectionError = CodegraphCycleCollectionErrors[keyof CodegraphCycleCollectionErrors]
+export type ApertureCycleLensError = ApertureCycleLensErrors[keyof ApertureCycleLensErrors]
 
-export type CodegraphCycleCollectionResponses = {
+export type ApertureCycleLensResponses = {
   /**
-   * The newly-active tag collection
+   * The newly-active Lens
    */
   200: {
     id: string
     name: string
     legend: Array<{
-      tag: string
+      facet: string
       label: string
       color: string
     }>
   }
 }
 
-export type CodegraphCycleCollectionResponse =
-  CodegraphCycleCollectionResponses[keyof CodegraphCycleCollectionResponses]
+export type ApertureCycleLensResponse = ApertureCycleLensResponses[keyof ApertureCycleLensResponses]
 
-export type CodegraphDeleteCollectionData = {
+export type ApertureDeleteLensData = {
   body?: never
   path?: never
   query: {
     directory?: string
     workspace?: string
-    collection: string
+    lens: string
   }
-  url: "/codegraph/collection/delete"
+  url: "/aperture/lens/delete"
 }
 
-export type CodegraphDeleteCollectionErrors = {
+export type ApertureDeleteLensErrors = {
   /**
    * Bad request
    */
   400: BadRequestError
 }
 
-export type CodegraphDeleteCollectionError = CodegraphDeleteCollectionErrors[keyof CodegraphDeleteCollectionErrors]
+export type ApertureDeleteLensError = ApertureDeleteLensErrors[keyof ApertureDeleteLensErrors]
 
-export type CodegraphDeleteCollectionResponses = {
+export type ApertureDeleteLensResponses = {
   /**
-   * The outcome and the now-active tag collection
+   * The outcome and the now-active Lens
    */
   200: {
     status: "ok" | "not-found" | "builtin"
@@ -5079,7 +5079,7 @@ export type CodegraphDeleteCollectionResponses = {
       id: string
       name: string
       legend: Array<{
-        tag: string
+        facet: string
         label: string
         color: string
       }>
@@ -5087,8 +5087,7 @@ export type CodegraphDeleteCollectionResponses = {
   }
 }
 
-export type CodegraphDeleteCollectionResponse =
-  CodegraphDeleteCollectionResponses[keyof CodegraphDeleteCollectionResponses]
+export type ApertureDeleteLensResponse = ApertureDeleteLensResponses[keyof ApertureDeleteLensResponses]
 
 export type ConfigGetData = {
   body?: never

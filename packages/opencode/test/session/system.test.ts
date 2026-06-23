@@ -41,9 +41,9 @@ const build: Agent.Info = {
   options: {},
 }
 
-// Minimal Storage stub — the `tagging` method captures Storage at layer build
+// Minimal Storage stub — the `aperture` method captures Storage at layer build
 // time, but the assertions below only exercise `skills` and the non-build/plan
-// `tagging` gate (which returns before touching storage), so the bodies are unused.
+// `aperture` gate (which returns before touching storage), so the bodies are unused.
 const storageStub = Layer.succeed(
   Storage.Service,
   Storage.Service.of({
@@ -98,10 +98,10 @@ describe("session.system", () => {
     }),
   )
 
-  it.effect("tagging is gated to the build/plan agents", () =>
+  it.effect("aperture is gated to the build/plan agents", () =>
     Effect.gen(function* () {
       const prompt = yield* SystemPrompt.Service
-      const tag: Agent.Info = { name: "tag", mode: "all", permission: Permission.fromConfig({ "*": "allow" }), options: {} }
+      const lens: Agent.Info = { name: "lens", mode: "all", permission: Permission.fromConfig({ "*": "allow" }), options: {} }
       const explore: Agent.Info = {
         name: "explore",
         mode: "subagent",
@@ -109,8 +109,8 @@ describe("session.system", () => {
         options: {},
       }
       // Non-build/plan agents return before touching storage — no data needed.
-      expect(yield* prompt.tagging(tag)).toBeUndefined()
-      expect(yield* prompt.tagging(explore)).toBeUndefined()
+      expect(yield* prompt.aperture(lens)).toBeUndefined()
+      expect(yield* prompt.aperture(explore)).toBeUndefined()
     }),
   )
 })

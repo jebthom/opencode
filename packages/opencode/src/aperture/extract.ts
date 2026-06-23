@@ -2,9 +2,9 @@ import { Effect, Option } from "effect"
 import path from "path"
 import { createHash } from "crypto"
 import { FSUtil } from "@opencode-ai/core/fs-util"
-import { CodeGraphPayload } from "./payload"
+import { AperturePayload } from "./payload"
 
-// Deterministic structure extractor. Produces a CodeGraphPayload from a
+// Deterministic structure extractor. Produces a AperturePayload from a
 // directory tree plus lightweight import parsing for TS/JS and Python. No agent
 // involvement here — the output depends only on the files on disk, so the same
 // repo state always yields the same payload (see PLAN.md, step 1).
@@ -21,7 +21,7 @@ const ENTRY_GLOB = "*"
 
 // How many layers below the scope the view shows: the scope's direct children
 // (layer 0) plus their children (layer 1). Also the window the service uses to
-// decide whether a file change is visible (see codegraph.ts).
+// decide whether a file change is visible (see aperture.ts).
 export const VIEW_DEPTH = 2
 
 // Directories that never carry useful structure and would otherwise dominate the
@@ -36,7 +36,7 @@ const MAX_FILES = 20000
 const MAX_FILE_BYTES = 512 * 1024
 const READ_CONCURRENCY = 24
 
-export const extract = Effect.fn("CodeGraph.extract")(function* (
+export const extract = Effect.fn("Aperture.extract")(function* (
   root: string,
   options?: { scope?: string; depth?: number },
 ) {
@@ -138,7 +138,7 @@ export const extract = Effect.fn("CodeGraph.extract")(function* (
     { concurrency: READ_CONCURRENCY },
   )
 
-  const edges: CodeGraphPayload.Edge[] = []
+  const edges: AperturePayload.Edge[] = []
   const seenEdges = new Set<string>()
   const addEdge = (fromID: string, toID: string) => {
     if (fromID === toID) return
@@ -197,7 +197,7 @@ export const extract = Effect.fn("CodeGraph.extract")(function* (
   )
   const resolvedProbe = new Map(probeResults)
 
-  const boundaries = new Map<string, CodeGraphPayload.Boundary>()
+  const boundaries = new Map<string, AperturePayload.Boundary>()
   for (const { from, probeKey } of pendingBoundaryEdges) {
     const rel = resolvedProbe.get(probeKey)
     // A probe that resolved back into the window is already a normal edge via pass
@@ -210,7 +210,7 @@ export const extract = Effect.fn("CodeGraph.extract")(function* (
 
   const positions = layout(relFiles, [...dirSet], scope, birthtimes)
 
-  const nodes: CodeGraphPayload.Node[] = [
+  const nodes: AperturePayload.Node[] = [
     ...[...dirSet].map((d) => ({
       id: nodeID(d),
       path: d,
@@ -233,24 +233,24 @@ export const extract = Effect.fn("CodeGraph.extract")(function* (
   const boundaryList = [...boundaries.values()].toSorted((a, b) => a.id.localeCompare(b.id))
 
   return {
-    version: CodeGraphPayload.PAYLOAD_VERSION,
+    version: AperturePayload.PAYLOAD_VERSION,
     nodes,
     edges,
     boundaries: boundaryList,
     semantics: {},
-  } satisfies CodeGraphPayload.Payload
+  } satisfies AperturePayload.Payload
 })
 
 // Whole-repo file enumeration — the deterministic walk used by the periodic sweep
-// (codegraph.ts) rather than the per-scope view of `extract`. It is deliberately
+// (aperture.ts) rather than the per-scope view of `extract`. It is deliberately
 // *not* windowed: a single recursive glob finds every non-ignored source file in
 // the repo, repo-relative + sorted + capped, each paired with its stable node id.
 // Unlike `extract` it parses no imports and computes no layout — the sweep only
-// needs file identities to hand to the tagger, and edges/positions are a per-scope
+// needs file identities to hand to the painter, and edges/positions are a per-scope
 // display concern computed lazily on navigation. Reuses the same ignore set, cap,
 // and id scheme so a file's identity matches whatever `extract` later produces for
-// it (tag once here, paint everywhere it appears in a window).
-export const listFiles = Effect.fn("CodeGraph.listFiles")(function* (root: string) {
+// it (paint once here, paint everywhere it appears in a window).
+export const listFiles = Effect.fn("Aperture.listFiles")(function* (root: string) {
   const fs = yield* FSUtil.Service
   const found = yield* fs.glob("**/" + SOURCE_GLOB, { cwd: root, include: "file", dot: false, ignore: IGNORE_GLOBS })
   const rels = [
@@ -268,7 +268,7 @@ export const listFiles = Effect.fn("CodeGraph.listFiles")(function* (root: strin
 // one that descends into a sibling subdir, otherwise compare the segments lexically.
 // The effect is that a directory's own files — and recursively its subtrees — emit
 // contiguously before the next sibling, so directories "light up" coherently as the
-// background tagger walks the repo from the root outward.
+// background painter walks the repo from the root outward.
 export function dfsCompare(a: string, b: string): number {
   const as = a.split("/")
   const bs = b.split("/")
@@ -284,11 +284,11 @@ export function dfsCompare(a: string, b: string): number {
 }
 
 // Like `listFiles`, but ordered in DFS pre-order (see `dfsCompare`) so the
-// background tagger paints whole directories from the root outward rather than in
+// background painter paints whole directories from the root outward rather than in
 // flat lexical order. The cap is applied *after* the DFS sort so the kept files are
 // the earliest-walked (root-most) ones. Same glob/ignore/cap/id scheme as `listFiles`
 // so a file's identity matches whatever `extract` later produces for it.
-export const listFilesDfs = Effect.fn("CodeGraph.listFilesDfs")(function* (root: string) {
+export const listFilesDfs = Effect.fn("Aperture.listFilesDfs")(function* (root: string) {
   const fs = yield* FSUtil.Service
   const found = yield* fs.glob("**/" + SOURCE_GLOB, { cwd: root, include: "file", dot: false, ignore: IGNORE_GLOBS })
   const rels = [
@@ -306,7 +306,7 @@ export const listFilesDfs = Effect.fn("CodeGraph.listFilesDfs")(function* (root:
 // returns every descendant file's stable id, repo-relative path, and byte size.
 // Paths are repo-relative (so ids match `extract`'s) even though globbed under the
 // scope base. Reuses the same glob/ignore/cap/id scheme as `listFiles`.
-export const listSubtree = Effect.fn("CodeGraph.listSubtree")(function* (root: string, scopeRaw?: string) {
+export const listSubtree = Effect.fn("Aperture.listSubtree")(function* (root: string, scopeRaw?: string) {
   const fs = yield* FSUtil.Service
   const scope = normalizeScope(scopeRaw ?? "")
   const base = scope === "" ? root : path.join(root, scope)
@@ -366,7 +366,7 @@ function layout(files: string[], dirs: string[], scope: string, birthtimes: Map<
     byLayer.set(layer, bucket)
   }
   const order = (a: string, b: string) => (birthtimes.get(a) ?? 0) - (birthtimes.get(b) ?? 0) || a.localeCompare(b)
-  const positions = new Map<string, CodeGraphPayload.Position>()
+  const positions = new Map<string, AperturePayload.Position>()
   for (const [layer, members] of byLayer) {
     members.toSorted(order).forEach((p, index) => positions.set(p, { layer, index }))
   }
@@ -380,7 +380,7 @@ function birthMillis(stat: { birthtime: Option.Option<Date> }) {
 }
 
 // Last-modification time in millis from an Effect FileSystem stat, or 0 when the
-// platform doesn't report one. Used by the deterministic edit-recency collection to
+// platform doesn't report one. Used by the deterministic edit-recency Lens to
 // bucket files by when they were last locally edited (carried on listSubtree).
 function mtimeMillis(stat: { mtime: Option.Option<Date> }) {
   return Option.getOrElse(stat.mtime, () => new Date(0)).getTime()
@@ -404,8 +404,8 @@ function isIgnoredPath(rel: string) {
   return rel.split("/").some((seg) => IGNORED_DIR_SET.has(seg))
 }
 
-function emptyPayload(): CodeGraphPayload.Payload {
-  return { version: CodeGraphPayload.PAYLOAD_VERSION, nodes: [], edges: [], boundaries: [], semantics: {} }
+function emptyPayload(): AperturePayload.Payload {
+  return { version: AperturePayload.PAYLOAD_VERSION, nodes: [], edges: [], boundaries: [], semantics: {} }
 }
 
 // --- import parsing --------------------------------------------------------
@@ -489,4 +489,4 @@ function posixDir(p: string) {
   return idx === -1 ? "" : p.slice(0, idx)
 }
 
-export * as CodeGraphExtract from "./extract"
+export * as ApertureExtract from "./extract"

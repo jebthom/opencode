@@ -14,17 +14,17 @@ import { Config } from "@/config/config"
 import { InstanceState } from "@/effect/instance-state"
 import type { InstanceContext } from "@/project/instance-context"
 import { registerDisposer } from "@/effect/instance-registry"
-import { CodeGraphPayload } from "./payload"
-import { CodeGraphExtract } from "./extract"
-import { CodeGraphEvent } from "./event"
-import { CodeGraphSemanticStore } from "./semantic-store"
-import { CodeGraphTagger } from "./tagger"
-import { CodeGraphCollectionStore } from "./collection-store"
-import { CodeGraphDeterministic } from "./deterministic"
+import { AperturePayload } from "./payload"
+import { ApertureExtract } from "./extract"
+import { ApertureEvent } from "./event"
+import { ApertureSemanticStore } from "./semantic-store"
+import { AperturePainter } from "./painter"
+import { ApertureLensStore } from "./lens-store"
+import { ApertureDeterministic } from "./deterministic"
 import { Git } from "@/git"
-import { type TagCollection, type PaletteId, legend as collectionLegend, NONE_TAG, NONE_HUE, ARCHITECTURE_ID, isBuiltinCollection, isDeterministic } from "./collections"
+import { type Lens, type PaletteId, legend as lensLegend, NONE_FACET, NONE_HUE, ARCHITECTURE_ID, isBuiltinLens, isDeterministic } from "./lenses"
 
-// Server-side code-graph service (PLAN.md steps 1 + 2.5). Owns the deterministic
+// Server-side Aperture service (PLAN.md steps 1 + 2.5). Owns the deterministic
 // payload, but unlike step 1 the graph is a *2-level window* rooted at a scope
 // (a repo-relative directory the TUI is viewing). The view is built on demand:
 // each scope the user navigates to is extracted, cached per project, and reused.
@@ -32,7 +32,7 @@ import { type TagCollection, type PaletteId, legend as collectionLegend, NONE_TA
 // Recompute is visibility-gated (the merge of step 3). We subscribe to file
 // events and only mark a cached scope dirty when the changed file falls within
 // that scope's window — a file buried in an unopened directory dirties nothing.
-// When a *currently cached* scope goes dirty we also publish codegraph.invalidated
+// When a *currently cached* scope goes dirty we also publish aperture.invalidated
 // so the live view refetches just that scope; recompute itself still happens
 // lazily on the next get(). Caches and the dirty set live per project directory.
 //
@@ -40,119 +40,119 @@ import { type TagCollection, type PaletteId, legend as collectionLegend, NONE_TA
 // the *viewed window* fresh as the user navigates — cheap, and the path that
 // catches local edits/creations. The whole-repo `sweep` runs on open and on each
 // turn completion: the deterministic walk enumerates every file in the repo and
-// the tagger paints all of them, so semantics fill in beyond the viewed window.
+// the painter paints all of them, so semantics fill in beyond the viewed window.
 // Both layers keep their skip checks — a scope already cached + clean isn't
-// recomputed, and a file whose content hash is unchanged isn't re-tagged — so the
+// recomputed, and a file whose content hash is unchanged isn't re-painted — so the
 // sweep only spends work on what's new or actually changed.
 
-const log = Log.create({ service: "codegraph" })
+const log = Log.create({ service: "aperture" })
 
 // Shared concurrency gate across the foreground (per-scope window) and background
-// (whole-repo) taggers: at most this many tagger *passes* in flight at once, so the
+// (whole-repo) painters: at most this many painter *passes* in flight at once, so the
 // two never collide on the API. Each pass internally fans its dir-bins out up to
-// TAG_FANOUT-wide (see tagger.ts); the gate serializes whole passes, not individual
+// FACET_FANOUT-wide (see painter.ts); the gate serializes whole passes, not individual
 // model calls. The background loop holds a permit only for one batch and releases it
-// during its inter-batch pause, so a foreground tag always wins a permit promptly —
+// during its inter-batch pause, so a foreground paint always wins a permit promptly —
 // that's how the visible view stays prioritized.
-const TAG_CONCURRENCY = 1
-// Files handed to one background tagStale call; must equal MAX_PER_PASS in the tagger
+const PAINT_CONCURRENCY = 1
+// Files handed to one background paintStale call; must equal MAX_PER_PASS in the painter
 // so each call fully consumes the slice (a smaller MAX_PER_PASS would silently drop the
 // slice's tail). Sized so the pass has ~2x as many dir-bins as workers — enough
-// oversubscription to keep the TAG_FANOUT-wide pool busy through uneven bin latencies.
+// oversubscription to keep the FACET_FANOUT-wide pool busy through uneven bin latencies.
 const BG_BATCH = 960
-// Pause between background batches, held *outside* the permit so a foreground tag
+// Pause between background batches, held *outside* the permit so a foreground paint
 // arriving mid-pause acquires immediately. Short because each batch already self-spaces
 // via its concurrent calls; just enough to yield the gate between waves.
 const BG_BATCH_DELAY = "250 millis"
 
-// Storage key: ["codegraph", <projectID>, "structure", <scopeKey>]. Per project
+// Storage key: ["aperture", <projectID>, "structure", <scopeKey>]. Per project
 // and per scope so each navigated directory keeps its own durable subgraph.
 function storageKey(projectID: string, scope: string) {
   const scopeKey = scope === "" ? "root" : "s_" + createHash("sha256").update(scope).digest("hex").slice(0, 16)
-  return ["codegraph", projectID, "structure", scopeKey]
+  return ["aperture", projectID, "structure", scopeKey]
 }
 
 interface DirCache {
   readonly projectID: string
-  readonly scopes: Map<string, CodeGraphPayload.Payload>
+  readonly scopes: Map<string, AperturePayload.Payload>
   readonly dirty: Set<string>
 }
 
-export interface CreateCollectionInput {
+export interface CreateLensInput {
   readonly name: string
   readonly description: string
   readonly palette: PaletteId
   readonly prompt: string
-  readonly tags: ReadonlyArray<{ readonly label: string; readonly description: string }>
-  // Optional repo-relative directories the tagger front-loads (see TagCollection).
+  readonly facets: ReadonlyArray<{ readonly label: string; readonly description: string }>
+  // Optional repo-relative directories the painter front-loads (see Lens).
   readonly directories?: ReadonlyArray<string>
-  // Whether to make the new collection active (switching the viewed collection and
-  // starting the tagger on it). Defaults to true — the interactive /tag behaviour.
+  // Whether to make the new Lens active (switching the viewed Lens and
+  // starting the painter on it). Defaults to true — the interactive /lens behaviour.
   // Pass false to create without disturbing the user's current view (the new
-  // collection then stays untagged until it is selected).
+  // Lens then stays unpainted until it is selected).
   readonly activate?: boolean
 }
 
-export interface EditCollectionInput {
-  // Id or name of the collection to edit (must be a user/project collection).
-  readonly collection: string
+export interface EditLensInput {
+  // Id or name of the Lens to edit (must be a user/project Lens).
+  readonly lens: string
   readonly name?: string
   readonly description?: string
   readonly palette?: PaletteId
   readonly prompt?: string
-  // The complete desired tag list (like create). Tags keep their id — and thus their
-  // existing tagged files — when an id or label matches; new labels mint new tags.
-  readonly tags?: ReadonlyArray<{ readonly id?: string; readonly label: string; readonly description: string }>
+  // The complete desired facet list (like create). Facets keep their id — and thus their
+  // existing painted files — when an id or label matches; new labels mint new facets.
+  readonly facets?: ReadonlyArray<{ readonly id?: string; readonly label: string; readonly description: string }>
   readonly directories?: ReadonlyArray<string>
 }
 
-// Outcome of an edit/merge/delete: a resolved collection or why it was refused. The
-// built-in (global) collections are immutable, so they refuse with "builtin".
-export type CollectionMutation =
-  | { readonly status: "ok"; readonly collection: TagCollection; readonly structural: boolean }
+// Outcome of an edit/merge/delete: a resolved Lens or why it was refused. The
+// built-in (global) Lenses are immutable, so they refuse with "builtin".
+export type LensMutation =
+  | { readonly status: "ok"; readonly lens: Lens; readonly structural: boolean }
   | { readonly status: "not-found" }
   | { readonly status: "builtin" }
-  | { readonly status: "unknown-tag"; readonly tag: string }
+  | { readonly status: "unknown-facet"; readonly facet: string }
 
-// Outcome of a delete: the now-active collection (after falling back to Architecture
+// Outcome of a delete: the now-active Lens (after falling back to Architecture
 // when the deleted one was active) or why it was refused.
 export type DeleteOutcome =
-  | { readonly status: "ok"; readonly active: CodeGraphPayload.CollectionInfo }
+  | { readonly status: "ok"; readonly active: AperturePayload.LensInfo }
   | { readonly status: "not-found" }
   | { readonly status: "builtin" }
 
 export interface Interface {
   // Cached payload for `scope` (default repo root); computes + persists on a miss
   // or when the scope has been marked dirty by a file change in its window.
-  readonly get: (scope?: string) => Effect.Effect<CodeGraphPayload.Payload>
+  readonly get: (scope?: string) => Effect.Effect<AperturePayload.Payload>
   // Recompute `scope` from disk, persist, and refresh the in-memory copy.
-  readonly refresh: (scope?: string) => Effect.Effect<CodeGraphPayload.Payload>
-  // Built-in + project-defined tag collections, and the active one.
-  readonly collections: () => Effect.Effect<TagCollection[]>
-  readonly activeCollection: () => Effect.Effect<TagCollection>
-  // Define a new per-project collection (additive — never overwrites), make it
-  // active, and kick off tagging.
-  readonly createCollection: (input: CreateCollectionInput) => Effect.Effect<TagCollection>
-  // Switch the active collection by id or name; re-paints from cache and tags any
-  // not-yet-tagged files. Returns the resolved collection, or undefined if unknown.
-  readonly selectCollection: (idOrName: string) => Effect.Effect<TagCollection | undefined>
-  // Step one collection forward ("next") or back ("prev") in the list (built-ins +
+  readonly refresh: (scope?: string) => Effect.Effect<AperturePayload.Payload>
+  // Built-in + project-defined Lenses, and the active one.
+  readonly lenses: () => Effect.Effect<Lens[]>
+  readonly activeLens: () => Effect.Effect<Lens>
+  // Define a new per-project Lens (additive — never overwrites), make it
+  // active, and kick off painting.
+  readonly createLens: (input: CreateLensInput) => Effect.Effect<Lens>
+  // Switch the active Lens by id or name; re-paints from cache and paints any
+  // not-yet-painted files. Returns the resolved Lens, or undefined if unknown.
+  readonly selectLens: (idOrName: string) => Effect.Effect<Lens | undefined>
+  // Step one Lens forward ("next") or back ("prev") in the list (built-ins +
   // user-defined), wrapping at the ends, and re-paint. Returns the newly-active
-  // collection's info. Drives the top-bar's ◀/▶ arrows.
-  readonly cycleCollection: (direction: "next" | "prev") => Effect.Effect<CodeGraphPayload.CollectionInfo>
-  // Edit a user collection in place. A structural change (tags added/removed/redefined
-  // or prompt changed) clears that collection's tags so the sweep re-tags from scratch;
+  // Lens's info. Drives the top-bar's ◀/▶ arrows.
+  readonly cycleLens: (direction: "next" | "prev") => Effect.Effect<AperturePayload.LensInfo>
+  // Edit a user Lens in place. A structural change (facets added/removed/redefined
+  // or prompt changed) clears that Lens's facets so the sweep re-paints from scratch;
   // a cosmetic change (name/label/palette/directories) just re-paints. Built-ins refuse.
-  readonly editCollection: (input: EditCollectionInput) => Effect.Effect<CollectionMutation>
-  // Deterministically fold one tag into another for a user collection (no re-tag, no
+  readonly editLens: (input: EditLensInput) => Effect.Effect<LensMutation>
+  // Deterministically fold one facet into another for a user Lens (no re-paint, no
   // tokens): drops `from` and re-labels its files as `into`. Both id or label.
-  readonly mergeTags: (collection: string, from: string, into: string) => Effect.Effect<CollectionMutation>
-  // Delete a user collection (and its tags), falling back to the built-in active
-  // collection when the deleted one was active. Not exposed to the tagging agent.
-  readonly deleteCollection: (idOrName: string) => Effect.Effect<DeleteOutcome>
+  readonly mergeFacets: (lens: string, from: string, into: string) => Effect.Effect<LensMutation>
+  // Delete a user Lens (and its facets), falling back to the built-in active
+  // Lens when the deleted one was active. Not exposed to the lens agent.
+  readonly deleteLens: (idOrName: string) => Effect.Effect<DeleteOutcome>
 }
 
-export class Service extends Context.Service<Service, Interface>()("@opencode/CodeGraph") {}
+export class Service extends Context.Service<Service, Interface>()("@opencode/Aperture") {}
 
 export const use = serviceUse(Service)
 
@@ -162,7 +162,7 @@ export const layer = Layer.effect(
     const storage = yield* Storage.Service
     const events = yield* EventV2.Service
     // Provider/Config are not self-provided (see defaultLayer) — they ride the
-    // server's merged layer like Session does. Captured here so the forked tagger
+    // server's merged layer like Session does. Captured here so the forked painter
     // keeps a clean R = never and `get`/`refresh` expose no extra requirements.
     const provider = yield* Provider.Service
     const config = yield* Config.Service
@@ -170,19 +170,19 @@ export const layer = Layer.effect(
     // Provider/Config it's self-provided in defaultLayer so the layer stays R = never.
     const git = yield* Git.Service
 
-    // Shared by the foreground and background taggers (see TAG_CONCURRENCY).
-    const tagGate = yield* Semaphore.make(TAG_CONCURRENCY)
+    // Shared by the foreground and background painters (see PAINT_CONCURRENCY).
+    const paintGate = yield* Semaphore.make(PAINT_CONCURRENCY)
     // The layer-construction scope: background loops fork into it (not the per-get
     // request scope) so they live for the service's lifetime and are interrupted
     // when it's released, while keeping get()/refresh() at R = never.
     const serviceScope = yield* Effect.scope
 
     const empty = {
-      version: CodeGraphPayload.PAYLOAD_VERSION,
+      version: AperturePayload.PAYLOAD_VERSION,
       nodes: [],
       edges: [],
       semantics: {},
-    } satisfies CodeGraphPayload.Payload
+    } satisfies AperturePayload.Payload
 
     // Per-directory caches. Created lazily on first get(); the file-event
     // subscription only ever touches directories that already have a cache, so
@@ -201,15 +201,15 @@ export const layer = Layer.effect(
     // refreshes every fetch (so finalize runs constantly) but the file set only changes
     // when files change — we drop the entry from the same file-event / turn-completion
     // subscriptions that already fire below, so it rebuilds lazily on the next read.
-    const subtreeCache = new Map<string, ReadonlyArray<CodeGraphDeterministic.SubtreeFile>>()
+    const subtreeCache = new Map<string, ReadonlyArray<ApertureDeterministic.SubtreeFile>>()
     const subtreeFor = (directory: string) =>
       Effect.gen(function* () {
         const cached = subtreeCache.get(directory)
         if (cached) return cached
-        const files = yield* CodeGraphExtract.listSubtree(directory, "").pipe(
+        const files = yield* ApertureExtract.listSubtree(directory, "").pipe(
           Effect.catch((cause) => {
             log.error("listSubtree failed", { directory, cause })
-            return Effect.succeed([] as ReadonlyArray<CodeGraphDeterministic.SubtreeFile>)
+            return Effect.succeed([] as ReadonlyArray<ApertureDeterministic.SubtreeFile>)
           }),
           Effect.provide(FSUtil.defaultLayer),
         )
@@ -221,14 +221,14 @@ export const layer = Layer.effect(
     // cached per directory because the TUI refetches constantly (so finalize runs often)
     // but git state only moves when files change. Dropped from the same file-event /
     // turn-completion hooks that invalidate subtreeCache below, so it rebuilds lazily.
-    const gitStatusCache = new Map<string, CodeGraphDeterministic.GitChanged>()
+    const gitStatusCache = new Map<string, ApertureDeterministic.GitChanged>()
     const gitChangedFor = (directory: string) =>
       Effect.gen(function* () {
         const cached = gitStatusCache.get(directory)
         if (cached) return cached
         const items = yield* git.status(directory)
         const prefix = yield* git.prefix(directory)
-        const resolved: CodeGraphDeterministic.GitChanged = { prefix, changed: new Set(items.map((i) => i.file)) }
+        const resolved: ApertureDeterministic.GitChanged = { prefix, changed: new Set(items.map((i) => i.file)) }
         gitStatusCache.set(directory, resolved)
         return resolved
       })
@@ -247,18 +247,18 @@ export const layer = Layer.effect(
       })
 
     // A deterministic built-in can have an environmental prerequisite: git-changed needs a
-    // git work tree. A collection whose prerequisite isn't met is hidden everywhere a
-    // collection is chosen or listed (collections()/cycle/select), so the user can never
+    // git work tree. A Lens whose prerequisite isn't met is hidden everywhere a
+    // Lens is chosen or listed (lenses()/cycle/select), so the user can never
     // land on a meaningless view — git-changed simply doesn't exist in a non-git folder.
-    const isAvailable = (collection: TagCollection, directory: string): Effect.Effect<boolean> =>
-      collection.deterministic === "git-changed" ? isRepoFor(directory) : Effect.succeed(true)
+    const isAvailable = (lens: Lens, directory: string): Effect.Effect<boolean> =>
+      lens.deterministic === "git-changed" ? isRepoFor(directory) : Effect.succeed(true)
 
-    // The active+listed collections minus any whose prerequisite is unmet for this directory.
+    // The active+listed Lenses minus any whose prerequisite is unmet for this directory.
     const listAvailable = (directory: string, projectID: string) =>
       Effect.gen(function* () {
-        const all = yield* CodeGraphCollectionStore.list(storage, projectID)
-        const keep: TagCollection[] = []
-        for (const collection of all) if (yield* isAvailable(collection, directory)) keep.push(collection)
+        const all = yield* ApertureLensStore.list(storage, projectID)
+        const keep: Lens[] = []
+        for (const lens of all) if (yield* isAvailable(lens, directory)) keep.push(lens)
         return keep
       })
 
@@ -269,14 +269,14 @@ export const layer = Layer.effect(
       isRepoCache.delete(directory)
       // The loop fiber itself is interrupted when the instance scope closes
       // (forkScoped); drop the map entry so a later reopen can start a fresh one.
-      bgTaggers.delete(directory)
+      bgPainters.delete(directory)
     })
     yield* Effect.addFinalizer(() => Effect.sync(off))
 
     // FS failures degrade to an empty payload rather than crashing the UI.
-    const compute = Effect.fn("CodeGraph.compute")(
+    const compute = Effect.fn("Aperture.compute")(
       function* (directory: string, projectID: string, scope: string) {
-        const payload = yield* CodeGraphExtract.extract(directory, { scope }).pipe(
+        const payload = yield* ApertureExtract.extract(directory, { scope }).pipe(
           Effect.catch((cause) => {
             log.error("extract failed", { projectID, scope, cause })
             return Effect.succeed(empty)
@@ -292,179 +292,179 @@ export const layer = Layer.effect(
     // The structure cache (container.scopes + storage) stays pure: semantics are
     // merged onto a copy at the read boundary from the separate per-project store,
     // so the deterministic structure is never mutated by the async paint. Every
-    // read path runs through finalize so the merge + background tagging happen
+    // read path runs through finalize so the merge + background painting happen
     // exactly once regardless of where the structure came from (memory, disk,
     // recompute).
     const inFlight = new Set<string>()
 
-    const scheduleTag = (
+    const schedulePaint = (
       directory: string,
       projectID: string,
       scope: string,
-      nodes: CodeGraphPayload.Payload["nodes"],
-      boundaries: readonly CodeGraphPayload.Boundary[],
-      collection: TagCollection,
+      nodes: AperturePayload.Payload["nodes"],
+      boundaries: readonly AperturePayload.Boundary[],
+      lens: Lens,
     ) =>
       Effect.gen(function* () {
-        // Tag in-window files *and* the one-hop boundary targets (step 6): a
-        // boundary's tile is painted from its target's layer, so the target must be
-        // tagged even though it falls outside the current window. The store is keyed
-        // by stable node id, so this tag is reused when the file is later viewed
-        // in-window. stale-only dedup in the tagger keeps the extra files cheap.
+        // Paint in-window files *and* the one-hop boundary targets (step 6): a
+        // boundary's tile is painted from its target's facet, so the target must be
+        // painted even though it falls outside the current window. The store is keyed
+        // by stable node id, so this paint is reused when the file is later viewed
+        // in-window. stale-only dedup in the painter keeps the extra files cheap.
         const fileNodes = [...nodes.filter((n) => n.kind === "file"), ...boundaries.filter((b) => b.kind === "file")].map(
           (n) => ({ id: n.id, path: n.path }),
         )
         if (fileNodes.length === 0) return
-        // Key by collection too: a foreground pass for a freshly-switched collection
+        // Key by Lens too: a foreground pass for a freshly-switched Lens
         // must not be deduped against an in-flight pass for the previous one.
-        const key = JSON.stringify([directory, scope, collection.id])
+        const key = JSON.stringify([directory, scope, lens.id])
         if (inFlight.has(key)) return
         inFlight.add(key)
-        yield* CodeGraphTagger.tagStale(
+        yield* AperturePainter.paintStale(
           { storage, events, provider, config },
           directory,
           projectID,
           scope,
           fileNodes,
           "fg",
-          collection,
+          lens,
         ).pipe(
-          tagGate.withPermits(1),
+          paintGate.withPermits(1),
           Effect.ensuring(Effect.sync(() => inFlight.delete(key))),
           Effect.forkDetach,
         )
       })
 
-    const finalize = (ctx: InstanceContext, scope: string, structure: CodeGraphPayload.Payload) =>
+    const finalize = (ctx: InstanceContext, scope: string, structure: AperturePayload.Payload) =>
       Effect.gen(function* () {
-        // Paint with the *active* collection: its tag store, its legend (tag → colour),
+        // Paint with the *active* Lens: its facet store, its legend (facet → colour),
         // and its name travel out on the payload so the renderer needs no hard-coded
-        // vocabulary. Switching collections re-paints from that collection's own
-        // (cached) store — no other collection's work is touched.
-        const collection = yield* CodeGraphCollectionStore.getActive(storage, ctx.project.id)
+        // vocabulary. Switching Lenses re-paints from that Lens's own
+        // (cached) store — no other Lens's work is touched.
+        const lens = yield* ApertureLensStore.getActive(storage, ctx.project.id)
         // Whole-repo membership (full depth), needed both for directory composition and —
-        // for the deterministic built-ins — as the file set whose tags we synthesize.
+        // for the deterministic built-ins — as the file set whose facets we synthesize.
         const subtree = yield* subtreeFor(ctx.directory)
-        // Deterministic built-ins (git-changed / mtime-buckets) compute their tags from the
-        // repo instead of reading the persisted store: no tagger, no tokens, always fresh.
-        const det = isDeterministic(collection)
+        // Deterministic built-ins (git-changed / mtime-buckets) compute their facets from the
+        // repo instead of reading the persisted store: no painter, no tokens, always fresh.
+        const det = isDeterministic(lens)
         const store = det
-          ? CodeGraphDeterministic.computeStore(
-              collection.deterministic!,
+          ? ApertureDeterministic.computeStore(
+              lens.deterministic!,
               subtree,
-              collection.deterministic === "git-changed" ? yield* gitChangedFor(ctx.directory) : undefined,
+              lens.deterministic === "git-changed" ? yield* gitChangedFor(ctx.directory) : undefined,
             )
-          : yield* CodeGraphSemanticStore.read(storage, ctx.project.id, collection.id)
-        const colorByTag = new Map(collection.tags.map((t) => [t.id, t.color]))
-        const semantics: Record<string, CodeGraphPayload.Semantic> = {}
-        // The store holds only the semantic (tag); hue/tags are derived here, so
-        // palette/vocabulary changes apply without a re-tag. Boundaries (step 6) are
+          : yield* ApertureSemanticStore.read(storage, ctx.project.id, lens.id)
+        const colorByFacet = new Map(lens.facets.map((t) => [t.id, t.color]))
+        const semantics: Record<string, AperturePayload.Semantic> = {}
+        // The store holds only the semantic (facet); hue/facets are derived here, so
+        // palette/vocabulary changes apply without a re-paint. Boundaries (step 6) are
         // painted from the same store so an out-of-window tile shows its target's hue
-        // once that target has been tagged.
+        // once that target has been painted.
         const applySemantic = (id: string) => {
           const entry = store[id]
-          if (entry) semantics[id] = { tags: [entry.tag], hue: entry.tag === NONE_TAG ? NONE_HUE : colorByTag.get(entry.tag) }
+          if (entry) semantics[id] = { facets: [entry.facet], hue: entry.facet === NONE_FACET ? NONE_HUE : colorByFacet.get(entry.facet) }
         }
         for (const node of structure.nodes) applySemantic(node.id)
         for (const boundary of structure.boundaries ?? []) applySemantic(boundary.id)
-        // Paint each in-window directory as its subtree's tag composition: bucket every
-        // descendant source file (full depth, from the cached membership) by its tagged
-        // tag, summing both a file count and a byte sum so the renderer can pick either
+        // Paint each in-window directory as its subtree's facet composition: bucket every
+        // descendant source file (full depth, from the cached membership) by its painted
+        // facet, summing both a file count and a byte sum so the renderer can pick either
         // metric. Derived here alongside `semantics` so the structure cache stays pure.
-        const composition = computeComposition(structure.nodes, subtree, store, collection)
-        // Deterministic collections are fully painted above; only semantic ones schedule
-        // the foreground tagger for the in-window files + boundary targets.
+        const composition = computeComposition(structure.nodes, subtree, store, lens)
+        // Deterministic Lenses are fully painted above; only semantic ones schedule
+        // the foreground painter for the in-window files + boundary targets.
         if (!det)
-          yield* scheduleTag(ctx.directory, ctx.project.id, scope, structure.nodes, structure.boundaries ?? [], collection)
-        const collectionInfo: CodeGraphPayload.CollectionInfo = {
-          id: collection.id,
-          name: collection.name,
-          legend: collectionLegend(collection),
+          yield* schedulePaint(ctx.directory, ctx.project.id, scope, structure.nodes, structure.boundaries ?? [], lens)
+        const lensInfo: AperturePayload.LensInfo = {
+          id: lens.id,
+          name: lens.name,
+          legend: lensLegend(lens),
         }
-        return { ...structure, semantics, composition, collection: collectionInfo }
+        return { ...structure, semantics, composition, lens: lensInfo }
       })
 
-    // Background whole-repo tagger (vs. the per-scope window of get/refresh). One
+    // Background whole-repo painter (vs. the per-scope window of get/refresh). One
     // self-rescheduling loop per directory walks every source file in DFS order
     // (so directories light up from the root outward), painting BG_BATCH files per
     // step under the shared gate with a pause between steps. When a full pass is
     // done it parks until a file change / turn completion wakes it, then re-walks —
-    // picking up created/deleted files. The stale-hash skip in the tagger makes
+    // picking up created/deleted files. The stale-hash skip in the painter makes
     // every re-walk cheap (unchanged files spend nothing). forkScoped binds the loop
-    // to the instance scope so it dies with the TUI; the bgTaggers map dedups starts
+    // to the instance scope so it dies with the TUI; the bgPainters map dedups starts
     // and the dropping(1) wake queue coalesces a burst of changes into one rescan.
-    const bgTaggers = new Map<string, { readonly wake: Queue.Queue<void> }>()
-    // Per-directory counter bumped whenever the active collection changes
-    // (onCollectionChanged). The bg loop snapshots it at pass start and abandons an
-    // in-flight sweep when it changes, so a freshly-selected collection starts filling
-    // in immediately instead of waiting for the previous collection's sweep to finish.
-    const collectionEpoch = new Map<string, number>()
+    const bgPainters = new Map<string, { readonly wake: Queue.Queue<void> }>()
+    // Per-directory counter bumped whenever the active Lens changes
+    // (onLensChanged). The bg loop snapshots it at pass start and abandons an
+    // in-flight sweep when it changes, so a freshly-selected Lens starts filling
+    // in immediately instead of waiting for the previous Lens's sweep to finish.
+    const lensEpoch = new Map<string, number>()
 
     const backgroundLoop = (directory: string, projectID: string, wake: Queue.Queue<void>) =>
       Effect.gen(function* () {
         while (true) {
-          // Re-read the active collection each pass so a switch (which wakes this loop)
-          // re-walks the repo tagging for the *new* collection; cached entries make a
-          // re-walk of an already-tagged collection free.
-          const collection = yield* CodeGraphCollectionStore.getActive(storage, projectID)
+          // Re-read the active Lens each pass so a switch (which wakes this loop)
+          // re-walks the repo painting for the *new* Lens; cached entries make a
+          // re-walk of an already-painted Lens free.
+          const lens = yield* ApertureLensStore.getActive(storage, projectID)
           // Deterministic built-ins are painted synchronously in finalize — there's nothing
-          // for the whole-repo sweep to do. Park until a collection switch (or file change)
-          // wakes us; the next pass re-reads the active collection and resumes the sweep if
+          // for the whole-repo sweep to do. Park until a Lens switch (or file change)
+          // wakes us; the next pass re-reads the active Lens and resumes the sweep if
           // it's switched back to a semantic one.
-          if (isDeterministic(collection)) {
+          if (isDeterministic(lens)) {
             yield* Queue.take(wake)
             continue
           }
-          const epoch = collectionEpoch.get(directory) ?? 0
-          const files = yield* CodeGraphExtract.listFilesDfs(directory).pipe(
+          const epoch = lensEpoch.get(directory) ?? 0
+          const files = yield* ApertureExtract.listFilesDfs(directory).pipe(
             Effect.catchCause((cause) => {
               log.error("background enumerate failed", { projectID, cause })
               return Effect.succeed<ReadonlyArray<{ id: string; path: string }>>([])
             }),
             Effect.provide(FSUtil.defaultLayer),
           )
-          // Front-load the collection's relevant directories (if any): tag files under
+          // Front-load the Lens's relevant directories (if any): paint files under
           // them first, in their existing DFS order, then the rest of the repo. The
           // sweep still covers everything; this only changes the order so the targeted
-          // area lights up first. Already-tagged files in the tail are stale-skipped.
-          const ordered = orderByDirectories(files, collection.directories)
+          // area lights up first. Already-painted files in the tail are stale-skipped.
+          const ordered = orderByDirectories(files, lens.directories)
           // Always-written diagnostic so a bg loop that produces no request lines is
           // still visible in the perf log (distinguishes "loop never ran" from
-          // "ran but every slice was already tagged / no model").
-          yield* CodeGraphTagger.appendPerfEvent(directory, "bg", "pass-start", { files: ordered.length, collection: collection.id })
+          // "ran but every slice was already painted / no model").
+          yield* AperturePainter.appendPerfEvent(directory, "bg", "pass-start", { files: ordered.length, lens: lens.id })
           let interrupted = false
           for (let cursor = 0; cursor < ordered.length; cursor += BG_BATCH) {
             const slice = ordered.slice(cursor, cursor + BG_BATCH)
-            // scope "" — the tag store is keyed by stable node id, so a file tagged
+            // scope "" — the facet store is keyed by stable node id, so a file painted
             // here is reused in every window it later appears in. The permit is held
             // only for the batch; the pause below runs without it so foreground wins.
-            yield* CodeGraphTagger.tagStale({ storage, events, provider, config }, directory, projectID, "", slice, "bg", collection).pipe(
-              tagGate.withPermits(1),
+            yield* AperturePainter.paintStale({ storage, events, provider, config }, directory, projectID, "", slice, "bg", lens).pipe(
+              paintGate.withPermits(1),
               Effect.catchCause((cause) =>
                 Effect.sync(() => log.error("background batch failed", { projectID, cause })),
               ),
             )
             yield* Effect.sleep(BG_BATCH_DELAY)
-            // Abandon the rest of this sweep when the active collection changed under
-            // us, so the new collection takes over without finishing the old one.
-            if ((collectionEpoch.get(directory) ?? 0) !== epoch) {
+            // Abandon the rest of this sweep when the active Lens changed under
+            // us, so the new Lens takes over without finishing the old one.
+            if ((lensEpoch.get(directory) ?? 0) !== epoch) {
               interrupted = true
               break
             }
           }
           // On interruption, drain the switch's own wake signal and re-loop immediately
-          // (the next pass re-reads the now-active collection). Otherwise park until a
-          // file change / turn completion / collection switch wakes us.
+          // (the next pass re-reads the now-active Lens). Otherwise park until a
+          // file change / turn completion / Lens switch wakes us.
           if (interrupted) yield* Queue.poll(wake)
           else yield* Queue.take(wake)
         }
       })
 
-    const startBackgroundTagger = (directory: string, projectID: string) =>
+    const startBackgroundPainter = (directory: string, projectID: string) =>
       Effect.gen(function* () {
-        if (bgTaggers.has(directory)) return
+        if (bgPainters.has(directory)) return
         const wake = yield* Queue.dropping<void>(1)
-        bgTaggers.set(directory, { wake })
+        bgPainters.set(directory, { wake })
         yield* backgroundLoop(directory, projectID, wake).pipe(
           Effect.catchCause((cause) => Effect.sync(() => log.error("background loop crashed", { projectID, cause }))),
           (loop) => Effect.forkIn(loop, serviceScope),
@@ -475,28 +475,28 @@ export const layer = Layer.effect(
     // burst of file events / repeated turn completions coalesce into a single rescan.
     const wakeBackground = (directory: string) =>
       Effect.gen(function* () {
-        const entry = bgTaggers.get(directory)
+        const entry = bgPainters.get(directory)
         if (!entry) return
         yield* Queue.offer(entry.wake, void 0).pipe(Effect.ignore)
       })
 
-    const load = Effect.fn("CodeGraph.load")(function* (scope?: string) {
+    const load = Effect.fn("Aperture.load")(function* (scope?: string) {
       const ctx = yield* InstanceState.context
       const container = containerFor(ctx.directory, ctx.project.id)
-      // On open (first get for this directory) start the background whole-repo tagger
+      // On open (first get for this directory) start the background whole-repo painter
       // so semantics fill in past the initially-viewed window without the user having
       // to navigate. Idempotent per directory; file changes / turn completion wake it
       // to re-walk (the subscriptions below).
-      yield* startBackgroundTagger(ctx.directory, ctx.project.id)
-      const norm = CodeGraphExtract.normalizeScope(scope ?? "")
+      yield* startBackgroundPainter(ctx.directory, ctx.project.id)
+      const norm = ApertureExtract.normalizeScope(scope ?? "")
 
       if (!container.dirty.has(norm)) {
         const inMemory = container.scopes.get(norm)
         if (inMemory) return yield* finalize(ctx, norm, inMemory)
         const cached = yield* storage
-          .read<CodeGraphPayload.Payload>(storageKey(ctx.project.id, norm))
+          .read<AperturePayload.Payload>(storageKey(ctx.project.id, norm))
           .pipe(Effect.catch(() => Effect.void))
-        if (cached && cached.version === CodeGraphPayload.PAYLOAD_VERSION) {
+        if (cached && cached.version === AperturePayload.PAYLOAD_VERSION) {
           container.scopes.set(norm, cached)
           return yield* finalize(ctx, norm, cached)
         }
@@ -508,23 +508,23 @@ export const layer = Layer.effect(
       return yield* finalize(ctx, norm, payload)
     })
 
-    const refresh = Effect.fn("CodeGraph.refresh")(function* (scope?: string) {
+    const refresh = Effect.fn("Aperture.refresh")(function* (scope?: string) {
       const ctx = yield* InstanceState.context
       const container = containerFor(ctx.directory, ctx.project.id)
       // The TUI fetches with refresh=true, so this — not load — is the path that
-      // actually runs on open; start the background tagger here too (idempotent per
+      // actually runs on open; start the background painter here too (idempotent per
       // directory) or it would never kick off.
-      yield* startBackgroundTagger(ctx.directory, ctx.project.id)
-      const norm = CodeGraphExtract.normalizeScope(scope ?? "")
+      yield* startBackgroundPainter(ctx.directory, ctx.project.id)
+      const norm = ApertureExtract.normalizeScope(scope ?? "")
       // A deterministic built-in (mtime / git-changed) paints from live disk state that
       // finalize reads via subtreeCache / gitStatusCache. Those caches otherwise only drop on
       // a file event or turn completion, so a manual IDE edit while one is already on screen
       // stays stale until the next turn. refresh is the path every TUI fetch takes — the
       // turn-end refetch, the manual ⟳, and the periodic poll — so dropping the inputs here
       // recomputes them fresh on each, picking up watcher-missed changes. The whole-repo walk
-      // + git status are cheap, and this only fires while a deterministic collection is the
-      // active view; semantic collections read the persisted tag store and keep their caches.
-      const active = yield* CodeGraphCollectionStore.getActive(storage, ctx.project.id)
+      // + git status are cheap, and this only fires while a deterministic Lens is the
+      // active view; semantic Lenses read the persisted facet store and keep their caches.
+      const active = yield* ApertureLensStore.getActive(storage, ctx.project.id)
       if (isDeterministic(active)) {
         subtreeCache.delete(ctx.directory)
         gitStatusCache.delete(ctx.directory)
@@ -555,10 +555,10 @@ export const layer = Layer.effect(
           if (!isWithinWindow(scope, rel)) continue
           container.dirty.add(scope)
           yield* events
-            .publish(CodeGraphEvent.Event.Invalidated, { scope }, location ? { location } : undefined)
+            .publish(ApertureEvent.Event.Invalidated, { scope }, location ? { location } : undefined)
             .pipe(Effect.ignore)
         }
-        // Wake the background tagger so the change is (re)tagged even when it falls
+        // Wake the background painter so the change is (re)painted even when it falls
         // outside every viewed window — the stale-hash skip keeps the re-walk cheap.
         yield* wakeBackground(directory)
       })
@@ -575,8 +575,8 @@ export const layer = Layer.effect(
     )
 
     // Turn completion: when a session goes idle (the agent returned from a building
-    // turn) wake the background tagger so files created/changed during the turn get
-    // tagged. Gated on an existing cache so we only touch repos whose graph is open —
+    // turn) wake the background painter so files created/changed during the turn get
+    // painted. Gated on an existing cache so we only touch repos whose graph is open —
     // an unopened project stays inert, matching the lazy-cache philosophy.
     const onSessionIdle = (location: EventV2.Payload["location"]) =>
       Effect.gen(function* () {
@@ -601,159 +601,159 @@ export const layer = Layer.effect(
       ),
     )
 
-    // Re-paint every viewed scope after the active collection changes: mark each
-    // cached scope dirty so the next get re-runs finalize with the new collection, and
-    // publish an invalidation so the live view refetches. The bg tagger is woken so the
-    // new collection also fills in beyond the viewed window.
-    const onCollectionChanged = (directory: string) =>
+    // Re-paint every viewed scope after the active Lens changes: mark each
+    // cached scope dirty so the next get re-runs finalize with the new Lens, and
+    // publish an invalidation so the live view refetches. The bg painter is woken so the
+    // new Lens also fills in beyond the viewed window.
+    const onLensChanged = (directory: string) =>
       Effect.gen(function* () {
         const container = caches.get(directory)
         if (container) {
           for (const scope of container.scopes.keys()) {
             container.dirty.add(scope)
-            yield* events.publish(CodeGraphEvent.Event.Invalidated, { scope }).pipe(Effect.ignore)
+            yield* events.publish(ApertureEvent.Event.Invalidated, { scope }).pipe(Effect.ignore)
           }
         }
-        // Bump the epoch so an in-flight background sweep abandons the old collection
+        // Bump the epoch so an in-flight background sweep abandons the old Lens
         // and restarts for the new one (the wake below re-runs the parked loop).
-        collectionEpoch.set(directory, (collectionEpoch.get(directory) ?? 0) + 1)
+        lensEpoch.set(directory, (lensEpoch.get(directory) ?? 0) + 1)
         yield* wakeBackground(directory)
       })
 
-    const collections = Effect.fn("CodeGraph.collections")(function* () {
+    const lenses = Effect.fn("Aperture.lenses")(function* () {
       const ctx = yield* InstanceState.context
       // Hide deterministic built-ins whose prerequisite is unmet (git-changed off-git).
       return yield* listAvailable(ctx.directory, ctx.project.id)
     })
 
-    const activeCollection = Effect.fn("CodeGraph.activeCollection")(function* () {
+    const activeLens = Effect.fn("Aperture.activeLens")(function* () {
       const ctx = yield* InstanceState.context
-      return yield* CodeGraphCollectionStore.getActive(storage, ctx.project.id)
+      return yield* ApertureLensStore.getActive(storage, ctx.project.id)
     })
 
-    const createCollection = Effect.fn("CodeGraph.createCollection")(function* (input: CreateCollectionInput) {
+    const createLens = Effect.fn("Aperture.createLens")(function* (input: CreateLensInput) {
       const ctx = yield* InstanceState.context
-      const collection = yield* CodeGraphCollectionStore.create(storage, ctx.project.id, input)
-      // Default: activate the new collection (switch the view, start the tagger on
-      // it). When activate is false the collection is only persisted — the active
-      // collection and its in-flight sweep are left untouched, so the user's current
+      const lens = yield* ApertureLensStore.create(storage, ctx.project.id, input)
+      // Default: activate the new Lens (switch the view, start the painter on
+      // it). When activate is false the Lens is only persisted — the active
+      // Lens and its in-flight sweep are left untouched, so the user's current
       // view is undisturbed (the new one paints later if/when it is selected).
       if (input.activate !== false) {
-        yield* CodeGraphCollectionStore.setActive(storage, ctx.project.id, collection.id)
-        yield* onCollectionChanged(ctx.directory)
+        yield* ApertureLensStore.setActive(storage, ctx.project.id, lens.id)
+        yield* onLensChanged(ctx.directory)
       }
-      return collection
+      return lens
     })
 
-    const selectCollection = Effect.fn("CodeGraph.selectCollection")(function* (idOrName: string) {
+    const selectLens = Effect.fn("Aperture.selectLens")(function* (idOrName: string) {
       const ctx = yield* InstanceState.context
-      // Resolve only against *available* collections so an unavailable built-in (e.g.
+      // Resolve only against *available* Lenses so an unavailable built-in (e.g.
       // git-changed in a non-git folder) reports as unknown rather than activating a
-      // collection that can't paint anything meaningful.
+      // Lens that can't paint anything meaningful.
       const all = yield* listAvailable(ctx.directory, ctx.project.id)
       const needle = idOrName.toLowerCase()
       const found = all.find((c) => c.id === idOrName || c.name.toLowerCase() === needle)
       if (!found) return undefined
-      yield* CodeGraphCollectionStore.setActive(storage, ctx.project.id, found.id)
-      yield* onCollectionChanged(ctx.directory)
+      yield* ApertureLensStore.setActive(storage, ctx.project.id, found.id)
+      yield* onLensChanged(ctx.directory)
       return found
     })
 
-    const cycleCollection = Effect.fn("CodeGraph.cycleCollection")(function* (direction: "next" | "prev") {
+    const cycleLens = Effect.fn("Aperture.cycleLens")(function* (direction: "next" | "prev") {
       const ctx = yield* InstanceState.context
-      // Cycle only through available collections so the arrows skip a hidden built-in
+      // Cycle only through available Lenses so the arrows skip a hidden built-in
       // (e.g. git-changed in a non-git folder) instead of landing the user on it.
       const all = yield* listAvailable(ctx.directory, ctx.project.id)
-      const activeId = yield* CodeGraphCollectionStore.getActiveId(storage, ctx.project.id)
+      const activeId = yield* ApertureLensStore.getActiveId(storage, ctx.project.id)
       const idx = all.findIndex((c) => c.id === activeId)
       const len = all.length
       // Wrap at both ends so the arrows loop through the list rather than stopping.
       // An unresolved active id (-1) starts from the head so a click still moves.
       const base = idx === -1 ? 0 : idx
       const next = all[(base + (direction === "next" ? 1 : len - 1)) % len]!
-      yield* CodeGraphCollectionStore.setActive(storage, ctx.project.id, next.id)
-      yield* onCollectionChanged(ctx.directory)
-      return { id: next.id, name: next.name, legend: collectionLegend(next) }
+      yield* ApertureLensStore.setActive(storage, ctx.project.id, next.id)
+      yield* onLensChanged(ctx.directory)
+      return { id: next.id, name: next.name, legend: lensLegend(next) }
     })
 
-    // Resolve a collection by id or (case-insensitive) name. Used by edit/merge/delete
+    // Resolve a Lens by id or (case-insensitive) name. Used by edit/merge/delete
     // to find the target and refuse the immutable built-ins.
-    const resolveCollection = (all: ReadonlyArray<TagCollection>, idOrName: string) => {
+    const resolveLens = (all: ReadonlyArray<Lens>, idOrName: string) => {
       const needle = idOrName.toLowerCase()
       return all.find((c) => c.id === idOrName || c.name.toLowerCase() === needle)
     }
 
-    const editCollection = Effect.fn("CodeGraph.editCollection")(function* (input: EditCollectionInput) {
+    const editLens = Effect.fn("Aperture.editLens")(function* (input: EditLensInput) {
       const ctx = yield* InstanceState.context
-      const all = yield* CodeGraphCollectionStore.list(storage, ctx.project.id)
-      const found = resolveCollection(all, input.collection)
+      const all = yield* ApertureLensStore.list(storage, ctx.project.id)
+      const found = resolveLens(all, input.lens)
       if (!found) return { status: "not-found" } as const
-      if (isBuiltinCollection(found)) return { status: "builtin" } as const
-      const result = yield* CodeGraphCollectionStore.update(storage, ctx.project.id, found.id, {
+      if (isBuiltinLens(found)) return { status: "builtin" } as const
+      const result = yield* ApertureLensStore.update(storage, ctx.project.id, found.id, {
         name: input.name,
         description: input.description,
         palette: input.palette,
         prompt: input.prompt,
-        tags: input.tags,
+        facets: input.facets,
         directories: input.directories,
       })
       if (!result) return { status: "not-found" } as const
-      // Structural edits invalidate the inferred tags — clear them so the sweep
-      // re-tags from scratch. Cosmetic edits keep the tags and just re-paint.
-      if (result.structural) yield* CodeGraphSemanticStore.clear(storage, ctx.project.id, found.id)
-      yield* onCollectionChanged(ctx.directory)
-      return { status: "ok", collection: result.collection, structural: result.structural } as const
+      // Structural edits invalidate the inferred facets — clear them so the sweep
+      // re-paints from scratch. Cosmetic edits keep the facets and just re-paint.
+      if (result.structural) yield* ApertureSemanticStore.clear(storage, ctx.project.id, found.id)
+      yield* onLensChanged(ctx.directory)
+      return { status: "ok", lens: result.lens, structural: result.structural } as const
     })
 
-    const mergeTags = Effect.fn("CodeGraph.mergeTags")(function* (collection: string, from: string, into: string) {
+    const mergeFacets = Effect.fn("Aperture.mergeFacets")(function* (lens: string, from: string, into: string) {
       const ctx = yield* InstanceState.context
-      const all = yield* CodeGraphCollectionStore.list(storage, ctx.project.id)
-      const found = resolveCollection(all, collection)
+      const all = yield* ApertureLensStore.list(storage, ctx.project.id)
+      const found = resolveLens(all, lens)
       if (!found) return { status: "not-found" } as const
-      if (isBuiltinCollection(found)) return { status: "builtin" } as const
-      // Accept either a tag id or its (case-insensitive) label for both ends.
-      const resolveTag = (ref: string) =>
-        found.tags.find((t) => t.id === ref || t.label.toLowerCase() === ref.toLowerCase())?.id
-      const fromId = resolveTag(from)
-      const intoId = resolveTag(into)
-      if (!fromId) return { status: "unknown-tag", tag: from } as const
-      if (!intoId) return { status: "unknown-tag", tag: into } as const
-      const updated = yield* CodeGraphCollectionStore.mergeTags(storage, ctx.project.id, found.id, fromId, intoId)
+      if (isBuiltinLens(found)) return { status: "builtin" } as const
+      // Accept either a facet id or its (case-insensitive) label for both ends.
+      const resolveFacet = (ref: string) =>
+        found.facets.find((t) => t.id === ref || t.label.toLowerCase() === ref.toLowerCase())?.id
+      const fromId = resolveFacet(from)
+      const intoId = resolveFacet(into)
+      if (!fromId) return { status: "unknown-facet", facet: from } as const
+      if (!intoId) return { status: "unknown-facet", facet: into } as const
+      const updated = yield* ApertureLensStore.mergeFacets(storage, ctx.project.id, found.id, fromId, intoId)
       if (!updated) return { status: "not-found" } as const
-      yield* CodeGraphSemanticStore.mergeTag(storage, ctx.project.id, found.id, fromId, intoId)
-      yield* onCollectionChanged(ctx.directory)
-      return { status: "ok", collection: updated, structural: false } as const
+      yield* ApertureSemanticStore.mergeFacet(storage, ctx.project.id, found.id, fromId, intoId)
+      yield* onLensChanged(ctx.directory)
+      return { status: "ok", lens: updated, structural: false } as const
     })
 
-    const deleteCollection = Effect.fn("CodeGraph.deleteCollection")(function* (idOrName: string) {
+    const deleteLens = Effect.fn("Aperture.deleteLens")(function* (idOrName: string) {
       const ctx = yield* InstanceState.context
-      const all = yield* CodeGraphCollectionStore.list(storage, ctx.project.id)
-      const found = resolveCollection(all, idOrName)
+      const all = yield* ApertureLensStore.list(storage, ctx.project.id)
+      const found = resolveLens(all, idOrName)
       if (!found) return { status: "not-found" } as const
-      if (isBuiltinCollection(found)) return { status: "builtin" } as const
-      const activeId = yield* CodeGraphCollectionStore.getActiveId(storage, ctx.project.id)
-      yield* CodeGraphCollectionStore.remove(storage, ctx.project.id, found.id)
-      yield* CodeGraphSemanticStore.clear(storage, ctx.project.id, found.id)
-      if (activeId === found.id) yield* CodeGraphCollectionStore.setActive(storage, ctx.project.id, ARCHITECTURE_ID)
-      yield* onCollectionChanged(ctx.directory)
-      const active = yield* CodeGraphCollectionStore.getActive(storage, ctx.project.id)
+      if (isBuiltinLens(found)) return { status: "builtin" } as const
+      const activeId = yield* ApertureLensStore.getActiveId(storage, ctx.project.id)
+      yield* ApertureLensStore.remove(storage, ctx.project.id, found.id)
+      yield* ApertureSemanticStore.clear(storage, ctx.project.id, found.id)
+      if (activeId === found.id) yield* ApertureLensStore.setActive(storage, ctx.project.id, ARCHITECTURE_ID)
+      yield* onLensChanged(ctx.directory)
+      const active = yield* ApertureLensStore.getActive(storage, ctx.project.id)
       return {
         status: "ok",
-        active: { id: active.id, name: active.name, legend: collectionLegend(active) },
+        active: { id: active.id, name: active.name, legend: lensLegend(active) },
       } as const
     })
 
     return Service.of({
       get: (scope) => load(scope),
       refresh: (scope) => refresh(scope),
-      collections: () => collections(),
-      activeCollection: () => activeCollection(),
-      createCollection: (input) => createCollection(input),
-      selectCollection: (idOrName) => selectCollection(idOrName),
-      cycleCollection: (direction) => cycleCollection(direction),
-      editCollection: (input) => editCollection(input),
-      mergeTags: (collection, from, into) => mergeTags(collection, from, into),
-      deleteCollection: (idOrName) => deleteCollection(idOrName),
+      lenses: () => lenses(),
+      activeLens: () => activeLens(),
+      createLens: (input) => createLens(input),
+      selectLens: (idOrName) => selectLens(idOrName),
+      cycleLens: (direction) => cycleLens(direction),
+      editLens: (input) => editLens(input),
+      mergeFacets: (lens, from, into) => mergeFacets(lens, from, into),
+      deleteLens: (idOrName) => deleteLens(idOrName),
     })
   }),
 )
@@ -762,7 +762,7 @@ export const defaultLayer = layer.pipe(
   Layer.provide(Storage.defaultLayer),
   Layer.provide(EventV2.defaultLayer),
   // Self-provided (Provider's own stack is self-contained) so the layer stays
-  // R = never, mirroring Agent.defaultLayer — the tagger needs both to resolve a
+  // R = never, mirroring Agent.defaultLayer — the painter needs both to resolve a
   // small model and read the context flag.
   Layer.provide(Provider.defaultLayer),
   Layer.provide(Config.defaultLayer),
@@ -770,7 +770,7 @@ export const defaultLayer = layer.pipe(
   Layer.provide(Git.defaultLayer),
 )
 
-// Reorder the enumerated files so any under the collection's relevant directories
+// Reorder the enumerated files so any under the Lens's relevant directories
 // come first (keeping each group's existing DFS order), then the rest of the repo.
 // Returns the input unchanged when no directories are set. The targeted dirs are
 // repo-relative with no leading/trailing slashes (normalized at create/edit time);
@@ -789,49 +789,49 @@ function orderByDirectories(
 // --- composition -----------------------------------------------------------
 
 // Per-directory subtree composition: for every directory node, tally its descendant
-// source files by tagged layer into a count + byte sum. A file under nested
+// source files by painted facet into a count + byte sum. A file under nested
 // directories counts toward each of its in-window ancestors (each directory reflects
 // its own full subtree). Every descendant file also feeds the directory's `subtree*`
-// totals regardless of tagging, so a directory with no tagged files still reports its
+// totals regardless of painting, so a directory with no painted files still reports its
 // real size (the renderer sizes its grey block from that rather than painting it
 // full-bleed). Pure: a function of the window's directories, the subtree file set,
 // and the semantic store.
 function computeComposition(
-  nodes: CodeGraphPayload.Payload["nodes"],
+  nodes: AperturePayload.Payload["nodes"],
   files: ReadonlyArray<{ id: string; path: string; size: number }>,
-  store: CodeGraphSemanticStore.Store,
-  collection: TagCollection,
-): Record<string, CodeGraphPayload.Composition> {
+  store: ApertureSemanticStore.Store,
+  lens: Lens,
+): Record<string, AperturePayload.Composition> {
   const dirs = nodes.filter((n) => n.kind === "directory").map((d) => ({ id: d.id, prefix: d.path + "/" }))
   if (dirs.length === 0) return {}
-  const tagged = new Map<string, Map<string, { count: number; bytes: number }>>()
+  const painted = new Map<string, Map<string, { count: number; bytes: number }>>()
   const subtree = new Map<string, { count: number; bytes: number }>()
   for (const file of files) {
-    const tag = store[file.id]?.tag
+    const facet = store[file.id]?.facet
     for (const dir of dirs) {
       if (!file.path.startsWith(dir.prefix)) continue
       const s = subtree.get(dir.id) ?? { count: 0, bytes: 0 }
       s.count += 1
       s.bytes += file.size
       subtree.set(dir.id, s)
-      if (!tag) continue
-      let byTag = tagged.get(dir.id)
-      if (!byTag) tagged.set(dir.id, (byTag = new Map()))
-      const w = byTag.get(tag) ?? { count: 0, bytes: 0 }
+      if (!facet) continue
+      let byFacet = painted.get(dir.id)
+      if (!byFacet) painted.set(dir.id, (byFacet = new Map()))
+      const w = byFacet.get(facet) ?? { count: 0, bytes: 0 }
       w.count += 1
       w.bytes += file.size
-      byTag.set(tag, w)
+      byFacet.set(facet, w)
     }
   }
   // Emit an entry for every directory that has any descendant file, even when none
-  // are tagged (empty `weights`) — that's the grey case the renderer sizes by subtree.
-  const order = [...collection.tags.map((t) => t.id), NONE_TAG]
-  const result: Record<string, CodeGraphPayload.Composition> = {}
+  // are painted (empty `weights`) — that's the grey case the renderer sizes by subtree.
+  const order = [...lens.facets.map((t) => t.id), NONE_FACET]
+  const result: Record<string, AperturePayload.Composition> = {}
   for (const [id, s] of subtree) {
-    const byTag = tagged.get(id)
-    // Weights in the collection's tag order so the payload is stable and the
+    const byFacet = painted.get(id)
+    // Weights in the Lens's facet order so the payload is stable and the
     // renderer's colour bands are consistent.
-    const weights = byTag ? order.filter((t) => byTag.has(t)).map((tag) => ({ tag, ...byTag.get(tag)! })) : []
+    const weights = byFacet ? order.filter((t) => byFacet.has(t)).map((facet) => ({ facet, ...byFacet.get(facet)! })) : []
     const totalCount = weights.reduce((sum, w) => sum + w.count, 0)
     const totalBytes = weights.reduce((sum, w) => sum + w.bytes, 0)
     result[id] = { weights, totalCount, totalBytes, subtreeCount: s.count, subtreeBytes: s.bytes }
@@ -855,7 +855,7 @@ function isWithinWindow(scope: string, rel: string): boolean {
   if (scope !== "" && rel !== scope && !rel.startsWith(scope + "/")) return false
   const scopeSegments = scope === "" ? 0 : scope.split("/").length
   const relativeDepth = rel.split("/").length - scopeSegments - 1
-  return relativeDepth >= 0 && relativeDepth < CodeGraphExtract.VIEW_DEPTH
+  return relativeDepth >= 0 && relativeDepth < ApertureExtract.VIEW_DEPTH
 }
 
-export * as CodeGraph from "./codegraph"
+export * as Aperture from "./aperture"

@@ -222,7 +222,7 @@ export function Session() {
   const dimensions = useTerminalDimensions()
   const [sidebar, setSidebar] = kv.signal<"auto" | "hide">("sidebar", "auto")
   const [sidebarOpen, setSidebarOpen] = createSignal(false)
-  const [codegraph, setCodegraph] = kv.signal<"show" | "hide">("codegraph", "show")
+  const [aperture, setAperture] = kv.signal<"show" | "hide">("aperture", "show")
   const [conceal, setConceal] = createSignal(true)
   const thinking = useThinkingMode()
   const thinkingMode = thinking.mode
@@ -243,12 +243,12 @@ export function Session() {
     return false
   })
   const showTimestamps = createMemo(() => timestamps() === "show")
-  // Code-graph top bar: hidden for subagent sessions and very short terminals,
+  // Aperture top bar: hidden for subagent sessions and very short terminals,
   // where the fixed-height strip would crowd out the conversation.
-  const codegraphVisible = createMemo(() => {
+  const apertureVisible = createMemo(() => {
     if (session()?.parentID) return false
     if (dimensions().height < 20) return false
-    return codegraph() === "show"
+    return aperture() === "show"
   })
   const contentWidth = createMemo(() => dimensions().width - (sidebarVisible() ? 42 : 0) - 4)
   const providers = createMemo(() => Model.index(sync.data.provider))
@@ -679,11 +679,11 @@ export function Session() {
       },
     },
     {
-      title: codegraph() === "show" ? "Hide code graph" : "Show code graph",
-      value: "session.codegraph.toggle",
+      title: aperture() === "show" ? "Hide Aperture" : "Show Aperture",
+      value: "session.aperture.toggle",
       category: "Session",
       run: () => {
-        setCodegraph((prev) => (prev === "show" ? "hide" : "show"))
+        setAperture((prev) => (prev === "show" ? "hide" : "show"))
         dialog.clear()
       },
     },
@@ -1152,9 +1152,9 @@ export function Session() {
         }}
       >
         <box flexDirection="column" flexGrow={1} minHeight={0}>
-          <Show when={codegraphVisible()}>
+          <Show when={apertureVisible()}>
             <box flexShrink={0}>
-              <TuiPluginRuntime.Slot name="codegraph_top" session_id={route.sessionID} />
+              <TuiPluginRuntime.Slot name="aperture_top" session_id={route.sessionID} />
             </box>
           </Show>
           <box flexDirection="row" flexGrow={1} minHeight={0}>
