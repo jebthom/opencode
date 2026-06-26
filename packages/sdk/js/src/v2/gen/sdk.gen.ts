@@ -249,6 +249,8 @@ import type {
   TuiControlResponseResponses,
   TuiExecuteCommandErrors,
   TuiExecuteCommandResponses,
+  TuiOpenFileErrors,
+  TuiOpenFileResponses,
   TuiOpenHelpErrors,
   TuiOpenHelpResponses,
   TuiOpenModelsErrors,
@@ -5548,6 +5550,43 @@ export class Tui extends HeyApiClient {
     )
     return (options?.client ?? this.client).post<TuiShowToastResponses, TuiShowToastErrors, ThrowOnError>({
       url: "/tui/show-toast",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Reveal file in host editor
+   *
+   * Publish an intent for the host editor to open/reveal a file.
+   */
+  public openFile<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      path?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "path" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<TuiOpenFileResponses, TuiOpenFileErrors, ThrowOnError>({
+      url: "/tui/open-file",
       ...options,
       ...params,
       headers: {

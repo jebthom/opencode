@@ -83,6 +83,13 @@ export const tuiHandlers = HttpApiBuilder.group(InstanceHttpApi, "tui", (handler
       return true
     })
 
+    const openFile = Effect.fn("TuiHttpApi.openFile")(function* (ctx: {
+      payload: typeof TuiEvent.FileOpen.data.Type
+    }) {
+      yield* events.publish(TuiEvent.FileOpen, ctx.payload)
+      return true
+    })
+
     const publish = Effect.fn("TuiHttpApi.publish")(function* (ctx: { payload: typeof TuiPublishPayload.Type }) {
       if (ctx.payload.type === TuiEvent.PromptAppend.type)
         yield* events.publish(TuiEvent.PromptAppend, ctx.payload.properties)
@@ -123,6 +130,7 @@ export const tuiHandlers = HttpApiBuilder.group(InstanceHttpApi, "tui", (handler
       .handle("clearPrompt", clearPrompt)
       .handle("executeCommand", executeCommand)
       .handle("showToast", showToast)
+      .handle("openFile", openFile)
       .handle("publish", publish)
       .handle("selectSession", selectSession)
       .handle("controlNext", controlNext)

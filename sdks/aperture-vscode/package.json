@@ -1,0 +1,58 @@
+{
+  "name": "aperture",
+  "displayName": "Aperture",
+  "description": "Function-level Aperture facet painting in the editor",
+  "version": "0.0.1",
+  "publisher": "sst-dev",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/anomalyco/opencode"
+  },
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "aperture.repaint",
+        "title": "Aperture: Repaint active editor"
+      }
+    ],
+    "configuration": {
+      "title": "Aperture",
+      "properties": {
+        "aperture.host": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "description": "Host of the running opencode server."
+        },
+        "aperture.port": {
+          "type": "number",
+          "default": 4096,
+          "description": "Port of the running opencode server (the port passed to `opencode --port`)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "bun run package",
+    "compile": "bun run check-types && node esbuild.js",
+    "watch:esbuild": "node esbuild.js --watch",
+    "package": "bun run check-types && node esbuild.js --production",
+    "check-types": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.96.0",
+    "@types/node": "20.x",
+    "esbuild": "^0.25.3",
+    "typescript": "^5.8.3"
+  }
+}

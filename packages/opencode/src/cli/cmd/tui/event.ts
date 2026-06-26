@@ -50,4 +50,14 @@ export const TuiEvent = {
       sessionID: SessionID.annotate({ description: "Session ID to navigate to" }),
     },
   }),
+  // A generic "reveal this file in the host editor" intent. Published when the user
+  // drills into a file in the TUI; a host (e.g. the Aperture VSCode extension) listens
+  // on the event stream and opens it. The CLI stays host-agnostic — it only announces
+  // the intent.
+  FileOpen: EventV2.define({
+    type: "tui.file.open",
+    schema: {
+      path: Schema.String.annotate({ description: "Repo-relative path of the file to reveal" }),
+    },
+  }),
 }

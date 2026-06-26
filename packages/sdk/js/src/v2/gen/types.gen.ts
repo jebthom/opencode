@@ -64,6 +64,7 @@ export type Event =
   | EventTuiCommandExecute2
   | EventTuiToastShow2
   | EventTuiSessionSelect2
+  | EventTuiFileOpen
   | EventMcpToolsChanged
   | EventMcpBrowserOpenFailed
   | EventSessionStatus
@@ -1304,6 +1305,16 @@ export type GlobalEvent = {
            * Session ID to navigate to
            */
           sessionID: string
+        }
+      }
+    | {
+        id: string
+        type: "tui.file.open"
+        properties: {
+          /**
+           * Repo-relative path of the file to reveal
+           */
+          path: string
         }
       }
     | {
@@ -4436,6 +4447,17 @@ export type EventPermissionReplied = {
     sessionID: string
     requestID: string
     reply: "once" | "always" | "reject"
+  }
+}
+
+export type EventTuiFileOpen = {
+  id: string
+  type: "tui.file.open"
+  properties: {
+    /**
+     * Repo-relative path of the file to reveal
+     */
+    path: string
   }
 }
 
@@ -9282,6 +9304,39 @@ export type TuiShowToastResponses = {
 }
 
 export type TuiShowToastResponse = TuiShowToastResponses[keyof TuiShowToastResponses]
+
+export type TuiOpenFileData = {
+  body?: {
+    /**
+     * Repo-relative path of the file to reveal
+     */
+    path: string
+  }
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/tui/open-file"
+}
+
+export type TuiOpenFileErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type TuiOpenFileError = TuiOpenFileErrors[keyof TuiOpenFileErrors]
+
+export type TuiOpenFileResponses = {
+  /**
+   * File open intent published successfully
+   */
+  200: boolean
+}
+
+export type TuiOpenFileResponse = TuiOpenFileResponses[keyof TuiOpenFileResponses]
 
 export type TuiPublishData = {
   body?: EventTuiPromptAppend | EventTuiCommandExecute | EventTuiToastShow | EventTuiSessionSelect

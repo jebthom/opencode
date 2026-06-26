@@ -43,6 +43,7 @@ export const TuiPaths = {
   clearPrompt: `${root}/clear-prompt`,
   executeCommand: `${root}/execute-command`,
   showToast: `${root}/show-toast`,
+  openFile: `${root}/open-file`,
   publish: `${root}/publish`,
   selectSession: `${root}/select-session`,
   controlNext: `${root}/control/next`,
@@ -146,6 +147,17 @@ export const TuiApi = HttpApi.make("tui")
             identifier: "tui.showToast",
             summary: "Show TUI toast",
             description: "Show a toast notification in the TUI.",
+          }),
+        ),
+        HttpApiEndpoint.post("openFile", TuiPaths.openFile, {
+          query: WorkspaceRoutingQuery,
+          payload: TuiEvent.FileOpen.data,
+          success: described(Schema.Boolean, "File open intent published successfully"),
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "tui.openFile",
+            summary: "Reveal file in host editor",
+            description: "Publish an intent for the host editor to open/reveal a file.",
           }),
         ),
         HttpApiEndpoint.post("publish", TuiPaths.publish, {

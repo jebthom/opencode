@@ -233,7 +233,16 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   // (A5), or undefined. Sent as `drill` on the fetch; the server returns the file's
   // `extents` and schedules the drill-in painter. Clicking a file toggles it.
   const [drilledFile, setDrilledFile] = createSignal<string | undefined>(undefined)
-  const toggleDrill = (path: string) => setDrilledFile((cur) => (cur === path ? undefined : path))
+  const toggleDrill = (path: string) =>
+    setDrilledFile((cur) => {
+      const next = cur === path ? undefined : path
+      // On enable only (a deliberate click into a file), announce a host "reveal file"
+      // intent so an editor host (e.g. the Aperture VSCode extension) can open it. Gated
+      // to the enable edge so poll/invalidation refetches (which re-send `drill`) never
+      // re-trigger an open. Fire-and-forget: a failed publish must not break the click.
+      if (next !== undefined) void props.api.client.tui.openFile({ path: next })
+      return next
+    })
   // Navigating the directory tree clears the drilled file (its tiles belong to the
   // view you left). Deferred so it doesn't fire on mount.
   createEffect(on(scope, () => setDrilledFile(undefined), { defer: true }))
