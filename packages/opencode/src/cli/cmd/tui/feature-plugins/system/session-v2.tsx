@@ -4,7 +4,6 @@ import { useSyncV2 } from "@tui/context/sync-v2"
 import { SplitBorder } from "@tui/component/border"
 import { Spinner } from "@tui/component/spinner"
 import { useTheme } from "@tui/context/theme"
-import { navigateAperture } from "./aperture-nav"
 import { useLocal } from "@tui/context/local"
 import { reasoningSummary, useThinkingMode } from "@tui/context/thinking"
 import { useRenderer, useTerminalDimensions, type JSX } from "@opentui/solid"
@@ -778,20 +777,11 @@ function Glob(props: ToolProps) {
   )
 }
 
-// A clickable file/directory reference (A4): renders the normalized path and, on
-// click, re-roots the Aperture top bar at it (a file → its parent dir). Underlined to
-// hint it's interactive; colour inherits the surrounding line so it doesn't stand out
-// loudly. Used in tool titles (Read/Edit/Write) and the Read "↳ Loaded" line.
+// Renders a repo-relative file/directory path inline in a tool title or the "↳ Loaded"
+// line. (Was an interactive link experiment; that was removed because an inline text run
+// is a TextNode with no mouse events — use the top-bar "go to path" prompt instead.)
 function PathLink(props: { path: string | undefined; kind?: "file" | "directory" }) {
-  return (
-    <Show when={props.path}>
-      {(path) => (
-        <text attributes={TextAttributes.UNDERLINE} onMouseDown={() => navigateAperture(path(), props.kind ?? "file")}>
-          {normalizePath(path())}
-        </text>
-      )}
-    </Show>
-  )
+  return <Show when={props.path}>{(path) => <span>{normalizePath(path())}</span>}</Show>
 }
 
 function Read(props: ToolProps) {

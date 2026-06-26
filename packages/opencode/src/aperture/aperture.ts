@@ -476,45 +476,65 @@ export const layer = Layer.effect(
           name: lens.name,
           legend: lensLegend(lens),
         }
-        // Drill-in (A5): attach the drilled file's function-level tiles. Semantic
-        // Lenses colour each tile from the per-function store (unpainted tiles stay
-        // grey until the scheduled drill paint fills them in); the git-changed built-in
-        // colours them deterministically from `git diff` hunks (no model, fully tiled).
-        // mtime-recency can't subdivide a file (per-file stat), so it carries no extents.
-        const wantExtents = drillFile && (!det || lens.deterministic === "git-changed")
+        // Drill-in (A5): attach function-level tiles for every file that has been
+        // drilled in this directory AND is in the current window — not just the file the
+        // user just clicked. Once a file is function-painted it keeps its measured band
+        // as the user drills siblings or navigates away and back (the paint persists in
+        // the per-function store; it supersedes the single file-level hue). Without this,
+        // only the actively-drilled file carried extents, so every other tile snapped
+        // back to file-level paint on the next click / refetch. Semantic Lenses colour
+        // tiles from that store (unpainted stay grey until the scheduled drill paint fills
+        // them in); the git-changed built-in colours them deterministically from `git
+        // diff` hunks; mtime-recency can't subdivide a file, so it carries no extents.
+        const supportsExtents = !det || lens.deterministic === "git-changed"
         let extents: Record<string, ReadonlyArray<AperturePayload.Extent>> | undefined
-        if (wantExtents) {
-          const fileId = subtree.find((f) => f.path === drillFile)?.id
-          const content = fileId ? yield* readFileText(ctx.directory, drillFile!) : undefined
-          if (fileId && content !== undefined) {
-            // name → facet id for the file's extents.
-            let facetByName: Map<string, string>
-            if (det) {
-              // git-changed: overlap each extent with the diff's changed line ranges,
-              // falling back to the file-level changed result for an untracked file.
-              const ranges = yield* changedRangesFor(ctx.directory, drillFile!)
-              const fileChanged = store[fileId]?.facet === "changed"
-              facetByName = ApertureExtents.extentChangeFacets(content, ranges, fileChanged)
-            } else {
-              const subStore = yield* ApertureSubfacetStore.read(storage, ctx.project.id, lens.id)
-              facetByName = new Map()
-              for (const e of ApertureExtents.extentsOf(content)) {
-                const entry = subStore[ApertureExtents.subNodeID(drillFile!, e.name)]
-                if (entry) facetByName.set(e.name, entry.facet)
+        if (supportsExtents) {
+          // In-window file nodes by path; a drilled file that's off-window is skipped
+          // (its tiles would render on no tile).
+          const idByPath = new Map<string, string>()
+          for (const n of structure.nodes) if (n.kind === "file") idByPath.set(n.path, n.id)
+          const targets = new Set<string>()
+          for (const f of drilledFiles.get(ctx.directory) ?? []) if (idByPath.has(f)) targets.add(f)
+          // The freshly-clicked file is already in drilledFiles (the drill path adds it
+          // before finalize), but include it defensively against ordering changes.
+          if (drillFile && idByPath.has(drillFile)) targets.add(drillFile)
+          if (targets.size) {
+            // Semantic Lenses read the per-function store once for all targets.
+            const subStore = det ? undefined : yield* ApertureSubfacetStore.read(storage, ctx.project.id, lens.id)
+            const built: Record<string, ReadonlyArray<AperturePayload.Extent>> = {}
+            for (const file of targets) {
+              const fileId = idByPath.get(file)!
+              const content = yield* readFileText(ctx.directory, file)
+              if (content === undefined) continue
+              const exs = ApertureExtents.extentsOf(content)
+              // name → facet id for this file's extents.
+              let facetByName: Map<string, string>
+              if (det) {
+                // git-changed: overlap each extent with the diff's changed line ranges,
+                // falling back to the file-level changed result for an untracked file.
+                const ranges = yield* changedRangesFor(ctx.directory, file)
+                const fileChanged = store[fileId]?.facet === "changed"
+                facetByName = ApertureExtents.extentChangeFacets(content, ranges, fileChanged)
+              } else {
+                facetByName = new Map()
+                for (const e of exs) {
+                  const entry = subStore![ApertureExtents.subNodeID(file, e.name)]
+                  if (entry) facetByName.set(e.name, entry.facet)
+                }
               }
+              built[fileId] = exs.map((e): AperturePayload.Extent => {
+                const facet = facetByName.get(e.name)
+                const hue = facet ? (facet === NONE_FACET ? NONE_HUE : colorByFacet.get(facet)) : undefined
+                return {
+                  name: e.name,
+                  startLine: e.startLine,
+                  endLine: e.endLine,
+                  ...(facet ? { facet } : {}),
+                  ...(hue ? { hue } : {}),
+                }
+              })
             }
-            const tiles = ApertureExtents.extentsOf(content).map((e): AperturePayload.Extent => {
-              const facet = facetByName.get(e.name)
-              const hue = facet ? (facet === NONE_FACET ? NONE_HUE : colorByFacet.get(facet)) : undefined
-              return {
-                name: e.name,
-                startLine: e.startLine,
-                endLine: e.endLine,
-                ...(facet ? { facet } : {}),
-                ...(hue ? { hue } : {}),
-              }
-            })
-            extents = { [fileId]: tiles }
+            if (Object.keys(built).length) extents = built
           }
         }
         return { ...structure, semantics, composition, lens: lensInfo, ...(extents ? { extents } : {}) }

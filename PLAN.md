@@ -96,10 +96,18 @@ Tasks:
 - **A3 — View + Lenses live in the project, with agent access.** ✅ DONE. Lens
   defs + active pointer persist to `.opencode/aperture/`; `lens_facet_files` tool
   lists files by Facet (`aperture.facetFiles`). Paint results stay in global KV.
-- **A4 — Click-to-navigate from chat.** ✅ DONE. A shared module-level nav bus
-  (`aperture-nav.ts`) bridges the chat and the Aperture slot (no client-side event
-  emit in the plugin API); chat file/dir references (Read/Edit/Write/Loaded/Grep) are
-  clickable `PathLink`s that re-root the top-bar scope (a file → its parent dir).
+- **A4 — Navigate the view to a path (was: click-to-navigate from chat).** ✅ DONE,
+  via a different mechanism. The original clickable-chat-path approach was **reverted**:
+  in this TUI an inline text run is a `TextNodeRenderable` with no mouse events, so a path
+  nested inside a tool title / markdown reply can't be made clickable (confirmed against
+  the renderer; coordinate hit-testing on the container also failed in the live layout).
+  Navigation now lives entirely in the top-bar nav row (⟳ ⌖ ⌂ ◀ breadcrumb): the
+  breadcrumb crumbs are clickable to jump between scope levels, and a new **⌖ "go to path"
+  button** opens `api.ui.DialogPrompt` prefilled with the current scope — typing or pasting
+  a repo-relative path re-roots the view (a pasted *file* path roots at its parent dir). So
+  a path mentioned in chat is reached by copy-paste into the prompt rather than a click on
+  the chat text. The nav bus (`aperture-nav.ts`) and clickable `PathLink` were removed;
+  `PathLink` now just renders the path as plain text.
 - **A5 — On-demand function-level Facets (drill-in sub-file resolution).** ✅ DONE
   (Phase 1 data + Phase 2 TUI). Drill-in-gated, line-delimited extents (no parsing,
   `extents.ts`), per-function store (`subfacet-store.ts`, global KV), payload v7

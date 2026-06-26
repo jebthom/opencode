@@ -9,7 +9,6 @@ import { NONE_FACET, NONE_HUE, NONE_LABEL, UNTAGGED_HUE, UNTAGGED_LABEL, BUILTIN
 import { allocateCells, buildGrid, coalesce } from "@/aperture/treemap"
 import { ACTION_GLYPH, ACTION_LABEL, ACTIONS, type Action, type ActivityEntry, type Fill, type Style } from "@/aperture/activity"
 import { createActivityTracker } from "./aperture-activity"
-import { apertureNavRequest } from "./aperture-nav"
 import { openLensPicker } from "./aperture-lens-picker"
 
 const id = "internal:aperture"
@@ -238,17 +237,6 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   // Navigating the directory tree clears the drilled file (its tiles belong to the
   // view you left). Deferred so it doesn't fire on mount.
   createEffect(on(scope, () => setDrilledFile(undefined), { defer: true }))
-  // Click-to-navigate from chat (A4): a file/dir reference clicked in the chat
-  // publishes a re-root request on the shared nav bus; honour it by re-scoping.
-  createEffect(
-    on(
-      apertureNavRequest,
-      (req) => {
-        if (req) setScope(req.scope)
-      },
-      { defer: true },
-    ),
-  )
 
   // Layer-0 directories whose child row is expanded past MAX_CHILDREN to show all
   // children (the unlimited horizontal strip makes this cheap). Keyed by node id.
@@ -650,6 +638,28 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     scroll.scrollLeft += dir === "up" ? -cells : cells
   }
 
+  // Re-root the view by typing/pasting a repo-relative path. This is the reliable way to
+  // point the bar at something the agent mentioned: file/dir references in the chat aren't
+  // clickable (an inline text run carries no mouse events), so instead of hunting for a
+  // tile you copy the path from anywhere and drop it here. Opened from the ⌖ button;
+  // prefilled with the current scope, blank input means the repo root. Opens on mouse-up
+  // (a dialog opened on mouse-down is dismissed by the backdrop seeing the release).
+  const openGoto = () => {
+    const DialogPrompt = props.api.ui.DialogPrompt
+    props.api.ui.dialog.replace(() => (
+      <DialogPrompt
+        title="Go to path"
+        value={scope()}
+        placeholder="repo-relative path (blank = repo root)"
+        onConfirm={(value: string) => {
+          setScope(scopeFromInput(value))
+          props.api.ui.dialog.clear()
+        }}
+        onCancel={() => props.api.ui.dialog.clear()}
+      />
+    ))
+  }
+
   return (
     <box
       flexShrink={0}
@@ -672,11 +682,21 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
         </text>
       </box>
 
-      {/* Navigation row: refresh + root + up + breadcrumb. Always present so the
-          graph area below doesn't jump as the user drills in and out. */}
+      {/* Navigation row: refresh + go-to + root + up + breadcrumb. Always present so the
+          graph area below doesn't jump as the user drills in and out. Crumbs are clickable
+          for quick navigation; the ⌖ button opens a "go to path" prompt (type/paste a path)
+          for jumping somewhere arbitrary — e.g. a path the agent mentioned in chat. */}
       <box flexDirection="row" gap={1} height={1} flexShrink={0}>
         <text fg={theme().accent} onMouseDown={() => refetch()}>
           ⟳
+        </text>
+        <text
+          fg={theme().accent}
+          onMouseUp={() => openGoto()}
+          onMouseOver={() => setHovered("go to a path (type or paste)")}
+          onMouseOut={() => setHovered(undefined)}
+        >
+          ⌖
         </text>
         <Show when={scope() !== ""} fallback={<text fg={theme().textMuted}>/</text>}>
           <text fg={theme().accent} onMouseDown={() => setScope("")}>
@@ -713,8 +733,11 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
               ▶
             </text>
             {/* Open the searchable Lens picker (A2) — the scalable alternative to
-                cycling once there are many Lenses. */}
-            <text fg={theme().textMuted} onMouseDown={() => openLensPicker(props.api)} wrapMode="none">
+                cycling once there are many Lenses. Opened on mouse *up*, not down:
+                the dialog backdrop dismisses itself on the mouse-up it sees outside
+                its inner box, so opening on mouse-down means the same gesture's
+                release closes the popup immediately (see ui/dialog.tsx). */}
+            <text fg={theme().textMuted} onMouseUp={() => openLensPicker(props.api)} wrapMode="none">
               ⌄
             </text>
             {/* Delete the active (user) collection: click to arm, click again to
@@ -1462,6 +1485,18 @@ function formatBytes(n: number) {
 
 function basename(p: string) {
   return p.split("/").pop() ?? p
+}
+
+// Turn typed/pasted text into a directory scope: trim surrounding slashes/space, and if it
+// points at a file (a basename with an extension — a dot past the first char) root at its
+// parent directory, so pasting a file path from chat lands on the file's 2-level window.
+// Dotfiles (".github") keep their own name, as the dot is leading.
+function scopeFromInput(input: string): string {
+  const trimmed = input.trim().replace(/^\/+|\/+$/g, "")
+  if (trimmed === "") return ""
+  const segs = trimmed.split("/")
+  if ((segs[segs.length - 1] ?? "").lastIndexOf(".") > 0) segs.pop()
+  return segs.join("/")
 }
 
 function posixDir(p: string) {
