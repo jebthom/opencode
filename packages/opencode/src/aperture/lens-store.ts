@@ -1,6 +1,7 @@
 import { Effect } from "effect"
 import { createHash } from "crypto"
-import type { Storage } from "@/storage/storage"
+import path from "path"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import {
   type Lens,
   type Facet,
@@ -13,59 +14,84 @@ import {
   slugify,
 } from "./lenses"
 
-// Durable per-project store for *user-defined* Lenses plus the pointer to
-// the currently active Lens. Built-in Lenses (architecture) are global
-// and live in code (`BUILTIN_LENSES`); only user Lenses are persisted
-// here. Creation is strictly additive — a new Lens always gets a fresh id and
-// no existing Lens is ever mutated or removed — because each Lens's facet
-// results cost tokens and must never be lost.
+// Per-project store for *user-defined* Lenses plus the pointer to the currently
+// active Lens, persisted in the project directory under `.opencode/aperture/`
+// (A3) so a Lens is shareable/committable and an agent can read it directly.
+// Built-in Lenses (architecture) are global and live in code (`BUILTIN_LENSES`);
+// only user Lenses are persisted here. Creation is strictly additive — a new
+// Lens always gets a fresh id and no existing Lens is ever mutated or removed —
+// because each Lens's facet results cost tokens and must never be lost.
+//
+// Painted Facet *results* deliberately stay in global durable KV (see
+// semantic-store.ts): they are large (~200KB/Lens), rewritten on every sweep,
+// and free to regenerate, so they are not committed alongside the definitions.
 
-function lensesKey(projectID: string) {
-  return ["aperture", projectID, "lenses"]
+function apertureDir(directory: string) {
+  return path.join(directory, ".opencode", "aperture")
 }
 
-function activeKey(projectID: string) {
-  return ["aperture", projectID, "active-lens"]
+// The committable Lens definitions (Record<lensID, Lens>).
+function lensesFile(directory: string) {
+  return path.join(apertureDir(directory), "lenses.json")
+}
+
+// The active-lens pointer ({ id }).
+function activeFile(directory: string) {
+  return path.join(apertureDir(directory), "active.json")
 }
 
 type StoredLenses = Record<string, Lens>
 
+// Read a JSON doc from disk, falling back to `fallback` when the file is missing
+// or unreadable. Self-provides the FS layer so callers keep R = never (the store
+// previously took a Storage value arg; the project directory replaces it).
+function readDoc<T>(file: string, fallback: T): Effect.Effect<T> {
+  return Effect.gen(function* () {
+    const fs = yield* FSUtil.Service
+    return (yield* fs.readJson(file).pipe(Effect.catch(() => Effect.succeed(fallback)))) as T
+  }).pipe(Effect.provide(FSUtil.defaultLayer))
+}
+
+// Write a JSON doc to disk (creating `.opencode/aperture/` as needed). Best-effort:
+// a write failure is swallowed so a flaky disk never breaks a Lens mutation's caller.
+function writeDoc(file: string, content: unknown): Effect.Effect<void> {
+  return Effect.gen(function* () {
+    const fs = yield* FSUtil.Service
+    yield* fs.writeWithDirs(file, JSON.stringify(content, null, 2))
+  }).pipe(Effect.provide(FSUtil.defaultLayer), Effect.ignore)
+}
+
 // All user-defined Lenses for a project (empty when none defined yet).
-const readProject = (storage: Storage.Interface, projectID: string): Effect.Effect<StoredLenses> =>
-  storage.read<StoredLenses>(lensesKey(projectID)).pipe(Effect.catch(() => Effect.succeed<StoredLenses>({})))
+const readProject = (directory: string): Effect.Effect<StoredLenses> => readDoc<StoredLenses>(lensesFile(directory), {})
 
 // Built-in (global) Lenses first, then the project's user-defined ones.
-export const list = (storage: Storage.Interface, projectID: string): Effect.Effect<Lens[]> =>
-  readProject(storage, projectID).pipe(Effect.map((project) => [...BUILTIN_LENSES, ...Object.values(project)]))
+export const list = (directory: string): Effect.Effect<Lens[]> =>
+  readProject(directory).pipe(Effect.map((project) => [...BUILTIN_LENSES, ...Object.values(project)]))
 
 // Resolve a Lens by id, checking built-ins then the project store. Returns
 // undefined when unknown.
-export const get = (
-  storage: Storage.Interface,
-  projectID: string,
-  id: string,
-): Effect.Effect<Lens | undefined> =>
-  list(storage, projectID).pipe(Effect.map((all) => all.find((c) => c.id === id)))
+export const get = (directory: string, id: string): Effect.Effect<Lens | undefined> =>
+  list(directory).pipe(Effect.map((all) => all.find((c) => c.id === id)))
 
 // The active Lens id, defaulting to architecture when unset.
-export const getActiveId = (storage: Storage.Interface, projectID: string): Effect.Effect<string> =>
-  storage
-    .read<{ id: string }>(activeKey(projectID))
-    .pipe(Effect.map((doc) => doc.id), Effect.catch(() => Effect.succeed(ARCHITECTURE_ID)))
+export const getActiveId = (directory: string): Effect.Effect<string> =>
+  readDoc<{ id: string } | undefined>(activeFile(directory), undefined).pipe(
+    Effect.map((doc) => doc?.id ?? ARCHITECTURE_ID),
+  )
 
 // The active Lens, falling back to architecture if the stored id no longer
 // resolves (e.g. a deleted/edited store) so the view always has something to paint.
-export const getActive = (storage: Storage.Interface, projectID: string): Effect.Effect<Lens> =>
+export const getActive = (directory: string): Effect.Effect<Lens> =>
   Effect.gen(function* () {
-    const id = yield* getActiveId(storage, projectID)
-    const found = yield* get(storage, projectID, id)
+    const id = yield* getActiveId(directory)
+    const found = yield* get(directory, id)
     return found ?? BUILTIN_LENSES[0]!
   })
 
 // Set the active Lens. No validation here (callers resolve the id first);
 // kept minimal so the tools can flip it cheaply.
-export const setActive = (storage: Storage.Interface, projectID: string, id: string): Effect.Effect<void> =>
-  storage.write(activeKey(projectID), { id }).pipe(Effect.ignore)
+export const setActive = (directory: string, id: string): Effect.Effect<void> =>
+  writeDoc(activeFile(directory), { id })
 
 export interface CreateInput {
   readonly name: string
@@ -91,11 +117,7 @@ function mintId(input: CreateInput): string {
 // untouched) and return it. Facet ids default to a slug of the label; colours are
 // assigned from the chosen palette in order. Throws if the facet count exceeds the
 // palette size (MAX_FACETS) — the tools validate first, this is the backstop.
-export const create = (
-  storage: Storage.Interface,
-  projectID: string,
-  input: CreateInput,
-): Effect.Effect<Lens> =>
+export const create = (directory: string, input: CreateInput): Effect.Effect<Lens> =>
   Effect.gen(function* () {
     if (input.facets.length === 0) return yield* Effect.die(new Error("a Lens needs at least one facet"))
     if (input.facets.length > MAX_FACETS)
@@ -125,11 +147,12 @@ export const create = (
       ...(input.directories?.length ? { directories: normalizeDirectories(input.directories) } : {}),
     }
 
-    yield* storage
-      .update<StoredLenses>(lensesKey(projectID), (draft) => {
-        draft[lens.id] = lens
-      })
-      .pipe(Effect.catch(() => storage.write(lensesKey(projectID), { [lens.id]: lens })), Effect.ignore)
+    // Additive read-modify-write: load the existing project doc, add the fresh
+    // Lens, write back. Lens mutations are infrequent and single-user, so the
+    // plain RMW (vs. the old storage.update write-lock) is fine.
+    const project = yield* readProject(directory)
+    project[lens.id] = lens
+    yield* writeDoc(lensesFile(directory), project)
 
     return lens
   })
@@ -192,13 +215,12 @@ export interface UpdateResult {
 // flag telling the caller whether the previously-inferred facets are now invalid.
 // Returns undefined when the id isn't a project Lens.
 export const update = (
-  storage: Storage.Interface,
-  projectID: string,
+  directory: string,
   id: string,
   input: UpdateInput,
 ): Effect.Effect<UpdateResult | undefined> =>
   Effect.gen(function* () {
-    const project = yield* readProject(storage, projectID)
+    const project = yield* readProject(directory)
     const prev = project[id]
     if (!prev) return undefined
 
@@ -229,9 +251,8 @@ export const update = (
       ...(directories?.length ? { directories } : {}),
     }
 
-    yield* storage.update<StoredLenses>(lensesKey(projectID), (draft) => {
-      draft[id] = next
-    }).pipe(Effect.ignore)
+    project[id] = next
+    yield* writeDoc(lensesFile(directory), project)
 
     return { lens: next, structural }
   })
@@ -241,35 +262,32 @@ export const update = (
 // caller folds the stored semantics (ApertureSemanticStore.mergeFacet) so no re-paint is
 // needed. Returns the updated Lens, or undefined when the id/facets don't resolve.
 export const mergeFacets = (
-  storage: Storage.Interface,
-  projectID: string,
+  directory: string,
   id: string,
   from: string,
   into: string,
 ): Effect.Effect<Lens | undefined> =>
   Effect.gen(function* () {
-    const project = yield* readProject(storage, projectID)
+    const project = yield* readProject(directory)
     const prev = project[id]
     if (!prev) return undefined
     if (from === into) return prev
     if (!prev.facets.some((t) => t.id === from) || !prev.facets.some((t) => t.id === into)) return undefined
     const next: Lens = { ...prev, facets: prev.facets.filter((t) => t.id !== from) }
-    yield* storage.update<StoredLenses>(lensesKey(projectID), (draft) => {
-      draft[id] = next
-    }).pipe(Effect.ignore)
+    project[id] = next
+    yield* writeDoc(lensesFile(directory), project)
     return next
   })
 
 // Remove a *user* Lens from the project doc. Returns true when something was
 // removed (built-ins aren't in the doc, so they return false). The caller resets the
 // active pointer and clears the Lens's semantics.
-export const remove = (storage: Storage.Interface, projectID: string, id: string): Effect.Effect<boolean> =>
+export const remove = (directory: string, id: string): Effect.Effect<boolean> =>
   Effect.gen(function* () {
-    const project = yield* readProject(storage, projectID)
+    const project = yield* readProject(directory)
     if (!project[id]) return false
-    yield* storage.update<StoredLenses>(lensesKey(projectID), (draft) => {
-      delete draft[id]
-    }).pipe(Effect.ignore)
+    delete project[id]
+    yield* writeDoc(lensesFile(directory), project)
     return true
   })
 

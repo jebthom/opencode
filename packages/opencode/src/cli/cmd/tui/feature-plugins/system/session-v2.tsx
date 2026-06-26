@@ -4,6 +4,7 @@ import { useSyncV2 } from "@tui/context/sync-v2"
 import { SplitBorder } from "@tui/component/border"
 import { Spinner } from "@tui/component/spinner"
 import { useTheme } from "@tui/context/theme"
+import { navigateAperture } from "./aperture-nav"
 import { useLocal } from "@tui/context/local"
 import { reasoningSummary, useThinkingMode } from "@tui/context/thinking"
 import { useRenderer, useTerminalDimensions, type JSX } from "@opentui/solid"
@@ -765,7 +766,7 @@ function Glob(props: ToolProps) {
   return (
     <InlineTool icon="✱" pending="Finding files..." complete={toolComplete(props.part)} part={props.part}>
       Glob "{stringValue(props.input.pattern) ?? pendingInput(props.part)}"{" "}
-      <Show when={stringValue(props.input.path)}>in {normalizePath(stringValue(props.input.path))} </Show>
+      <Show when={stringValue(props.input.path)}>in <PathLink path={stringValue(props.input.path)} kind="directory" /> </Show>
       <Show when={numberValue(props.metadata.count)}>
         {(count) => (
           <>
@@ -774,6 +775,22 @@ function Glob(props: ToolProps) {
         )}
       </Show>
     </InlineTool>
+  )
+}
+
+// A clickable file/directory reference (A4): renders the normalized path and, on
+// click, re-roots the Aperture top bar at it (a file → its parent dir). Underlined to
+// hint it's interactive; colour inherits the surrounding line so it doesn't stand out
+// loudly. Used in tool titles (Read/Edit/Write) and the Read "↳ Loaded" line.
+function PathLink(props: { path: string | undefined; kind?: "file" | "directory" }) {
+  return (
+    <Show when={props.path}>
+      {(path) => (
+        <text attributes={TextAttributes.UNDERLINE} onMouseDown={() => navigateAperture(path(), props.kind ?? "file")}>
+          {normalizePath(path())}
+        </text>
+      )}
+    </Show>
   )
 }
 
@@ -791,14 +808,14 @@ function Read(props: ToolProps) {
         spinner={props.part.state.status === "running"}
         part={props.part}
       >
-        Read {normalizePath(stringValue(props.input.filePath) ?? pendingInput(props.part))}{" "}
+        Read <PathLink path={stringValue(props.input.filePath) ?? pendingInput(props.part)} />{" "}
         {input(props.input, ["filePath"])}
       </InlineTool>
       <For each={loaded()}>
         {(filepath) => (
           <box paddingLeft={3} flexShrink={0}>
             <text paddingLeft={3} fg={theme.textMuted}>
-              ↳ Loaded {normalizePath(filepath)}
+              ↳ Loaded <PathLink path={filepath} />
             </text>
           </box>
         )}
@@ -811,7 +828,7 @@ function Grep(props: ToolProps) {
   return (
     <InlineTool icon="✱" pending="Searching content..." complete={toolComplete(props.part)} part={props.part}>
       Grep "{stringValue(props.input.pattern) ?? pendingInput(props.part)}"{" "}
-      <Show when={stringValue(props.input.path)}>in {normalizePath(stringValue(props.input.path))} </Show>
+      <Show when={stringValue(props.input.path)}>in <PathLink path={stringValue(props.input.path)} kind="directory" /> </Show>
       <Show when={numberValue(props.metadata.matches)}>
         {(matches) => (
           <>
@@ -863,7 +880,7 @@ function Write(props: ToolProps) {
       </Match>
       <Match when={true}>
         <InlineTool icon="←" pending="Preparing write..." complete={filePath()} part={props.part}>
-          Write {normalizePath(filePath())}
+          Write <PathLink path={filePath()} />
         </InlineTool>
       </Match>
     </Switch>
@@ -907,7 +924,7 @@ function Edit(props: ToolProps) {
       </Match>
       <Match when={true}>
         <InlineTool icon="←" pending="Preparing edit..." complete={filePath()} part={props.part}>
-          Edit {normalizePath(filePath())} {input({ replaceAll: props.input.replaceAll })}
+          Edit <PathLink path={filePath()} /> {input({ replaceAll: props.input.replaceAll })}
         </InlineTool>
       </Match>
     </Switch>

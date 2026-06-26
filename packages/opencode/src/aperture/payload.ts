@@ -25,7 +25,11 @@ import { Schema } from "effect"
 // - 6: Aperture rename (codegraph → aperture). Wire field names changed
 //   (`collection` → `lens`, `tags` → `facets`, weight `tag` → `facet`); a v5 cache
 //   uses the old field names and decodes to a thinner graph.
-export const PAYLOAD_VERSION = 6
+// - 7: sub-file resolution (A5). The payload may carry `extents` — per-function
+//   line-delimited tiles for a drilled-into file, each with its own facet/hue.
+//   Optional and derived at the read boundary (like `composition`), so it doesn't
+//   change the structure cache; the bump is conservative so no v6 cache lingers.
+export const PAYLOAD_VERSION = 7
 
 export const NodeKind = Schema.Literals(["file", "directory"])
 export type NodeKind = typeof NodeKind.Type
@@ -127,6 +131,20 @@ export const Composition = Schema.Struct({
 })
 export type Composition = typeof Composition.Type
 
+// One sub-file tile (A5): a top-level declaration's line-delimited extent within a
+// file, with its own inferred facet/hue. Produced on drill-in only (painting, not
+// reading). Lines are 1-based inclusive; the extents of a file tile it exhaustively
+// (see extents.ts), so a file's facet mix is a true aggregation of its functions.
+// `facet`/`hue` are absent until the drill-in painter colours the function.
+export const Extent = Schema.Struct({
+  name: Schema.String,
+  startLine: Schema.Int,
+  endLine: Schema.Int,
+  facet: Schema.optional(Schema.String),
+  hue: Schema.optional(Schema.String),
+})
+export type Extent = typeof Extent.Type
+
 export const Payload = Schema.Struct({
   version: Schema.Int,
   nodes: Schema.Array(Node),
@@ -143,6 +161,10 @@ export const Payload = Schema.Struct({
   // The active Lens + its legend, merged in at the read boundary. Optional
   // so older/empty payloads still decode; the renderer falls back to no legend.
   lens: Schema.optional(LensInfo),
+  // Sub-file tiles (A5), keyed by *file* node id. Present only for a drilled-into
+  // file (at most one key in practice); derived at the read boundary like
+  // `composition`, so it's backward compatible with structure caches.
+  extents: Schema.optional(Schema.Record(Schema.String, Schema.Array(Extent))),
 })
 export type Payload = typeof Payload.Type
 

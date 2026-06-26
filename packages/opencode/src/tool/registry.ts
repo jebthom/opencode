@@ -18,6 +18,7 @@ import { LensCreateTool } from "./lens-create"
 import { LensSelectTool } from "./lens-select"
 import { LensMergeFacetsTool } from "./lens-merge-facets"
 import { LensEditTool } from "./lens-edit"
+import { LensFacetFilesTool } from "./lens-facet-files"
 import { Aperture } from "@/aperture/aperture"
 import * as Tool from "./tool"
 import { Config } from "@/config/config"
@@ -143,6 +144,7 @@ export const layer: Layer.Layer<
     const lensSelect = yield* LensSelectTool
     const lensMergeFacets = yield* LensMergeFacetsTool
     const lensEdit = yield* LensEditTool
+    const lensFacetFiles = yield* LensFacetFilesTool
     const agent = yield* Agent.Service
 
     const state = yield* InstanceState.make<State>(
@@ -255,6 +257,7 @@ export const layer: Layer.Layer<
           lensSelect: Tool.init(lensSelect),
           lensMergeFacets: Tool.init(lensMergeFacets),
           lensEdit: Tool.init(lensEdit),
+          lensFacetFiles: Tool.init(lensFacetFiles),
         })
 
         return {
@@ -279,6 +282,7 @@ export const layer: Layer.Layer<
             tool.lensSelect,
             tool.lensMergeFacets,
             tool.lensEdit,
+            tool.lensFacetFiles,
             ...(flags.experimentalLspTool ? [tool.lsp] : []),
             ...(flags.experimentalPlanMode && flags.client === "cli" ? [tool.plan] : []),
           ],

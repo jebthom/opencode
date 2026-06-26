@@ -1,0 +1,47 @@
+{
+  "ui-components-7a6b52dd": {
+    "id": "ui-components-7a6b52dd",
+    "name": "UI Components",
+    "description": "Classifies files by their role in the UI component system (primitive components, composed features, application views, styling/theme, and utility/helper code)",
+    "palette": "bright",
+    "prompt": "Classify files by their role in the UI/UX component system. Primitive components are simple, reusable UI building blocks like button, input, checkbox, icon, avatar, badge, spinner. Composed features combine multiple primitives into complex interactive patterns like dialog, menu, tooltip, popover, list, accordion, tabs. Application views are full pages or major screen layouts specific to the app's domain like session pages, home pages, settings dialogs, sidebars. Styling files include CSS, design tokens, and theme definitions. UI hooks and utilities are custom hooks, UI helper functions, and supporting logic specific to rendering and interactive components (not general application logic).",
+    "facets": [
+      {
+        "id": "primitive-components",
+        "label": "Primitive Components",
+        "description": "Basic reusable UI building blocks (button, input, checkbox, icon, avatar, badge, spinner, etc.)",
+        "color": "#4E79A7"
+      },
+      {
+        "id": "composed-features",
+        "label": "Composed Features",
+        "description": "Complex components combining primitives (dialog, menu, tooltip, popover, list, accordion, tabs, etc.)",
+        "color": "#F28E2B"
+      },
+      {
+        "id": "application-views",
+        "label": "Application Views",
+        "description": "Full-page or major screen layouts and domain-specific UI (session page, home page, settings dialogs, sidebars, etc.)",
+        "color": "#59A14F"
+      },
+      {
+        "id": "styling-theme",
+        "label": "Styling & Theme",
+        "description": "CSS, theming, design tokens, and visual/animation system files",
+        "color": "#E15759"
+      },
+      {
+        "id": "ui-hooks-utilities",
+        "label": "UI Hooks & Utilities",
+        "description": "Custom hooks, UI helper functions, and supporting logic specific to rendering and interactive components",
+        "color": "#B07AA1"
+      }
+    ],
+    "scope": "project",
+    "directories": [
+      "packages/ui",
+      "packages/app/src/components",
+      "packages/opencode/src/cli/cmd/tui/ui"
+    ]
+  }
+}

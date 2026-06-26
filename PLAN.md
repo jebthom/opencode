@@ -84,27 +84,39 @@ Example dialogue:
 > **User:** Let's investigate `<file-a>` together.
 
 Tasks:
-- **A1 — Paint + explore in parallel.** When a sensemaking question warrants a
-  new Lens, the agent kicks off Facet painting (the painter) **and** exploration
-  concurrently, so the Lens fills in while explore runs (today it paints, then
-  explores serially).
-- **A2 — A new way of organizing Lenses.** *[OPEN DESIGN QUESTION — logged, to be
-  settled during the sprint, not now.]* Sensemaking accumulates many Lenses; the
-  flat list + ◀/▶ cycle won't scale. Brainstorm candidates: grouping/folders,
-  nesting, search/filter.
-- **A3 — View + Lenses live in the project, with agent access.** Persist the
-  View/Lenses in the project directory (the clean-break storage move), add
-  guidance, and provide a **helper tool** so the agent can list every file
-  carrying a given Facet (or set of Facets) and read them. This is what powers
-  "tell me about `<component-a>`'s files".
-- **A4 — Click-to-navigate from chat.** Clicking a file or directory reference in
-  the chat re-roots / changes the View in the top bar.
-- **A5 — On-demand function-level Facets (drill-in sub-file resolution).** The one
-  non-trivial task. Design already sketched in
-  `docs/codegraph-subfile-resolution.md` — drill-in-gated, line-delimited extents
-  (no parsing), top priority on the single-permit painter
-  (`drill-in > foreground view > background sweep`), painting-not-reading. Follow
-  that doc rather than restating it here.
+- **A1 — Paint + explore in parallel.** ✅ DONE. Guidance in the Aperture-awareness
+  block (`session/system.ts`): on a sensemaking question, call `lens_create` first
+  (paint is backgrounded, returns at once) then explore in the same turn — the Lens
+  fills in while exploration runs, instead of serially.
+- **A2 — A new way of organizing Lenses.** ✅ DONE (settled: **searchable picker**).
+  New `listLenses`/`selectLens` HTTP routes + SDK; a `DialogSelect`-based Lens picker
+  (`aperture-lens-picker.tsx`) grouped Project/Built-in with fuzzy filter + active
+  marker, opened from the command palette (`/lens-switch`) or a `⌄` affordance in the
+  legend. The ◀/▶ cycle stays for quick adjacent switching.
+- **A3 — View + Lenses live in the project, with agent access.** ✅ DONE. Lens
+  defs + active pointer persist to `.opencode/aperture/`; `lens_facet_files` tool
+  lists files by Facet (`aperture.facetFiles`). Paint results stay in global KV.
+- **A4 — Click-to-navigate from chat.** ✅ DONE. A shared module-level nav bus
+  (`aperture-nav.ts`) bridges the chat and the Aperture slot (no client-side event
+  emit in the plugin API); chat file/dir references (Read/Edit/Write/Loaded/Grep) are
+  clickable `PathLink`s that re-root the top-bar scope (a file → its parent dir).
+- **A5 — On-demand function-level Facets (drill-in sub-file resolution).** ✅ DONE
+  (Phase 1 data + Phase 2 TUI). Drill-in-gated, line-delimited extents (no parsing,
+  `extents.ts`), per-function store (`subfacet-store.ts`, global KV), payload v7
+  `extents`, drill-in paint lane on the single permit, `drill` HTTP route + SDK.
+  TUI (column layout): clicking a file paints its bar as a positional band of its
+  function extents. Auto-refresh on edit (hash-scoped) + deterministic git-changed
+  function painting via diff hunks. Followed `docs/codegraph-subfile-resolution.md`.
+
+- **A6 (extension, deferred) — Surface function-level Facets in the editor (VSCode).**
+  *[Logged, NOT this pass — revisit after A1/A2/A4.]* Resolves guardrail #2 (no code
+  reader in the TUI): annotate the real editor instead. Most data already exists —
+  the `drill` route returns per-function `{name, range, facet, hue}`; `lenses.json`
+  carries facet→colour. Likely additive inside the existing `sdks/vscode/` extension
+  (`sst-dev.opencode`). Key insight: store only `name→facet` on disk and recompute
+  line ranges live in the extension (edit-robust); "drill" maps to *the focused file*.
+  Open decision: HTTP-live via the `drill` route (primary) vs. a committable on-disk
+  snapshot vs. both.
 
 ### Workflow B — Building Flow (create a new feature)
 

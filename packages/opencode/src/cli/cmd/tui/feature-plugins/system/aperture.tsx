@@ -3,12 +3,14 @@ import type { MouseEvent, ScrollBoxRenderable } from "@opentui/core"
 import { RGBA } from "@opentui/core"
 import { useTerminalDimensions } from "@opentui/solid"
 import type { InternalTuiPlugin } from "../../plugin/internal"
-import { createEffect, createMemo, createResource, createSignal, For, onCleanup, Show } from "solid-js"
+import { createEffect, createMemo, createResource, createSignal, For, on, onCleanup, Show } from "solid-js"
 import { DIRECTORY_HUE } from "@/aperture/semantics"
 import { NONE_FACET, NONE_HUE, NONE_LABEL, UNTAGGED_HUE, UNTAGGED_LABEL, BUILTIN_LENS_IDS } from "@/aperture/lenses"
 import { allocateCells, buildGrid, coalesce } from "@/aperture/treemap"
 import { ACTION_GLYPH, ACTION_LABEL, ACTIONS, type Action, type ActivityEntry, type Fill, type Style } from "@/aperture/activity"
 import { createActivityTracker } from "./aperture-activity"
+import { apertureNavRequest } from "./aperture-nav"
+import { openLensPicker } from "./aperture-lens-picker"
 
 const id = "internal:aperture"
 
@@ -54,6 +56,11 @@ type Composition = {
 // importing node. An edge's `to` may reference a boundary id.
 type GraphBoundary = { id: string; path: string; kind: "file" | "directory" }
 
+// One sub-file (function-level) tile for a drilled-into file (A5): a top-level
+// declaration's line span with its own facet/hue. `facet`/`hue` are absent until the
+// drill-in painter colours the function. Present only for the drilled file.
+type GraphExtent = { name: string; startLine: number; endLine: number; facet?: string; hue?: string }
+
 type Graph = {
   version: number
   nodes: GraphNode[]
@@ -63,6 +70,8 @@ type Graph = {
   composition?: Record<string, Composition>
   // The active Lens + legend (facet → label + colour), merged in server-side.
   lens?: { id: string; name: string; legend: readonly { facet: string; label: string; color: string }[] }
+  // Function-level tiles keyed by *file* node id, present only for the drilled file.
+  extents?: Record<string, readonly GraphExtent[]>
 }
 
 // Layout mode for the top bar. "grid" = the current wide block-over-child-grid
@@ -221,6 +230,25 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   // fits the viewport (see scrollbarVisible / barHeight below).
   const dimensions = useTerminalDimensions()
   const [scope, setScope] = createSignal("")
+  // The file (repo-relative path) the user has drilled into for function-level paint
+  // (A5), or undefined. Sent as `drill` on the fetch; the server returns the file's
+  // `extents` and schedules the drill-in painter. Clicking a file toggles it.
+  const [drilledFile, setDrilledFile] = createSignal<string | undefined>(undefined)
+  const toggleDrill = (path: string) => setDrilledFile((cur) => (cur === path ? undefined : path))
+  // Navigating the directory tree clears the drilled file (its tiles belong to the
+  // view you left). Deferred so it doesn't fire on mount.
+  createEffect(on(scope, () => setDrilledFile(undefined), { defer: true }))
+  // Click-to-navigate from chat (A4): a file/dir reference clicked in the chat
+  // publishes a re-root request on the shared nav bus; honour it by re-scoping.
+  createEffect(
+    on(
+      apertureNavRequest,
+      (req) => {
+        if (req) setScope(req.scope)
+      },
+      { defer: true },
+    ),
+  )
 
   // Layer-0 directories whose child row is expanded past MAX_CHILDREN to show all
   // children (the unlimited horizontal strip makes this cheap). Keyed by node id.
@@ -261,10 +289,12 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   // child that changed/vanished is reflected the moment you open it). The server
   // cache + invalidation still spare recompute for scopes nobody is viewing.
   const [graph, { refetch }] = createResource(
-    () => ({ directory: props.api.state.path.directory, scope: scope() }),
+    () => ({ directory: props.api.state.path.directory, scope: scope(), drill: drilledFile() }),
     async (key) => {
       const result = await props.api.client.aperture.get(
-        { scope: key.scope, refresh: "true" },
+        // `drill` (when set) makes the server attach the file's function-level extents
+        // and schedule the drill-in paint pass; it supersedes refresh server-side.
+        { scope: key.scope, refresh: "true", ...(key.drill ? { drill: key.drill } : {}) },
         { throwOnError: true },
       )
       return result.data as Graph
@@ -399,8 +429,36 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   // Column-mode file row: the file's single layer color (or panel bg when untagged)
   // spread across `width` columns, so a file paints as a flat 1-row bar matching the
   // borderless child-directory bars beside it (childDirColors' file analogue).
-  const fileRowColors = (id: string, width: number): (TuiThemeCurrent["text"] | undefined)[] =>
-    Array.from({ length: width }, () => fileBg(id))
+  const fileRowColors = (id: string, width: number): (TuiThemeCurrent["text"] | undefined)[] => {
+    // A drilled-into file (the only one the server sends extents for) paints as a
+    // positional band of its functions; every other file is its single flat hue.
+    const ex = extentsForId(id)
+    if (ex && ex.length) return fileExtentColors(ex, width)
+    return Array.from({ length: width }, () => fileBg(id))
+  }
+  // Guarded extents accessor — never call the resource in its error state (the
+  // documented render→catch→re-render leak, PLAN.md).
+  const extentsForId = (id: string) => (graph.error ? undefined : graph()?.extents?.[id])
+  // Lay a drilled file's extents across `width` columns in file order: each segment
+  // sized by its line span, coloured by its facet (grey until the function is painted),
+  // so the bar reads as a left-to-right strip of where each concept lives in the file.
+  const fileExtentColors = (
+    extents: readonly GraphExtent[],
+    width: number,
+  ): (TuiThemeCurrent["text"] | undefined)[] => {
+    const bands = extents.map((e) => ({ key: e.facet ?? GREY_CELL, value: Math.max(1, e.endLine - e.startLine + 1) }))
+    const alloc = allocateCells(bands, width)
+    const flat: TuiThemeCurrent["text"][] = []
+    for (const a of alloc) for (let i = 0; i < a.n; i++) flat.push(colorFor(a.key))
+    while (flat.length < width) flat.push(theme().backgroundPanel)
+    return flat
+  }
+  // The extent band for a file id at `width`, or undefined when it isn't the drilled
+  // file. Drives the grid FileTile's drilled-state strip.
+  const bandForFile = (id: string, width: number) => {
+    const ex = extentsForId(id)
+    return ex && ex.length ? fileExtentColors(ex, width) : undefined
+  }
   // Whole-subtree size of a node (0 when it has no composition yet), the metric the
   // column-mode block width scales by (same denominator as maxDirSubtree0).
   const subtreeOf = (id: string) => {
@@ -654,6 +712,11 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
             <text fg={theme().accent} onMouseDown={() => cycleLens("next")} wrapMode="none">
               ▶
             </text>
+            {/* Open the searchable Lens picker (A2) — the scalable alternative to
+                cycling once there are many Lenses. */}
+            <text fg={theme().textMuted} onMouseDown={() => openLensPicker(props.api)} wrapMode="none">
+              ⌄
+            </text>
             {/* Delete the active (user) collection: click to arm, click again to
                 confirm. Hidden for the immutable built-in Architecture collection. */}
             <Show when={canDeleteActive()}>
@@ -802,6 +865,8 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                         theme={theme}
                         onEnter={() => enterNode(item.node)}
                         onLeave={() => leaveNode()}
+                        onDrill={() => toggleDrill(item.node.path)}
+                        bandColors={(w) => bandForFile(item.node.id, w)}
                       />
                     }
                   >
@@ -850,7 +915,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                             width={outerW()}
                             flexDirection="row"
                             flexShrink={0}
-                            onMouseDown={() => (cell.kind === "directory" ? setScope(cell.path) : undefined)}
+                            onMouseDown={() => (cell.kind === "directory" ? setScope(cell.path) : toggleDrill(cell.path))}
                             onMouseOver={() => enterNode(cell)}
                             onMouseOut={() => leaveNode()}
                           >
@@ -932,6 +997,8 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                       theme={theme}
                       onEnter={() => enterNode(item.node)}
                       onLeave={() => leaveNode()}
+                      onDrill={() => toggleDrill(item.node.path)}
+                      bandColors={(w) => bandForFile(item.node.id, w)}
                     />
                   }
                 >
@@ -1013,6 +1080,8 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                                       theme={theme}
                                       onEnter={() => enterNode(cell)}
                                       onLeave={() => leaveNode()}
+                                      onDrill={() => toggleDrill(cell.path)}
+                                      bandColors={(w) => bandForFile(cell.id, w)}
                                     />
                                   }
                                 >
@@ -1243,7 +1312,16 @@ function FileTile(props: {
   theme: () => TuiThemeCurrent
   onEnter: () => void
   onLeave: () => void
+  // Click to drill into the file's function-level paint (A5); absent for boundary
+  // probes / non-drillable tiles.
+  onDrill?: () => void
+  // When the file is drilled, builds a per-column band of its function extents (A5)
+  // for the given inner width; the tile then paints that strip instead of its
+  // single-hue fill. Returns undefined when the file isn't drilled.
+  bandColors?: (width: number) => (TuiThemeCurrent["text"] | undefined)[] | undefined
 }) {
+  const band = () => props.bandColors?.(nameWidth())
+  const nameWidth = () => Math.max(0, (props.width ?? 0) - 2 - props.overlays().length)
   return (
     <box flexDirection="column" flexShrink={0}>
       <Show when={(props.topSpacer ?? 0) > 0}>
@@ -1255,15 +1333,26 @@ function FileTile(props: {
         borderColor={props.borderColor()}
         width={props.width}
         flexShrink={0}
+        onMouseDown={() => props.onDrill?.()}
         onMouseOver={() => props.onEnter()}
         onMouseOut={() => props.onLeave()}
       >
-        <box backgroundColor={props.bg()} flexDirection="row" gap={1} flexShrink={0}>
-          <text fg={props.fg()} wrapMode="none">
-            {props.label}
-          </text>
-          <OverlayRow overlays={props.overlays} theme={props.theme} color={props.fg} />
-        </box>
+        <Show
+          when={band()?.length}
+          fallback={
+            <box backgroundColor={props.bg()} flexDirection="row" gap={1} flexShrink={0}>
+              <text fg={props.fg()} wrapMode="none">
+                {props.label}
+              </text>
+              <OverlayRow overlays={props.overlays} theme={props.theme} color={props.fg} />
+            </box>
+          }
+        >
+          <box flexDirection="row" height={1} flexShrink={0}>
+            <NameRow name={props.label} width={nameWidth()} colors={() => band()!} textColor={props.fg} theme={props.theme} />
+            <OverlayRow overlays={props.overlays} theme={props.theme} />
+          </box>
+        </Show>
       </box>
     </box>
   )
@@ -1451,6 +1540,22 @@ const tui: TuiPlugin = async (api) => {
         return <View api={api} session_id={props.session_id} />
       },
     },
+  })
+  // A2: searchable Lens picker, reachable from the command palette / `/lens-switch`
+  // (and from a click on the active-Lens name in the legend, see View).
+  api.keymap.registerLayer({
+    commands: [
+      {
+        name: "aperture.lens.switch",
+        title: "Switch Lens",
+        slashName: "lens-switch",
+        category: "Aperture",
+        namespace: "palette",
+        run() {
+          openLensPicker(api)
+        },
+      },
+    ],
   })
 }
 

@@ -18,6 +18,8 @@ import { AperturePayload } from "./payload"
 import { ApertureExtract } from "./extract"
 import { ApertureEvent } from "./event"
 import { ApertureSemanticStore } from "./semantic-store"
+import { ApertureSubfacetStore } from "./subfacet-store"
+import { ApertureExtents } from "./extents"
 import { AperturePainter } from "./painter"
 import { ApertureLensStore } from "./lens-store"
 import { ApertureDeterministic } from "./deterministic"
@@ -121,6 +123,19 @@ export type DeleteOutcome =
   | { readonly status: "not-found" }
   | { readonly status: "builtin" }
 
+// Files carrying one or more Facets of a Lens, grouped by Facet (A3 helper tool).
+// Powers "tell me about <component>'s files": the agent gets the paths under a
+// Facet and reads them itself. Built from the painted store joined against the
+// repo file listing (the store is keyed by an un-invertible path hash).
+export type FacetFilesOutcome =
+  | {
+      readonly status: "ok"
+      readonly lens: { readonly id: string; readonly name: string }
+      readonly groups: ReadonlyArray<{ readonly facet: string; readonly label: string; readonly paths: ReadonlyArray<string> }>
+      readonly unknownFacets: ReadonlyArray<string>
+    }
+  | { readonly status: "not-found" }
+
 export interface Interface {
   // Cached payload for `scope` (default repo root); computes + persists on a miss
   // or when the scope has been marked dirty by a file change in its window.
@@ -150,6 +165,16 @@ export interface Interface {
   // Delete a user Lens (and its facets), falling back to the built-in active
   // Lens when the deleted one was active. Not exposed to the lens agent.
   readonly deleteLens: (idOrName: string) => Effect.Effect<DeleteOutcome>
+  // List the files carrying the given Facet(s) of a Lens, grouped by Facet. `lens`
+  // is an id/name (or undefined for the active Lens); `facets` are facet ids or
+  // labels (empty = every Facet in the Lens). Returns not-found when the Lens is
+  // unknown. Used by the `lens_facet_files` tool for sensemaking.
+  readonly facetFiles: (lens: string | undefined, facets: ReadonlyArray<string>) => Effect.Effect<FacetFilesOutcome>
+  // Drill into a file (A5): like `get`, but the payload also carries `extents` —
+  // the file's function-level tiles, coloured from the per-function store — and a
+  // drill-in paint pass is scheduled at top priority to fill any not-yet-painted
+  // functions. `scope` is the surrounding window (default repo root).
+  readonly drill: (file: string, scope?: string) => Effect.Effect<AperturePayload.Payload>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Aperture") {}
@@ -202,6 +227,16 @@ export const layer = Layer.effect(
     // when files change — we drop the entry from the same file-event / turn-completion
     // subscriptions that already fire below, so it rebuilds lazily on the next read.
     const subtreeCache = new Map<string, ReadonlyArray<ApertureDeterministic.SubtreeFile>>()
+    // Read a repo-relative file's text (or undefined when unreadable). Self-provides
+    // the FS layer so callers keep R = never. Used by finalize for drill-in extents.
+    const readFileText = (directory: string, rel: string) =>
+      Effect.gen(function* () {
+        const fs = yield* FSUtil.Service
+        return yield* fs
+          .readFileStringSafe(path.join(directory, rel))
+          .pipe(Effect.orElseSucceed(() => undefined as string | undefined))
+      }).pipe(Effect.provide(FSUtil.defaultLayer))
+
     const subtreeFor = (directory: string) =>
       Effect.gen(function* () {
         const cached = subtreeCache.get(directory)
@@ -233,6 +268,19 @@ export const layer = Layer.effect(
         return resolved
       })
 
+    // Changed line ranges (in the current file) for the git-changed Lens at function
+    // granularity: `git diff --unified=0 HEAD -- <file>` parsed to hunk ranges. Empty
+    // for an unchanged or untracked file (the caller falls back to the file-level
+    // changed result). Soft-fails to "no ranges" so a git hiccup never breaks drill-in.
+    const changedRangesFor = (directory: string, relPath: string) =>
+      Effect.gen(function* () {
+        const result = yield* git
+          .run(["diff", "--unified=0", "HEAD", "--", relPath], { cwd: directory })
+          .pipe(Effect.catch(() => Effect.succeed(undefined)))
+        if (!result || result.exitCode !== 0) return [] as Array<[number, number]>
+        return ApertureExtents.parseHunkRanges(result.text())
+      })
+
     // Whether the directory is a git work tree, cached because it almost never changes
     // (only `git init`). Cleared on turn completion (an agent may have run `git init`) and
     // on disposal. Gates the git-changed built-in's availability below.
@@ -256,7 +304,7 @@ export const layer = Layer.effect(
     // The active+listed Lenses minus any whose prerequisite is unmet for this directory.
     const listAvailable = (directory: string, projectID: string) =>
       Effect.gen(function* () {
-        const all = yield* ApertureLensStore.list(storage, projectID)
+        const all = yield* ApertureLensStore.list(directory)
         const keep: Lens[] = []
         for (const lens of all) if (yield* isAvailable(lens, directory)) keep.push(lens)
         return keep
@@ -296,6 +344,14 @@ export const layer = Layer.effect(
     // exactly once regardless of where the structure came from (memory, disk,
     // recompute).
     const inFlight = new Set<string>()
+    // Directories with an in-flight drill-in (function-level) paint. The background
+    // loop checks this between batches and yields the shared permit a beat longer so
+    // a user's drill-in wins over the whole-repo sweep (A5 priority approximation).
+    const drillActive = new Set<string>()
+    // Repo-relative files that have been function-painted, per directory. A change to
+    // one re-runs the drill-in painter (onFileChanged) so its tiles stay fresh; the
+    // per-extent hash scopes that repaint to the functions that actually changed.
+    const drilledFiles = new Map<string, Set<string>>()
 
     const schedulePaint = (
       directory: string,
@@ -335,13 +391,52 @@ export const layer = Layer.effect(
         )
       })
 
-    const finalize = (ctx: InstanceContext, scope: string, structure: AperturePayload.Payload) =>
+    // Drill-in (A5) function-level paint. Forked onto the *shared* single-permit
+    // gate, so the API is never hit concurrently with the foreground/background
+    // file painters. `drillActive` is bumped around the schedule so the background
+    // loop yields the permit between batches to the more-recent user action —
+    // approximating the `drill-in > foreground > background` priority without a
+    // second gate. Deduped per (directory, file, lens) while a pass is in flight.
+    const extentInFlight = new Set<string>()
+    const scheduleExtentPaint = (directory: string, projectID: string, relPath: string, scope: string) =>
+      Effect.gen(function* () {
+        // Remember the file so a later edit re-refreshes its tiles (onFileChanged).
+        let files = drilledFiles.get(directory)
+        if (!files) drilledFiles.set(directory, (files = new Set()))
+        files.add(relPath)
+        const lens = yield* ApertureLensStore.getActive(directory)
+        // Deterministic built-ins are fully computed; nothing to model-paint.
+        if (isDeterministic(lens)) return
+        const key = JSON.stringify([directory, relPath, lens.id])
+        if (extentInFlight.has(key)) return
+        extentInFlight.add(key)
+        drillActive.add(directory)
+        yield* AperturePainter.paintExtentsStale(
+          { storage, events, provider, config },
+          directory,
+          projectID,
+          relPath,
+          lens,
+          scope,
+        ).pipe(
+          paintGate.withPermits(1),
+          Effect.ensuring(
+            Effect.sync(() => {
+              extentInFlight.delete(key)
+              drillActive.delete(directory)
+            }),
+          ),
+          Effect.forkDetach,
+        )
+      })
+
+    const finalize = (ctx: InstanceContext, scope: string, structure: AperturePayload.Payload, drillFile?: string) =>
       Effect.gen(function* () {
         // Paint with the *active* Lens: its facet store, its legend (facet → colour),
         // and its name travel out on the payload so the renderer needs no hard-coded
         // vocabulary. Switching Lenses re-paints from that Lens's own
         // (cached) store — no other Lens's work is touched.
-        const lens = yield* ApertureLensStore.getActive(storage, ctx.project.id)
+        const lens = yield* ApertureLensStore.getActive(ctx.directory)
         // Whole-repo membership (full depth), needed both for directory composition and —
         // for the deterministic built-ins — as the file set whose facets we synthesize.
         const subtree = yield* subtreeFor(ctx.directory)
@@ -381,7 +476,48 @@ export const layer = Layer.effect(
           name: lens.name,
           legend: lensLegend(lens),
         }
-        return { ...structure, semantics, composition, lens: lensInfo }
+        // Drill-in (A5): attach the drilled file's function-level tiles. Semantic
+        // Lenses colour each tile from the per-function store (unpainted tiles stay
+        // grey until the scheduled drill paint fills them in); the git-changed built-in
+        // colours them deterministically from `git diff` hunks (no model, fully tiled).
+        // mtime-recency can't subdivide a file (per-file stat), so it carries no extents.
+        const wantExtents = drillFile && (!det || lens.deterministic === "git-changed")
+        let extents: Record<string, ReadonlyArray<AperturePayload.Extent>> | undefined
+        if (wantExtents) {
+          const fileId = subtree.find((f) => f.path === drillFile)?.id
+          const content = fileId ? yield* readFileText(ctx.directory, drillFile!) : undefined
+          if (fileId && content !== undefined) {
+            // name → facet id for the file's extents.
+            let facetByName: Map<string, string>
+            if (det) {
+              // git-changed: overlap each extent with the diff's changed line ranges,
+              // falling back to the file-level changed result for an untracked file.
+              const ranges = yield* changedRangesFor(ctx.directory, drillFile!)
+              const fileChanged = store[fileId]?.facet === "changed"
+              facetByName = ApertureExtents.extentChangeFacets(content, ranges, fileChanged)
+            } else {
+              const subStore = yield* ApertureSubfacetStore.read(storage, ctx.project.id, lens.id)
+              facetByName = new Map()
+              for (const e of ApertureExtents.extentsOf(content)) {
+                const entry = subStore[ApertureExtents.subNodeID(drillFile!, e.name)]
+                if (entry) facetByName.set(e.name, entry.facet)
+              }
+            }
+            const tiles = ApertureExtents.extentsOf(content).map((e): AperturePayload.Extent => {
+              const facet = facetByName.get(e.name)
+              const hue = facet ? (facet === NONE_FACET ? NONE_HUE : colorByFacet.get(facet)) : undefined
+              return {
+                name: e.name,
+                startLine: e.startLine,
+                endLine: e.endLine,
+                ...(facet ? { facet } : {}),
+                ...(hue ? { hue } : {}),
+              }
+            })
+            extents = { [fileId]: tiles }
+          }
+        }
+        return { ...structure, semantics, composition, lens: lensInfo, ...(extents ? { extents } : {}) }
       })
 
     // Background whole-repo painter (vs. the per-scope window of get/refresh). One
@@ -406,7 +542,7 @@ export const layer = Layer.effect(
           // Re-read the active Lens each pass so a switch (which wakes this loop)
           // re-walks the repo painting for the *new* Lens; cached entries make a
           // re-walk of an already-painted Lens free.
-          const lens = yield* ApertureLensStore.getActive(storage, projectID)
+          const lens = yield* ApertureLensStore.getActive(directory)
           // Deterministic built-ins are painted synchronously in finalize — there's nothing
           // for the whole-repo sweep to do. Park until a Lens switch (or file change)
           // wakes us; the next pass re-reads the active Lens and resumes the sweep if
@@ -445,6 +581,9 @@ export const layer = Layer.effect(
               ),
             )
             yield* Effect.sleep(BG_BATCH_DELAY)
+            // Hold off (permit released) while a drill-in paint is in flight for this
+            // directory, so the user's function-level request takes the permit first.
+            while (drillActive.has(directory)) yield* Effect.sleep(BG_BATCH_DELAY)
             // Abandon the rest of this sweep when the active Lens changed under
             // us, so the new Lens takes over without finishing the old one.
             if ((lensEpoch.get(directory) ?? 0) !== epoch) {
@@ -480,32 +619,53 @@ export const layer = Layer.effect(
         yield* Queue.offer(entry.wake, void 0).pipe(Effect.ignore)
       })
 
+    // The deterministic structure for `norm`: served from memory, then the durable
+    // cache (when fresh), else recomputed. Shared by load/drill so both run the same
+    // cache logic before finalize merges semantics/composition/extents.
+    const structureFor = (ctx: InstanceContext, norm: string) =>
+      Effect.gen(function* () {
+        const container = containerFor(ctx.directory, ctx.project.id)
+        if (!container.dirty.has(norm)) {
+          const inMemory = container.scopes.get(norm)
+          if (inMemory) return inMemory
+          const cached = yield* storage
+            .read<AperturePayload.Payload>(storageKey(ctx.project.id, norm))
+            .pipe(Effect.catch(() => Effect.void))
+          if (cached && cached.version === AperturePayload.PAYLOAD_VERSION) {
+            container.scopes.set(norm, cached)
+            return cached
+          }
+        }
+        const payload = yield* compute(ctx.directory, ctx.project.id, norm)
+        container.scopes.set(norm, payload)
+        container.dirty.delete(norm)
+        return payload
+      })
+
     const load = Effect.fn("Aperture.load")(function* (scope?: string) {
       const ctx = yield* InstanceState.context
-      const container = containerFor(ctx.directory, ctx.project.id)
       // On open (first get for this directory) start the background whole-repo painter
       // so semantics fill in past the initially-viewed window without the user having
       // to navigate. Idempotent per directory; file changes / turn completion wake it
       // to re-walk (the subscriptions below).
       yield* startBackgroundPainter(ctx.directory, ctx.project.id)
       const norm = ApertureExtract.normalizeScope(scope ?? "")
+      const structure = yield* structureFor(ctx, norm)
+      return yield* finalize(ctx, norm, structure)
+    })
 
-      if (!container.dirty.has(norm)) {
-        const inMemory = container.scopes.get(norm)
-        if (inMemory) return yield* finalize(ctx, norm, inMemory)
-        const cached = yield* storage
-          .read<AperturePayload.Payload>(storageKey(ctx.project.id, norm))
-          .pipe(Effect.catch(() => Effect.void))
-        if (cached && cached.version === AperturePayload.PAYLOAD_VERSION) {
-          container.scopes.set(norm, cached)
-          return yield* finalize(ctx, norm, cached)
-        }
-      }
-
-      const payload = yield* compute(ctx.directory, ctx.project.id, norm)
-      container.scopes.set(norm, payload)
-      container.dirty.delete(norm)
-      return yield* finalize(ctx, norm, payload)
+    const drill = Effect.fn("Aperture.drill")(function* (file: string, scope?: string) {
+      const ctx = yield* InstanceState.context
+      yield* startBackgroundPainter(ctx.directory, ctx.project.id)
+      const norm = ApertureExtract.normalizeScope(scope ?? "")
+      // The file is a repo-relative path; normalizeScope trims stray slashes.
+      const rel = ApertureExtract.normalizeScope(file)
+      const structure = yield* structureFor(ctx, norm)
+      // Kick the drill-in paint pass (top priority) so not-yet-painted functions fill
+      // in, then return the window payload with the file's current tiles attached. The
+      // paint completion invalidates `norm` (the viewed scope) so the band live-fills.
+      yield* scheduleExtentPaint(ctx.directory, ctx.project.id, rel, norm)
+      return yield* finalize(ctx, norm, structure, rel)
     })
 
     const refresh = Effect.fn("Aperture.refresh")(function* (scope?: string) {
@@ -524,7 +684,7 @@ export const layer = Layer.effect(
       // recomputes them fresh on each, picking up watcher-missed changes. The whole-repo walk
       // + git status are cheap, and this only fires while a deterministic Lens is the
       // active view; semantic Lenses read the persisted facet store and keep their caches.
-      const active = yield* ApertureLensStore.getActive(storage, ctx.project.id)
+      const active = yield* ApertureLensStore.getActive(ctx.directory)
       if (isDeterministic(active)) {
         subtreeCache.delete(ctx.directory)
         gitStatusCache.delete(ctx.directory)
@@ -561,6 +721,17 @@ export const layer = Layer.effect(
         // Wake the background painter so the change is (re)painted even when it falls
         // outside every viewed window — the stale-hash skip keeps the re-walk cheap.
         yield* wakeBackground(directory)
+        // If the changed file has function-level paint, re-run the drill-in painter so
+        // its tiles stay current. The per-extent content hash scopes the actual model
+        // calls to the functions that changed — a free, diff-shaped repaint. Invalidate
+        // the file's own directory window; viewers of it refetch and re-merge.
+        if (drilledFiles.get(directory)?.has(rel))
+          yield* scheduleExtentPaint(
+            directory,
+            container.projectID,
+            rel,
+            rel.includes("/") ? rel.slice(0, rel.lastIndexOf("/")) : "",
+          )
       })
 
     yield* Effect.forkScoped(
@@ -628,18 +799,18 @@ export const layer = Layer.effect(
 
     const activeLens = Effect.fn("Aperture.activeLens")(function* () {
       const ctx = yield* InstanceState.context
-      return yield* ApertureLensStore.getActive(storage, ctx.project.id)
+      return yield* ApertureLensStore.getActive(ctx.directory)
     })
 
     const createLens = Effect.fn("Aperture.createLens")(function* (input: CreateLensInput) {
       const ctx = yield* InstanceState.context
-      const lens = yield* ApertureLensStore.create(storage, ctx.project.id, input)
+      const lens = yield* ApertureLensStore.create(ctx.directory, input)
       // Default: activate the new Lens (switch the view, start the painter on
       // it). When activate is false the Lens is only persisted — the active
       // Lens and its in-flight sweep are left untouched, so the user's current
       // view is undisturbed (the new one paints later if/when it is selected).
       if (input.activate !== false) {
-        yield* ApertureLensStore.setActive(storage, ctx.project.id, lens.id)
+        yield* ApertureLensStore.setActive(ctx.directory,lens.id)
         yield* onLensChanged(ctx.directory)
       }
       return lens
@@ -654,7 +825,7 @@ export const layer = Layer.effect(
       const needle = idOrName.toLowerCase()
       const found = all.find((c) => c.id === idOrName || c.name.toLowerCase() === needle)
       if (!found) return undefined
-      yield* ApertureLensStore.setActive(storage, ctx.project.id, found.id)
+      yield* ApertureLensStore.setActive(ctx.directory,found.id)
       yield* onLensChanged(ctx.directory)
       return found
     })
@@ -664,14 +835,14 @@ export const layer = Layer.effect(
       // Cycle only through available Lenses so the arrows skip a hidden built-in
       // (e.g. git-changed in a non-git folder) instead of landing the user on it.
       const all = yield* listAvailable(ctx.directory, ctx.project.id)
-      const activeId = yield* ApertureLensStore.getActiveId(storage, ctx.project.id)
+      const activeId = yield* ApertureLensStore.getActiveId(ctx.directory)
       const idx = all.findIndex((c) => c.id === activeId)
       const len = all.length
       // Wrap at both ends so the arrows loop through the list rather than stopping.
       // An unresolved active id (-1) starts from the head so a click still moves.
       const base = idx === -1 ? 0 : idx
       const next = all[(base + (direction === "next" ? 1 : len - 1)) % len]!
-      yield* ApertureLensStore.setActive(storage, ctx.project.id, next.id)
+      yield* ApertureLensStore.setActive(ctx.directory,next.id)
       yield* onLensChanged(ctx.directory)
       return { id: next.id, name: next.name, legend: lensLegend(next) }
     })
@@ -685,11 +856,11 @@ export const layer = Layer.effect(
 
     const editLens = Effect.fn("Aperture.editLens")(function* (input: EditLensInput) {
       const ctx = yield* InstanceState.context
-      const all = yield* ApertureLensStore.list(storage, ctx.project.id)
+      const all = yield* ApertureLensStore.list(ctx.directory)
       const found = resolveLens(all, input.lens)
       if (!found) return { status: "not-found" } as const
       if (isBuiltinLens(found)) return { status: "builtin" } as const
-      const result = yield* ApertureLensStore.update(storage, ctx.project.id, found.id, {
+      const result = yield* ApertureLensStore.update(ctx.directory, found.id, {
         name: input.name,
         description: input.description,
         palette: input.palette,
@@ -700,14 +871,17 @@ export const layer = Layer.effect(
       if (!result) return { status: "not-found" } as const
       // Structural edits invalidate the inferred facets — clear them so the sweep
       // re-paints from scratch. Cosmetic edits keep the facets and just re-paint.
-      if (result.structural) yield* ApertureSemanticStore.clear(storage, ctx.project.id, found.id)
+      if (result.structural) {
+        yield* ApertureSemanticStore.clear(storage, ctx.project.id, found.id)
+        yield* ApertureSubfacetStore.clear(storage, ctx.project.id, found.id)
+      }
       yield* onLensChanged(ctx.directory)
       return { status: "ok", lens: result.lens, structural: result.structural } as const
     })
 
     const mergeFacets = Effect.fn("Aperture.mergeFacets")(function* (lens: string, from: string, into: string) {
       const ctx = yield* InstanceState.context
-      const all = yield* ApertureLensStore.list(storage, ctx.project.id)
+      const all = yield* ApertureLensStore.list(ctx.directory)
       const found = resolveLens(all, lens)
       if (!found) return { status: "not-found" } as const
       if (isBuiltinLens(found)) return { status: "builtin" } as const
@@ -718,29 +892,84 @@ export const layer = Layer.effect(
       const intoId = resolveFacet(into)
       if (!fromId) return { status: "unknown-facet", facet: from } as const
       if (!intoId) return { status: "unknown-facet", facet: into } as const
-      const updated = yield* ApertureLensStore.mergeFacets(storage, ctx.project.id, found.id, fromId, intoId)
+      const updated = yield* ApertureLensStore.mergeFacets(ctx.directory, found.id, fromId, intoId)
       if (!updated) return { status: "not-found" } as const
       yield* ApertureSemanticStore.mergeFacet(storage, ctx.project.id, found.id, fromId, intoId)
+      yield* ApertureSubfacetStore.mergeFacet(storage, ctx.project.id, found.id, fromId, intoId)
       yield* onLensChanged(ctx.directory)
       return { status: "ok", lens: updated, structural: false } as const
     })
 
     const deleteLens = Effect.fn("Aperture.deleteLens")(function* (idOrName: string) {
       const ctx = yield* InstanceState.context
-      const all = yield* ApertureLensStore.list(storage, ctx.project.id)
+      const all = yield* ApertureLensStore.list(ctx.directory)
       const found = resolveLens(all, idOrName)
       if (!found) return { status: "not-found" } as const
       if (isBuiltinLens(found)) return { status: "builtin" } as const
-      const activeId = yield* ApertureLensStore.getActiveId(storage, ctx.project.id)
-      yield* ApertureLensStore.remove(storage, ctx.project.id, found.id)
+      const activeId = yield* ApertureLensStore.getActiveId(ctx.directory)
+      yield* ApertureLensStore.remove(ctx.directory, found.id)
       yield* ApertureSemanticStore.clear(storage, ctx.project.id, found.id)
-      if (activeId === found.id) yield* ApertureLensStore.setActive(storage, ctx.project.id, ARCHITECTURE_ID)
+      yield* ApertureSubfacetStore.clear(storage, ctx.project.id, found.id)
+      if (activeId === found.id) yield* ApertureLensStore.setActive(ctx.directory,ARCHITECTURE_ID)
       yield* onLensChanged(ctx.directory)
-      const active = yield* ApertureLensStore.getActive(storage, ctx.project.id)
+      const active = yield* ApertureLensStore.getActive(ctx.directory)
       return {
         status: "ok",
         active: { id: active.id, name: active.name, legend: lensLegend(active) },
       } as const
+    })
+
+    const facetFiles = Effect.fn("Aperture.facetFiles")(function* (
+      lens: string | undefined,
+      facets: ReadonlyArray<string>,
+    ) {
+      const ctx = yield* InstanceState.context
+      const all = yield* ApertureLensStore.list(ctx.directory)
+      const resolved = lens ? resolveLens(all, lens) : yield* ApertureLensStore.getActive(ctx.directory)
+      if (!resolved) return { status: "not-found" } as const
+
+      // Same store source as finalize: deterministic built-ins compute their facets
+      // from the repo; semantic Lenses read the painted store.
+      const subtree = yield* subtreeFor(ctx.directory)
+      const store = isDeterministic(resolved)
+        ? ApertureDeterministic.computeStore(
+            resolved.deterministic!,
+            subtree,
+            resolved.deterministic === "git-changed" ? yield* gitChangedFor(ctx.directory) : undefined,
+          )
+        : yield* ApertureSemanticStore.read(storage, ctx.project.id, resolved.id)
+
+      // The store is keyed by stable node id (an un-invertible path hash), so recover
+      // paths by joining against the repo file listing.
+      const pathById = new Map(subtree.map((f) => [f.id, f.path]))
+      const pathsByFacet = new Map<string, string[]>()
+      for (const [id, entry] of Object.entries(store)) {
+        const path = pathById.get(id)
+        if (!path) continue
+        const list = pathsByFacet.get(entry.facet) ?? []
+        list.push(path)
+        pathsByFacet.set(entry.facet, list)
+      }
+
+      // Resolve each requested ref (facet id or case-insensitive label) to a facet id;
+      // an empty request means every Facet in the Lens.
+      const resolveFacet = (ref: string) =>
+        resolved.facets.find((t) => t.id === ref || t.label.toLowerCase() === ref.toLowerCase())
+      const requested = facets.length ? facets : resolved.facets.map((t) => t.id)
+      const groups: { facet: string; label: string; paths: string[] }[] = []
+      const unknownFacets: string[] = []
+      const seen = new Set<string>()
+      for (const ref of requested) {
+        const facet = resolveFacet(ref)
+        if (!facet) {
+          unknownFacets.push(ref)
+          continue
+        }
+        if (seen.has(facet.id)) continue
+        seen.add(facet.id)
+        groups.push({ facet: facet.id, label: facet.label, paths: (pathsByFacet.get(facet.id) ?? []).sort() })
+      }
+      return { status: "ok", lens: { id: resolved.id, name: resolved.name }, groups, unknownFacets } as const
     })
 
     return Service.of({
@@ -754,6 +983,8 @@ export const layer = Layer.effect(
       editLens: (input) => editLens(input),
       mergeFacets: (lens, from, into) => mergeFacets(lens, from, into),
       deleteLens: (idOrName) => deleteLens(idOrName),
+      facetFiles: (lens, facets) => facetFiles(lens, facets),
+      drill: (file, scope) => drill(file, scope),
     })
   }),
 )

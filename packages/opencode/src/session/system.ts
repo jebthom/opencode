@@ -15,7 +15,6 @@ import type { Provider } from "@/provider/provider"
 import type { Agent } from "@/agent/agent"
 import { Permission } from "@/permission"
 import { Skill } from "@/skill"
-import { Storage } from "@/storage/storage"
 import { ApertureLensStore } from "@/aperture/lens-store"
 
 export function provider(model: Provider.Model) {
@@ -46,7 +45,6 @@ export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const skill = yield* Skill.Service
-    const storage = yield* Storage.Service
 
     return Service.of({
       environment: Effect.fn("SystemPrompt.environment")(function* (model: Provider.Model) {
@@ -89,8 +87,8 @@ export const layer = Layer.effect(
         if (agent.name !== "build" && agent.name !== "plan") return
 
         const ctx = yield* InstanceState.context
-        const all = yield* ApertureLensStore.list(storage, ctx.project.id)
-        const active = yield* ApertureLensStore.getActive(storage, ctx.project.id)
+        const all = yield* ApertureLensStore.list(ctx.directory)
+        const active = yield* ApertureLensStore.getActive(ctx.directory)
         const others = all.filter((c) => c.id !== active.id).map((c) => c.name)
 
         return [
@@ -106,6 +104,15 @@ export const layer = Layer.effect(
           "Lens — just fulfill it directly and normally: call lens_create (which",
           "activates the new Lens and switches the view) or lens_select. Do NOT",
           "route an explicit user request through a subagent, and do NOT pass activate:false.",
+          "",
+          "PAINT AND EXPLORE IN PARALLEL. When a sensemaking question warrants a Lens (e.g.",
+          "\"what are the X features\", \"how does Y work\", \"which files touch Z\"), call",
+          "lens_create FIRST so the painter starts immediately, then proceed to explore the",
+          "relevant files (grep/read, or a subagent) in the SAME turn — do not wait for the",
+          "paint to finish. The Lens fills in asynchronously while you explore, so the user",
+          "watches it colour the repo as your answer takes shape. lens_create returns at once",
+          "(painting is backgrounded); treating it as a blocking step and exploring only",
+          "afterwards is the anti-pattern to avoid.",
           "",
           "Separately, you may OPPORTUNISTICALLY introduce a Lens on your own initiative — but",
           "SPARINGLY, since defining one re-paints the repo and costs tokens. Never spam new",
@@ -130,6 +137,6 @@ export const layer = Layer.effect(
   }),
 )
 
-export const defaultLayer = layer.pipe(Layer.provide(Skill.defaultLayer), Layer.provide(Storage.defaultLayer))
+export const defaultLayer = layer.pipe(Layer.provide(Skill.defaultLayer))
 
 export * as SystemPrompt from "./system"

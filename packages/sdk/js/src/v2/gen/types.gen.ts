@@ -4940,6 +4940,7 @@ export type ApertureGetData = {
     workspace?: string
     scope?: string
     refresh?: "true" | "false"
+    drill?: string
   }
   url: "/aperture"
 }
@@ -5005,6 +5006,15 @@ export type ApertureGetResponses = {
         facet: string
         label: string
         color: string
+      }>
+    }
+    extents?: {
+      [key: string]: Array<{
+        name: string
+        startLine: number
+        endLine: number
+        facet?: string
+        hue?: string
       }>
     }
   }
@@ -5088,6 +5098,81 @@ export type ApertureDeleteLensResponses = {
 }
 
 export type ApertureDeleteLensResponse = ApertureDeleteLensResponses[keyof ApertureDeleteLensResponses]
+
+export type ApertureListLensesData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/aperture/lens/list"
+}
+
+export type ApertureListLensesErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ApertureListLensesError = ApertureListLensesErrors[keyof ApertureListLensesErrors]
+
+export type ApertureListLensesResponses = {
+  /**
+   * All available Lenses (built-in + user), with the active one marked
+   */
+  200: Array<{
+    id: string
+    name: string
+    description: string
+    scope: "global" | "project"
+    builtin: boolean
+    active: boolean
+  }>
+}
+
+export type ApertureListLensesResponse = ApertureListLensesResponses[keyof ApertureListLensesResponses]
+
+export type ApertureSelectLensData = {
+  body?: never
+  path?: never
+  query: {
+    directory?: string
+    workspace?: string
+    lens: string
+  }
+  url: "/aperture/lens/select"
+}
+
+export type ApertureSelectLensErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ApertureSelectLensError = ApertureSelectLensErrors[keyof ApertureSelectLensErrors]
+
+export type ApertureSelectLensResponses = {
+  /**
+   * The outcome and the now-active Lens
+   */
+  200: {
+    status: "ok" | "not-found"
+    active?: {
+      id: string
+      name: string
+      legend: Array<{
+        facet: string
+        label: string
+        color: string
+      }>
+    }
+  }
+}
+
+export type ApertureSelectLensResponse = ApertureSelectLensResponses[keyof ApertureSelectLensResponses]
 
 export type ConfigGetData = {
   body?: never

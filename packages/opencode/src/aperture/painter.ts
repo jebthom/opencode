@@ -10,9 +10,11 @@ import type { Storage } from "@/storage/storage"
 import type { Provider } from "@/provider/provider"
 import type { Config } from "@/config/config"
 import { ApertureSemanticStore } from "./semantic-store"
+import { ApertureSubfacetStore } from "./subfacet-store"
 import { ApertureEvent } from "./event"
 import { type Lens, isAssignableFacet, facetEnumIds, buildSystemPrompt } from "./lenses"
 import { ApertureExtract } from "./extract"
+import { ApertureExtents } from "./extents"
 
 // Semantic painter (PLAN.md step 4). Given the file nodes of a viewed scope, it
 // infers one facet per file with a small/fast model and writes the
@@ -189,6 +191,94 @@ export const paintStale = Effect.fn("Aperture.paintStale")(function* (
   // (the next pass finds matching hashes and publishes nothing).
   yield* deps.events.publish(ApertureEvent.Event.Invalidated, { scope }).pipe(Effect.ignore)
 }, Effect.provide(FSUtil.defaultLayer))
+
+// --- sub-file (drill-in) painter -------------------------------------------
+
+// Paint the top-level declarations of a single drilled-into file (A5). The unit of
+// work is a function-level extent (extents.ts), classified with the *same* Lens
+// vocabulary as file-level painting but minimal per-function context (signature +
+// leading comment). Stale-only by the extent's content hash, so re-drilling an
+// unedited file spends nothing. Writes the per-function facet store; soft-fails to
+// "paint nothing". Strictly a drill-in refinement — never on the critical path of
+// defining or filling a Lens (see docs/codegraph-subfile-resolution.md). The caller
+// schedules this on the shared single-permit gate at drill-in priority.
+export const paintExtentsStale = Effect.fn("Aperture.paintExtentsStale")(function* (
+  deps: Deps,
+  directory: string,
+  projectID: string,
+  relPath: string,
+  lens: Lens,
+  // Scope to publish the invalidation for once tiles are coloured — the window the
+  // user is viewing, so the drilled band live-fills regardless of the file's own dir.
+  scope: string,
+) {
+  const fs = yield* FSUtil.Service
+  const content = yield* fs
+    .readFileStringSafe(path.join(directory, relPath))
+    .pipe(Effect.orElseSucceed(() => undefined as string | undefined))
+  if (typeof content !== "string") return
+
+  // A file with no top-level declaration (a single whole-file preamble tile) needs
+  // no function painting — file-level already suffices there.
+  const paintable = ApertureExtents.extentsOf(content).filter((e) => e.name !== ApertureExtents.PREAMBLE)
+  if (paintable.length === 0) return
+
+  const store = yield* ApertureSubfacetStore.read(deps.storage, projectID, lens.id)
+  const stale = paintable
+    .map((extent) => {
+      const text = ApertureExtents.extentText(content, extent)
+      return { extent, id: ApertureExtents.subNodeID(relPath, extent.name), text, hash: hashContent(text) }
+    })
+    .filter((r) => store[r.id]?.hash !== r.hash)
+  if (stale.length === 0) {
+    yield* appendPerfEvent(directory, "fg", "skip", { reason: "no-stale-extents", file: relPath })
+    return
+  }
+
+  const language = yield* resolveLanguage(deps.provider)
+  if (!language) return
+
+  const facetSchema = buildFacetSchema(lens)
+  const system = buildSystemPrompt(lens)
+  // Each extent is one classify "block", labelled `relPath#name` so the model echoes
+  // an identifier that maps back to the sub-node id.
+  const blocks = stale.map((r) => describeExtent(relPath, r.extent.name, r.text)).join("\n\n")
+  const idByLabel = new Map(stale.map((r) => [`${relPath}#${r.extent.name}`, r.id]))
+  const hashByLabel = new Map(stale.map((r) => [`${relPath}#${r.extent.name}`, r.hash]))
+
+  const assignments = yield* classifyWithRetry(language, blocks, facetSchema, system, lens).pipe(
+    Effect.catchCause((cause) => {
+      log.error("classify extents failed", { projectID, file: relPath, cause })
+      return Effect.succeed<ReadonlyArray<{ path: string; facet: string }>>([])
+    }),
+  )
+  yield* appendPerfLog(directory, "fg", lens.id, blocks, assignments)
+
+  const painted: ApertureSubfacetStore.Store = {}
+  for (const a of assignments) {
+    const id = idByLabel.get(a.path)
+    const hash = hashByLabel.get(a.path)
+    if (!id || !hash) continue
+    painted[id] = { facet: a.facet, hash }
+  }
+  if (Object.keys(painted).length === 0) return
+
+  yield* ApertureSubfacetStore.upsert(deps.storage, projectID, lens.id, painted)
+  log.info("painted extents", { projectID, file: relPath, lens: lens.id, count: Object.keys(painted).length })
+  // Nudge the viewed scope to re-merge the drilled file's now-coloured tiles.
+  yield* deps.events.publish(ApertureEvent.Event.Invalidated, { scope }).pipe(Effect.ignore)
+}, Effect.provide(FSUtil.defaultLayer))
+
+// Minimal per-extent context: its path label, the declaration's signature (first
+// non-blank line), and any leading comment. Mirrors the file-level `minimal` mode.
+function describeExtent(relPath: string, name: string, text: string): string {
+  const signature = (text.split("\n").find((l) => l.trim() !== "") ?? "").trim().slice(0, 200)
+  const comment = leadingComment(text)
+  const lines = [`path: ${relPath}#${name}`]
+  if (signature) lines.push(`signature: ${signature}`)
+  if (comment) lines.push(`comment: ${comment}`)
+  return lines.join("\n")
+}
 
 // --- perf log --------------------------------------------------------------
 

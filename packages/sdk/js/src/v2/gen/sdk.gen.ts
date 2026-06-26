@@ -10,6 +10,10 @@ import type {
   ApertureDeleteLensResponses,
   ApertureGetErrors,
   ApertureGetResponses,
+  ApertureListLensesErrors,
+  ApertureListLensesResponses,
+  ApertureSelectLensErrors,
+  ApertureSelectLensResponses,
   AppAgentsErrors,
   AppAgentsResponses,
   AppLogErrors,
@@ -671,6 +675,7 @@ export class Aperture extends HeyApiClient {
       workspace?: string
       scope?: string
       refresh?: "true" | "false"
+      drill?: string
     },
     options?: Options<never, ThrowOnError>,
   ) {
@@ -683,6 +688,7 @@ export class Aperture extends HeyApiClient {
             { in: "query", key: "workspace" },
             { in: "query", key: "scope" },
             { in: "query", key: "refresh" },
+            { in: "query", key: "drill" },
           ],
         },
       ],
@@ -753,6 +759,68 @@ export class Aperture extends HeyApiClient {
     )
     return (options?.client ?? this.client).get<ApertureDeleteLensResponses, ApertureDeleteLensErrors, ThrowOnError>({
       url: "/aperture/lens/delete",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * List Lenses
+   *
+   * List every available Aperture Lens (built-in + user-defined) for the searchable Lens picker.
+   */
+  public listLenses<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<ApertureListLensesResponses, ApertureListLensesErrors, ThrowOnError>({
+      url: "/aperture/lens/list",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Select a Lens
+   *
+   * Activate an Aperture Lens by id or name; the view re-paints from its cached facets.
+   */
+  public selectLens<ThrowOnError extends boolean = false>(
+    parameters: {
+      directory?: string
+      workspace?: string
+      lens: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "query", key: "lens" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<ApertureSelectLensResponses, ApertureSelectLensErrors, ThrowOnError>({
+      url: "/aperture/lens/select",
       ...options,
       ...params,
     })

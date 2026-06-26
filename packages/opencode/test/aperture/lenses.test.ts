@@ -129,7 +129,7 @@ describe("aperture deterministic built-ins", () => {
   })
 })
 
-describe("aperture payload v6", () => {
+describe("aperture payload v7", () => {
   test("decodes a Lens payload (string facets + legend)", async () => {
     const payload = {
       version: AperturePayload.PAYLOAD_VERSION,
@@ -145,5 +145,40 @@ describe("aperture payload v6", () => {
     expect(decoded.lens?.id).toBe("auth-x")
     expect(decoded.composition?.["d1"]!.weights[0]!.facet).toBe("auth")
     expect(decoded.semantics["n1"]!.facets[0]).toBe("auth")
+  })
+
+  test("version is 7 and a payload without extents still decodes (omitted when not drilled)", async () => {
+    expect(AperturePayload.PAYLOAD_VERSION).toBe(7)
+    const decoded = await Effect.runPromise(
+      AperturePayload.decodeUnknown({
+        version: AperturePayload.PAYLOAD_VERSION,
+        nodes: [],
+        edges: [],
+        semantics: {},
+      }),
+    )
+    expect(decoded.extents).toBeUndefined()
+  })
+
+  test("decodes drill-in extents keyed by file node id, painted and unpainted tiles", async () => {
+    const decoded = await Effect.runPromise(
+      AperturePayload.decodeUnknown({
+        version: AperturePayload.PAYLOAD_VERSION,
+        nodes: [{ id: "n1", path: "src/a.ts", kind: "file", size: 10, position: { layer: 0, index: 0 } }],
+        edges: [],
+        semantics: {},
+        extents: {
+          n1: [
+            { name: "(preamble)", startLine: 1, endLine: 2 },
+            { name: "login", startLine: 3, endLine: 9, facet: "auth", hue: "#4E79A7" },
+          ],
+        },
+      }),
+    )
+    const tiles = decoded.extents?.["n1"]!
+    expect(tiles).toHaveLength(2)
+    // Unpainted preamble carries no facet/hue; the painted function does.
+    expect(tiles[0]!.facet).toBeUndefined()
+    expect(tiles[1]).toEqual({ name: "login", startLine: 3, endLine: 9, facet: "auth", hue: "#4E79A7" })
   })
 })

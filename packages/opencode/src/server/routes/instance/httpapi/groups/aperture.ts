@@ -18,6 +18,10 @@ const ApertureQuery = Schema.Struct({
   ...WorkspaceRoutingQueryFields,
   scope: Schema.optional(Schema.String),
   refresh: Schema.optional(Schema.Literals(["true", "false"])),
+  // Drill into a file (A5): a repo-relative file path. When present the payload also
+  // carries `extents` (the file's function-level tiles) and a drill-in paint pass is
+  // scheduled at top priority. Rides the same endpoint so the TUI keeps one fetch path.
+  drill: Schema.optional(Schema.String),
 })
 
 // Step the active Lens one forward/back in the list, wrapping at the
@@ -40,6 +44,29 @@ const DeleteLensQuery = Schema.Struct({
 // active), or a refusal ("not-found" / "builtin").
 const DeleteLensResult = Schema.Struct({
   status: Schema.Literals(["ok", "not-found", "builtin"]),
+  active: Schema.optional(AperturePayload.LensInfo),
+})
+
+// One row in the Lens picker (A2): enough to list, group, and mark the active Lens.
+const LensSummary = Schema.Struct({
+  id: Schema.String,
+  name: Schema.String,
+  description: Schema.String,
+  // "global" = built-in (architecture / git-changed / mtime), "project" = user-defined.
+  scope: Schema.Literals(["global", "project"]),
+  builtin: Schema.Boolean,
+  active: Schema.Boolean,
+})
+
+// Activate a Lens by id or name (the searchable Lens picker / `/lens-switch`). The
+// repaint rides the aperture.invalidated event the switch publishes; this returns the
+// resolved Lens, or "not-found" when the id/name doesn't match an available Lens.
+const SelectLensQuery = Schema.Struct({
+  ...WorkspaceRoutingQueryFields,
+  lens: Schema.String,
+})
+const SelectLensResult = Schema.Struct({
+  status: Schema.Literals(["ok", "not-found"]),
   active: Schema.optional(AperturePayload.LensInfo),
 })
 
@@ -79,6 +106,30 @@ export const ApertureApi = HttpApi.make("aperture")
             identifier: "aperture.deleteLens",
             summary: "Delete a Lens",
             description: "Delete a user-defined Aperture Lens by id or name. Built-in Lenses are immutable.",
+          }),
+        ),
+      )
+      .add(
+        HttpApiEndpoint.get("listLenses", `${root}/lens/list`, {
+          query: Schema.Struct({ ...WorkspaceRoutingQueryFields }),
+          success: described(Schema.Array(LensSummary), "All available Lenses (built-in + user), with the active one marked"),
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "aperture.listLenses",
+            summary: "List Lenses",
+            description: "List every available Aperture Lens (built-in + user-defined) for the searchable Lens picker.",
+          }),
+        ),
+      )
+      .add(
+        HttpApiEndpoint.get("selectLens", `${root}/lens/select`, {
+          query: SelectLensQuery,
+          success: described(SelectLensResult, "The outcome and the now-active Lens"),
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "aperture.selectLens",
+            summary: "Select a Lens",
+            description: "Activate an Aperture Lens by id or name; the view re-paints from its cached facets.",
           }),
         ),
       )
