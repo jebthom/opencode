@@ -117,8 +117,6 @@ export const layer = Layer.effect(
           "Separately, you may OPPORTUNISTICALLY introduce a Lens on your own initiative — but",
           "SPARINGLY, since defining one re-paints the repo and costs tokens. Never spam new",
           "Lenses (at most one per feature or question). Consider it only when:",
-          "- You are about to build or plan a LARGE multi-file feature: a feature-spread Lens",
-          "  lets the user watch the feature paint across the codebase as you create the files.",
           "- The user asks a spatial/spread question (\"which files touch X\", \"how far does Y reach\")",
           "  and has NOT used /lens — a Lens answers it visually.",
           "Prefer an existing Lens: if one above already fits, do not create a new one.",
@@ -130,6 +128,35 @@ export const layer = Layer.effect(
           "(no waiting for approval) with activate:false so the user's current view is undisturbed,",
           "then report the Lens name and facets. Afterwards tell the user the Lens exists",
           "and ask whether to switch to it (it paints once active).",
+          ...(agent.name === "build"
+            ? [
+                "",
+                "BUILDING A FEATURE. When you are about to build a LARGE multi-file feature",
+                "(especially one just planned/approved, where the plan proposed a Lens), sequence",
+                "the work so the user watches the feature paint across the repo as you create it:",
+                "1. Create the feature Lens FIRST with lens_create and activate it — its facets are",
+                "   the feature's sub-areas/layers (e.g. UI, state, API, tests). If an approved plan",
+                "   proposed a Lens schema, use that schema. This is the explicit/approved path:",
+                "   create and activate directly — do NOT route through the lens subagent or pass",
+                "   activate:false. lens_create returns each facet's hue.",
+                "2. THEN write your task-tracking list (todowrite). Tag each item with the facet it",
+                "   advances (by label, noting its hue) so the user can map tasks to the colours",
+                "   appearing in the view as you work.",
+                "3. THEN work the tasks, creating files under those facets so the view paints as you go.",
+                "When you finish, summarize the build referencing the Lens: which facets the feature",
+                "touched and how it spread across the repo.",
+              ]
+            : []),
+          ...(agent.name === "plan"
+            ? [
+                "",
+                "PLANNING A FEATURE. When your plan is for a LARGE multi-file feature, propose a Lens",
+                "alongside it: in your final plan, add a short \"Aperture Lens\" section naming the Lens,",
+                "its palette, and its 1–6 facets (the feature's sub-areas) each with a one-line",
+                "definition. Do NOT create the Lens here — plan mode is read-only. The build agent will",
+                "create it first so the user watches the feature paint as it is built.",
+              ]
+            : []),
           "</aperture>",
         ].join("\n")
       }),
