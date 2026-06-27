@@ -43,5 +43,51 @@
       "packages/app/src/components",
       "packages/opencode/src/cli/cmd/tui/ui"
     ]
+  },
+  "aperture-architecture-0b04a758": {
+    "id": "aperture-architecture-0b04a758",
+    "name": "Aperture Architecture",
+    "description": "Classifies files by their role in the Aperture View system (data model, painting/AI, storage, rendering, tools/CLI).",
+    "palette": "bright",
+    "prompt": "Classify each file by its role in the Aperture system. Separate semantic layers: files involved in data definitions and Lens contracts; the AI painter and model integration; durable storage and state; repository structure extraction; the TUI renderer and navigation; and the HTTP/CLI tool layer specific to Aperture.",
+    "facets": [
+      {
+        "id": "data-model",
+        "label": "Data Model",
+        "description": "Aperture-specific payload schemas, Lens definitions, Facet contracts, and type interfaces (`payload.ts`, `lenses.ts`, `semantics.ts`).",
+        "color": "#4E79A7"
+      },
+      {
+        "id": "painter-ai",
+        "label": "Painter & AI",
+        "description": "Aperture facet assignment engine, painter prompts, semantic inference, and deterministic Lens computation (`painter.ts`, `deterministic.ts`).",
+        "color": "#F28E2B"
+      },
+      {
+        "id": "storage-state",
+        "label": "Storage & State",
+        "description": "Aperture persistent caching, lens/semantic stores, subfacet stores, and per-instance state (`*-store.ts`, `activity.ts`).",
+        "color": "#59A14F"
+      },
+      {
+        "id": "extraction-traversal",
+        "label": "Extraction & Traversal",
+        "description": "Aperture directory structure extraction, DFS enumeration, import parsing, and function-level extent resolution (`extract.ts`, `extents.ts`).",
+        "color": "#E15759"
+      },
+      {
+        "id": "rendering-tui",
+        "label": "Rendering & TUI",
+        "description": "Aperture View React components, treemap layout, navigation, legend, drill-in UI, and activity display (`aperture.tsx`, `aperture-lens-picker.tsx`, `aperture-activity.ts`).",
+        "color": "#B07AA1"
+      },
+      {
+        "id": "aperture-tools-api",
+        "label": "Aperture Tools & API",
+        "description": "HTTP routes, SDK generation, CLI commands, and Lens management tools exclusively for Aperture (`/aperture` routes, `/lens` command, `tool/lens-*.ts`).",
+        "color": "#EDC948"
+      }
+    ],
+    "scope": "project"
   }
 }

@@ -4,6 +4,7 @@ import { createHash } from "crypto"
 import { appendFile, mkdir, writeFile } from "fs/promises"
 import { generateObject } from "ai"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { AbsolutePath } from "@opencode-ai/core/schema"
 import * as Log from "@opencode-ai/core/util/log"
 import type { EventV2 } from "@opencode-ai/core/event"
 import type { Storage } from "@/storage/storage"
@@ -188,8 +189,11 @@ export const paintStale = Effect.fn("Aperture.paintStale")(function* (
 
   // Only now that something actually changed do we nudge the live view to refetch
   // and re-merge — the guard that keeps a paint→refetch→paint cycle from forming
-  // (the next pass finds matching hashes and publishes nothing).
-  yield* deps.events.publish(ApertureEvent.Event.Invalidated, { scope }).pipe(Effect.ignore)
+  // (the next pass finds matching hashes and publishes nothing). Attach the location
+  // explicitly: this runs in a forked fiber with no ambient Location.Service, so
+  // without it the HTTP /event SSE filter (event.location.directory === instance
+  // .directory) drops the event and the VSCode extension never refetches.
+  yield* deps.events.publish(ApertureEvent.Event.Invalidated, { scope }, { location: { directory: AbsolutePath.make(directory) } }).pipe(Effect.ignore)
 }, Effect.provide(FSUtil.defaultLayer))
 
 // --- sub-file (drill-in) painter -------------------------------------------
@@ -265,8 +269,10 @@ export const paintExtentsStale = Effect.fn("Aperture.paintExtentsStale")(functio
 
   yield* ApertureSubfacetStore.upsert(deps.storage, projectID, lens.id, painted)
   log.info("painted extents", { projectID, file: relPath, lens: lens.id, count: Object.keys(painted).length })
-  // Nudge the viewed scope to re-merge the drilled file's now-coloured tiles.
-  yield* deps.events.publish(ApertureEvent.Event.Invalidated, { scope }).pipe(Effect.ignore)
+  // Nudge the viewed scope to re-merge the drilled file's now-coloured tiles. Attach
+  // the location (forked fiber → no ambient Location.Service) or the HTTP /event SSE
+  // filter drops it and the extension's drilled file never fills in.
+  yield* deps.events.publish(ApertureEvent.Event.Invalidated, { scope }, { location: { directory: AbsolutePath.make(directory) } }).pipe(Effect.ignore)
 }, Effect.provide(FSUtil.defaultLayer))
 
 // Minimal per-extent context: its path label, the declaration's signature (first

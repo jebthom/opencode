@@ -15,6 +15,15 @@ import * as vscode from "vscode"
 
 const REPAINT_DEBOUNCE_MS = 150
 const RECONNECT_DELAY_MS = 2000
+// Low-frequency self-heal poll, mirroring the TUI's REFRESH_POLL_MS. Repaints are
+// normally pushed via the aperture.invalidated SSE event, but a missed/dropped event
+// (or a paint that lands between two editor changes) would otherwise leave stale
+// colours on screen; the poll re-fetches the active file so the view stays honest.
+const REFRESH_POLL_MS = 5000
+// Width of the colored strip painted at the left of each function's lines, and the gap
+// between that strip and the line's text (so the strip never sits under the leading chars).
+const STRIP_WIDTH_PX = 4
+const TEXT_GAP_PX = 4
 
 // One decoration type per hex color, created lazily and reused. Cleared (set to an empty
 // range list) on every repaint for colors not present this pass, so stale strips vanish.
@@ -22,6 +31,10 @@ const decorationByColor = new Map<string, vscode.TextEditorDecorationType>()
 
 let sse: { abort: () => void } | undefined
 let repaintTimer: ReturnType<typeof setTimeout> | undefined
+let pollTimer: ReturnType<typeof setInterval> | undefined
+// True while a repaint's fetch is outstanding, so the poll skips a tick rather than
+// stacking refetches behind a slow server walk.
+let repainting = false
 
 export function activate(context: vscode.ExtensionContext) {
   const out = vscode.window.createOutputChannel("Aperture")
@@ -36,23 +49,54 @@ export function activate(context: vscode.ExtensionContext) {
 
   // ---- gutter painting -----------------------------------------------------
 
-  function decorationFor(color: string): vscode.TextEditorDecorationType {
-    let deco = decorationByColor.get(color)
+  // A facet's `hue` is either a hex string (`#RRGGBB`, user/deterministic palettes) or
+  // an opencode theme-role token (the built-in Architecture Lens and the `none`/grey
+  // facets). The TUI resolves tokens against its loaded theme; we can't, so we map each
+  // known token to the nearest VSCode ThemeColor so the strip still adapts to the
+  // editor's theme. Unknown tokens resolve to undefined and are skipped (not painted).
+  const THEME_ROLE_COLORS: Record<string, string> = {
+    info: "charts.blue",
+    success: "charts.green",
+    warning: "charts.yellow",
+    accent: "charts.purple",
+    error: "charts.red",
+    textMuted: "descriptionForeground",
+    border: "descriptionForeground",
+  }
+
+  function resolveHue(hue: string): string | vscode.ThemeColor | undefined {
+    if (hue.startsWith("#")) return hue
+    const role = THEME_ROLE_COLORS[hue]
+    return role ? new vscode.ThemeColor(role) : undefined
+  }
+
+  // Keyed by the raw hue string (hex or token), so a token and a hex never collide and
+  // each maps to one reused decoration type.
+  function decorationFor(hue: string): vscode.TextEditorDecorationType {
+    let deco = decorationByColor.get(hue)
     if (!deco) {
+      const color = resolveHue(hue)
+      // A colored block rendered *before* each line's text rather than a left border:
+      // the block reserves its own width + a right-margin gap, so the text is pushed
+      // clear of it instead of sitting underneath (as a border does).
       deco = vscode.window.createTextEditorDecorationType({
-        isWholeLine: true,
-        borderWidth: "0 0 0 2px",
-        borderStyle: "solid",
-        borderColor: color,
+        before: {
+          contentText: "",
+          backgroundColor: color,
+          width: `${STRIP_WIDTH_PX}px`,
+          height: "100%",
+          margin: `0 ${TEXT_GAP_PX}px 0 0`,
+        },
         overviewRulerColor: color,
         overviewRulerLane: vscode.OverviewRulerLane.Left,
       })
-      decorationByColor.set(color, deco)
+      decorationByColor.set(hue, deco)
     }
     return deco
   }
 
   type Extent = { name: string; startLine: number; endLine: number; facet?: string; hue?: string }
+  type GraphNode = { id: string; path: string; kind: string }
 
   async function fetchExtents(relPath: string): Promise<Extent[] | undefined> {
     const dir = directory()
@@ -63,9 +107,13 @@ export function activate(context: vscode.ExtensionContext) {
     const url = `${baseUrl()}/aperture?drill=${encodeURIComponent(relPath)}&scope=${encodeURIComponent(scope)}`
     const res = await fetch(url, { headers: { "x-opencode-directory": dir } })
     if (!res.ok) return undefined
-    const data = (await res.json()) as { extents?: Record<string, Extent[]> }
-    // `extents` is keyed by file node id with at most one key (the drilled file).
-    return Object.values(data.extents ?? {})[0]
+    const data = (await res.json()) as { nodes?: GraphNode[]; extents?: Record<string, Extent[]> }
+    // `extents` is keyed by file node id and carries EVERY drilled file still in the
+    // window — not just the one we asked for. Select by this file's node id; taking the
+    // first entry would paint a sibling's extents onto the current file.
+    const node = data.nodes?.find((n) => n.kind === "file" && n.path === relPath)
+    if (!node) return undefined
+    return data.extents?.[node.id]
   }
 
   async function repaint(editor: vscode.TextEditor | undefined) {
@@ -76,23 +124,30 @@ export function activate(context: vscode.ExtensionContext) {
     const relPath = vscode.workspace.asRelativePath(editor.document.uri, false).replace(/\\/g, "/")
 
     let extents: Extent[] | undefined
+    repainting = true
     try {
       extents = await fetchExtents(relPath)
     } catch (e) {
       log(`fetch FAILED for ${relPath}: ${String(e)} (baseUrl=${baseUrl()} dir=${directory()})`)
       return
+    } finally {
+      repainting = false
     }
-    const painted = (extents ?? []).filter((e) => e.hue?.startsWith("#")).length
+    const painted = (extents ?? []).filter((e) => e.hue && resolveHue(e.hue) !== undefined).length
     log(`drill ${relPath}: ${extents?.length ?? 0} extents, ${painted} painted`)
 
-    // Group line ranges by color; only painted functions carry a hex hue.
+    // Group line ranges by hue; a painted function carries a hue we can resolve (hex or
+    // a known theme-role token). Functions with no/unresolvable hue stay unpainted. One
+    // range per line: the `before` strip only renders at a range's start, so a multi-line
+    // range would leave every line but the first un-striped.
     const rangesByColor = new Map<string, vscode.Range[]>()
     for (const ex of extents ?? []) {
       const hue = ex.hue
-      if (!hue || !hue.startsWith("#")) continue
-      const range = new vscode.Range(ex.startLine - 1, 0, ex.endLine - 1, 0)
+      if (!hue || resolveHue(hue) === undefined) continue
       const list = rangesByColor.get(hue) ?? []
-      list.push(range)
+      for (let line = ex.startLine - 1; line <= ex.endLine - 1; line++) {
+        list.push(new vscode.Range(line, 0, line, 0))
+      }
       rangesByColor.set(hue, list)
     }
 
@@ -212,12 +267,20 @@ export function activate(context: vscode.ExtensionContext) {
     }),
   )
 
+  // Self-heal poll: re-fetch the active file's tiles on a slow cadence so a dropped
+  // invalidation (or a paint that completes outside an editor change) still surfaces.
+  // Skipped while a fetch is already outstanding so a slow walk can't stack refetches.
+  pollTimer = setInterval(() => {
+    if (!repainting) scheduleRepaint()
+  }, REFRESH_POLL_MS)
+
   // Paint whatever is already open.
   scheduleRepaint()
 }
 
 export function deactivate() {
   if (repaintTimer) clearTimeout(repaintTimer)
+  if (pollTimer) clearInterval(pollTimer)
   sse?.abort()
   sse = undefined
   for (const deco of decorationByColor.values()) deco.dispose()

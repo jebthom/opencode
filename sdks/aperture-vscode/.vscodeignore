@@ -2,6 +2,9 @@
 node_modules/**
 src/**
 .gitignore
+*.vsix
+*.bak
+package-vsix.sh
 bun.lock
 esbuild.js
 **/tsconfig.json

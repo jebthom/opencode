@@ -4,6 +4,7 @@ import { createHash } from "crypto"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import * as Log from "@opencode-ai/core/util/log"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { AbsolutePath } from "@opencode-ai/core/schema"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Watcher } from "@opencode-ai/core/filesystem/watcher"
 import { FileSystem } from "@opencode-ai/core/filesystem"
@@ -802,7 +803,10 @@ export const layer = Layer.effect(
         if (container) {
           for (const scope of container.scopes.keys()) {
             container.dirty.add(scope)
-            yield* events.publish(ApertureEvent.Event.Invalidated, { scope }).pipe(Effect.ignore)
+            // Attach the location: this runs in a forked fiber with no ambient
+            // Location.Service, so without it the HTTP /event SSE filter drops the
+            // event and the VSCode extension never refetches the freshly-switched Lens.
+            yield* events.publish(ApertureEvent.Event.Invalidated, { scope }, { location: { directory: AbsolutePath.make(directory) } }).pipe(Effect.ignore)
           }
         }
         // Bump the epoch so an in-flight background sweep abandons the old Lens
