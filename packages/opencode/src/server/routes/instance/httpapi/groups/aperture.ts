@@ -70,6 +70,19 @@ const SelectLensResult = Schema.Struct({
   active: Schema.optional(AperturePayload.LensInfo),
 })
 
+// Aperture research/study logging: one top-bar interaction (a click in the view —
+// lens switch, tile/breadcrumb navigation, file drill, etc.). Posted by the TUI so
+// every user interaction lands in the same per-session timeline as the agent's
+// prompts/tool-calls. `interaction` is the type id (e.g. "lens.cycle", "tile.drill").
+export const InteractionInput = Schema.Struct({
+  sessionID: Schema.String.annotate({ description: "The viewed session the interaction belongs to" }),
+  interaction: Schema.String.annotate({ description: "Interaction type id, e.g. lens.cycle / tile.drill / breadcrumb.nav" }),
+  scope: Schema.optional(Schema.String).annotate({ description: "Repo-relative scope the view was at" }),
+  drill: Schema.optional(Schema.String).annotate({ description: "Drilled file path, if any" }),
+  lens: Schema.optional(Schema.String).annotate({ description: "Active lens id at the time" }),
+  detail: Schema.optional(Schema.String).annotate({ description: "Optional extra payload (e.g. the target path)" }),
+})
+
 export const ApertureApi = HttpApi.make("aperture")
   .add(
     HttpApiGroup.make("aperture")
@@ -130,6 +143,19 @@ export const ApertureApi = HttpApi.make("aperture")
             identifier: "aperture.selectLens",
             summary: "Select a Lens",
             description: "Activate an Aperture Lens by id or name; the view re-paints from its cached facets.",
+          }),
+        ),
+      )
+      .add(
+        HttpApiEndpoint.post("interaction", `${root}/interaction`, {
+          query: Schema.Struct({ ...WorkspaceRoutingQueryFields }),
+          payload: InteractionInput,
+          success: described(Schema.Boolean, "Interaction recorded"),
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "aperture.interaction",
+            summary: "Log an Aperture view interaction",
+            description: "Record a top-bar click in the Aperture view to the per-session study log (research logging).",
           }),
         ),
       )

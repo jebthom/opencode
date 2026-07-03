@@ -236,6 +236,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   const toggleDrill = (path: string) =>
     setDrilledFile((cur) => {
       const next = cur === path ? undefined : path
+      logInteraction(next === undefined ? "tile.undrill" : "tile.drill", path)
       // On enable only (a deliberate click into a file), announce a host "reveal file"
       // intent so an editor host (e.g. the Aperture VSCode extension) can open it. Gated
       // to the enable edge so poll/invalidation refetches (which re-send `drill`) never
@@ -264,7 +265,10 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     setExpanded(new Set<string>())
     setChildOffset(new Map<string, number>())
   })
-  const expand = (id: string) => setExpanded((prev) => new Set(prev).add(id))
+  const expand = (id: string) => {
+    logInteraction("tile.expand", id)
+    setExpanded((prev) => new Set(prev).add(id))
+  }
   // Foundation A hover-info line: what a node tile / link shows when pointed at.
   // Cleared on mouse-out so the header falls back to the summary. Set as a plain
   // string so any feature (node detail, edge target, …) can drive it uniformly.
@@ -303,6 +307,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   // viewed scope, which the subscription below turns into a refetch — so the repaint
   // rides the same path a `/lens`-driven switch already uses.
   const cycleLens = (direction: "next" | "prev") => {
+    logInteraction("lens.cycle", direction)
     // Fire-and-forget: the repaint arrives via aperture.invalidated, so we don't
     // throwOnError (an unhandled rejection on a click) — a failed switch just
     // leaves the current Lens painted.
@@ -364,6 +369,27 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   // delete affordance for them. Gated on the group so new built-ins are covered too.
   const canDeleteActive = () => activeId() !== "" && !BUILTIN_LENS_IDS.has(activeId())
 
+  // Aperture research/study logging: record a top-bar interaction (a click in the
+  // view) to the per-session study log, interleaved with the agent's prompts/tool
+  // calls. `interaction` is the type id (e.g. "lens.cycle", "tile.drill"); `detail`
+  // is an optional target (e.g. the path navigated to). Fire-and-forget — a logging
+  // failure must never break a click.
+  const logInteraction = (interaction: string, detail?: string) => {
+    void props.api.client.aperture.interaction({
+      sessionID: props.session_id,
+      interaction,
+      scope: scope(),
+      ...(drilledFile() ? { drill: drilledFile() } : {}),
+      lens: activeId(),
+      ...(detail !== undefined ? { detail } : {}),
+    })
+  }
+  // Navigate the directory tree by clicking a tile — logs the navigation then re-roots.
+  const navigateScope = (path: string) => {
+    logInteraction("tile.navigate", path)
+    setScope(path)
+  }
+
   // Delete the active Lens via the ✕ control. Two-step: the first click arms a
   // "confirm?" state, the second performs the delete. Fire-and-forget — the repaint
   // (and the fall-back to Architecture) rides aperture.invalidated like a cycle.
@@ -375,6 +401,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
       return
     }
     setConfirmingDelete(false)
+    logInteraction("lens.delete", activeId())
     void props.api.client.aperture.deleteLens({ lens: activeId() })
   }
   // Disarm the confirm if the active Lens changes out from under us.
@@ -661,6 +688,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
         value={scope()}
         placeholder="repo-relative path (blank = repo root)"
         onConfirm={(value: string) => {
+          logInteraction("goto", scopeFromInput(value))
           setScope(scopeFromInput(value))
           props.api.ui.dialog.clear()
         }}
@@ -696,7 +724,13 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
           for quick navigation; the ⌖ button opens a "go to path" prompt (type/paste a path)
           for jumping somewhere arbitrary — e.g. a path the agent mentioned in chat. */}
       <box flexDirection="row" gap={1} height={1} flexShrink={0}>
-        <text fg={theme().accent} onMouseDown={() => refetch()}>
+        <text
+          fg={theme().accent}
+          onMouseDown={() => {
+            logInteraction("refresh")
+            refetch()
+          }}
+        >
           ⟳
         </text>
         <text
@@ -708,15 +742,33 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
           ⌖
         </text>
         <Show when={scope() !== ""} fallback={<text fg={theme().textMuted}>/</text>}>
-          <text fg={theme().accent} onMouseDown={() => setScope("")}>
+          <text
+            fg={theme().accent}
+            onMouseDown={() => {
+              logInteraction("nav.root")
+              setScope("")
+            }}
+          >
             ⌂
           </text>
-          <text fg={theme().accent} onMouseDown={() => setScope(upTarget())}>
+          <text
+            fg={theme().accent}
+            onMouseDown={() => {
+              logInteraction("nav.up", upTarget())
+              setScope(upTarget())
+            }}
+          >
             ◀
           </text>
           <For each={crumbs()}>
             {(crumb, i) => (
-              <text fg={i() === crumbs().length - 1 ? theme().text : theme().textMuted} onMouseDown={() => setScope(crumb.path)}>
+              <text
+                fg={i() === crumbs().length - 1 ? theme().text : theme().textMuted}
+                onMouseDown={() => {
+                  logInteraction("breadcrumb.nav", crumb.path)
+                  setScope(crumb.path)
+                }}
+              >
                 {(i() === 0 ? "" : "/ ") + crumb.label}
               </text>
             )}
@@ -746,7 +798,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                 the dialog backdrop dismisses itself on the mouse-up it sees outside
                 its inner box, so opening on mouse-down means the same gesture's
                 release closes the popup immediately (see ui/dialog.tsx). */}
-            <text fg={theme().textMuted} onMouseUp={() => openLensPicker(props.api)} wrapMode="none">
+            <text fg={theme().textMuted} onMouseUp={() => openLensPicker(props.api, props.session_id)} wrapMode="none">
               ⌄
             </text>
             {/* Delete the active (user) collection: click to arm, click again to
@@ -918,7 +970,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                       maxSubtree={maxDirSubtree0}
                       overlays={() => overlaysFor(item.node)}
                       theme={theme}
-                      onDrill={() => setScope(item.node.path)}
+                      onDrill={() => navigateScope(item.node.path)}
                       onEnter={() => enterNode(item.node)}
                       onLeave={() => leaveNode()}
                     />
@@ -947,7 +999,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                             width={outerW()}
                             flexDirection="row"
                             flexShrink={0}
-                            onMouseDown={() => (cell.kind === "directory" ? setScope(cell.path) : toggleDrill(cell.path))}
+                            onMouseDown={() => (cell.kind === "directory" ? navigateScope(cell.path) : toggleDrill(cell.path))}
                             onMouseOver={() => enterNode(cell)}
                             onMouseOut={() => leaveNode()}
                           >
@@ -1046,7 +1098,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                     maxSubtree={maxDirSubtree0}
                     overlays={() => overlaysFor(item.node)}
                     theme={theme}
-                    onDrill={() => setScope(item.node.path)}
+                    onDrill={() => navigateScope(item.node.path)}
                     onEnter={() => enterNode(item.node)}
                     onLeave={() => leaveNode()}
                   />
@@ -1125,7 +1177,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                                     borderColor={() => borderColorFor(cell)}
                                     overlays={() => overlaysFor(cell)}
                                     theme={theme}
-                                    onDrill={() => setScope(cell.path)}
+                                    onDrill={() => navigateScope(cell.path)}
                                     onEnter={() => enterNode(cell)}
                                     onLeave={() => leaveNode()}
                                   />
@@ -1161,7 +1213,10 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                           width={TILE_W}
                           alignItems="center"
                           flexShrink={0}
-                          onMouseDown={() => setScope(posixDir(b.path))}
+                          onMouseDown={() => {
+                            logInteraction("boundary.nav", posixDir(b.path))
+                            setScope(posixDir(b.path))
+                          }}
                           onMouseOver={() => setHovered(b.path)}
                           onMouseOut={() => setHovered(undefined)}
                         >
@@ -1596,7 +1651,10 @@ const tui: TuiPlugin = async (api) => {
         category: "Aperture",
         namespace: "palette",
         run() {
-          openLensPicker(api)
+          openLensPicker(
+            api,
+            ("params" in api.route.current ? api.route.current.params?.sessionID : undefined) as string | undefined,
+          )
         },
       },
     ],

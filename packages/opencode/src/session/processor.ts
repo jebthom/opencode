@@ -9,6 +9,7 @@ import { Permission } from "@/permission"
 import { Plugin } from "@/plugin"
 import { Snapshot } from "@/snapshot"
 import { Session } from "./session"
+import * as StudyLog from "@/aperture/study-log"
 import { LLM } from "./llm"
 import { MessageV2 } from "./message-v2"
 import { isOverflow } from "./overflow"
@@ -380,6 +381,16 @@ export const layer = Layer.effect(
             }
             const toolCall = yield* ensureToolCall(value)
             const input = isRecord(value.input) ? value.input : { value: value.input }
+            // Aperture study logging: every agent tool call, with Aperture (lens_*)
+            // calls tagged and attributed to the invoking agent (byAgent count).
+            yield* StudyLog.record(ctx.sessionID, {
+              type: "tool",
+              name: value.name,
+              aperture: value.name.startsWith("lens_"),
+              agent: ctx.assistantMessage.agent,
+              callID: value.id,
+              input: JSON.stringify(input).slice(0, 2000),
+            })
             if (!toolCall.call.inputEnded) {
               // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
               if (flags.experimentalEventSystem) {
@@ -499,6 +510,13 @@ export const layer = Layer.effect(
                 timestamp: DateTime.makeUnsafe(Date.now()),
               })
             }
+            // Aperture study logging: tool result (truncated) for issue recreation.
+            yield* StudyLog.record(ctx.sessionID, {
+              type: "tool-result",
+              callID: value.id,
+              ok: true,
+              output: output.output.slice(0, 4000),
+            })
             yield* completeToolCall(value.id, output)
             return
           }
@@ -520,6 +538,13 @@ export const layer = Layer.effect(
                 timestamp: DateTime.makeUnsafe(Date.now()),
               })
             }
+            // Aperture study logging: tool error for issue recreation.
+            yield* StudyLog.record(ctx.sessionID, {
+              type: "tool-error",
+              callID: value.id,
+              ok: false,
+              error: value.message,
+            })
             yield* failToolCall(value.id, value.error ?? new Error(value.message))
             return
           }
@@ -578,6 +603,33 @@ export const layer = Layer.effect(
             ctx.assistantMessage.finish = value.reason
             ctx.assistantMessage.cost += usage.cost
             ctx.assistantMessage.tokens = usage.tokens
+            // Aperture study logging: per-step conversation tokens/cost (always-on;
+            // Step.Ended above is flag-gated). On a terminal step (finish reason is not
+            // "tool-calls") also capture the assistant's output text for the transcript.
+            if (!ctx.assistantMessage.summary) {
+              const terminal = value.reason !== "tool-calls"
+              let text: string | undefined
+              if (terminal) {
+                const parts = yield* MessageV2.parts(ctx.assistantMessage.id).pipe(
+                  Effect.provideService(Database.Service, database),
+                )
+                const joined = parts
+                  .filter((p): p is Extract<typeof p, { type: "text" }> => p.type === "text")
+                  .map((p) => p.text)
+                  .join("")
+                  .trim()
+                text = joined || undefined
+              }
+              yield* StudyLog.record(ctx.sessionID, {
+                type: "assistant-step",
+                agent: ctx.assistantMessage.agent,
+                model: `${ctx.assistantMessage.providerID}/${ctx.assistantMessage.modelID}`,
+                finish: value.reason,
+                tokens: usage.tokens,
+                cost: usage.cost,
+                ...(text ? { text } : {}),
+              })
+            }
             yield* session.updatePart({
               id: PartID.ascending(),
               reason: value.reason,

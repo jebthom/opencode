@@ -7,6 +7,7 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import * as Log from "@opencode-ai/core/util/log"
 import type { EventV2 } from "@opencode-ai/core/event"
+import * as StudyLog from "./study-log"
 import type { Storage } from "@/storage/storage"
 import type { Provider } from "@/provider/provider"
 import type { Config } from "@/config/config"
@@ -157,13 +158,13 @@ export const paintStale = Effect.fn("Aperture.paintStale")(function* (
   const classifyBin = (bin: typeof stale) =>
     Effect.gen(function* () {
       const blocks = bin.map((r) => describe(r.node.path, r.content, context)).join("\n\n")
-      const assignments = yield* classifyWithRetry(language, blocks, facetSchema, system, lens).pipe(
+      const { files: assignments, usage } = yield* classifyWithRetry(language, blocks, facetSchema, system, lens).pipe(
         Effect.catchCause((cause) => {
           log.error("classify failed", { projectID, scope, cause })
-          return Effect.succeed<ReadonlyArray<{ path: string; facet: string }>>([])
+          return Effect.succeed<ClassifyResult>(EMPTY_CLASSIFY)
         }),
       )
-      return { blocks, assignments }
+      return { blocks, assignments, usage }
     })
   const results = yield* Effect.forEach(bins, classifyBin, { concurrency: fanout })
 
@@ -171,7 +172,11 @@ export const paintStale = Effect.fn("Aperture.paintStale")(function* (
   // store are written here, not inside the concurrent workers, so the fan-out
   // never races the counter or interleaves appends.
   const painted: ApertureSemanticStore.Store = {}
-  for (const { blocks, assignments } of results) {
+  let painterInput = 0
+  let painterOutput = 0
+  for (const { blocks, assignments, usage } of results) {
+    painterInput += usage.inputTokens
+    painterOutput += usage.outputTokens
     yield* appendPerfLog(directory, origin, lens.id, blocks, assignments)
     for (const a of assignments) {
       const id = idByPath.get(a.path)
@@ -180,6 +185,11 @@ export const paintStale = Effect.fn("Aperture.paintStale")(function* (
       painted[id] = { facet: a.facet, hash }
     }
   }
+
+  // Aperture study logging: painter token spend, kept separate from conversation
+  // tokens. Attributed to the most-recently-active session (painter is not
+  // session-scoped).
+  yield* StudyLog.recordPainter({ origin, lens: lens.id, inputTokens: painterInput, outputTokens: painterOutput })
 
   const count = Object.keys(painted).length
   if (count === 0) return
@@ -250,13 +260,21 @@ export const paintExtentsStale = Effect.fn("Aperture.paintExtentsStale")(functio
   const idByLabel = new Map(stale.map((r) => [`${relPath}#${r.extent.name}`, r.id]))
   const hashByLabel = new Map(stale.map((r) => [`${relPath}#${r.extent.name}`, r.hash]))
 
-  const assignments = yield* classifyWithRetry(language, blocks, facetSchema, system, lens).pipe(
+  const { files: assignments, usage } = yield* classifyWithRetry(language, blocks, facetSchema, system, lens).pipe(
     Effect.catchCause((cause) => {
       log.error("classify extents failed", { projectID, file: relPath, cause })
-      return Effect.succeed<ReadonlyArray<{ path: string; facet: string }>>([])
+      return Effect.succeed<ClassifyResult>(EMPTY_CLASSIFY)
     }),
   )
   yield* appendPerfLog(directory, "fg", lens.id, blocks, assignments)
+  // Aperture study logging: drill-in (function-level) painter token spend.
+  yield* StudyLog.recordPainter({
+    origin: "fg",
+    lens: lens.id,
+    scope: relPath,
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+  })
 
   const painted: ApertureSubfacetStore.Store = {}
   for (const a of assignments) {
@@ -378,9 +396,26 @@ const classify = (
       ],
     }).then((r) => {
       const result = r.object as typeof facetSchema.Type
-      return result.files.filter((f): f is { path: string; facet: string } => isAssignableFacet(lens, f.facet))
+      const files = result.files.filter((f): f is { path: string; facet: string } => isAssignableFacet(lens, f.facet))
+      // Surface token usage so the study log can account for the painter's model
+      // spend separately from conversation tokens. AI-SDK v5 uses input/outputTokens.
+      const u = r.usage as
+        | { inputTokens?: number; outputTokens?: number; promptTokens?: number; completionTokens?: number }
+        | undefined
+      const usage = {
+        inputTokens: u?.inputTokens ?? u?.promptTokens ?? 0,
+        outputTokens: u?.outputTokens ?? u?.completionTokens ?? 0,
+      }
+      return { files, usage }
     }),
   )
+
+// One classify call's outcome: the assignable facets + the model token spend.
+type ClassifyResult = {
+  files: ReadonlyArray<{ path: string; facet: string }>
+  usage: { inputTokens: number; outputTokens: number }
+}
+const EMPTY_CLASSIFY: ClassifyResult = { files: [], usage: { inputTokens: 0, outputTokens: 0 } }
 
 // Retry a classify call on rate-limit / overload errors with exponential backoff +
 // jitter, capped at BG_MAX_RETRIES. Only retries bounceback (429/5xx/overloaded);

@@ -29,6 +29,7 @@ import { PartTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { Log } from "@opencode-ai/core/util/log"
 import { MessageV2 } from "./message-v2"
+import * as StudyLog from "@/aperture/study-log"
 import type { InstanceContext } from "../project/instance-context"
 import { InstanceState } from "@/effect/instance-state"
 import { Snapshot } from "@/snapshot"
@@ -593,6 +594,18 @@ export const layer: Layer.Layer<
         },
       }
       log.info("created", result)
+
+      // Aperture study logging: register the session's per-session log folder before
+      // any prompt/tool/click can fire (root creates the folder; child shares its
+      // root's). Best-effort — never breaks session creation.
+      yield* StudyLog.register({
+        id: result.id,
+        parentID: result.parentID,
+        directory: result.directory,
+        createdMs: result.time.created,
+        agent: result.agent,
+        version: result.version,
+      })
 
       yield* events.publish(
         SessionV1.Event.Created,

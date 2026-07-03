@@ -116,22 +116,18 @@ export function activate(context: vscode.ExtensionContext) {
     return data.extents?.[node.id]
   }
 
-  async function repaint(editor: vscode.TextEditor | undefined) {
-    if (!editor || editor.document.uri.scheme !== "file") {
-      log(`skip: no file editor (scheme=${editor?.document.uri.scheme})`)
-      return
-    }
+  // Fetch one editor's file extents and (re)apply its gutter. The fetch also drills the
+  // file server-side, so painting a visible editor is what schedules its server paint.
+  async function repaintEditor(editor: vscode.TextEditor) {
+    if (editor.document.uri.scheme !== "file") return
     const relPath = vscode.workspace.asRelativePath(editor.document.uri, false).replace(/\\/g, "/")
 
     let extents: Extent[] | undefined
-    repainting = true
     try {
       extents = await fetchExtents(relPath)
     } catch (e) {
       log(`fetch FAILED for ${relPath}: ${String(e)} (baseUrl=${baseUrl()} dir=${directory()})`)
       return
-    } finally {
-      repainting = false
     }
     const painted = (extents ?? []).filter((e) => e.hue && resolveHue(e.hue) !== undefined).length
     log(`drill ${relPath}: ${extents?.length ?? 0} extents, ${painted} painted`)
@@ -157,26 +153,48 @@ export function activate(context: vscode.ExtensionContext) {
     }
   }
 
-  function scheduleRepaint(editor = vscode.window.activeTextEditor) {
-    if (repaintTimer) clearTimeout(repaintTimer)
-    repaintTimer = setTimeout(() => void repaint(editor), REPAINT_DEBOUNCE_MS)
+  // Repaint every *visible* editor, not just the focused one. A file you're reading in a
+  // split pane — or while focus sits in the TUI/terminal — is visible but is not
+  // `activeTextEditor`; painting only the active editor is why such a file stayed grey
+  // until you clicked into it (the click made it active, firing the first drill). Driving
+  // off `visibleTextEditors` makes the invariant "visible ⇒ drilled-and-painted", so the
+  // click stops mattering. `repainting` gates the poll so it skips rather than stacking.
+  async function repaintVisible() {
+    repainting = true
+    try {
+      await Promise.all(vscode.window.visibleTextEditors.map((e) => repaintEditor(e)))
+    } finally {
+      repainting = false
+    }
   }
 
-  // Pre-warm the server's function paint for every open tab, not just the active one. The
-  // gutter only drills the file you focus; warming the rest means the server has already
-  // function-painted them, so switching tabs shows colours immediately instead of the
-  // click → wait → watch-the-colours-appear beat. Same drill GET the gutter uses, result
-  // discarded (a non-visible tab has no editor to decorate; the fetch's side effect —
-  // scheduling the server-side paint — is the whole point). Deduped via `warmed`: once per
-  // file per session, since real edits repaint server-side and the SSE/poll refresh the gutter.
+  function scheduleRepaint() {
+    if (repaintTimer) clearTimeout(repaintTimer)
+    repaintTimer = setTimeout(() => void repaintVisible(), REPAINT_DEBOUNCE_MS)
+  }
+
+  // Pre-warm the server's function paint for open-but-hidden tabs. `repaintVisible` already
+  // drills + paints every visible editor; warming covers the tabs you have open but aren't
+  // looking at, so the server has already function-painted them and switching to one shows
+  // colours immediately instead of the drill → wait → watch-the-colours-appear beat. Same
+  // drill GET the gutter uses, result discarded (a hidden tab has no editor to decorate; the
+  // fetch's side effect — scheduling the server-side paint — is the whole point). Deduped via
+  // `warmed`: once per file per connection, since real edits repaint server-side and the
+  // SSE/poll refresh the gutter.
   const warmed = new Set<string>()
   async function warmOpenTabs() {
+    // Visible tabs are handled by repaintVisible; warm only the hidden ones.
+    const visible = new Set(
+      vscode.window.visibleTextEditors
+        .filter((e) => e.document.uri.scheme === "file")
+        .map((e) => vscode.workspace.asRelativePath(e.document.uri, false).replace(/\\/g, "/")),
+    )
     for (const group of vscode.window.tabGroups.all) {
       for (const tab of group.tabs) {
         const input = tab.input
         if (!(input instanceof vscode.TabInputText) || input.uri.scheme !== "file") continue
         const rel = vscode.workspace.asRelativePath(input.uri, false).replace(/\\/g, "/")
-        if (warmed.has(rel)) continue
+        if (visible.has(rel) || warmed.has(rel)) continue
         warmed.add(rel)
         try {
           await fetchExtents(rel)
@@ -284,12 +302,14 @@ export function activate(context: vscode.ExtensionContext) {
 
   context.subscriptions.push(
     vscode.commands.registerCommand("aperture.repaint", () => scheduleRepaint()),
-    vscode.window.onDidChangeActiveTextEditor((editor) => scheduleRepaint(editor)),
-    // Warm newly-opened tabs so their function paint is ready before they're focused.
+    vscode.window.onDidChangeActiveTextEditor(() => scheduleRepaint()),
+    // A newly split/opened editor becomes visible without necessarily becoming active —
+    // repaint so it drills + fills without needing a focus.
+    vscode.window.onDidChangeVisibleTextEditors(() => scheduleRepaint()),
+    // Warm open-but-hidden tabs so their function paint is ready before they're focused.
     vscode.window.tabGroups.onDidChangeTabs(() => void warmOpenTabs()),
     vscode.workspace.onDidSaveTextDocument((doc) => {
-      const editor = vscode.window.activeTextEditor
-      if (editor && editor.document === doc) scheduleRepaint(editor)
+      if (vscode.window.visibleTextEditors.some((e) => e.document === doc)) scheduleRepaint()
     }),
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (!e.affectsConfiguration("aperture")) return
@@ -301,15 +321,15 @@ export function activate(context: vscode.ExtensionContext) {
     }),
   )
 
-  // Self-heal poll: re-fetch the active file's tiles on a slow cadence so a dropped
+  // Self-heal poll: re-fetch the visible files' tiles on a slow cadence so a dropped
   // invalidation (or a paint that completes outside an editor change) still surfaces.
   // Skipped while a fetch is already outstanding so a slow walk can't stack refetches.
   pollTimer = setInterval(() => {
     if (!repainting) scheduleRepaint()
   }, REFRESH_POLL_MS)
 
-  // Paint the active file. Open tabs are warmed on SSE connect (see connectEvents), so
-  // switching to one is instant (no click-to-drill).
+  // Paint the visible files. Open-but-hidden tabs are warmed on SSE connect (see
+  // connectEvents), so switching to one is instant (no click-to-drill).
   scheduleRepaint()
 }
 

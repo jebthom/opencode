@@ -5196,6 +5196,47 @@ export type ApertureSelectLensResponses = {
 
 export type ApertureSelectLensResponse = ApertureSelectLensResponses[keyof ApertureSelectLensResponses]
 
+export type ApertureInteractionData = {
+  body?: {
+    /**
+     * The viewed session the interaction belongs to
+     */
+    sessionID: string
+    /**
+     * Interaction type id, e.g. lens.cycle / tile.drill / breadcrumb.nav
+     */
+    interaction: string
+    scope?: string
+    drill?: string
+    lens?: string
+    detail?: string
+  }
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/aperture/interaction"
+}
+
+export type ApertureInteractionErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ApertureInteractionError = ApertureInteractionErrors[keyof ApertureInteractionErrors]
+
+export type ApertureInteractionResponses = {
+  /**
+   * Interaction recorded
+   */
+  200: boolean
+}
+
+export type ApertureInteractionResponse = ApertureInteractionResponses[keyof ApertureInteractionResponses]
+
 export type ConfigGetData = {
   body?: never
   path?: never

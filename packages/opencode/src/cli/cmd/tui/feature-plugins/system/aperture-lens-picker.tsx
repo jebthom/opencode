@@ -19,7 +19,7 @@ type LensSummary = {
   active: boolean
 }
 
-export function LensPicker(props: { api: TuiPluginApi }) {
+export function LensPicker(props: { api: TuiPluginApi; sessionID?: string }) {
   const { theme } = useTheme()
   const [lenses] = createResource(async () => {
     const result = await props.api.client.aperture.listLenses({}, { throwOnError: true })
@@ -44,6 +44,15 @@ export function LensPicker(props: { api: TuiPluginApi }) {
       options={options()}
       current={current()}
       onSelect={(item) => {
+        // Aperture research/study logging: record the lens selection (user-driven).
+        // Only when we know the session (top-bar path); the palette/`/lens-switch`
+        // path may lack one, and study logging must never block the switch.
+        if (props.sessionID)
+          void props.api.client.aperture.interaction({
+            sessionID: props.sessionID,
+            interaction: "lens.select",
+            lens: item.value,
+          })
         void props.api.client.aperture.selectLens({ lens: item.value })
         props.api.ui.dialog.clear()
       }}
@@ -52,7 +61,7 @@ export function LensPicker(props: { api: TuiPluginApi }) {
 }
 
 // Open the picker as a medium dialog. Wired to a palette command and the legend.
-export function openLensPicker(api: TuiPluginApi) {
-  api.ui.dialog.replace(() => <LensPicker api={api} />)
+export function openLensPicker(api: TuiPluginApi, sessionID?: string) {
+  api.ui.dialog.replace(() => <LensPicker api={api} sessionID={sessionID} />)
   api.ui.dialog.setSize("medium")
 }

@@ -10,6 +10,8 @@ import type {
   ApertureDeleteLensResponses,
   ApertureGetErrors,
   ApertureGetResponses,
+  ApertureInteractionErrors,
+  ApertureInteractionResponses,
   ApertureListLensesErrors,
   ApertureListLensesResponses,
   ApertureSelectLensErrors,
@@ -826,6 +828,55 @@ export class Aperture extends HeyApiClient {
       ...options,
       ...params,
     })
+  }
+
+  /**
+   * Log an Aperture view interaction
+   *
+   * Record a top-bar click in the Aperture view to the per-session study log (research logging).
+   */
+  public interaction<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      sessionID?: string
+      interaction?: string
+      scope?: string
+      drill?: string
+      lens?: string
+      detail?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "sessionID" },
+            { in: "body", key: "interaction" },
+            { in: "body", key: "scope" },
+            { in: "body", key: "drill" },
+            { in: "body", key: "lens" },
+            { in: "body", key: "detail" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<ApertureInteractionResponses, ApertureInteractionErrors, ThrowOnError>(
+      {
+        url: "/aperture/interaction",
+        ...options,
+        ...params,
+        headers: {
+          "Content-Type": "application/json",
+          ...options?.headers,
+          ...params.headers,
+        },
+      },
+    )
   }
 }
 

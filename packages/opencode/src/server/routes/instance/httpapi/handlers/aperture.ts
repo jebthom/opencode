@@ -1,8 +1,10 @@
 import { Aperture } from "@/aperture/aperture"
 import { legend } from "@/aperture/lenses"
+import * as StudyLog from "@/aperture/study-log"
 import { Effect } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
+import type { InteractionInput } from "../groups/aperture"
 
 export const apertureHandlers = HttpApiBuilder.group(InstanceHttpApi, "aperture", (handlers) =>
   Effect.gen(function* () {
@@ -50,11 +52,27 @@ export const apertureHandlers = HttpApiBuilder.group(InstanceHttpApi, "aperture"
       return { status: "ok" as const, active: { id: found.id, name: found.name, legend: legend(found) } }
     })
 
+    const interaction = Effect.fn("ApertureHttpApi.interaction")(function* (ctx: {
+      payload: typeof InteractionInput.Type
+    }) {
+      const p = ctx.payload
+      yield* StudyLog.record(p.sessionID, {
+        type: "click",
+        interaction: p.interaction,
+        ...(p.scope !== undefined ? { scope: p.scope } : {}),
+        ...(p.drill !== undefined ? { drill: p.drill } : {}),
+        ...(p.lens !== undefined ? { lens: p.lens } : {}),
+        ...(p.detail !== undefined ? { detail: p.detail } : {}),
+      })
+      return true
+    })
+
     return handlers
       .handle("get", get)
       .handle("cycleLens", cycleLens)
       .handle("deleteLens", deleteLens)
       .handle("listLenses", listLenses)
       .handle("selectLens", selectLens)
+      .handle("interaction", interaction)
   }),
 )

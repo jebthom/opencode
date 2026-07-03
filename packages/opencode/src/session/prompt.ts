@@ -7,6 +7,7 @@ import { MessageV2 } from "./message-v2"
 import { Log } from "@opencode-ai/core/util/log"
 import { SessionRevert } from "./revert"
 import { Session } from "./session"
+import * as StudyLog from "@/aperture/study-log"
 import { Agent } from "../agent/agent"
 import { Provider } from "@/provider/provider"
 
@@ -741,6 +742,13 @@ export const layer = Layer.effect(
           timestamp: DateTime.makeUnsafe(info.time.created),
           agent: info.agent,
         })
+        // Aperture study logging: phase transition (e.g. plan <-> build) so the
+        // timeline segments cleanly. Always-on.
+        yield* StudyLog.record(input.sessionID, {
+          type: "agent-switch",
+          from: current?.agent,
+          to: info.agent,
+        })
       }
       if (
         current?.model?.providerID !== info.model.providerID ||
@@ -1199,6 +1207,14 @@ export const layer = Layer.effect(
           },
         })
       }
+      // Aperture study logging: record the prompt on the always-on path (the event
+      // above is gated behind the experimental flag). `info.agent` is the plan/build
+      // distinction.
+      yield* StudyLog.record(input.sessionID, {
+        type: "prompt",
+        agent: info.agent,
+        text: nextPrompt.text.join("\n"),
+      })
       for (const text of nextPrompt.synthetic) {
         // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
         if (flags.experimentalEventSystem) {
