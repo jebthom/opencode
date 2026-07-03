@@ -67,6 +67,15 @@ const BG_BATCH = 960
 // arriving mid-pause acquires immediately. Short because each batch already self-spaces
 // via its concurrent calls; just enough to yield the gate between waves.
 const BG_BATCH_DELAY = "250 millis"
+// Ceiling on how many git working-set files we proactively function-paint per pass.
+// Function-level painting is the expensive path (see the aperture-function-tagging-cost
+// finding: ~5.8× the file-level token cost), so it stays scoped to the working set —
+// the deterministic "interest" heuristic that supersedes click-to-drill. The cap guards
+// the degenerate case: a repo with no commits reports *every* file as untracked (the whole
+// tree is "changed"), which without a limit would turn this into an eager whole-repo
+// function paint. Above the cap the proactive pass is skipped; those files still paint
+// on-demand when drilled.
+const WORKING_SET_PAINT_CAP = 200
 
 // Storage key: ["aperture", <projectID>, "structure", <scopeKey>]. Per project
 // and per scope so each navigated directory keeps its own durable subgraph.
@@ -431,6 +440,50 @@ export const layer = Layer.effect(
         )
       })
 
+    // Proactively function-paint the git working set (files with uncommitted changes) under
+    // the active Lens, so their tiles are ready before the user looks — the deterministic
+    // "interest" heuristic that replaces click-to-drill (clicking was only ever a proxy for
+    // interest, and the working set is a better, free one). Reuses the per-file drill path
+    // (scheduleExtentPaint): dedup, stale-skip, the shared gate, and drilledFiles bookkeeping
+    // all apply, and switching Lens re-paints from that Lens alone. Capped (WORKING_SET_PAINT_CAP)
+    // so an uncommitted repo can't turn this into a whole-repo function paint. Deterministic
+    // Lenses compute their function tiles offline in finalize, so there's nothing to model-paint.
+    const scheduleWorkingSetPaint = (directory: string, projectID: string) =>
+      Effect.gen(function* () {
+        const lens = yield* ApertureLensStore.getActive(directory)
+        if (isDeterministic(lens)) return
+        // No git work tree → no working set (and git.status would error). Bail quietly.
+        if (!(yield* isRepoFor(directory))) return
+        const git = yield* gitChangedFor(directory)
+        if (git.changed.size === 0) return
+        // git reports repo-root-relative paths; the subtree is directory-relative. Bridging
+        // with the repo prefix also filters the change set down to source files (the subtree's
+        // only members) as the directory-relative paths scheduleExtentPaint expects.
+        const subtree = yield* subtreeFor(directory)
+        const workingSet = subtree.filter((f) => git.changed.has(git.prefix + f.path)).map((f) => f.path)
+        if (workingSet.length === 0 || workingSet.length > WORKING_SET_PAINT_CAP) return
+        for (const rel of workingSet) yield* scheduleExtentPaint(directory, projectID, rel, parentScope(rel))
+      })
+
+    // Re-paint every already-function-painted file under the now-active Lens. Function tiles
+    // are per-(lens, extent-hash), so a freshly-selected Lens has an empty sub-facet store and
+    // its drilled files would render bare until re-painted. Mirrors the file-level policy —
+    // active Lens only, never a fan-out over every Lens (see aperture-a5 lens decision).
+    const repaintDrilledFiles = (directory: string, projectID: string) =>
+      Effect.gen(function* () {
+        for (const rel of drilledFiles.get(directory) ?? []) yield* scheduleExtentPaint(directory, projectID, rel, parentScope(rel))
+      })
+
+    // Fork a best-effort proactive paint (working-set seed / lens repaint) into the service
+    // scope so it never blocks a fetch and its failure only logs; the inner per-file
+    // scheduleExtentPaint calls are already detached + gated.
+    const forkProactivePaint = <E>(label: string, projectID: string, eff: Effect.Effect<void, E>) =>
+      eff.pipe(
+        Effect.catchCause((cause) => Effect.sync(() => log.error(label, { projectID, cause }))),
+        (e) => Effect.forkIn(e, serviceScope),
+        Effect.asVoid,
+      )
+
     const finalize = (ctx: InstanceContext, scope: string, structure: AperturePayload.Payload, drillFile?: string) =>
       Effect.gen(function* () {
         // Paint with the *active* Lens: its facet store, its legend (facet → colour),
@@ -629,6 +682,10 @@ export const layer = Layer.effect(
           Effect.catchCause((cause) => Effect.sync(() => log.error("background loop crashed", { projectID, cause }))),
           (loop) => Effect.forkIn(loop, serviceScope),
         )
+        // Seed the working-set function paint once per open, so files with pre-existing
+        // uncommitted changes light up at function granularity without a manual drill.
+        // Forked so its git status / subtree IO never delays the first fetch.
+        yield* forkProactivePaint("working-set seed failed", projectID, scheduleWorkingSetPaint(directory, projectID))
       })
 
     // Nudge a parked background loop to re-enumerate and re-walk. dropping(1) makes a
@@ -742,17 +799,15 @@ export const layer = Layer.effect(
         // Wake the background painter so the change is (re)painted even when it falls
         // outside every viewed window — the stale-hash skip keeps the re-walk cheap.
         yield* wakeBackground(directory)
-        // If the changed file has function-level paint, re-run the drill-in painter so
-        // its tiles stay current. The per-extent content hash scopes the actual model
-        // calls to the functions that changed — a free, diff-shaped repaint. Invalidate
-        // the file's own directory window; viewers of it refetch and re-merge.
-        if (drilledFiles.get(directory)?.has(rel))
-          yield* scheduleExtentPaint(
-            directory,
-            container.projectID,
-            rel,
-            rel.includes("/") ? rel.slice(0, rel.lastIndexOf("/")) : "",
-          )
+        // A changed *source* file is, by definition, part of the working set, so proactively
+        // (re)paint its function tiles — the deterministic interest heuristic keeps the slice
+        // fresh with no manual drill. Already-painted files repaint too (the per-extent content
+        // hash scopes the model calls to the functions that actually changed — a diff-shaped
+        // repaint); a non-source file has no extents to paint, and only files already drilled
+        // fall through to keep their tiles current. Invalidate the file's own directory window;
+        // viewers of it refetch and re-merge.
+        if (isPaintableSource(rel) || drilledFiles.get(directory)?.has(rel))
+          yield* scheduleExtentPaint(directory, container.projectID, rel, parentScope(rel))
       })
 
     yield* Effect.forkScoped(
@@ -784,6 +839,10 @@ export const layer = Layer.effect(
         gitStatusCache.delete(directory)
         isRepoCache.delete(directory)
         yield* wakeBackground(directory)
+        // A turn may have changed the working set via shell ops that fire no file event
+        // (mv/rm/scaffolding, git add/commit); with the git cache dropped above, re-seed the
+        // working-set function paint so the current changed slice stays covered.
+        yield* forkProactivePaint("working-set seed failed", container.projectID, scheduleWorkingSetPaint(directory, container.projectID))
       })
     yield* Effect.forkScoped(
       events.subscribe(SessionStatus.Event.Status).pipe(
@@ -808,6 +867,24 @@ export const layer = Layer.effect(
             // event and the VSCode extension never refetches the freshly-switched Lens.
             yield* events.publish(ApertureEvent.Event.Invalidated, { scope }, { location: { directory: AbsolutePath.make(directory) } }).pipe(Effect.ignore)
           }
+          // Function tiles are per-(lens, extent-hash), so the freshly-selected Lens has an
+          // empty sub-facet store. Two forked passes fill it (both stale-skipped, deduped, and
+          // gated), mirroring the file-level sweep's per-active-Lens repaint (cached per
+          // (lens, hash), so flipping back is free):
+          //   - repaintDrilledFiles: everything already function-painted (open VSCode tabs the
+          //     client warmed, manually drilled files, working set seen under a prior Lens);
+          //   - scheduleWorkingSetPaint: the current git working set, which catches files never
+          //     yet in drilledFiles — e.g. pre-existing changes when the prior Lens was
+          //     deterministic (so its seed was skipped). Overlap is deduped in scheduleExtentPaint.
+          const projectID = container.projectID
+          yield* forkProactivePaint(
+            "lens repaint failed",
+            projectID,
+            Effect.gen(function* () {
+              yield* repaintDrilledFiles(directory, projectID)
+              yield* scheduleWorkingSetPaint(directory, projectID)
+            }),
+          )
         }
         // Bump the epoch so an in-flight background sweep abandons the old Lens
         // and restarts for the new one (the wake below re-runs the parked loop).
@@ -1095,6 +1172,22 @@ function computeComposition(
 }
 
 // --- window math -----------------------------------------------------------
+
+// Parent directory of a repo-relative path — the window scope whose viewers should be
+// invalidated when the file's function tiles repaint; "" for a root-level file.
+function parentScope(rel: string): string {
+  const i = rel.lastIndexOf("/")
+  return i === -1 ? "" : rel.slice(0, i)
+}
+
+// The source extensions the extractor walks (SOURCE_GLOB in extract.ts). Only these can
+// carry function-level extents, so a changed file with any other extension has nothing to
+// function-paint and is left out of the working-set trigger.
+const PAINTABLE_EXTS = new Set(["ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts", "py"])
+function isPaintableSource(rel: string): boolean {
+  const i = rel.lastIndexOf(".")
+  return i !== -1 && PAINTABLE_EXTS.has(rel.slice(i + 1))
+}
 
 // Repo-relative POSIX path for an absolute file under `directory`, or undefined
 // if it escapes the directory (file events carry absolute paths).

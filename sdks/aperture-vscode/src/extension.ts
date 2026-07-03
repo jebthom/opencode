@@ -162,6 +162,31 @@ export function activate(context: vscode.ExtensionContext) {
     repaintTimer = setTimeout(() => void repaint(editor), REPAINT_DEBOUNCE_MS)
   }
 
+  // Pre-warm the server's function paint for every open tab, not just the active one. The
+  // gutter only drills the file you focus; warming the rest means the server has already
+  // function-painted them, so switching tabs shows colours immediately instead of the
+  // click → wait → watch-the-colours-appear beat. Same drill GET the gutter uses, result
+  // discarded (a non-visible tab has no editor to decorate; the fetch's side effect —
+  // scheduling the server-side paint — is the whole point). Deduped via `warmed`: once per
+  // file per session, since real edits repaint server-side and the SSE/poll refresh the gutter.
+  const warmed = new Set<string>()
+  async function warmOpenTabs() {
+    for (const group of vscode.window.tabGroups.all) {
+      for (const tab of group.tabs) {
+        const input = tab.input
+        if (!(input instanceof vscode.TabInputText) || input.uri.scheme !== "file") continue
+        const rel = vscode.workspace.asRelativePath(input.uri, false).replace(/\\/g, "/")
+        if (warmed.has(rel)) continue
+        warmed.add(rel)
+        try {
+          await fetchExtents(rel)
+        } catch {
+          warmed.delete(rel) // transient failure — allow a retry on the next tab change
+        }
+      }
+    }
+  }
+
   // ---- open-in-editor via SSE ----------------------------------------------
 
   async function revealFile(relPath: string) {
@@ -206,6 +231,12 @@ export function activate(context: vscode.ExtensionContext) {
             await delay(RECONNECT_DELAY_MS)
             continue
           }
+          // Fresh connection (first connect, or a reconnect after a server restart — which
+          // drops the server's in-memory drilled-file set that drives extent attachment).
+          // Re-warm every open tab so their function paint is re-established under the active
+          // Lens without needing a focus, keeping the "open ⇒ painted-or-in-flight" invariant.
+          warmed.clear()
+          void warmOpenTabs()
           const reader = res.body.getReader()
           const decoder = new TextDecoder()
           let buffer = ""
@@ -254,13 +285,16 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.commands.registerCommand("aperture.repaint", () => scheduleRepaint()),
     vscode.window.onDidChangeActiveTextEditor((editor) => scheduleRepaint(editor)),
+    // Warm newly-opened tabs so their function paint is ready before they're focused.
+    vscode.window.tabGroups.onDidChangeTabs(() => void warmOpenTabs()),
     vscode.workspace.onDidSaveTextDocument((doc) => {
       const editor = vscode.window.activeTextEditor
       if (editor && editor.document === doc) scheduleRepaint(editor)
     }),
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (!e.affectsConfiguration("aperture")) return
-      // Reconnect against the new host/port and repaint.
+      // Reconnect against the new host/port and repaint. The fresh connection re-warms every
+      // open tab on connect (see connectEvents), so no explicit re-warm is needed here.
       sse?.abort()
       sse = connectEvents()
       scheduleRepaint()
@@ -274,7 +308,8 @@ export function activate(context: vscode.ExtensionContext) {
     if (!repainting) scheduleRepaint()
   }, REFRESH_POLL_MS)
 
-  // Paint whatever is already open.
+  // Paint the active file. Open tabs are warmed on SSE connect (see connectEvents), so
+  // switching to one is instant (no click-to-drill).
   scheduleRepaint()
 }
 

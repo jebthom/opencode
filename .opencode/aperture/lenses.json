@@ -1,93 +1,96 @@
 {
-  "ui-components-7a6b52dd": {
-    "id": "ui-components-7a6b52dd",
-    "name": "UI Components",
-    "description": "Classifies files by their role in the UI component system (primitive components, composed features, application views, styling/theme, and utility/helper code)",
+  "agent-architecture-f43eb025": {
+    "id": "agent-architecture-f43eb025",
+    "name": "Agent Architecture",
+    "description": "Maps where agents are defined, configured, managed, and tested across the codebase.",
     "palette": "bright",
-    "prompt": "Classify files by their role in the UI/UX component system. Primitive components are simple, reusable UI building blocks like button, input, checkbox, icon, avatar, badge, spinner. Composed features combine multiple primitives into complex interactive patterns like dialog, menu, tooltip, popover, list, accordion, tabs. Application views are full pages or major screen layouts specific to the app's domain like session pages, home pages, settings dialogs, sidebars. Styling files include CSS, design tokens, and theme definitions. UI hooks and utilities are custom hooks, UI helper functions, and supporting logic specific to rendering and interactive components (not general application logic).",
+    "prompt": "Classify each file by its role in the agent system: configuration files that define agents, service implementations that manage them, CLI commands for user interaction, integration points with sessions/plugins, or tests covering agent functionality.",
     "facets": [
       {
-        "id": "primitive-components",
-        "label": "Primitive Components",
-        "description": "Basic reusable UI building blocks (button, input, checkbox, icon, avatar, badge, spinner, etc.)",
+        "id": "configuration",
+        "label": "Configuration",
+        "description": "Agent definition files in .opencode/agent/ and config loaders that parse agent markdown files",
         "color": "#4E79A7"
       },
       {
-        "id": "composed-features",
-        "label": "Composed Features",
-        "description": "Complex components combining primitives (dialog, menu, tooltip, popover, list, accordion, tabs, etc.)",
+        "id": "service-layer",
+        "label": "Service & Layer",
+        "description": "Agent service implementations, Effect layers, and core business logic for managing agent state",
         "color": "#F28E2B"
       },
       {
-        "id": "application-views",
-        "label": "Application Views",
-        "description": "Full-page or major screen layouts and domain-specific UI (session page, home page, settings dialogs, sidebars, etc.)",
+        "id": "cli-commands",
+        "label": "CLI & Commands",
+        "description": "Agent command handling and CLI interface for creating, listing, and managing agents",
         "color": "#59A14F"
       },
       {
-        "id": "styling-theme",
-        "label": "Styling & Theme",
-        "description": "CSS, theming, design tokens, and visual/animation system files",
+        "id": "integration",
+        "label": "Integration",
+        "description": "Agent integration with plugins, sessions, events, and message types",
         "color": "#E15759"
       },
       {
-        "id": "ui-hooks-utilities",
-        "label": "UI Hooks & Utilities",
-        "description": "Custom hooks, UI helper functions, and supporting logic specific to rendering and interactive components",
+        "id": "testing",
+        "label": "Testing",
+        "description": "Agent tests, test fixtures, test utilities, and test coverage",
         "color": "#B07AA1"
       }
     ],
     "scope": "project",
     "directories": [
-      "packages/ui",
-      "packages/app/src/components",
-      "packages/opencode/src/cli/cmd/tui/ui"
+      "packages/opencode/src/agent",
+      "packages/core/src/agent.ts",
+      ".opencode/agent"
     ]
   },
-  "aperture-architecture-0b04a758": {
-    "id": "aperture-architecture-0b04a758",
-    "name": "Aperture Architecture",
-    "description": "Classifies files by their role in the Aperture View system (data model, painting/AI, storage, rendering, tools/CLI).",
-    "palette": "bright",
-    "prompt": "Classify each file by its role in the Aperture system. Separate semantic layers: files involved in data definitions and Lens contracts; the AI painter and model integration; durable storage and state; repository structure extraction; the TUI renderer and navigation; and the HTTP/CLI tool layer specific to Aperture.",
+  "tui-features-architecture-1146ff62": {
+    "id": "tui-features-architecture-1146ff62",
+    "name": "TUI Features & Architecture",
+    "description": "Maps TUI features across architectural layers—from core app to context providers, UI components, feature plugins, and utilities.",
+    "palette": "earthy",
+    "prompt": "Classify each file by its layer in the TUI architecture: the main app and routing layer, state management contexts, reusable UI components and dialogs, full-page routes, modular feature plugins, or utilities and configuration helpers.",
     "facets": [
       {
-        "id": "data-model",
-        "label": "Data Model",
-        "description": "Aperture-specific payload schemas, Lens definitions, Facet contracts, and type interfaces (`payload.ts`, `lenses.ts`, `semantics.ts`).",
-        "color": "#4E79A7"
+        "id": "app-routing",
+        "label": "App & Routing",
+        "description": "Main app entry point, global routing, keymaps, and app lifecycle (app.tsx, routes setup)",
+        "color": "#8C7A5B"
       },
       {
-        "id": "painter-ai",
-        "label": "Painter & AI",
-        "description": "Aperture facet assignment engine, painter prompts, semantic inference, and deterministic Lens computation (`painter.ts`, `deterministic.ts`).",
-        "color": "#F28E2B"
+        "id": "contexts-providers",
+        "label": "Contexts & Providers",
+        "description": "State management providers for project, editor, theme, sync, SDK, dialog, and other global state",
+        "color": "#A65E2E"
       },
       {
-        "id": "storage-state",
-        "label": "Storage & State",
-        "description": "Aperture persistent caching, lens/semantic stores, subfacet stores, and per-instance state (`*-store.ts`, `activity.ts`).",
-        "color": "#59A14F"
+        "id": "ui-components-dialogs",
+        "label": "UI Components & Dialogs",
+        "description": "Reusable UI widgets, dialog components, spinners, toasts, and form components",
+        "color": "#6B8E5A"
       },
       {
-        "id": "extraction-traversal",
-        "label": "Extraction & Traversal",
-        "description": "Aperture directory structure extraction, DFS enumeration, import parsing, and function-level extent resolution (`extract.ts`, `extents.ts`).",
-        "color": "#E15759"
+        "id": "routes-pages",
+        "label": "Routes & Pages",
+        "description": "Full-page views and route implementations like home and session screens",
+        "color": "#C2A878"
       },
       {
-        "id": "rendering-tui",
-        "label": "Rendering & TUI",
-        "description": "Aperture View React components, treemap layout, navigation, legend, drill-in UI, and activity display (`aperture.tsx`, `aperture-lens-picker.tsx`, `aperture-activity.ts`).",
-        "color": "#B07AA1"
+        "id": "feature-plugins",
+        "label": "Feature Plugins",
+        "description": "Modular feature implementations (session, sidebar, home, system) that extend the app",
+        "color": "#5B6C5D"
       },
       {
-        "id": "aperture-tools-api",
-        "label": "Aperture Tools & API",
-        "description": "HTTP routes, SDK generation, CLI commands, and Lens management tools exclusively for Aperture (`/aperture` routes, `/lens` command, `tool/lens-*.ts`).",
-        "color": "#EDC948"
+        "id": "utilities-config",
+        "label": "Utilities & Config",
+        "description": "Helper functions, configuration, editor integration, audio, clipboard, and keybindings",
+        "color": "#9C6B4F"
       }
     ],
-    "scope": "project"
+    "scope": "project",
+    "directories": [
+      "packages/opencode/src/cli/cmd/tui"
+    ]
   }
 }
