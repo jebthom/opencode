@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import {
+  attributeFileBytes,
   extentsOf,
   extentText,
   fileComposition,
@@ -8,6 +9,7 @@ import {
   subNodeID,
   PREAMBLE,
   type Extent,
+  type FileComposition,
 } from "@/aperture/extents"
 
 // Assert a set of extents tiles [1, total] exhaustively: sorted, contiguous, no
@@ -143,6 +145,74 @@ describe("aperture extents (sub-file resolution)", () => {
       expect(comp.weights).toEqual([])
       expect(comp.totalCount).toBe(0)
       expect(comp.subtreeBytes).toBe(Buffer.byteLength(content))
+    })
+  })
+
+  describe("attributeFileBytes (function facets supersede the file-level facet)", () => {
+    // 1000-byte file: 600 bytes of painted functions (400 "hot", 200 "cold"), 400 bytes
+    // of preamble/unpainted extents.
+    const mix: FileComposition = {
+      weights: [
+        { facet: "cold", count: 1, bytes: 200 },
+        { facet: "hot", count: 1, bytes: 400 },
+      ],
+      totalCount: 2,
+      totalBytes: 600,
+      subtreeCount: 3,
+      subtreeBytes: 1000,
+    }
+
+    test("an unmixed file puts all of its bytes on its file-level facet", () => {
+      expect(attributeFileBytes(1000, undefined, "likely")).toEqual({
+        weights: [{ facet: "likely", bytes: 1000 }],
+        dominant: "likely",
+      })
+    })
+
+    test("an unpainted file is attributed nothing (it stays grey)", () => {
+      expect(attributeFileBytes(1000, undefined, undefined)).toEqual({ weights: [], dominant: undefined })
+    })
+
+    test("painted functions take their bytes; the file-level facet keeps only the remainder", () => {
+      const a = attributeFileBytes(1000, mix, "likely")
+      expect(a.weights).toEqual([
+        { facet: "cold", bytes: 200 },
+        { facet: "hot", bytes: 400 },
+        // The 400 bytes the drill-in painter hasn't reached (preamble + unpainted extents).
+        { facet: "likely", bytes: 400 },
+      ])
+      expect(a.dominant).toBe("hot")
+      expect(a.weights.reduce((s, w) => s + w.bytes, 0)).toBe(1000)
+    })
+
+    test("a fully function-painted file drops the file-level facet entirely", () => {
+      const full: FileComposition = { ...mix, totalBytes: 1000, weights: [{ facet: "hot", count: 2, bytes: 1000 }] }
+      expect(attributeFileBytes(1000, full, "likely")).toEqual({
+        weights: [{ facet: "hot", bytes: 1000 }],
+        dominant: "hot",
+      })
+    })
+
+    test("a mix measured against a since-edited file is scaled onto its current size", () => {
+      // File has doubled since it was function-painted; proportions hold, totals don't
+      // exceed the file's real bytes (the total* ≤ subtree* partition contract).
+      const a = attributeFileBytes(2000, mix, "likely")
+      expect(a.weights).toEqual([
+        { facet: "cold", bytes: 400 },
+        { facet: "hot", bytes: 800 },
+        { facet: "likely", bytes: 800 },
+      ])
+      expect(a.weights.reduce((s, w) => s + w.bytes, 0)).toBe(2000)
+    })
+
+    test("an unpainted remainder on a file with no file-level facet stays unattributed", () => {
+      const a = attributeFileBytes(1000, mix, undefined)
+      expect(a.weights).toEqual([
+        { facet: "cold", bytes: 200 },
+        { facet: "hot", bytes: 400 },
+      ])
+      // The 400 unpainted bytes belong to no facet — the renderer sizes grey from them.
+      expect(a.weights.reduce((s, w) => s + w.bytes, 0)).toBe(600)
     })
   })
 

@@ -1,5 +1,6 @@
 import { Effect } from "effect"
 import type { Storage } from "@/storage/storage"
+import type { FileComposition } from "./extents"
 
 // Durable per-project, per-Lens store for *sub-file* (function-level) facets (A5).
 // Kept separate from the file-level semantic store (semantic-store.ts) so drill-in
@@ -21,8 +22,24 @@ export interface Entry {
 
 export type Store = Record<string, Entry>
 
+// A function-painted file's *measured* facet mix: the byte-weighted spread of its
+// function facets (extents.ts `fileComposition`), keyed by repo-relative path. It is a
+// derived summary of the entries above, but it's persisted rather than recomputed at the
+// read boundary because computing it needs the file's text — and directory composition
+// tallies the whole repo's files on every payload read, which can't afford to re-read
+// them. The drill-in painter has the content in hand anyway, so it writes this as it
+// paints; composition then folds a file's function facets into its directory with a map
+// lookup (see `attributeFileBytes`). Path-keyed, not node-id-keyed: composition already
+// walks the subtree by path, and it keeps the doc readable.
+export type Mix = FileComposition
+export type Mixes = Record<string, Mix>
+
 function key(projectID: string, lensID: string) {
   return ["aperture", projectID, "subfacets", lensID]
+}
+
+function mixKey(projectID: string, lensID: string) {
+  return ["aperture", projectID, "subfacet-mix", lensID]
 }
 
 // Stored map, or empty when nothing has been painted yet (missing doc).
@@ -44,8 +61,44 @@ export const upsert = (
     })
     .pipe(Effect.catch(() => storage.write(key(projectID, lensID), entries)), Effect.ignore)
 
+// Every file's mix, or empty when nothing has been function-painted yet.
+export const readMixes = (storage: Storage.Interface, projectID: string, lensID: string): Effect.Effect<Mixes> =>
+  storage.read<Mixes>(mixKey(projectID, lensID)).pipe(Effect.catch(() => Effect.succeed<Mixes>({})))
+
+// Store one file's mix, reporting whether it actually changed. The caller uses that to
+// decide whether to invalidate the view: the painter re-derives the mix on every pass
+// (cheap, no tokens) so a file painted before mixes existed heals itself, and publishing
+// unconditionally would turn that into a paint→refetch→paint cycle.
+export const upsertMix = (
+  storage: Storage.Interface,
+  projectID: string,
+  lensID: string,
+  relPath: string,
+  mix: Mix,
+): Effect.Effect<boolean> =>
+  Effect.gen(function* () {
+    let changed = false
+    const apply = (draft: Mixes) => {
+      if (JSON.stringify(draft[relPath]) === JSON.stringify(mix)) return
+      draft[relPath] = mix
+      changed = true
+    }
+    yield* storage
+      .update<Mixes>(mixKey(projectID, lensID), apply)
+      .pipe(
+        Effect.catch(() => {
+          const fresh: Mixes = {}
+          apply(fresh)
+          return storage.write(mixKey(projectID, lensID), fresh)
+        }),
+        Effect.ignore,
+      )
+    return changed
+  })
+
 // Deterministically fold one facet into another for a Lens (mirrors the file-level
-// store) so a facet merge keeps sub-file colours consistent without a re-paint.
+// store) so a facet merge keeps sub-file colours consistent without a re-paint. The
+// mixes are folded the same way, so directory composition follows the merge too.
 export const mergeFacet = (
   storage: Storage.Interface,
   projectID: string,
@@ -53,17 +106,45 @@ export const mergeFacet = (
   from: string,
   into: string,
 ): Effect.Effect<void> =>
-  storage
-    .update<Store>(key(projectID, lensID), (draft) => {
-      for (const [id, entry] of Object.entries(draft)) {
-        if (entry.facet === from) draft[id] = { facet: into, hash: entry.hash }
-      }
-    })
-    .pipe(Effect.ignore)
+  Effect.gen(function* () {
+    yield* storage
+      .update<Store>(key(projectID, lensID), (draft) => {
+        for (const [id, entry] of Object.entries(draft)) {
+          if (entry.facet === from) draft[id] = { facet: into, hash: entry.hash }
+        }
+      })
+      .pipe(Effect.ignore)
+    yield* storage
+      .update<Mixes>(mixKey(projectID, lensID), (draft) => {
+        for (const [path, mix] of Object.entries(draft)) {
+          if (!mix.weights.some((w) => w.facet === from)) continue
+          // Re-fold: the merged facet may collide with an existing weight, so sum them
+          // and re-sort by facet id to keep the same stable shape `fileComposition` emits.
+          const byFacet = new Map<string, { count: number; bytes: number }>()
+          for (const w of mix.weights) {
+            const facet = w.facet === from ? into : w.facet
+            const acc = byFacet.get(facet) ?? { count: 0, bytes: 0 }
+            acc.count += w.count
+            acc.bytes += w.bytes
+            byFacet.set(facet, acc)
+          }
+          const weights = [...byFacet.entries()]
+            .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+            .map(([facet, w]) => ({ facet, count: w.count, bytes: w.bytes }))
+          draft[path] = { ...mix, weights }
+        }
+      })
+      .pipe(Effect.ignore)
+  })
 
 // Drop every sub-file facet for a Lens, forcing a from-scratch re-paint on the next
 // drill-in. Used when a structural edit invalidates the Lens's inferred facets.
 export const clear = (storage: Storage.Interface, projectID: string, lensID: string): Effect.Effect<void> =>
-  storage.write(key(projectID, lensID), {} as Store).pipe(Effect.ignore)
+  Effect.gen(function* () {
+    yield* storage.write(key(projectID, lensID), {} as Store).pipe(Effect.ignore)
+    // Mixes are derived from those facets, so they go with them — otherwise composition
+    // would keep attributing bytes to functions whose paint no longer exists.
+    yield* storage.write(mixKey(projectID, lensID), {} as Mixes).pipe(Effect.ignore)
+  })
 
 export * as ApertureSubfacetStore from "./subfacet-store"

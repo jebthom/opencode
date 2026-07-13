@@ -643,6 +643,50 @@ export const layer = Layer.effect(
         }).pipe(Effect.ensuring(Effect.sync(() => busFactorInFlight.delete(directory))))
       })
 
+    // --- function-mix backfill (background, once per Lens) -------------------
+    // A file's mix is measured by the drill-in painter, so a file function-painted before
+    // mixes existed — or in a previous process, since the painter only revisits files the
+    // user touches — has facets in the sub-facet store but no mix, and its directory would
+    // keep showing the superseded file-level facet until it happened to be repainted. The
+    // sub-facet store is keyed by a path+name *hash*, so there's no way to ask it which
+    // files it covers: the only way to find them is to re-derive each file's extent ids and
+    // look them up. That means reading the subtree once — far too much I/O for the read
+    // path (composition runs on every payload read), but fine as a one-shot background pass:
+    // it's pure I/O and regex, no model, no tokens. Skipped entirely when the Lens has no
+    // function paints at all, which is the common case.
+    const mixBackfilled = new Set<string>()
+    const backfillMixes = (directory: string, projectID: string, lens: Lens) =>
+      Effect.gen(function* () {
+        const key = JSON.stringify([directory, lens.id])
+        if (mixBackfilled.has(key)) return
+        mixBackfilled.add(key)
+        const subStore = yield* ApertureSubfacetStore.read(storage, projectID, lens.id)
+        if (Object.keys(subStore).length === 0) return
+        const mixes = yield* ApertureSubfacetStore.readMixes(storage, projectID, lens.id)
+        const subtree = yield* subtreeFor(directory)
+        let written = 0
+        for (const file of subtree) {
+          if (mixes[file.path]) continue
+          const content = yield* readFileText(directory, file.path)
+          if (content === undefined) continue
+          const facetByName = new Map<string, string>()
+          for (const extent of ApertureExtents.extentsOf(content)) {
+            const entry = subStore[ApertureExtents.subNodeID(file.path, extent.name)]
+            if (entry) facetByName.set(extent.name, entry.facet)
+          }
+          if (facetByName.size === 0) continue
+          const mix = ApertureExtents.fileComposition(content, facetByName)
+          if (yield* ApertureSubfacetStore.upsertMix(storage, projectID, lens.id, file.path, mix)) written++
+        }
+        if (written === 0) return
+        log.info("backfilled function mixes", { projectID, lens: lens.id, files: written })
+        const container = caches.get(directory)
+        for (const viewed of container?.scopes.keys() ?? [])
+          yield* events
+            .publish(ApertureEvent.Event.Invalidated, { scope: viewed }, { location: { directory: AbsolutePath.make(directory) } })
+            .pipe(Effect.ignore)
+      })
+
     const finalize = (ctx: InstanceContext, scope: string, structure: AperturePayload.Payload, drillFile?: string) =>
       Effect.gen(function* () {
         // Paint with the *active* Lens: its facet store, its legend (facet → colour),
@@ -684,7 +728,20 @@ export const layer = Layer.effect(
         // descendant source file (full depth, from the cached membership) by its painted
         // facet, summing both a file count and a byte sum so the renderer can pick either
         // metric. Derived here alongside `semantics` so the structure cache stays pure.
-        const composition = computeComposition(structure.nodes, subtree, store, lens)
+        //
+        // A file that has been function-painted is bucketed by the *mix* of its function
+        // facets instead (the drill-in painter measures and persists it): those facets were
+        // assigned with the code in view, so they supersede the file-level one the coarse
+        // painter guessed from the path — otherwise a directory keeps showing the coarse
+        // tags long after its files have been refined. Deterministic Lenses carry no
+        // sub-facet store (git-changed derives its function tiles offline from the diff,
+        // and its file-level facet already describes the whole file's heat), so they keep
+        // the plain file-level attribution.
+        const mixes = det ? {} : yield* ApertureSubfacetStore.readMixes(storage, ctx.project.id, lens.id)
+        const composition = computeComposition(structure.nodes, subtree, store, mixes, lens)
+        // Fill in the mixes of files function-painted before this ran (see backfillMixes):
+        // forked, so the view renders from what's persisted now and re-merges when it lands.
+        if (!det) yield* forkProactivePaint("mix backfill failed", ctx.project.id, backfillMixes(ctx.directory, ctx.project.id, lens))
         // Deterministic Lenses are fully painted above; only semantic ones schedule
         // the foreground painter for the in-window files + boundary targets.
         if (!det)
@@ -1308,11 +1365,18 @@ function orderByDirectories(
 // totals regardless of painting, so a directory with no painted files still reports its
 // real size (the renderer sizes its grey block from that rather than painting it
 // full-bleed). Pure: a function of the window's directories, the subtree file set,
-// and the semantic store.
-function computeComposition(
+// the semantic store, and the function-level mixes.
+//
+// A file's bytes are attributed by `attributeFileBytes`: whole-file to its file-level
+// facet normally, but split across its function facets once it has a mix — the
+// finer-grained paint supersedes the coarse one. `count` stays whole-file (the file
+// counts once, toward the facet holding most of its bytes) so the count metric keeps
+// meaning "files", not "functions".
+export function computeComposition(
   nodes: AperturePayload.Payload["nodes"],
   files: ReadonlyArray<{ id: string; path: string; size: number }>,
   store: ApertureSemanticStore.Store,
+  mixes: ApertureSubfacetStore.Mixes,
   lens: Lens,
 ): Record<string, AperturePayload.Composition> {
   const dirs = nodes.filter((n) => n.kind === "directory").map((d) => ({ id: d.id, prefix: d.path + "/" }))
@@ -1320,20 +1384,22 @@ function computeComposition(
   const painted = new Map<string, Map<string, { count: number; bytes: number }>>()
   const subtree = new Map<string, { count: number; bytes: number }>()
   for (const file of files) {
-    const facet = store[file.id]?.facet
+    const attribution = ApertureExtents.attributeFileBytes(file.size, mixes[file.path], store[file.id]?.facet)
     for (const dir of dirs) {
       if (!file.path.startsWith(dir.prefix)) continue
       const s = subtree.get(dir.id) ?? { count: 0, bytes: 0 }
       s.count += 1
       s.bytes += file.size
       subtree.set(dir.id, s)
-      if (!facet) continue
+      if (attribution.weights.length === 0) continue
       let byFacet = painted.get(dir.id)
       if (!byFacet) painted.set(dir.id, (byFacet = new Map()))
-      const w = byFacet.get(facet) ?? { count: 0, bytes: 0 }
-      w.count += 1
-      w.bytes += file.size
-      byFacet.set(facet, w)
+      for (const weight of attribution.weights) {
+        const w = byFacet.get(weight.facet) ?? { count: 0, bytes: 0 }
+        if (weight.facet === attribution.dominant) w.count += 1
+        w.bytes += weight.bytes
+        byFacet.set(weight.facet, w)
+      }
     }
   }
   // Emit an entry for every directory that has any descendant file, even when none

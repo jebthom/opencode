@@ -96,4 +96,57 @@ describe("aperture subfacet-store (function-level facets)", () => {
     await run(ApertureSubfacetStore.upsert(iface, PID, "lens-a", { n_aaa: { facet: "x", hash: "h1" } }))
     expect(await run(ApertureSubfacetStore.read(iface, PID, "lens-b"))).toEqual({})
   })
+
+  // The per-file mix is what carries function-level paint up into directory composition.
+  describe("mixes (the file's measured function-facet spread)", () => {
+    const mix = (facet: string): ApertureSubfacetStore.Mix => ({
+      weights: [{ facet, count: 1, bytes: 60 }],
+      totalCount: 1,
+      totalBytes: 60,
+      subtreeCount: 2,
+      subtreeBytes: 100,
+    })
+
+    test("empty until a file is function-painted", async () => {
+      const { iface } = memStorage()
+      expect(await run(ApertureSubfacetStore.readMixes(iface, PID, LENS))).toEqual({})
+    })
+
+    test("upsertMix reports a change on first write and on a real change, not on a rewrite", async () => {
+      const { iface } = memStorage()
+      // First write (doc doesn't exist yet — the update→write fallback path).
+      expect(await run(ApertureSubfacetStore.upsertMix(iface, PID, LENS, "src/a.ts", mix("login")))).toBe(true)
+      // Identical re-derivation: no change, so the painter publishes nothing and the
+      // paint→refetch→paint guard holds.
+      expect(await run(ApertureSubfacetStore.upsertMix(iface, PID, LENS, "src/a.ts", mix("login")))).toBe(false)
+      expect(await run(ApertureSubfacetStore.upsertMix(iface, PID, LENS, "src/a.ts", mix("tokens")))).toBe(true)
+      expect(await run(ApertureSubfacetStore.readMixes(iface, PID, LENS))).toEqual({ "src/a.ts": mix("tokens") })
+    })
+
+    test("mergeFacet folds a file's weights, summing a collision back into one weight", async () => {
+      const { iface } = memStorage()
+      await run(
+        ApertureSubfacetStore.upsertMix(iface, PID, LENS, "src/a.ts", {
+          weights: [
+            { facet: "login", count: 1, bytes: 60 },
+            { facet: "tokens", count: 2, bytes: 40 },
+          ],
+          totalCount: 3,
+          totalBytes: 100,
+          subtreeCount: 3,
+          subtreeBytes: 100,
+        }),
+      )
+      await run(ApertureSubfacetStore.mergeFacet(iface, PID, LENS, "login", "tokens"))
+      const mixes = await run(ApertureSubfacetStore.readMixes(iface, PID, LENS))
+      expect(mixes["src/a.ts"]!.weights).toEqual([{ facet: "tokens", count: 3, bytes: 100 }])
+    })
+
+    test("clear drops mixes with the facets they were derived from", async () => {
+      const { iface } = memStorage()
+      await run(ApertureSubfacetStore.upsertMix(iface, PID, LENS, "src/a.ts", mix("login")))
+      await run(ApertureSubfacetStore.clear(iface, PID, LENS))
+      expect(await run(ApertureSubfacetStore.readMixes(iface, PID, LENS))).toEqual({})
+    })
+  })
 })

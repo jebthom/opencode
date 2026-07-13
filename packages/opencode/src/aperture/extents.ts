@@ -133,6 +133,61 @@ export function fileComposition(content: string, facetByName: ReadonlyMap<string
   return { weights, totalCount, totalBytes, subtreeCount, subtreeBytes }
 }
 
+// How one file's bytes are attributed to facets when its *directory's* composition is
+// tallied. A file that has been function-painted is no longer one indivisible byte mass:
+// its painted extents carry a facet assigned with the code in view, which supersedes the
+// file-level facet the coarse painter inferred from the path/imports alone. So those bytes
+// go to the function facets, and the file-level facet keeps only the remainder — the
+// preamble and any extent the drill-in painter hasn't reached — which keeps a half-painted
+// file fully covered instead of dropping it to grey mid-paint.
+//
+// `size` is the file's size on disk *now*; `mix.subtreeBytes` is what it was when the
+// functions were last painted. They drift when the file is edited before the repaint
+// lands, so the mix's proportions are scaled onto the current size — a directory's facet
+// weights then always sum to at most the file's real bytes (the `total*` ≤ `subtree*`
+// partition contract the treemap relies on).
+export interface FileAttribution {
+  readonly weights: ReadonlyArray<{ readonly facet: string; readonly bytes: number }>
+  // The facet this file counts as one *file* toward: composition's `count` metric stays
+  // whole-file (a file is one file, however many facets its functions span), so the byte
+  // plurality wins it. Undefined when nothing about the file is painted at all.
+  readonly dominant: string | undefined
+}
+
+export function attributeFileBytes(
+  size: number,
+  mix: FileComposition | undefined,
+  fileFacet: string | undefined,
+): FileAttribution {
+  const unmixed: FileAttribution = fileFacet
+    ? { weights: [{ facet: fileFacet, bytes: size }], dominant: fileFacet }
+    : { weights: [], dominant: undefined }
+  if (!mix || mix.subtreeBytes <= 0 || mix.weights.length === 0) return unmixed
+
+  const scale = size / mix.subtreeBytes
+  const bytesByFacet = new Map<string, number>()
+  let assigned = 0
+  for (const w of mix.weights) {
+    // Clamp against the running total, not just `size`: rounding each share up can
+    // otherwise overrun the file's bytes and leave a negative remainder.
+    const bytes = Math.min(Math.round(w.bytes * scale), size - assigned)
+    if (bytes <= 0) continue
+    assigned += bytes
+    bytesByFacet.set(w.facet, (bytesByFacet.get(w.facet) ?? 0) + bytes)
+  }
+  const remainder = size - assigned
+  if (remainder > 0 && fileFacet) bytesByFacet.set(fileFacet, (bytesByFacet.get(fileFacet) ?? 0) + remainder)
+  if (bytesByFacet.size === 0) return unmixed
+
+  // Facet-id order, and a tie on bytes goes to the first of them, so the same inputs
+  // always produce the same weights and the same dominant facet.
+  const weights = [...bytesByFacet.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .map(([facet, bytes]) => ({ facet, bytes }))
+  const dominant = weights.reduce((max, w) => (w.bytes > max.bytes ? w : max)).facet
+  return { weights, dominant }
+}
+
 // Map each extent to changed/unchanged from a set of changed line ranges (1-based,
 // inclusive, in the *current* file) — the deterministic git-changed Lens at function
 // granularity (A5). An extent is "changed" if any of its lines overlap a changed

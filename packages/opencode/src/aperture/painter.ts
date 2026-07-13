@@ -247,6 +247,25 @@ export const paintExtentsStale = Effect.fn("Aperture.paintExtentsStale")(functio
   if (paintable.length === 0) return
 
   const store = yield* ApertureSubfacetStore.read(deps.storage, projectID, lens.id)
+
+  // Fold the file's function facets into a byte-weighted mix and persist it. Directory
+  // composition attributes this file's bytes to its *function* facets from that mix
+  // (superseding the coarser file-level facet), and it can't recompute it at read time —
+  // that would mean re-reading every file in the repo on every payload read. We have the
+  // content here, so we measure it here. Re-derived on every pass, not just when a
+  // function was repainted, so a file painted before mixes existed — or one whose extents
+  // shifted without any function's text changing — heals without spending a token.
+  const syncMix = (entries: ApertureSubfacetStore.Store) =>
+    Effect.gen(function* () {
+      const facetByName = new Map<string, string>()
+      for (const extent of ApertureExtents.extentsOf(content)) {
+        const entry = entries[ApertureExtents.subNodeID(relPath, extent.name)]
+        if (entry) facetByName.set(extent.name, entry.facet)
+      }
+      const mix = ApertureExtents.fileComposition(content, facetByName)
+      return yield* ApertureSubfacetStore.upsertMix(deps.storage, projectID, lens.id, relPath, mix)
+    })
+
   const stale = paintable
     .map((extent) => {
       const text = ApertureExtents.extentText(content, extent)
@@ -254,7 +273,14 @@ export const paintExtentsStale = Effect.fn("Aperture.paintExtentsStale")(functio
     })
     .filter((r) => store[r.id]?.hash !== r.hash)
   if (stale.length === 0) {
+    // Nothing to paint, but the mix may still be missing or stale. Publish only if that
+    // backfill actually changed something, so the paint→refetch→paint guard still holds.
+    const mixChanged = yield* syncMix(store)
     yield* appendPerfEvent(directory, "fg", "skip", { reason: "no-stale-extents", file: relPath })
+    if (mixChanged)
+      yield* deps.events
+        .publish(ApertureEvent.Event.Invalidated, { scope }, { location: { directory: AbsolutePath.make(directory) } })
+        .pipe(Effect.ignore)
     return
   }
 
@@ -295,6 +321,7 @@ export const paintExtentsStale = Effect.fn("Aperture.paintExtentsStale")(functio
   if (Object.keys(painted).length === 0) return
 
   yield* ApertureSubfacetStore.upsert(deps.storage, projectID, lens.id, painted)
+  yield* syncMix({ ...store, ...painted })
   log.info("painted extents", { projectID, file: relPath, lens: lens.id, count: Object.keys(painted).length })
   // Nudge the viewed scope to re-merge the drilled file's now-coloured tiles. Attach
   // the location (forked fiber → no ambient Location.Service) or the HTTP /event SSE
