@@ -92,5 +92,70 @@
     "directories": [
       "packages/opencode/src/cli/cmd/tui"
     ]
+  },
+  "attack-surface-pii-656fc57d": {
+    "id": "attack-surface-pii-656fc57d",
+    "name": "Attack Surface & PII",
+    "description": "Maps code handling secrets, authentication, authorization, external IO boundaries, and cryptographic operations across the codebase.",
+    "palette": "dark",
+    "prompt": "Classify files by their role in the attack surface: Secrets & PII (stores or handles sensitive credentials, tokens, API keys, redacts secrets), Auth & Authz (authentication, authorization, permissions, OAuth), External IO (HTTP endpoints, clients, API boundaries, webhooks), or Cryptographic Ops (hashing, encryption, signing, key derivation). Everything else falls into the automatic \"Other\" bucket.",
+    "facets": [
+      {
+        "id": "secrets-pii",
+        "label": "Secrets & PII",
+        "description": "Stores, transmits, redacts, or manages sensitive credentials (API keys, tokens, passwords, OAuth tokens, private keys)",
+        "color": "#AF5F5F"
+      },
+      {
+        "id": "auth-authz",
+        "label": "Auth & Authz",
+        "description": "Authentication middleware, permission rules, OAuth flows, credential validation, and access control",
+        "color": "#875F00"
+      },
+      {
+        "id": "external-io",
+        "label": "External IO",
+        "description": "HTTP clients, servers, API endpoints, webhooks, and boundaries with external systems",
+        "color": "#5F875F"
+      },
+      {
+        "id": "cryptographic-ops",
+        "label": "Cryptographic Ops",
+        "description": "Hashing, encoding, signing, encryption, or cryptographic utilities",
+        "color": "#008787"
+      }
+    ],
+    "scope": "project"
+  },
+  "terminal-performance-bottlenecks-7d814bd7": {
+    "id": "terminal-performance-bottlenecks-7d814bd7",
+    "name": "Terminal Performance Bottlenecks",
+    "description": "Maps TUI code by likelihood of causing terminal lag—from core render/event loops to features and utilities.",
+    "palette": "bright-ordinal",
+    "prompt": "Classify each file by how directly it impacts terminal responsiveness and frame rate. Files in core event loops, render pipes, and animation frames are \"Likely\"; feature plugins and dialogs are \"Possible\"; utilities and config are \"Adjacent\".",
+    "facets": [
+      {
+        "id": "likely",
+        "label": "Likely",
+        "description": "Core rendering loops, animation frames, event handling, and plugin runtime that directly drive screen updates and input processing.",
+        "color": "#4E5BA6"
+      },
+      {
+        "id": "possible",
+        "label": "Possible",
+        "description": "Feature-specific plugins, contexts, and UI dialogs that update frequently or have complex state.",
+        "color": "#3AAFA9"
+      },
+      {
+        "id": "adjacent",
+        "label": "Adjacent",
+        "description": "Configuration, utility helpers, and less-frequently-rendered components.",
+        "color": "#59A14F"
+      }
+    ],
+    "scope": "project",
+    "directories": [
+      "packages/opencode/src/cli/cmd/tui"
+    ]
   }
 }

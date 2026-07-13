@@ -101,6 +101,9 @@ export interface CreateInput {
   readonly facets: ReadonlyArray<{ readonly id?: string; readonly label: string; readonly description: string }>
   // Optional repo-relative directories the painter front-loads (see Lens).
   readonly directories?: ReadonlyArray<string>
+  // How much per-file context the painter sends for this Lens (see Lens.context). Only
+  // persisted when "medium" — absent means the default "minimal".
+  readonly context?: "minimal" | "medium"
 }
 
 // Mint a unique project Lens id: name slug + a short content hash so two
@@ -145,6 +148,8 @@ export const create = (directory: string, input: CreateInput): Effect.Effect<Len
       facets: withColors,
       scope: "project",
       ...(input.directories?.length ? { directories: normalizeDirectories(input.directories) } : {}),
+      // Only persist a non-default mode so existing minimal Lenses' JSON is unchanged.
+      ...(input.context === "medium" ? { context: "medium" as const } : {}),
     }
 
     // Additive read-modify-write: load the existing project doc, add the fresh
@@ -200,6 +205,9 @@ export interface UpdateInput {
   readonly prompt?: string
   readonly facets?: ReadonlyArray<{ readonly id?: string; readonly label: string; readonly description: string }>
   readonly directories?: ReadonlyArray<string>
+  // New per-file context mode (see Lens.context). Changing it re-classifies every file,
+  // so the caller treats it as a structural change and re-paints from scratch.
+  readonly context?: "minimal" | "medium"
 }
 
 export interface UpdateResult {
@@ -234,11 +242,12 @@ export const update = (
     const coloured = !input.facets && input.palette ? assignColors(palette, facets) : facets
 
     const prompt = input.prompt ?? prev.prompt
+    const context = input.context ?? prev.context
     const prevById = new Map(prev.facets.map((t) => [t.id, t]))
     const facetsAddedOrRemoved =
       coloured.length !== prev.facets.length || coloured.some((t) => !prevById.has(t.id))
     const definitionChanged = coloured.some((t) => prevById.get(t.id) && prevById.get(t.id)!.description !== t.description)
-    const structural = facetsAddedOrRemoved || definitionChanged || prompt !== prev.prompt
+    const structural = facetsAddedOrRemoved || definitionChanged || prompt !== prev.prompt || context !== prev.context
 
     const directories = input.directories ? normalizeDirectories(input.directories) : prev.directories
     const next: Lens = {
@@ -249,6 +258,10 @@ export const update = (
       prompt,
       facets: coloured,
       ...(directories?.length ? { directories } : {}),
+      // Explicit (overrides the ...prev spread) so a downgrade to minimal clears the
+      // field: undefined is dropped by JSON.stringify, keeping the "only present when
+      // medium" convention rather than persisting "minimal".
+      context: context === "medium" ? ("medium" as const) : undefined,
     }
 
     project[id] = next

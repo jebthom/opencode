@@ -16,8 +16,11 @@ export const Parameters = Schema.Struct({
   }),
   name: Schema.optional(Schema.String).annotate({ description: "New Lens name (optional)." }),
   description: Schema.optional(Schema.String).annotate({ description: "New one-line description (optional)." }),
-  palette: Schema.optional(Schema.Literals(["pastel", "dark", "bright", "earthy"])).annotate({
-    description: "New colour palette (optional). Cosmetic — re-colours without re-painting.",
+  palette: Schema.optional(
+    Schema.Literals(["pastel", "dark", "bright", "earthy", "pastel-ordinal", "bright-ordinal", "dark-ordinal"]),
+  ).annotate({
+    description:
+      "New colour palette (optional). Cosmetic — re-colours without re-painting. Categorical (pastel/dark/bright/earthy) for unordered facets; ordinal (*-ordinal) only when facets have a natural order.",
   }),
   prompt: Schema.optional(Schema.String).annotate({
     description: "New painter prompt (optional). Changing it re-paints the whole repo from scratch.",
@@ -37,6 +40,10 @@ export const Parameters = Schema.Struct({
   }),
   directories: Schema.optional(Schema.Array(Schema.String)).annotate({
     description: "New repo-relative focus directories the painter paints first (optional). Cosmetic — no re-paint.",
+  }),
+  context: Schema.optional(Schema.Literals(["minimal", "medium"])).annotate({
+    description:
+      "New per-file painter context mode (optional). 'minimal' = path + imports + comment; 'medium' also sends a structural skeleton (exports, line count, per-declaration signatures + lengths) for Lenses that judge the code's shape/quality. Changing it re-paints the whole repo from scratch.",
   }),
 })
 
@@ -70,6 +77,7 @@ export const LensEditTool = Tool.define(
             prompt: params.prompt,
             facets: params.facets?.map((t) => ({ id: t.id, label: t.label, description: t.description })),
             directories: params.directories,
+            context: params.context,
           })
           switch (result.status) {
             case "not-found":

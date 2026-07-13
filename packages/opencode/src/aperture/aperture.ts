@@ -25,7 +25,7 @@ import { AperturePainter } from "./painter"
 import { ApertureLensStore } from "./lens-store"
 import { ApertureDeterministic } from "./deterministic"
 import { Git } from "@/git"
-import { type Lens, type PaletteId, legend as lensLegend, NONE_FACET, NONE_HUE, ARCHITECTURE_ID, isBuiltinLens, isDeterministic } from "./lenses"
+import { type Lens, type PaletteId, legend as lensLegend, NONE_FACET, NONE_HUE, ARCHITECTURE_ID, BUS_FACTOR, BUS_FACTOR_ID, isBuiltinLens, isDeterministic } from "./lenses"
 
 // Server-side Aperture service (PLAN.md steps 1 + 2.5). Owns the deterministic
 // payload, but unlike step 1 the graph is a *2-level window* rooted at a scope
@@ -103,6 +103,9 @@ export interface CreateLensInput {
   // Pass false to create without disturbing the user's current view (the new
   // Lens then stays unpainted until it is selected).
   readonly activate?: boolean
+  // Per-file painter context mode for this Lens (see Lens.context). Defaults to
+  // "minimal"; pass "medium" only for Lenses that must judge the code's shape.
+  readonly context?: "minimal" | "medium"
 }
 
 export interface EditLensInput {
@@ -116,6 +119,9 @@ export interface EditLensInput {
   // existing painted files — when an id or label matches; new labels mint new facets.
   readonly facets?: ReadonlyArray<{ readonly id?: string; readonly label: string; readonly description: string }>
   readonly directories?: ReadonlyArray<string>
+  // New per-file painter context mode (see Lens.context). Changing it re-paints the
+  // whole repo from scratch (it re-classifies every file).
+  readonly context?: "minimal" | "medium"
 }
 
 // Outcome of an edit/merge/delete: a resolved Lens or why it was refused. The
@@ -267,15 +273,105 @@ export const layer = Layer.effect(
     // but git state only moves when files change. Dropped from the same file-event /
     // turn-completion hooks that invalidate subtreeCache below, so it rebuilds lazily.
     const gitStatusCache = new Map<string, ApertureDeterministic.GitChanged>()
+    // Above this many untracked files we skip per-file line counting (they fall to churn 0 =
+    // the smallest bucket). The degenerate case is a repo with no commits, which reports the
+    // *whole tree* as untracked; without this bound that would fan out into one `git diff`
+    // per file on every fetch. Mirrors WORKING_SET_PAINT_CAP's protection of the same case.
+    const UNTRACKED_STAT_CAP = 200
     const gitChangedFor = (directory: string) =>
       Effect.gen(function* () {
         const cached = gitStatusCache.get(directory)
         if (cached) return cached
-        const items = yield* git.status(directory)
         const prefix = yield* git.prefix(directory)
-        const resolved: ApertureDeterministic.GitChanged = { prefix, changed: new Set(items.map((i) => i.file)) }
+        const hasHead = yield* git.hasHead(directory)
+        // status = the membership set (modified/staged/untracked); stats = per-file numstat
+        // churn for *tracked* changes vs HEAD (staged + unstaged). Untracked files have no
+        // HEAD baseline, so numstat omits them — count their whole size via statUntracked.
+        const [items, stats] = yield* Effect.all(
+          [git.status(directory), hasHead ? git.stats(directory, "HEAD") : Effect.succeed([] as Git.Stat[])],
+          { concurrency: 2 },
+        )
+        const churnByPath = new Map<string, number>()
+        for (const s of stats) churnByPath.set(s.file, s.additions + s.deletions)
+        const untracked = items.filter((i) => i.status === "added" && !churnByPath.has(i.file))
+        if (untracked.length <= UNTRACKED_STAT_CAP)
+          yield* Effect.forEach(
+            untracked,
+            (i) =>
+              git
+                .statUntracked(directory, i.file)
+                .pipe(Effect.map((stat) => churnByPath.set(i.file, stat ? stat.additions + stat.deletions : 0))),
+            { concurrency: 8 },
+          )
+        // Membership is exactly the status set (as before); attach the churn where known,
+        // defaulting the rest to 0 (→ smallest bucket) so a change with no line delta — a
+        // mode-only edit, or an uncounted mass-untracked file — still reads as changed.
+        const changed = new Map<string, number>()
+        for (const i of items) changed.set(i.file, churnByPath.get(i.file) ?? 0)
+        const resolved: ApertureDeterministic.GitChanged = { prefix, changed }
         gitStatusCache.set(directory, resolved)
         return resolved
+      })
+
+    // Per-author line churn for the deterministic "Bus factor" built-in, cached per
+    // directory but — unlike gitStatusCache — keyed by HEAD sha, because a full
+    // `git log --numstat` is far too expensive to re-run on every TUI fetch. Authorship
+    // only moves when a commit lands (HEAD moves), never on working-tree edits, so the
+    // cheap `git.head` check below lets constant refetches reuse the cached pass. This is
+    // why busFactorCache is NOT dropped in the refresh/file-event/idle hooks (only on
+    // disposal) — those fire on edits that don't change history.
+    const busFactorCache = new Map<string, { head: string | undefined; value: ApertureDeterministic.GitAuthorship }>()
+    // Slim log (author + line counts only, no messages) with a generous cap; a truncated or
+    // failed log soft-fails to empty authorship (all files grey) rather than biased counts.
+    const BUS_FACTOR_MAX_OUTPUT = 64 * 1024 * 1024
+    const EMPTY_AUTHORSHIP: ApertureDeterministic.GitAuthorship = {
+      prefix: "",
+      byPath: new Map<string, ReadonlyMap<string, number>>(),
+    }
+    const busFactorFor = (directory: string) =>
+      Effect.gen(function* () {
+        // Cheap HEAD read each call so constant refetches reuse the cached log until a commit
+        // lands; undefined (no commits / not a repo) still keys the cache coherently.
+        const rev = yield* git.run(["rev-parse", "HEAD"], { cwd: directory })
+        const head = rev.exitCode === 0 ? rev.text().trim() : undefined
+        const cached = busFactorCache.get(directory)
+        if (cached && cached.head === head) return cached.value
+        const prefix = yield* git.prefix(directory)
+        const result = yield* git.run(["log", "--no-merges", "--use-mailmap", "--numstat", "--format=%x01%aN"], {
+          cwd: directory,
+          maxOutputBytes: BUS_FACTOR_MAX_OUTPUT,
+        })
+        if (result.truncated) log.warn("bus-factor git log truncated; painting empty", { directory })
+        const value =
+          result.exitCode !== 0 || result.truncated
+            ? EMPTY_AUTHORSHIP
+            : ApertureDeterministic.parseAuthorship(result.text(), prefix)
+        busFactorCache.set(directory, { head, value })
+        return value
+      })
+
+    // Resolve a deterministic Lens's facet store, fetching whichever pre-resolved IO its kind
+    // needs (git-changed's working-tree set, bus-factor's authorship; mtime needs none) and
+    // handing it to the pure computeStore. Single source of the per-kind wiring, shared by
+    // finalize and facetFiles.
+    const deterministicStoreFor = (
+      lens: Lens,
+      directory: string,
+      subtree: ReadonlyArray<ApertureDeterministic.SubtreeFile>,
+    ) =>
+      Effect.gen(function* () {
+        switch (lens.deterministic) {
+          case "git-changed":
+            return ApertureDeterministic.computeStore(lens.deterministic, subtree, {
+              git: yield* gitChangedFor(directory),
+            })
+          case "bus-factor":
+            return ApertureDeterministic.computeStore(lens.deterministic, subtree, {
+              authorship: yield* busFactorFor(directory),
+            })
+          default:
+            return ApertureDeterministic.computeStore(lens.deterministic!, subtree, {})
+        }
       })
 
     // Changed line ranges (in the current file) for the git-changed Lens at function
@@ -309,7 +405,9 @@ export const layer = Layer.effect(
     // Lens is chosen or listed (lenses()/cycle/select), so the user can never
     // land on a meaningless view — git-changed simply doesn't exist in a non-git folder.
     const isAvailable = (lens: Lens, directory: string): Effect.Effect<boolean> =>
-      lens.deterministic === "git-changed" ? isRepoFor(directory) : Effect.succeed(true)
+      lens.deterministic === "git-changed" || lens.deterministic === "bus-factor"
+        ? isRepoFor(directory)
+        : Effect.succeed(true)
 
     // The active+listed Lenses minus any whose prerequisite is unmet for this directory.
     const listAvailable = (directory: string, projectID: string) =>
@@ -324,6 +422,9 @@ export const layer = Layer.effect(
       caches.delete(directory)
       subtreeCache.delete(directory)
       gitStatusCache.delete(directory)
+      busFactorCache.delete(directory)
+      busFactorHead.delete(directory)
+      busFactorInFlight.delete(directory)
       isRepoCache.delete(directory)
       // The loop fiber itself is interrupted when the instance scope closes
       // (forkScoped); drop the map entry so a later reopen can start a fresh one.
@@ -484,6 +585,64 @@ export const layer = Layer.effect(
         Effect.asVoid,
       )
 
+    // --- bus-factor persistence (background, HEAD-keyed) --------------------
+    // Bus-factor's facets come from a whole-history `git log --numstat` — a multi-second walk
+    // on a large repo. Computing it inline on every view (like the cheap git-changed/mtime
+    // built-ins) meant a ~10s block each time the Lens was selected AND on every fresh process
+    // (the in-memory authorship cache dies with the process, so a reopen was always a cold
+    // miss). Instead we persist the *computed facet store* in the same durable semantic store
+    // the painted Lenses use, and recompute it in the background only when HEAD moves. Viewing
+    // the Lens is then a cheap store read; the walk happens off the view path, keyed by commit.
+
+    // The commit the persisted bus-factor store reflects. Persisted (survives restart, so a
+    // reopen at the same HEAD reuses the store instead of re-walking) with an in-memory mirror
+    // to skip the storage read on the hot path. `busFactorInFlight` dedups concurrent triggers
+    // (open + turn-completion + a viewer's finalize) onto a single git-log walk.
+    const busFactorHead = new Map<string, string | undefined>()
+    const busFactorInFlight = new Set<string>()
+    const busFactorHeadKey = (projectID: string) => ["aperture", projectID, "semantics", "bus-factor:head"]
+
+    const persistedBusFactorHead = (directory: string, projectID: string) =>
+      Effect.gen(function* () {
+        if (busFactorHead.has(directory)) return busFactorHead.get(directory)
+        const rec = yield* storage
+          .read<{ head?: string }>(busFactorHeadKey(projectID))
+          .pipe(Effect.catch(() => Effect.succeed(undefined)))
+        const head = rec?.head
+        busFactorHead.set(directory, head)
+        return head
+      })
+
+    // Recompute the bus-factor facet store from git history and persist it (store + HEAD
+    // marker), then invalidate viewed scopes so the live view refetches the filled store.
+    // HEAD-gated (skips when the persisted store already reflects the current commit) and
+    // deduped. Always forked, never awaited on the view path — the Lens renders whatever is
+    // persisted (empty/grey on first ever, or the previous commit's facets) and fills in when
+    // this completes. Bounded to a git work tree (the Lens is unavailable off-git anyway).
+    const refreshBusFactor = (directory: string, projectID: string) =>
+      Effect.gen(function* () {
+        if (!(yield* isRepoFor(directory))) return
+        const rev = yield* git.run(["rev-parse", "HEAD"], { cwd: directory })
+        const head = rev.exitCode === 0 ? rev.text().trim() : undefined
+        if ((yield* persistedBusFactorHead(directory, projectID)) === head) return
+        if (busFactorInFlight.has(directory)) return
+        busFactorInFlight.add(directory)
+        yield* Effect.gen(function* () {
+          const subtree = yield* subtreeFor(directory)
+          // Reuse the pure deterministic wiring: this resolves authorship (the expensive
+          // git-log, HEAD-cached in busFactorCache) and buckets every file by author count.
+          const store = yield* deterministicStoreFor(BUS_FACTOR, directory, subtree)
+          yield* ApertureSemanticStore.replace(storage, projectID, BUS_FACTOR_ID, store)
+          yield* storage.write(busFactorHeadKey(projectID), { head }).pipe(Effect.ignore)
+          busFactorHead.set(directory, head)
+          const container = caches.get(directory)
+          for (const scope of container?.scopes.keys() ?? [])
+            yield* events
+              .publish(ApertureEvent.Event.Invalidated, { scope }, { location: { directory: AbsolutePath.make(directory) } })
+              .pipe(Effect.ignore)
+        }).pipe(Effect.ensuring(Effect.sync(() => busFactorInFlight.delete(directory))))
+      })
+
     const finalize = (ctx: InstanceContext, scope: string, structure: AperturePayload.Payload, drillFile?: string) =>
       Effect.gen(function* () {
         // Paint with the *active* Lens: its facet store, its legend (facet → colour),
@@ -497,13 +656,18 @@ export const layer = Layer.effect(
         // Deterministic built-ins (git-changed / mtime-buckets) compute their facets from the
         // repo instead of reading the persisted store: no painter, no tokens, always fresh.
         const det = isDeterministic(lens)
-        const store = det
-          ? ApertureDeterministic.computeStore(
-              lens.deterministic!,
-              subtree,
-              lens.deterministic === "git-changed" ? yield* gitChangedFor(ctx.directory) : undefined,
-            )
-          : yield* ApertureSemanticStore.read(storage, ctx.project.id, lens.id)
+        // Bus-factor is deterministic but *expensive* (a whole-history git log), so unlike the
+        // cheap git-changed/mtime built-ins it isn't computed inline here — its facets are
+        // persisted in the semantic store (like a painted Lens) and refreshed in the background
+        // keyed by HEAD (refreshBusFactor). Reading it is a cheap store read; the fork below
+        // fills it on first ever view and self-heals a stale store, non-blocking.
+        const busFactor = lens.deterministic === "bus-factor"
+        const store =
+          det && !busFactor
+            ? yield* deterministicStoreFor(lens, ctx.directory, subtree)
+            : yield* ApertureSemanticStore.read(storage, ctx.project.id, lens.id)
+        if (busFactor)
+          yield* forkProactivePaint("bus-factor refresh failed", ctx.project.id, refreshBusFactor(ctx.directory, ctx.project.id))
         const colorByFacet = new Map(lens.facets.map((t) => [t.id, t.color]))
         const semantics: Record<string, AperturePayload.Semantic> = {}
         // The store holds only the semantic (facet); hue/facets are derived here, so
@@ -565,10 +729,16 @@ export const layer = Layer.effect(
               let facetByName: Map<string, string>
               if (det) {
                 // git-changed: overlap each extent with the diff's changed line ranges,
-                // falling back to the file-level changed result for an untracked file.
+                // falling back to the file-level result for an untracked file. A changed
+                // function inherits the file's magnitude bucket (so the whole file tiles at
+                // one heat level); unchanged functions stay muted.
                 const ranges = yield* changedRangesFor(ctx.directory, file)
-                const fileChanged = store[fileId]?.facet === "changed"
-                facetByName = ApertureExtents.extentChangeFacets(content, ranges, fileChanged)
+                const fileFacet = store[fileId]?.facet ?? "unchanged"
+                const fileChanged = fileFacet !== "unchanged"
+                facetByName = ApertureExtents.extentChangeFacets(content, ranges, fileChanged, {
+                  changed: fileFacet,
+                  unchanged: "unchanged",
+                })
               } else {
                 facetByName = new Map()
                 for (const e of exs) {
@@ -686,6 +856,11 @@ export const layer = Layer.effect(
         // uncommitted changes light up at function granularity without a manual drill.
         // Forked so its git status / subtree IO never delays the first fetch.
         yield* forkProactivePaint("working-set seed failed", projectID, scheduleWorkingSetPaint(directory, projectID))
+        // Warm the bus-factor store on open (HEAD-gated + deduped): its whole-history git-log
+        // walk is too slow to run inline when the Lens is selected, so we compute it here and on
+        // every HEAD change, and the view just reads the persisted store. Covers commits made
+        // while the process was closed (the persisted marker won't match the current HEAD).
+        yield* forkProactivePaint("bus-factor refresh failed", projectID, refreshBusFactor(directory, projectID))
       })
 
     // Nudge a parked background loop to re-enumerate and re-walk. dropping(1) makes a
@@ -843,6 +1018,10 @@ export const layer = Layer.effect(
         // (mv/rm/scaffolding, git add/commit); with the git cache dropped above, re-seed the
         // working-set function paint so the current changed slice stays covered.
         yield* forkProactivePaint("working-set seed failed", container.projectID, scheduleWorkingSetPaint(directory, container.projectID))
+        // A turn may have committed (HEAD moved) — recompute the bus-factor store in the
+        // background so the next view is a cheap read rather than a ~10s walk, even when it
+        // isn't the active Lens. HEAD-gated, so a turn that didn't commit costs only a rev-parse.
+        yield* forkProactivePaint("bus-factor refresh failed", container.projectID, refreshBusFactor(directory, container.projectID))
       })
     yield* Effect.forkScoped(
       events.subscribe(SessionStatus.Event.Status).pipe(
@@ -968,6 +1147,7 @@ export const layer = Layer.effect(
         prompt: input.prompt,
         facets: input.facets,
         directories: input.directories,
+        context: input.context,
       })
       if (!result) return { status: "not-found" } as const
       // Structural edits invalidate the inferred facets — clear them so the sweep
@@ -1029,16 +1209,17 @@ export const layer = Layer.effect(
       const resolved = lens ? resolveLens(all, lens) : yield* ApertureLensStore.getActive(ctx.directory)
       if (!resolved) return { status: "not-found" } as const
 
-      // Same store source as finalize: deterministic built-ins compute their facets
-      // from the repo; semantic Lenses read the painted store.
+      // Same store source as finalize: cheap deterministic built-ins compute their facets
+      // from the repo inline; bus-factor and semantic Lenses read the persisted store (the
+      // former filled in the background — kick a refresh so a stale/empty one self-heals).
       const subtree = yield* subtreeFor(ctx.directory)
-      const store = isDeterministic(resolved)
-        ? ApertureDeterministic.computeStore(
-            resolved.deterministic!,
-            subtree,
-            resolved.deterministic === "git-changed" ? yield* gitChangedFor(ctx.directory) : undefined,
-          )
-        : yield* ApertureSemanticStore.read(storage, ctx.project.id, resolved.id)
+      const busFactor = resolved.deterministic === "bus-factor"
+      const store =
+        isDeterministic(resolved) && !busFactor
+          ? yield* deterministicStoreFor(resolved, ctx.directory, subtree)
+          : yield* ApertureSemanticStore.read(storage, ctx.project.id, resolved.id)
+      if (busFactor)
+        yield* forkProactivePaint("bus-factor refresh failed", ctx.project.id, refreshBusFactor(ctx.directory, ctx.project.id))
 
       // The store is keyed by stable node id (an un-invertible path hash), so recover
       // paths by joining against the repo file listing.

@@ -28,8 +28,13 @@ import { ApertureExtents } from "./extents"
 //      content hash changed. Re-displaying unchanged files spends nothing.
 //   2. Minimal context — by default the model sees only the path, parsed import
 //      specifiers, and the leading comment; agent-authored code is rarely named
-//      pathologically, so that's usually enough to place a file. The `medium`
-//      flag (config) adds exported names + the file head when tuning.
+//      pathologically, so that's usually enough to place a file. A Lens whose facets
+//      need the code's *shape* (e.g. "code smells", "god files") opts into `medium`,
+//      which adds a cheap structural skeleton — exported names, the file's line count,
+//      and each top-level declaration's signature + length — never a function body, so
+//      cost scales with declaration count, not file size. The mode is per-Lens
+//      (Lens.context); a global config override (aperture.painter.context) can force one
+//      mode across all Lenses for experimentation.
 //
 // Failure is soft: any read/model/parse error leaves existing semantics intact
 // and publishes nothing, so the structure bar always keeps working.
@@ -58,8 +63,12 @@ const FACET_FANOUT = 64
 const BG_MAX_RETRIES = 4
 const READ_CONCURRENCY = 24
 const MAX_FILE_BYTES = 512 * 1024
-const HEAD_LINES = 30
 const MAX_COMMENT_CHARS = 240
+// `medium` skeleton caps: at most this many top-level declarations are listed (the rest
+// collapse to a "+N more" line so a huge file can't blow up a prompt), each signature
+// trimmed to this many chars. Bounds the extra input tokens medium spends per file.
+const MAX_SKELETON_DECLS = 40
+const SKELETON_SIG_CHARS = 120
 
 export interface FileNode {
   readonly id: string
@@ -134,7 +143,7 @@ export const paintStale = Effect.fn("Aperture.paintStale")(function* (
     return
   }
 
-  const context = yield* contextMode(deps.config)
+  const context = yield* contextMode(deps.config, lens)
   const language = yield* resolveLanguage(deps.provider)
   if (!language) {
     log.info("no small model available; skipping paint pass", { projectID, scope })
@@ -157,7 +166,7 @@ export const paintStale = Effect.fn("Aperture.paintStale")(function* (
   const fanout = yield* painterConcurrency(deps.config)
   const classifyBin = (bin: typeof stale) =>
     Effect.gen(function* () {
-      const blocks = bin.map((r) => describe(r.node.path, r.content, context)).join("\n\n")
+      const blocks = bin.map((r) => describeFile(r.node.path, r.content, context)).join("\n\n")
       const { files: assignments, usage } = yield* classifyWithRetry(language, blocks, facetSchema, system, lens).pipe(
         Effect.catchCause((cause) => {
           log.error("classify failed", { projectID, scope, cause })
@@ -296,7 +305,7 @@ export const paintExtentsStale = Effect.fn("Aperture.paintExtentsStale")(functio
 // Minimal per-extent context: its path label, the declaration's signature (first
 // non-blank line), and any leading comment. Mirrors the file-level `minimal` mode.
 function describeExtent(relPath: string, name: string, text: string): string {
-  const signature = (text.split("\n").find((l) => l.trim() !== "") ?? "").trim().slice(0, 200)
+  const signature = firstNonBlank(text).slice(0, 200)
   const comment = leadingComment(text)
   const lines = [`path: ${relPath}#${name}`]
   if (signature) lines.push(`signature: ${signature}`)
@@ -454,10 +463,17 @@ function isRateLimitError(error: unknown): boolean {
 
 // --- per-file context ------------------------------------------------------
 
-function contextMode(config: Config.Interface) {
+// Resolve the effective per-file context mode for a paint pass. The global config, when
+// explicitly set, wins (a deliberate override for A/B-ing a mode across every Lens);
+// otherwise each Lens decides via `lens.context`, defaulting to "minimal".
+function contextMode(config: Config.Interface, lens: Lens) {
+  const fromLens: "minimal" | "medium" = lens.context === "medium" ? "medium" : "minimal"
   return config.get().pipe(
-    Effect.map((cfg) => (cfg.aperture?.painter?.context === "medium" ? "medium" : "minimal") as "minimal" | "medium"),
-    Effect.catchCause(() => Effect.succeed("minimal" as const)),
+    Effect.map((cfg) => {
+      const override = cfg.aperture?.painter?.context
+      return (override === "medium" || override === "minimal" ? override : fromLens) as "minimal" | "medium"
+    }),
+    Effect.catchCause(() => Effect.succeed(fromLens)),
   )
 }
 
@@ -474,9 +490,12 @@ function clamp(n: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, Math.trunc(n)))
 }
 
-// Compact textual context for one file. `minimal` = path + imports + leading
-// comment; `medium` additionally includes exported names and the file head.
-function describe(rel: string, content: string, mode: "minimal" | "medium"): string {
+// Compact textual context for one file. `minimal` = path + imports + leading comment.
+// `medium` additionally sends a *structural skeleton* — exported names, the file's line
+// count, and each top-level declaration's signature + length — so a Lens can judge the
+// code's size and shape without ever shipping a function body (cost scales with the
+// declaration count, not the file size). Exported for the painter test.
+export function describeFile(rel: string, content: string, mode: "minimal" | "medium"): string {
   const capped = content.length > MAX_FILE_BYTES ? content.slice(0, MAX_FILE_BYTES) : content
   const imports = ApertureExtract.parseImports(rel, capped)
   const comment = leadingComment(capped)
@@ -486,9 +505,32 @@ function describe(rel: string, content: string, mode: "minimal" | "medium"): str
   if (mode === "medium") {
     const exports = exportedNames(capped)
     if (exports.length) lines.push(`exports: ${exports.slice(0, 20).join(", ")}`)
-    lines.push("head:", capped.split("\n").slice(0, HEAD_LINES).join("\n"))
+    lines.push(`lines: ${lineCount(capped)}`)
+    // Top-level declarations only (the preamble — imports/top-level code before the first
+    // declaration — is already covered by imports/comment). Each becomes one skeleton
+    // line: its signature (first non-blank line) + its span, so a long function or a file
+    // with too many responsibilities is visible at a glance.
+    const decls = ApertureExtents.extentsOf(capped).filter((e) => e.name !== ApertureExtents.PREAMBLE)
+    if (decls.length) {
+      lines.push("decls:")
+      for (const e of decls.slice(0, MAX_SKELETON_DECLS)) {
+        const sig = firstNonBlank(ApertureExtents.extentText(capped, e)).slice(0, SKELETON_SIG_CHARS)
+        lines.push(`- ${sig}  [${e.endLine - e.startLine + 1} lines]`)
+      }
+      if (decls.length > MAX_SKELETON_DECLS) lines.push(`- (+${decls.length - MAX_SKELETON_DECLS} more)`)
+    }
   }
   return lines.join("\n")
+}
+
+// Line count of a (possibly empty) string: 0 for "", else one per newline-delimited line.
+function lineCount(content: string): number {
+  return content.length === 0 ? 0 : content.split("\n").length
+}
+
+// First non-blank line of a block, trimmed. "" when the block is all whitespace.
+function firstNonBlank(text: string): string {
+  return (text.split("\n").find((l) => l.trim() !== "") ?? "").trim()
 }
 
 // First contiguous run of leading comments (// or /* */ or #), flattened.

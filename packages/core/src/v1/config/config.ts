@@ -187,7 +187,7 @@ export const Info = Schema.Struct({
         Schema.Struct({
           context: Schema.optional(Schema.Literals(["minimal", "medium"])).annotate({
             description:
-              "How much per-file context the Aperture semantic painter sends to the model. 'minimal' (default) uses path + imports + leading comment; 'medium' adds exported names and the file head.",
+              "Global override for how much per-file context the Aperture semantic painter sends the model, forcing one mode across ALL Lenses (normally each Lens chooses via its own 'context'). 'minimal' uses path + imports + leading comment; 'medium' adds a structural skeleton (exported names, file line count, and each top-level declaration's signature + length). Leave unset to let each Lens decide (default minimal).",
           }),
           concurrency: Schema.optional(Schema.Int).annotate({
             description:

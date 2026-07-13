@@ -12,8 +12,17 @@ import * as Tool from "./tool"
 export const Parameters = Schema.Struct({
   name: Schema.String.annotate({ description: 'Short human name for the Lens, e.g. "Auth flow".' }),
   description: Schema.String.annotate({ description: "One-line summary of what this Lens captures." }),
-  palette: Schema.Literals(["pastel", "dark", "bright", "earthy"]).annotate({
-    description: "Colour palette — one of the four predefined categorical palettes (pastel, dark, bright, earthy).",
+  palette: Schema.Literals([
+    "pastel",
+    "dark",
+    "bright",
+    "earthy",
+    "pastel-ordinal",
+    "bright-ordinal",
+    "dark-ordinal",
+  ]).annotate({
+    description:
+      "Colour palette. Use a CATEGORICAL palette (pastel, dark, bright, earthy) for unordered facets — each facet gets a distinct hue. Use an ORDINAL palette (pastel-ordinal, bright-ordinal, dark-ordinal) ONLY when the facets have a natural order (e.g. low→high, few→many, small→large): these run a cool→warm ramp so a facet's colour encodes its rank, and the facets MUST be listed in that order.",
   }),
   prompt: Schema.String.annotate({
     description:
@@ -32,6 +41,10 @@ export const Parameters = Schema.Struct({
   directories: Schema.optional(Schema.Array(Schema.String)).annotate({
     description:
       "Optional repo-relative directories (no leading slash) most relevant to this Lens — e.g. those surfaced while exploring. The painter paints these first, then the rest of the repo; it never restricts the sweep. Omit when there's no obvious focus area.",
+  }),
+  context: Schema.optional(Schema.Literals(["minimal", "medium"])).annotate({
+    description:
+      "How much per-file context the painter sends the model. 'minimal' (default) uses the path, imports, and leading comment — enough to place a file by WHAT IT IS (its role/feature/layer). Choose 'medium' ONLY when the facets require judging the code's SHAPE or QUALITY (e.g. code smells, complexity, god files, test coverage): it additionally sends a cheap structural skeleton (exported names, file line count, and each top-level declaration's signature + length) — never a function body. Medium costs more input tokens per file, so prefer minimal unless the facets genuinely can't be decided from path/imports/comment alone.",
   }),
   activate: Schema.optional(Schema.Boolean).annotate({
     description:
@@ -69,6 +82,7 @@ export const LensCreateTool = Tool.define(
             prompt: params.prompt,
             facets: params.facets.map((t) => ({ label: t.label, description: t.description })),
             directories: params.directories,
+            context: params.context,
             activate: params.activate,
           })
 

@@ -29,7 +29,7 @@ export type LensScope = "global" | "project"
 // this in `finalize` to synthesize the facet store directly; the painter and background
 // sweep are skipped entirely (no tokens, always fresh). Absent on every semantic
 // Lens (architecture + all user Lenses).
-export type DeterministicKind = "git-changed" | "mtime-buckets"
+export type DeterministicKind = "git-changed" | "mtime-buckets" | "bus-factor"
 
 export interface Lens {
   readonly id: string
@@ -51,17 +51,36 @@ export interface Lens {
   // Present only on the deterministic built-ins (see DeterministicKind). When set, the
   // server computes this Lens's facets from the repo rather than running the painter.
   readonly deterministic?: DeterministicKind
+  // How much per-file context the painter sends the model for THIS Lens (painter.ts
+  // `describe`). "minimal" (default, absent) = path + imports + leading comment — enough
+  // to place a file by what it *is*. "medium" additionally sends a cheap structural
+  // skeleton (exported names, file line count, and each top-level declaration's signature
+  // + length) so a Lens that needs to judge the *shape* of the code — e.g. "code smells",
+  // "god files", complexity — has real signal without ever shipping a function body. Opt
+  // into "medium" only when the facets genuinely require it; it costs more input tokens
+  // per file. A global config override (aperture.painter.context) can force one mode across
+  // all Lenses for experimentation.
+  readonly context?: "minimal" | "medium"
 }
 
 // --- palettes --------------------------------------------------------------
 
-// Four predefined *categorical* palettes (qualitative, never ordinal/diverging),
-// each a different tone so Lenses are partially visually distinctive at a
-// glance: soft pastels, deep darks, vivid brights, muted earth tones. Six colours
-// each caps a Lens at MAX_FACETS facets. Fixed hex (theme-independent) — the
-// distinctiveness across palettes is the point and can't survive being remapped
-// onto a theme's handful of roles.
-export type PaletteId = "pastel" | "dark" | "bright" | "earthy"
+// Predefined palettes, split by `kind`. CATEGORICAL palettes (qualitative — pastel, dark,
+// bright, earthy) give each facet a maximally *distinct* hue for unordered categories; each
+// is a different tone so Lenses are partially distinguishable at a glance. ORDINAL palettes
+// (pastel/bright/dark-ordinal) instead run a *cool→warm spectral ramp* so a facet's colour
+// encodes its rank — for facet sets that have a natural order (few→many, old→new, low→high).
+// Six colours each caps a Lens at MAX_FACETS facets. Fixed hex (theme-independent) — the
+// distinctiveness across palettes is the point and can't survive being remapped onto a
+// theme's handful of roles.
+export type PaletteId =
+  | "pastel"
+  | "dark"
+  | "bright"
+  | "earthy"
+  | "pastel-ordinal"
+  | "bright-ordinal"
+  | "dark-ordinal"
 
 export const MAX_FACETS = 6
 
@@ -85,31 +104,79 @@ export const UNTAGGED_LABEL = "Non-code"
 export interface Palette {
   readonly id: PaletteId
   readonly label: string
+  // "categorical" — distinct hues for unordered facets; "ordinal" — a cool→warm ramp whose
+  // position encodes rank, for facet sets with a natural order. The Lens designer picks a
+  // kind to match its facets (see the palette guidance in prompt/lens.txt).
+  readonly kind: "categorical" | "ordinal"
   readonly colors: ReadonlyArray<string>
 }
 
+// Palette colours must stay legible in a 256-colour terminal (COLORTERM unset), not just
+// truecolor: the renderer's RGB is quantised to the xterm-256 palette, and a colour that
+// is both dark *and* low-saturation snaps onto the grey ramp — where it reads as (and
+// collides with) the "Other"/Non-code greys (NONE_HUE/UNTAGGED_HUE). The safe move for a
+// muted look is to sit each colour on an exact colour-*cube* entry (channels drawn from
+// {0,95,135,175,215,255}) with at least two distinct levels, so it can never round to grey.
+// The "no ... collapses to grey" test in lenses.test.ts guards this.
 export const PALETTES: Record<PaletteId, Palette> = {
   pastel: {
     id: "pastel",
     label: "Pastel",
+    kind: "categorical",
     colors: ["#A8D5BA", "#F7C8A0", "#B5C7EB", "#F4B8C4", "#E2C2E9", "#F5E1A4"],
   },
+  // Muted-but-not-grey in 256-colour: every entry lands on an exact dark colour-cube cell
+  // (idx 131/94/65/30/61/96), spanning a full hue wheel while staying low-luminance.
   dark: {
     id: "dark",
     label: "Dark",
-    colors: ["#2E5266", "#6E4555", "#3B6B35", "#8C4843", "#4A4E69", "#7A5C2E"],
+    kind: "categorical",
+    colors: ["#AF5F5F", "#875F00", "#5F875F", "#008787", "#5F5FAF", "#875F87"],
   },
   bright: {
     id: "bright",
     label: "Bright",
+    kind: "categorical",
     colors: ["#4E79A7", "#F28E2B", "#59A14F", "#E15759", "#B07AA1", "#EDC948"],
   },
+  // #5B6C5D (slot 5) previously quantised to grey rgb(98,98,98); replaced with a muted
+  // slate that lands on an exact cube cell and stays clear of the other five earth tones.
   earthy: {
     id: "earthy",
     label: "Earthy",
-    colors: ["#8C7A5B", "#A65E2E", "#6B8E5A", "#C2A878", "#5B6C5D", "#9C6B4F"],
+    kind: "categorical",
+    colors: ["#8C7A5B", "#A65E2E", "#6B8E5A", "#C2A878", "#5F5F87", "#9C6B4F"],
+  },
+  // Ordinal ramps — cool (indigo) → warm (red) so colour position reads as rank. Three tonal
+  // registers mirroring the categorical trio. All 256-safe (no colour hits the grey ramp).
+  "pastel-ordinal": {
+    id: "pastel-ordinal",
+    label: "Pastel (ordinal)",
+    kind: "ordinal",
+    colors: ["#8E9BD9", "#79C7C1", "#9BCF8F", "#EFE08F", "#F3C08A", "#EB9A9A"],
+  },
+  // Vivid cool→warm spectrum; the same ramp the built-in "Edit recency" heat-map Lens paints
+  // (RECENCY_COLORS below is derived from this, so the two never drift).
+  "bright-ordinal": {
+    id: "bright-ordinal",
+    label: "Bright (ordinal)",
+    kind: "ordinal",
+    colors: ["#4E5BA6", "#3AAFA9", "#59A14F", "#EDC948", "#F28E2B", "#E15759"],
+  },
+  // Dark cool→warm ramp on exact colour-cube cells (256-safe by construction).
+  "dark-ordinal": {
+    id: "dark-ordinal",
+    label: "Dark (ordinal)",
+    kind: "ordinal",
+    colors: ["#5F5FAF", "#008787", "#5F875F", "#87875F", "#875F00", "#AF5F5F"],
   },
 }
+
+// The ids of the ordinal (ranked) palettes — the Lens designer picks one of these only when
+// a Lens's facets have a natural order. The rest are categorical.
+export const ORDINAL_PALETTE_IDS = (Object.values(PALETTES) as Palette[])
+  .filter((p) => p.kind === "ordinal")
+  .map((p) => p.id)
 
 export const PALETTE_IDS = Object.keys(PALETTES) as PaletteId[]
 
@@ -151,22 +218,49 @@ export const ARCHITECTURE: Lens = {
 
 // --- built-in deterministic Lenses ------------------------------------
 
-// "Changed since last commit": a two-facet Lens painted from `git status` rather
-// than the model. "changed" covers any working-tree change git reports (modified,
-// staged, AND untracked/new files); everything else is "unchanged" and recedes to a
-// muted theme grey so the changes pop. Colours: a fixed warm hex for changed, a
-// theme-role key for unchanged (resolveColor accepts both).
+// "Changed since last commit": painted from `git status` + `git diff --numstat` rather
+// than the model. A changed file (any working-tree change git reports — modified, staged,
+// OR untracked/new) is bucketed by its *magnitude* of change — total lines added + deleted
+// vs HEAD (a new file counts its whole size) — into five bands; everything else is
+// "unchanged" and recedes to a muted theme grey so the changes pop.
 export const GIT_CHANGED_ID = "git-changed"
+
+// Change-magnitude buckets, smallest→largest, naming each band's lower bound (change-1 =
+// 1–9 lines, and also the home of a 0-churn change like a mode-only edit). The single
+// source of truth for the index↔id mapping shared with the deterministic compute. Five
+// bands + "unchanged" = MAX_FACETS facets exactly.
+export const CHANGE_FACET_IDS = ["change-1", "change-10", "change-25", "change-50", "change-100"] as const
+// Upper edges of the first four buckets; a churn below edge `i` lands in bucket `i`, and
+// anything at/above the last edge lands in the final (100+) bucket.
+const CHANGE_EDGES = [10, 25, 50, 100] as const
+// Warm heat ramp (NOT the cool→warm ordinal ramps): different warm shades of the original
+// "Changed" amber, running pale gold → red as the change grows, so magnitude reads as heat.
+// Every colour sits on an exact 256-colour cube cell (channels from {0,95,135,175,215,255})
+// with ≥2 distinct levels, so none can quantise onto the grey ramp (see the PALETTES note).
+const CHANGE_COLORS = ["#FFD787", "#FFAF5F", "#FF8700", "#FF5F00", "#D70000"] as const
+const CHANGE_LABELS = ["< 10 lines", "10–24 lines", "25–49 lines", "50–99 lines", "100+ lines"] as const
+
+// Bucket a changed file's line churn (additions + deletions vs HEAD) into a CHANGE_FACET_IDS
+// index. Pure + total: churn 0 (e.g. a mode-only change) falls into the smallest band.
+export function changeBucketIndex(lines: number): number {
+  for (let i = 0; i < CHANGE_EDGES.length; i++) if (lines < CHANGE_EDGES[i]!) return i
+  return CHANGE_EDGES.length
+}
 
 export const GIT_CHANGED: Lens = {
   id: GIT_CHANGED_ID,
   name: "Changed since last commit",
-  description: "Highlights files with uncommitted working-tree changes (modified, staged, or new) against the rest.",
+  description: "Buckets files with uncommitted changes by how many lines changed (few = pale, many = hot); the rest recede.",
   prompt: "",
   scope: "global",
   deterministic: "git-changed",
   facets: [
-    { id: "changed", label: "Changed", description: "File has uncommitted working-tree changes.", color: "#F2A53A" },
+    ...CHANGE_FACET_IDS.map((id, i) => ({
+      id,
+      label: CHANGE_LABELS[i]!,
+      description: `File has ${CHANGE_LABELS[i]!.toLowerCase()} of uncommitted working-tree changes.`,
+      color: CHANGE_COLORS[i]!,
+    })),
     { id: "unchanged", label: "Unchanged", description: "File matches the last commit.", color: "textMuted" },
   ],
 }
@@ -180,9 +274,10 @@ export const GIT_CHANGED: Lens = {
 export const MTIME_RECENCY_ID = "edit-recency"
 
 // Facet ids in oldest→newest order; the single source of truth for index↔id mapping shared
-// with the deterministic compute. Colours run cool→warm so newest = red.
+// with the deterministic compute. Colours run cool→warm so newest = red — this heat-map ramp
+// IS the shared "bright-ordinal" palette (kept in one place so the two can't drift).
 export const RECENCY_FACET_IDS = ["recency-0", "recency-1", "recency-2", "recency-3", "recency-4", "recency-5"] as const
-const RECENCY_COLORS = ["#4E5BA6", "#3AAFA9", "#59A14F", "#EDC948", "#F28E2B", "#E15759"] as const
+const RECENCY_COLORS = PALETTES["bright-ordinal"].colors
 const RECENCY_LABELS = ["Oldest", "Older", "Mid-age", "Recent", "Newer", "Newest"] as const
 
 export const MTIME_RECENCY: Lens = {
@@ -209,13 +304,51 @@ export function bucketIndex(mtime: number, min: number, max: number, count = REC
   return Math.min(count - 1, Math.floor(((mtime - min) / (max - min)) * count))
 }
 
+// --- built-in bus-factor Lens -----------------------------------------
+
+// "Bus factor": a knowledge-silo heat map. Each file is bucketed by how many distinct
+// *significant* authors have ever touched it in git history (mailmap-normalised author,
+// not committer/pusher), so warm = few owners = high risk if they leave. Deterministic —
+// computed from `git log --numstat` in the server, no model call. Files with no history
+// (untracked/new) fall to the universal NONE_FACET grey. Colours run warm→cool so a
+// single-author file glows red. Availability-gated to a git work tree (like git-changed).
+export const BUS_FACTOR_ID = "bus-factor"
+
+// Facet ids in fewest→most-authors order (the single source of truth for the index↔id
+// mapping shared with the deterministic compute). Note the ids are not contiguous: they
+// name the *lower bound* of each bucket (bus-3 covers 3–4, bus-5 covers 5+).
+export const BUS_FACTOR_FACET_IDS = ["bus-1", "bus-2", "bus-3", "bus-5"] as const
+const BUS_FACTOR_COLORS = ["#E15759", "#F28E2B", "#59A14F", "#4E5BA6"] as const
+const BUS_FACTOR_LABELS = ["1 author", "2 authors", "3–4 authors", "5+ authors"] as const
+const BUS_FACTOR_DESCRIPTIONS = [
+  "Only one author has ever touched this file — highest bus-factor risk.",
+  "Two authors have touched this file.",
+  "Three or four authors have touched this file.",
+  "Five or more authors have touched this file — knowledge is well spread.",
+] as const
+
+export const BUS_FACTOR: Lens = {
+  id: BUS_FACTOR_ID,
+  name: "Bus factor",
+  description: "Buckets files by how many distinct authors have ever touched them (few = warm = risk).",
+  prompt: "",
+  scope: "global",
+  deterministic: "bus-factor",
+  facets: BUS_FACTOR_FACET_IDS.map((id, i) => ({
+    id,
+    label: BUS_FACTOR_LABELS[i]!,
+    description: BUS_FACTOR_DESCRIPTIONS[i]!,
+    color: BUS_FACTOR_COLORS[i]!,
+  })),
+}
+
 // All built-in (globally-defined) Lenses — the protected group. Built-ins are
 // immutable: they cannot be edited, have their facets merged, or be deleted (the
 // create/edit/merge/delete flows and the UI all refuse them via `isBuiltinLens`
 // / `BUILTIN_LENS_IDS`). They inherit that protection automatically from their
 // global scope — no other code needs to change to add one. The two deterministic ones
 // additionally carry a `deterministic` kind so the server paints them without the painter.
-export const BUILTIN_LENSES: ReadonlyArray<Lens> = [ARCHITECTURE, GIT_CHANGED, MTIME_RECENCY]
+export const BUILTIN_LENSES: ReadonlyArray<Lens> = [ARCHITECTURE, GIT_CHANGED, MTIME_RECENCY, BUS_FACTOR]
 
 // The ids of the protected built-in group — for callers that only have an id (e.g. the
 // renderer deciding whether to show a delete control).
@@ -277,7 +410,9 @@ export function buildSystemPrompt(lens: Lens): string {
     ...lens.facets.map((t) => `- ${t.id}: ${t.description}`),
     `- ${NONE_FACET}: none of the above — the file is unrelated to every facet`,
     `Assign each source file exactly one facet, using "${NONE_FACET}" when it fits none rather than forcing a fit.`,
-    "Infer the facet from the file path, its imports, and its leading comment.",
+    lens.context === "medium"
+      ? "Infer the facet from the file path, its imports, leading comment, exported names, and the declaration skeleton — the file's line count plus each top-level declaration's signature and length in lines (a proxy for the code's size and shape)."
+      : "Infer the facet from the file path, its imports, and its leading comment.",
     "Return one entry per input file, echoing its exact path.",
   ].join("\n")
 }

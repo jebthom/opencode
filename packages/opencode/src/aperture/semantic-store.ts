@@ -106,6 +106,16 @@ export const mergeFacet = (
     })
     .pipe(Effect.ignore)
 
+// Replace a Lens's entire facet store in one atomic write (vs upsert's merge). Used by the
+// bus-factor built-in, whose store is fully recomputed from git history on each HEAD change:
+// a merge would leave stale entries for since-deleted files, so we overwrite wholesale.
+export const replace = (
+  storage: Storage.Interface,
+  projectID: string,
+  lensID: string,
+  store: Store,
+): Effect.Effect<void> => storage.write(key(projectID, lensID), store).pipe(Effect.ignore)
+
 // Drop every facet for a Lens, forcing a from-scratch re-paint on the next sweep.
 // Used when a *structural* edit (facets added/removed/redefined, or the prompt changed)
 // invalidates the previously-inferred facets.

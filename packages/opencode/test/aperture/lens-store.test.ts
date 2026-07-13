@@ -76,4 +76,40 @@ describe("aperture lens-store (project-dir persistence)", () => {
     // Removing a built-in (lives in code, not on disk) is a no-op.
     expect(await Effect.runPromise(ApertureLensStore.remove(dir, ARCHITECTURE_ID))).toBe(false)
   })
+
+  test("context mode: medium persists, minimal is omitted (default)", async () => {
+    const minimal = await Effect.runPromise(ApertureLensStore.create(dir, { ...CREATE, name: "Min" }))
+    expect(minimal.context).toBeUndefined()
+
+    const medium = await Effect.runPromise(
+      ApertureLensStore.create(dir, { ...CREATE, name: "Smells", context: "medium" }),
+    )
+    expect(medium.context).toBe("medium")
+
+    // The default stays absent from the committed JSON; only the medium Lens carries it.
+    const onDisk = JSON.parse(await fs.readFile(path.join(dir, ".opencode", "aperture", "lenses.json"), "utf8"))
+    expect("context" in onDisk[minimal.id]).toBe(false)
+    expect(onDisk[medium.id].context).toBe("medium")
+  })
+
+  test("editing context is structural and a downgrade to minimal clears the field", async () => {
+    const lens = await Effect.runPromise(ApertureLensStore.create(dir, { ...CREATE, name: "Ctx" }))
+
+    const up = await Effect.runPromise(ApertureLensStore.update(dir, lens.id, { context: "medium" }))
+    expect(up?.structural).toBe(true)
+    expect(up?.lens.context).toBe("medium")
+
+    const down = await Effect.runPromise(ApertureLensStore.update(dir, lens.id, { context: "minimal" }))
+    expect(down?.structural).toBe(true)
+    expect(down?.lens.context).toBeUndefined()
+    // The field is dropped from disk, not persisted as "minimal".
+    const onDisk = JSON.parse(await fs.readFile(path.join(dir, ".opencode", "aperture", "lenses.json"), "utf8"))
+    expect("context" in onDisk[lens.id]).toBe(false)
+
+    // Editing something else leaves an existing medium mode untouched and non-structural.
+    await Effect.runPromise(ApertureLensStore.update(dir, lens.id, { context: "medium" }))
+    const cosmetic = await Effect.runPromise(ApertureLensStore.update(dir, lens.id, { name: "Ctx renamed" }))
+    expect(cosmetic?.structural).toBe(false)
+    expect(cosmetic?.lens.context).toBe("medium")
+  })
 })

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test"
-import { splitDirs } from "@/aperture/painter"
+import { splitDirs, describeFile } from "@/aperture/painter"
 
 // Records mirror the painter's stale shape; splitDirs only reads `node.path`.
 const rec = (path: string) => ({ node: { id: path, path } })
@@ -60,5 +60,58 @@ describe("splitDirs", () => {
     const a = splitDirs(recs(...paths), 30).map((b) => b.map((r) => r.node.path))
     const b = splitDirs(recs(...[...paths].reverse()), 30).map((b) => b.map((r) => r.node.path))
     expect(a).toEqual(b)
+  })
+})
+
+describe("describeFile", () => {
+  const SAMPLE = [
+    "// user store",
+    "import { db } from './db'",
+    "",
+    "export function load(id: string) {",
+    "  return db.get(id)",
+    "}",
+    "",
+    "export const CACHE = new Map()",
+  ].join("\n")
+
+  it("minimal sends only path + imports + leading comment (no skeleton)", () => {
+    const out = describeFile("src/store.ts", SAMPLE, "minimal")
+    expect(out).toContain("path: src/store.ts")
+    expect(out).toContain("imports: ./db")
+    expect(out).toContain("comment: user store")
+    expect(out).not.toContain("decls:")
+    expect(out).not.toContain("lines:")
+    expect(out).not.toContain("exports:")
+  })
+
+  it("medium adds exports, line count, and a per-declaration signature + span skeleton", () => {
+    const out = describeFile("src/store.ts", SAMPLE, "medium")
+    // Keeps the minimal signal…
+    expect(out).toContain("path: src/store.ts")
+    expect(out).toContain("imports: ./db")
+    // …and layers the structural skeleton on top.
+    expect(out).toContain("exports: load, CACHE")
+    expect(out).toContain(`lines: ${SAMPLE.split("\n").length}`)
+    expect(out).toContain("decls:")
+    // Span runs to the line before the next declaration (the trailing blank folds in).
+    expect(out).toContain("- export function load(id: string) {  [4 lines]")
+    expect(out).toContain("- export const CACHE = new Map()  [1 lines]")
+    // Never ships a function body.
+    expect(out).not.toContain("return db.get(id)")
+  })
+
+  it("medium caps the skeleton at 40 declarations with a +N-more line", () => {
+    const many = Array.from({ length: 50 }, (_, i) => `export const v${i} = ${i}`).join("\n")
+    const out = describeFile("src/many.ts", many, "medium")
+    const declLines = out.split("\n").filter((l) => l.startsWith("- "))
+    // 40 listed declarations + one "(+N more)" summary line.
+    expect(declLines.length).toBe(41)
+    expect(out).toContain("- (+10 more)")
+  })
+
+  it("medium on a declaration-free file emits no decls section", () => {
+    const out = describeFile("src/data.json", '{ "a": 1 }', "medium")
+    expect(out).not.toContain("decls:")
   })
 })
