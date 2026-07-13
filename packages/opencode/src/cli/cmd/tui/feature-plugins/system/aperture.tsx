@@ -9,7 +9,7 @@ import { NONE_FACET, NONE_HUE, NONE_LABEL, UNTAGGED_HUE, UNTAGGED_LABEL, BUILTIN
 import { allocateCells, buildGrid, coalesce } from "@/aperture/treemap"
 import { ACTION_GLYPH, ACTION_LABEL, ACTIONS, type Action, type ActivityEntry, type Fill, type Style } from "@/aperture/activity"
 import { createActivityTracker } from "./aperture-activity"
-import { openLensPicker } from "./aperture-lens-picker"
+import { openLensPicker, fetchLenses, drillDownsOf } from "./aperture-lens-picker"
 
 const id = "internal:aperture"
 
@@ -394,20 +394,33 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   // "confirm?" state, the second performs the delete. Fire-and-forget — the repaint
   // (and the fall-back to Architecture) rides aperture.invalidated like a cycle.
   const [confirmingDelete, setConfirmingDelete] = createSignal(false)
+  // Deleting a Lens also deletes every drill-down scoped to it (their domains are its
+  // facets — without it they can't paint at all). That's painted work the user can't see
+  // from here, so the confirm has to count it rather than destroy it silently.
+  const [cascade, setCascade] = createSignal(0)
   const deleteActiveLens = () => {
     if (!canDeleteActive()) return
     if (!confirmingDelete()) {
       setConfirmingDelete(true)
+      void fetchLenses(props.api)
+        .then((all) => setCascade(drillDownsOf(all, activeId()).length))
+        .catch(() => setCascade(0))
       return
     }
     setConfirmingDelete(false)
     logInteraction("lens.delete", activeId())
     void props.api.client.aperture.deleteLens({ lens: activeId() })
   }
+  const deleteLabel = () => {
+    if (!confirmingDelete()) return "✕"
+    const n = cascade()
+    return n > 0 ? `✕ confirm? (+${n} drill-down${n > 1 ? "s" : ""})` : "✕ confirm?"
+  }
   // Disarm the confirm if the active Lens changes out from under us.
   createEffect(() => {
     activeId()
     setConfirmingDelete(false)
+    setCascade(0)
   })
   const colorByFacet = createMemo(() => new Map(legendEntries().map((e) => [e.facet, e.color])))
   // A facet id → colour: the NONE_FACET escape paints the "Other" grey; a real facet paints
@@ -809,7 +822,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                 onMouseDown={() => deleteActiveLens()}
                 wrapMode="none"
               >
-                {confirmingDelete() ? "✕ confirm?" : "✕"}
+                {deleteLabel()}
               </text>
             </Show>
           </box>

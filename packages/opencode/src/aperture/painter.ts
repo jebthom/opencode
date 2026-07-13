@@ -14,7 +14,7 @@ import type { Config } from "@/config/config"
 import { ApertureSemanticStore } from "./semantic-store"
 import { ApertureSubfacetStore } from "./subfacet-store"
 import { ApertureEvent } from "./event"
-import { type Lens, isAssignableFacet, facetEnumIds, buildSystemPrompt } from "./lenses"
+import { type Lens, isAssignableFacet, facetEnumIds, buildSystemPrompt, NONE_FACET } from "./lenses"
 import { ApertureExtract } from "./extract"
 import { ApertureExtents } from "./extents"
 
@@ -75,6 +75,77 @@ export interface FileNode {
   readonly path: string
 }
 
+// The resolved domain of a *drill-down* Lens, handed to the painter by the caller (the
+// service owns resolution — it needs git and the whole-repo subtree, which the painter's
+// Deps deliberately lack). This is what makes a drill-down trustworthy: the model is only
+// ever shown in-domain files, so it cannot pull a file that wasn't in the drilled facet
+// into one of the child's facets. Everything else is bucketed out *deterministically*.
+export interface Domain {
+  // The parent Lens, for the system prompt's domain note.
+  readonly parent: Lens
+  // nodeID → the parent facet the file carries (its "witness"). A node ABSENT from this map
+  // has not been placed by the parent yet — it is neither in nor out of the domain, and the
+  // painter must leave it entirely alone (see the fail-closed note in paintStale).
+  readonly witness: ReadonlyMap<string, string>
+  // The nodeIDs whose witness falls in the drill-down's scoped subset.
+  readonly allowed: ReadonlySet<string>
+}
+
+// Whether a node needs (re)deciding: never painted, its content changed, or — for a
+// drill-down — the parent moved it to a different facet. That last case is invisible to a
+// content hash (the file didn't change, its *domain* did), which is why entries carry `via`.
+export function isStale(
+  entry: ApertureSemanticStore.Entry | undefined,
+  hash: string,
+  witness: string | undefined,
+): boolean {
+  if (!entry) return true
+  if (entry.hash !== hash) return true
+  return witness !== undefined && entry.via !== witness
+}
+
+export interface Partition<T> {
+  // In-domain: the only files the model ever sees.
+  readonly classify: T[]
+  // Out-of-domain: bucketed into NONE_FACET with no model call.
+  readonly bucket: T[]
+  // Unwitnessed — the parent hasn't placed them even after the fill. Left completely
+  // untouched and retried next sweep; bucketing them would be permanent (see paintStale).
+  readonly skip: T[]
+}
+
+// Split stale files three ways by domain membership. Pure and exported so the guarantee the
+// whole feature rests on — an out-of-domain file is NEVER handed to the model — is directly
+// testable, rather than only reachable through a live painter.
+export function partitionByDomain<T extends { readonly node: FileNode }>(
+  stale: ReadonlyArray<T>,
+  domain: Domain | undefined,
+): Partition<T> {
+  if (!domain) return { classify: [...stale], bucket: [], skip: [] }
+  const classify: T[] = []
+  const bucket: T[] = []
+  const skip: T[] = []
+  for (const r of stale) {
+    if (domain.witness.get(r.node.id) === undefined) skip.push(r)
+    else if (domain.allowed.has(r.node.id)) classify.push(r)
+    else bucket.push(r)
+  }
+  return { classify, bucket, skip }
+}
+
+export interface PaintOptions {
+  // Set when `lens` is a drill-down; absent for a root Lens (paint the whole repo).
+  readonly domain?: Domain
+  // Whether to publish an invalidation when something was painted. False for a nested
+  // parent-fill: the store it writes isn't the one being viewed, and the child's own pass
+  // publishes a moment later anyway — so publishing here only buys a wasted refetch.
+  readonly publish?: boolean
+  // The Lens whose sweep *caused* this pass, when that isn't `lens` itself (i.e. a parent
+  // fill forced by a drill-down). Study logging attributes the spend to both, so a
+  // drill-down's true cost — its own paint plus the ancestor fills it forced — is visible.
+  readonly trigger?: string
+}
+
 export interface Deps {
   readonly storage: Storage.Interface
   readonly events: EventV2.Interface
@@ -112,8 +183,10 @@ export const paintStale = Effect.fn("Aperture.paintStale")(function* (
   fileNodes: ReadonlyArray<FileNode>,
   origin: Origin,
   lens: Lens,
+  options: PaintOptions = {},
 ) {
   if (fileNodes.length === 0) return
+  const { domain, publish = true, trigger } = options
 
   const store = yield* ApertureSemanticStore.read(deps.storage, projectID, lens.id)
 
@@ -135,7 +208,10 @@ export const paintStale = Effect.fn("Aperture.paintStale")(function* (
   const stale = read
     .filter((r): r is { node: FileNode; content: string } => typeof r.content === "string")
     .map((r) => ({ ...r, hash: hashContent(r.content) }))
-    .filter((r) => store[r.node.id]?.hash !== r.hash)
+    // Keyed on the witness as well as the content hash: when a parent re-paints a file into
+    // a different facet the file's *content* is unchanged, so a hash-only check would freeze
+    // it at a facet its domain no longer supports.
+    .filter((r) => isStale(store[r.node.id], r.hash, domain?.witness.get(r.node.id)))
     .slice(0, MAX_PER_PASS)
 
   if (stale.length === 0) {
@@ -143,31 +219,56 @@ export const paintStale = Effect.fn("Aperture.paintStale")(function* (
     return
   }
 
+  // Domain gate. Every stale file lands in exactly one of three buckets:
+  //
+  //   in-domain     — its witness is one of the scoped parent facets. Classified below.
+  //   out-of-domain — witnessed, but by a facet outside the scope. Bucketed straight into
+  //                   NONE_FACET here, with NO model call. This is the guarantee the whole
+  //                   feature rests on: the stochastic painter never even sees these files,
+  //                   so it can't pull one into a drill-down facet.
+  //   unwitnessed   — the parent hasn't placed it yet, *even after* the caller's parent
+  //                   fill: a bin soft-failed, no model was available, the file was
+  //                   unreadable, or the model just omitted the path from its echo. FAIL
+  //                   CLOSED — skip it entirely and retry next sweep. Writing NONE here
+  //                   would be permanent: the entry's hash would match forever after, and
+  //                   the file would never be reconsidered.
+  const { classify: classifiable, bucket, skip } = partitionByDomain(stale, domain)
+  const direct: ApertureSemanticStore.Store = {}
+  for (const r of bucket) direct[r.node.id] = { facet: NONE_FACET, hash: r.hash, via: domain!.witness.get(r.node.id)! }
+  if (domain)
+    yield* appendPerfEvent(directory, origin, "domain", {
+      lens: lens.id,
+      parent: domain.parent.id,
+      inDomain: classifiable.length,
+      outOfDomain: bucket.length,
+      unwitnessed: skip.length,
+    })
+
   const context = yield* contextMode(deps.config, lens)
-  const language = yield* resolveLanguage(deps.provider)
-  if (!language) {
+  const language = classifiable.length === 0 ? undefined : yield* resolveLanguage(deps.provider)
+  if (classifiable.length > 0 && !language) {
     log.info("no small model available; skipping paint pass", { projectID, scope })
-    yield* appendPerfEvent(directory, origin, "skip", { reason: "no-language", stale: stale.length })
-    return
+    yield* appendPerfEvent(directory, origin, "skip", { reason: "no-language", stale: classifiable.length })
+    // The out-of-domain bucketing below needs no model, so it still lands.
   }
 
   const facetSchema = buildFacetSchema(lens)
-  const system = buildSystemPrompt(lens)
+  const system = buildSystemPrompt(lens, domain?.parent)
 
   // Path → its hash so we can record freshness on whatever the model returns.
-  const hashByPath = new Map(stale.map((r) => [r.node.path, r.hash]))
-  const idByPath = new Map(stale.map((r) => [r.node.path, r.node.id]))
+  const hashByPath = new Map(classifiable.map((r) => [r.node.path, r.hash]))
+  const idByPath = new Map(classifiable.map((r) => [r.node.path, r.node.id]))
 
   // Dir-coherent binning (the "dirsplit" perf-eval winner): one bin per directory,
   // big dirs split into same-dir chunks of FACET_BATCH — maximally coherent prompts.
   // Bins are classified up to `fanout`-wide; a single failed bin soft-fails to "paint
   // nothing" (catch inside the worker) without interrupting its siblings.
-  const bins = splitDirs(stale, FACET_BATCH)
+  const bins = language ? splitDirs(classifiable, FACET_BATCH) : []
   const fanout = yield* painterConcurrency(deps.config)
-  const classifyBin = (bin: typeof stale) =>
+  const classifyBin = (bin: typeof classifiable) =>
     Effect.gen(function* () {
       const blocks = bin.map((r) => describeFile(r.node.path, r.content, context)).join("\n\n")
-      const { files: assignments, usage } = yield* classifyWithRetry(language, blocks, facetSchema, system, lens).pipe(
+      const { files: assignments, usage } = yield* classifyWithRetry(language!, blocks, facetSchema, system, lens).pipe(
         Effect.catchCause((cause) => {
           log.error("classify failed", { projectID, scope, cause })
           return Effect.succeed<ClassifyResult>(EMPTY_CLASSIFY)
@@ -179,8 +280,9 @@ export const paintStale = Effect.fn("Aperture.paintStale")(function* (
 
   // Sequential post-pass: the perf log's byte counter (writePerfLine) and the painted
   // store are written here, not inside the concurrent workers, so the fan-out
-  // never races the counter or interleaves appends.
-  const painted: ApertureSemanticStore.Store = {}
+  // never races the counter or interleaves appends. Seeded with the out-of-domain
+  // bucketing so both halves land in one atomic upsert and one invalidation.
+  const painted: ApertureSemanticStore.Store = { ...direct }
   let painterInput = 0
   let painterOutput = 0
   for (const { blocks, assignments, usage } of results) {
@@ -191,20 +293,31 @@ export const paintStale = Effect.fn("Aperture.paintStale")(function* (
       const id = idByPath.get(a.path)
       const hash = hashByPath.get(a.path)
       if (!id || !hash) continue
-      painted[id] = { facet: a.facet, hash }
+      // Carry the witness onto the entry so a later parent re-paint re-opens this file.
+      const via = domain?.witness.get(id)
+      painted[id] = { facet: a.facet, hash, ...(via !== undefined ? { via } : {}) }
     }
   }
 
   // Aperture study logging: painter token spend, kept separate from conversation
   // tokens. Attributed to the most-recently-active session (painter is not
-  // session-scoped).
-  yield* StudyLog.recordPainter({ origin, lens: lens.id, inputTokens: painterInput, outputTokens: painterOutput })
+  // session-scoped). `trigger` is set when this pass is an ancestor fill forced by a
+  // drill-down, so the drill-down's true cost isn't hidden in its parent's column.
+  if (painterInput > 0 || painterOutput > 0)
+    yield* StudyLog.recordPainter({
+      origin,
+      lens: lens.id,
+      inputTokens: painterInput,
+      outputTokens: painterOutput,
+      ...(trigger && trigger !== lens.id ? { trigger } : {}),
+    })
 
   const count = Object.keys(painted).length
   if (count === 0) return
 
   yield* ApertureSemanticStore.upsert(deps.storage, projectID, lens.id, painted)
   log.info("painted", { projectID, scope, lens: lens.id, count })
+  if (!publish) return
 
   // Only now that something actually changed do we nudge the live view to refetch
   // and re-merge — the guard that keeps a paint→refetch→paint cycle from forming
@@ -234,6 +347,10 @@ export const paintExtentsStale = Effect.fn("Aperture.paintExtentsStale")(functio
   // Scope to publish the invalidation for once tiles are coloured — the window the
   // user is viewing, so the drilled band live-fills regardless of the file's own dir.
   scope: string,
+  // The resolved parent Lens when `lens` is a drill-down, for the prompt's domain note.
+  // The domain *gate* is the caller's job (scheduleExtentPaint refuses to function-paint an
+  // out-of-domain file at all), so by the time we get here the file is known in-domain.
+  parent?: Lens,
 ) {
   const fs = yield* FSUtil.Service
   const content = yield* fs
@@ -288,7 +405,7 @@ export const paintExtentsStale = Effect.fn("Aperture.paintExtentsStale")(functio
   if (!language) return
 
   const facetSchema = buildFacetSchema(lens)
-  const system = buildSystemPrompt(lens)
+  const system = buildSystemPrompt(lens, parent)
   // Each extent is one classify "block", labelled `relPath#name` so the model echoes
   // an identifier that maps back to the sub-node id.
   const blocks = stale.map((r) => describeExtent(relPath, r.extent.name, r.text)).join("\n\n")

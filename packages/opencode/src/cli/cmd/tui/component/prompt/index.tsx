@@ -19,6 +19,7 @@ import { tint, useTheme } from "@tui/context/theme"
 import { EmptyBorder, SplitBorder } from "@tui/component/border"
 import { Spinner } from "@tui/component/spinner"
 import { useSDK } from "@tui/context/sdk"
+import { fetchLenses, drillDownsOf } from "@tui/feature-plugins/system/aperture-lens-picker"
 import { useRoute } from "@tui/context/route"
 import { useProject } from "@tui/context/project"
 import { useSync } from "@tui/context/sync"
@@ -658,10 +659,18 @@ export function Prompt(props: PromptProps) {
             })
             return
           }
+          // Deleting a Lens cascades to the drill-downs scoped to it — their domain is its
+          // facets, so they can't survive it. Name them: they're painted work the user has
+          // no other way to see from this prompt.
+          const drillDowns = await fetchLenses(sdk)
+            .then((all) => drillDownsOf(all, active.id))
+            .catch(() => [])
           const ok = await DialogConfirm.show(
             dialog,
             "Delete Lens",
-            `Delete "${active.name}"? This removes the Lens and its facets.`,
+            drillDowns.length
+              ? `Delete "${active.name}"? This also deletes the ${drillDowns.length} drill-down Lens(es) scoped to it (${drillDowns.map((l) => l.name).join(", ")}), and all their facets.`
+              : `Delete "${active.name}"? This removes the Lens and its facets.`,
           )
           if (!ok) return
           const result = await sdk.client.aperture

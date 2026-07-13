@@ -5,12 +5,14 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import {
   type Lens,
   type Facet,
+  type LensParent,
   type PaletteId,
   ARCHITECTURE_ID,
   BUILTIN_LENSES,
   PALETTES,
   MAX_FACETS,
   assignColors,
+  orderForest,
   slugify,
 } from "./lenses"
 
@@ -64,9 +66,50 @@ function writeDoc(file: string, content: unknown): Effect.Effect<void> {
 // All user-defined Lenses for a project (empty when none defined yet).
 const readProject = (directory: string): Effect.Effect<StoredLenses> => readDoc<StoredLenses>(lensesFile(directory), {})
 
-// Built-in (global) Lenses first, then the project's user-defined ones.
+// Built-in (global) Lenses first, then the project's user-defined ones — but arranged as a
+// DFS forest (orderForest), so a drill-down always sits immediately after the Lens it is
+// scoped to. That single ordering is what makes the picker render children indented under
+// their parent *and* the ◀ ▶ cycle walk parent → children, with no ordering logic of their
+// own. A drill-down of a *built-in* therefore appears inside the built-in run; it is still
+// a project Lens (scope: "project"), so it stays editable and deletable.
 export const list = (directory: string): Effect.Effect<Lens[]> =>
-  readProject(directory).pipe(Effect.map((project) => [...BUILTIN_LENSES, ...Object.values(project)]))
+  readProject(directory).pipe(
+    Effect.map((project) => orderForest([...BUILTIN_LENSES, ...Object.values(project)]).map((e) => e.lens)),
+  )
+
+// The forest with each Lens's depth + root scope, for the picker (which needs the depth to
+// indent and the root's scope to group a child with its parent rather than tearing it into
+// another section).
+export const forest = (directory: string) =>
+  readProject(directory).pipe(Effect.map((project) => orderForest([...BUILTIN_LENSES, ...Object.values(project)])))
+
+// Only project Lenses can be drill-downs (built-ins live in code and declare no parent), so
+// the project doc alone answers every hierarchy question below.
+
+// The Lenses scoped directly to `id`.
+export const childrenOf = (directory: string, id: string): Effect.Effect<Lens[]> =>
+  readProject(directory).pipe(Effect.map((project) => Object.values(project).filter((l) => l.parent?.lens === id)))
+
+// Every Lens scoped to `id` directly or transitively, nearest first. Cycle-safe (a
+// hand-edited lenses.json could contain a loop, and this must not hang).
+export const descendantsOf = (directory: string, id: string): Effect.Effect<Lens[]> =>
+  readProject(directory).pipe(Effect.map((project) => descendants(Object.values(project), id)))
+
+function descendants(all: ReadonlyArray<Lens>, id: string): Lens[] {
+  const out: Lens[] = []
+  const frontier = [id]
+  const seen = new Set([id])
+  while (frontier.length) {
+    const parent = frontier.shift()!
+    for (const lens of all) {
+      if (lens.parent?.lens !== parent || seen.has(lens.id)) continue
+      seen.add(lens.id)
+      out.push(lens)
+      frontier.push(lens.id)
+    }
+  }
+  return out
+}
 
 // Resolve a Lens by id, checking built-ins then the project store. Returns
 // undefined when unknown.
@@ -104,6 +147,9 @@ export interface CreateInput {
   // How much per-file context the painter sends for this Lens (see Lens.context). Only
   // persisted when "medium" — absent means the default "minimal".
   readonly context?: "minimal" | "medium"
+  // Drill-down scope (see Lens.parent). The caller (aperture.createLens) has already
+  // resolved the parent id and validated that every facet id exists on it.
+  readonly parent?: LensParent
 }
 
 // Mint a unique project Lens id: name slug + a short content hash so two
@@ -150,6 +196,7 @@ export const create = (directory: string, input: CreateInput): Effect.Effect<Len
       ...(input.directories?.length ? { directories: normalizeDirectories(input.directories) } : {}),
       // Only persist a non-default mode so existing minimal Lenses' JSON is unchanged.
       ...(input.context === "medium" ? { context: "medium" as const } : {}),
+      ...(input.parent ? { parent: input.parent } : {}),
     }
 
     // Additive read-modify-write: load the existing project doc, add the fresh
@@ -288,20 +335,31 @@ export const mergeFacets = (
     if (!prev.facets.some((t) => t.id === from) || !prev.facets.some((t) => t.id === into)) return undefined
     const next: Lens = { ...prev, facets: prev.facets.filter((t) => t.id !== from) }
     project[id] = next
+    // A drill-down scoped to the facet that just went away has to follow it, or its domain
+    // would name a facet that no longer exists and it would paint nothing at all. (The
+    // caller does the matching rewrite of those Lenses' painted stores.)
+    for (const child of Object.values(project)) {
+      if (child.parent?.lens !== id || !child.parent.facets.includes(from)) continue
+      const facets = [...new Set(child.parent.facets.map((f) => (f === from ? into : f)))]
+      project[child.id] = { ...child, parent: { ...child.parent, facets } }
+    }
     yield* writeDoc(lensesFile(directory), project)
     return next
   })
 
-// Remove a *user* Lens from the project doc. Returns true when something was
-// removed (built-ins aren't in the doc, so they return false). The caller resets the
-// active pointer and clears the Lens's semantics.
-export const remove = (directory: string, id: string): Effect.Effect<boolean> =>
+// Remove a *user* Lens and every drill-down scoped to it, transitively: a drill-down's
+// domain is defined by its parent's facets, so without the parent it has no meaning and
+// could never repaint. Returns the ids actually removed (empty for a built-in / unknown id,
+// neither of which is in the doc). The caller clears each removed Lens's painted stores and
+// resets the active pointer if it was one of them.
+export const remove = (directory: string, id: string): Effect.Effect<string[]> =>
   Effect.gen(function* () {
     const project = yield* readProject(directory)
-    if (!project[id]) return false
-    delete project[id]
+    if (!project[id]) return []
+    const removed = [id, ...descendants(Object.values(project), id).map((l) => l.id)]
+    for (const victim of removed) delete project[victim]
     yield* writeDoc(lensesFile(directory), project)
-    return true
+    return removed
   })
 
 // Convenience for the tools: a tiny summary of every palette for the agent to pick

@@ -24,6 +24,19 @@ import { ARCHITECTURE_ID } from "./lenses"
 export interface Entry {
   readonly facet: string
   readonly hash: string
+  // Drill-down Lenses only: the *parent* facet this file carried when it was painted (its
+  // "witness"). Two jobs, neither of which the content hash can do:
+  //
+  //  1. Staleness. When the parent re-paints a file into a different facet its content is
+  //     unchanged, so the hash still matches and the child would never re-evaluate it.
+  //     The painter's stale check compares `via` as well, so a parent-facet flip re-opens
+  //     the file.
+  //  2. Disambiguating the child's two kinds of NONE_FACET — "outside my domain" vs "inside
+  //     it but fits none of my facets". They are stored identically; `via` tells them apart,
+  //     which is what lets a drill-down be scoped to its parent's own "Other" bucket.
+  //
+  // Absent on every root Lens's entries (and on entries written before drill-downs existed).
+  readonly via?: string
 }
 
 export type Store = Record<string, Entry>
@@ -101,7 +114,47 @@ export const mergeFacet = (
   storage
     .update<Store>(key(projectID, lensID), (draft) => {
       for (const [id, entry] of Object.entries(draft)) {
-        if (entry.facet === from) draft[id] = { facet: into, hash: entry.hash }
+        if (entry.facet === from) draft[id] = { ...entry, facet: into }
+      }
+    })
+    .pipe(Effect.ignore)
+
+// The drill-down half of a parent's facet merge. When a parent folds `from` into `into`, a
+// child scoped to either one still holds entries witnessed by the now-gone `from`; rewriting
+// them to `into` keeps every child entry's `via` pointing at a facet that still exists. The
+// files' own facets and hashes are untouched, so — when the child's domain is unchanged by
+// the merge — this costs no tokens and re-paints nothing, exactly like `mergeFacet` itself.
+export const remapVia = (
+  storage: Storage.Interface,
+  projectID: string,
+  lensID: string,
+  from: string,
+  into: string,
+): Effect.Effect<void> =>
+  storage
+    .update<Store>(key(projectID, lensID), (draft) => {
+      for (const [id, entry] of Object.entries(draft)) {
+        if (entry.via === from) draft[id] = { ...entry, via: into }
+      }
+    })
+    .pipe(Effect.ignore)
+
+// Drop every entry witnessed by `facet`, so the next sweep re-decides those files from
+// scratch. Used when a parent's merge *expands* a child's domain: files the child had
+// bucketed out (stored NONE_FACET, `via` = the newly-admitted facet) must be re-opened, and
+// they are the only ones — every other NONE_FACET entry is a genuine "fits no facet" and is
+// left alone. Deleting the entry (rather than rewriting it) is what re-opens it: the
+// painter's stale check re-paints any node with no entry at all.
+export const dropWhereVia = (
+  storage: Storage.Interface,
+  projectID: string,
+  lensID: string,
+  facet: string,
+): Effect.Effect<void> =>
+  storage
+    .update<Store>(key(projectID, lensID), (draft) => {
+      for (const [id, entry] of Object.entries(draft)) {
+        if (entry.via === facet) delete draft[id]
       }
     })
     .pipe(Effect.ignore)

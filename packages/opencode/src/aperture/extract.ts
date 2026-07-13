@@ -341,8 +341,10 @@ export const listSubtree = Effect.fn("Aperture.listSubtree")(function* (root: st
 // --- deterministic node identity ------------------------------------------
 
 // Content-independent: a stable hash of the repo-relative path. The same file
-// always maps to the same id across runs and across scopes.
-function nodeID(relPath: string) {
+// always maps to the same id across runs and across scopes. Exported because the facet
+// stores are keyed by it, so a caller holding only a path (e.g. the drill-in domain gate)
+// needs it to look a file up.
+export function nodeID(relPath: string) {
   return "n_" + createHash("sha256").update(relPath).digest("hex").slice(0, 16)
 }
 

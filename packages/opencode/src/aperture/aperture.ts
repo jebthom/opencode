@@ -25,7 +25,7 @@ import { AperturePainter } from "./painter"
 import { ApertureLensStore } from "./lens-store"
 import { ApertureDeterministic } from "./deterministic"
 import { Git } from "@/git"
-import { type Lens, type PaletteId, legend as lensLegend, NONE_FACET, NONE_HUE, ARCHITECTURE_ID, BUS_FACTOR, BUS_FACTOR_ID, isBuiltinLens, isDeterministic } from "./lenses"
+import { type Lens, type LensParent, type PaletteId, legend as lensLegend, orderForest, inDomain, NONE_FACET, NONE_HUE, NONE_LABEL, ARCHITECTURE, ARCHITECTURE_ID, BUS_FACTOR, BUS_FACTOR_ID, MAX_LENS_DEPTH, isBuiltinLens, isDeterministic } from "./lenses"
 
 // Server-side Aperture service (PLAN.md steps 1 + 2.5). Owns the deterministic
 // payload, but unlike step 1 the graph is a *2-level window* rooted at a scope
@@ -106,6 +106,12 @@ export interface CreateLensInput {
   // Per-file painter context mode for this Lens (see Lens.context). Defaults to
   // "minimal"; pass "medium" only for Lenses that must judge the code's shape.
   readonly context?: "minimal" | "medium"
+  // Makes this a *drill-down*: the Lens is scoped to the files another Lens painted into
+  // the named facets, and every other file in the repo is bucketed into "Other" without a
+  // model call. Both refs are permissive — the Lens by id or name, the facets by id or
+  // label (plus "Other"/`none` to drill into what the parent didn't cover) — and are
+  // resolved to ids by createLens.
+  readonly parent?: { readonly lens: string; readonly facets: ReadonlyArray<string> }
 }
 
 export interface EditLensInput {
@@ -131,6 +137,18 @@ export type LensMutation =
   | { readonly status: "not-found" }
   | { readonly status: "builtin" }
   | { readonly status: "unknown-facet"; readonly facet: string }
+  // The edit would drop a facet that a drill-down is scoped to, leaving it with a domain
+  // that no longer exists. Names the dependents so the caller can re-scope or delete them.
+  | { readonly status: "facet-in-use"; readonly facet: string; readonly lenses: ReadonlyArray<string> }
+
+// Outcome of creating a Lens: the new Lens, or why the requested drill-down scope was
+// refused. A root Lens (no `parent`) can only ever succeed.
+export type CreateOutcome =
+  | { readonly status: "ok"; readonly lens: Lens }
+  | { readonly status: "unknown-parent"; readonly parent: string }
+  | { readonly status: "unknown-facet"; readonly facets: ReadonlyArray<string> }
+  | { readonly status: "empty-scope" }
+  | { readonly status: "too-deep"; readonly max: number }
 
 // Outcome of a delete: the now-active Lens (after falling back to Architecture
 // when the deleted one was active) or why it was refused.
@@ -162,8 +180,9 @@ export interface Interface {
   readonly lenses: () => Effect.Effect<Lens[]>
   readonly activeLens: () => Effect.Effect<Lens>
   // Define a new per-project Lens (additive — never overwrites), make it
-  // active, and kick off painting.
-  readonly createLens: (input: CreateLensInput) => Effect.Effect<Lens>
+  // active, and kick off painting. Refuses only when a requested drill-down scope
+  // (input.parent) doesn't resolve.
+  readonly createLens: (input: CreateLensInput) => Effect.Effect<CreateOutcome>
   // Switch the active Lens by id or name; re-paints from cache and paints any
   // not-yet-painted files. Returns the resolved Lens, or undefined if unknown.
   readonly selectLens: (idOrName: string) => Effect.Effect<Lens | undefined>
@@ -374,6 +393,113 @@ export const layer = Layer.effect(
         }
       })
 
+    // --- drill-down domain gate ---------------------------------------------
+
+    // A Lens's facet store as seen by its children — the "witness" store. Mirrors finalize's
+    // three-way branch exactly: the cheap deterministic built-ins (git-changed / mtime) are
+    // computed inline, everything else is read from the persisted semantic store. Bus-factor
+    // is the trap — it is deterministic but its store is *persisted* precisely because
+    // computing it means a whole-history `git log` (~10s), so it must be READ here. Sending
+    // it through deterministicStoreFor would fire that walk inside every paint batch.
+    const witnessStoreFor = (lens: Lens, directory: string, projectID: string) =>
+      Effect.gen(function* () {
+        if (isDeterministic(lens) && lens.deterministic !== "bus-factor") {
+          const subtree = yield* subtreeFor(directory)
+          return yield* deterministicStoreFor(lens, directory, subtree)
+        }
+        const store = yield* ApertureSemanticStore.read(storage, projectID, lens.id)
+        // A cold bus-factor store witnesses nothing, so a drill-down of it paints nothing
+        // this pass (fail closed) — kick the background refresh and let the next sweep place
+        // the files once it lands.
+        if (lens.deterministic === "bus-factor" && Object.keys(store).length === 0)
+          yield* forkProactivePaint("bus-factor refresh failed", projectID, refreshBusFactor(directory, projectID))
+        return store
+      })
+
+    // Resolve a drill-down Lens's domain over `files`: which of them fall inside the parent
+    // facets it is scoped to, and the parent facet ("witness") each one carries. The painter
+    // then classifies only the in-domain files and buckets the rest straight into
+    // NONE_FACET — that is what makes a drill-down trustworthy.
+    //
+    // Two rules make this correct:
+    //
+    //  * We read only the IMMEDIATE parent's store, never the whole ancestor chain, because
+    //    a drill-down's store is itself a complete domain-restricted painting (its
+    //    out-of-domain files are stored NONE_FACET, and NONE_FACET is never one of a Lens's
+    //    own facets — so a file excluded by the parent can't be admitted by the child).
+    //    `via` is what keeps that honest when a child is scoped to its parent's *"Other"*:
+    //    it separates the parent's out-of-domain greys from its genuine "fits no facet" greys.
+    //  * A file the parent hasn't placed yet is filled in HERE, by painting it under the
+    //    parent Lens first (recursively — the parent may be a drill-down too). That spend is
+    //    never wasted: it lands in the parent's own store and is reused forever.
+    //
+    // MUST NOT acquire paintGate. This runs inside a permit its caller already holds
+    // (schedulePaint / backgroundLoop / scheduleExtentPaint) and Effect semaphores are not
+    // reentrant — re-acquiring here would block the fiber against itself and wedge both
+    // painters until the process restarts.
+    const resolveDomain = (
+      lens: Lens,
+      directory: string,
+      projectID: string,
+      files: ReadonlyArray<AperturePainter.FileNode>,
+      origin: AperturePainter.Origin,
+      depth = 0,
+    ): Effect.Effect<AperturePainter.Domain | undefined> =>
+      Effect.gen(function* () {
+        const scoped = lens.parent
+        if (!scoped) return undefined
+
+        const parent = yield* ApertureLensStore.get(directory, scoped.lens)
+        // Orphaned (parent deleted) or a chain deeper than we allow. listAvailable already
+        // hides such a Lens, so this is belt-and-braces — and it fails *closed*: an empty
+        // domain paints nothing, rather than silently painting the whole repo unfiltered.
+        if (!parent || depth >= MAX_LENS_DEPTH) {
+          log.error("drill-down has no usable parent", { lens: lens.id, parent: scoped.lens, depth })
+          return { parent: parent ?? lens, witness: new Map(), allowed: new Set() }
+        }
+
+        let store = yield* witnessStoreFor(parent, directory, projectID)
+        // Fill the files the parent hasn't placed yet. Only a semantic parent can be filled;
+        // a deterministic store already covers every file in the subtree by construction.
+        const pending = files.filter((f) => store[f.id] === undefined)
+        if (pending.length > 0 && !isDeterministic(parent)) {
+          const parentDomain = yield* resolveDomain(parent, directory, projectID, pending, origin, depth + 1)
+          yield* AperturePainter.paintStale(
+            { storage, events, provider, config },
+            directory,
+            projectID,
+            "",
+            pending,
+            origin,
+            parent,
+            // Silent: this writes the *parent's* store, which isn't the one being viewed, and
+            // our own pass publishes a moment later anyway. `trigger` keeps the spend
+            // attributable to the drill-down that forced it.
+            { domain: parentDomain, publish: false, trigger: lens.id },
+          ).pipe(
+            Effect.catchCause((cause) =>
+              Effect.sync(() => log.error("parent fill failed", { lens: lens.id, parent: parent.id, cause })),
+            ),
+          )
+          store = yield* ApertureSemanticStore.read(storage, projectID, parent.id)
+        }
+
+        const subset = new Set(scoped.facets)
+        const parentScope = parent.parent ? new Set(parent.parent.facets) : undefined
+        const witness = new Map<string, string>()
+        const allowed = new Set<string>()
+        for (const file of files) {
+          const entry = store[file.id]
+          // Unwitnessed even after the fill (a bin soft-failed, the model omitted the path,
+          // the file was unreadable). Left out of `witness` entirely so the painter skips it
+          // and retries next sweep — never bucketed, which would be permanent.
+          if (!entry) continue
+          witness.set(file.id, entry.facet)
+          if (inDomain(entry, subset, parentScope)) allowed.add(file.id)
+        }
+        return { parent, witness, allowed }
+      })
+
     // Changed line ranges (in the current file) for the git-changed Lens at function
     // granularity: `git diff --unified=0 HEAD -- <file>` parsed to hunk ranges. Empty
     // for an unchanged or untracked file (the caller falls back to the file-level
@@ -410,12 +536,46 @@ export const layer = Layer.effect(
         : Effect.succeed(true)
 
     // The active+listed Lenses minus any whose prerequisite is unmet for this directory.
+    // Keeps the store's DFS-forest order, so callers get parent → children for free.
     const listAvailable = (directory: string, projectID: string) =>
       Effect.gen(function* () {
         const all = yield* ApertureLensStore.list(directory)
+        const byId = new Map(all.map((l) => [l.id, l]))
         const keep: Lens[] = []
-        for (const lens of all) if (yield* isAvailable(lens, directory)) keep.push(lens)
+        for (const lens of all) {
+          if (!(yield* isAvailable(lens, directory))) continue
+          // A drill-down is only usable while its *whole* ancestor chain resolves and is
+          // itself available: its domain is read out of the parent's store, so a missing or
+          // unusable ancestor means no domain, which means it paints nothing at all. Hide it
+          // rather than strand the user on a Lens that can only ever show a grey repo. (The
+          // chain is walked with a visited set — lenses.json is hand-editable.)
+          let usable = true
+          let cur = lens
+          const seen = new Set([lens.id])
+          while (cur.parent) {
+            const up = byId.get(cur.parent.lens)
+            if (!up || seen.has(up.id) || !(yield* isAvailable(up, directory))) {
+              usable = false
+              break
+            }
+            seen.add(up.id)
+            cur = up
+          }
+          if (usable) keep.push(lens)
+        }
         return keep
+      })
+
+    // The active Lens, falling back to Architecture when it isn't usable here — an unmet
+    // prerequisite (git-changed in a non-git folder) or a drill-down whose ancestry is
+    // broken. Without this a stale active.json strands the view on a Lens that can never
+    // paint, and the repo just renders grey with no explanation.
+    const activeUsable = (directory: string, projectID: string) =>
+      Effect.gen(function* () {
+        const active = yield* ApertureLensStore.getActive(directory)
+        const available = yield* listAvailable(directory, projectID)
+        if (available.some((l) => l.id === active.id)) return active
+        return available.find((l) => l.id === ARCHITECTURE_ID) ?? ARCHITECTURE
       })
 
     const off = registerDisposer(async (directory) => {
@@ -487,15 +647,22 @@ export const layer = Layer.effect(
         const key = JSON.stringify([directory, scope, lens.id])
         if (inFlight.has(key)) return
         inFlight.add(key)
-        yield* AperturePainter.paintStale(
-          { storage, events, provider, config },
-          directory,
-          projectID,
-          scope,
-          fileNodes,
-          "fg",
-          lens,
-        ).pipe(
+        // The domain gate resolves *inside* the permit (and never re-acquires it — see
+        // resolveDomain), so the ancestor fill it may trigger is serialized with every other
+        // painter pass rather than racing them on the API.
+        yield* Effect.gen(function* () {
+          const domain = yield* resolveDomain(lens, directory, projectID, fileNodes, "fg")
+          yield* AperturePainter.paintStale(
+            { storage, events, provider, config },
+            directory,
+            projectID,
+            scope,
+            fileNodes,
+            "fg",
+            lens,
+            { domain },
+          )
+        }).pipe(
           paintGate.withPermits(1),
           Effect.ensuring(Effect.sync(() => inFlight.delete(key))),
           Effect.forkDetach,
@@ -515,21 +682,43 @@ export const layer = Layer.effect(
         let files = drilledFiles.get(directory)
         if (!files) drilledFiles.set(directory, (files = new Set()))
         files.add(relPath)
-        const lens = yield* ApertureLensStore.getActive(directory)
+        const lens = yield* activeUsable(directory, projectID)
         // Deterministic built-ins are fully computed; nothing to model-paint.
         if (isDeterministic(lens)) return
         const key = JSON.stringify([directory, relPath, lens.id])
         if (extentInFlight.has(key)) return
         extentInFlight.add(key)
         drillActive.add(directory)
-        yield* AperturePainter.paintExtentsStale(
-          { storage, events, provider, config },
-          directory,
-          projectID,
-          relPath,
-          lens,
-          scope,
-        ).pipe(
+        yield* Effect.gen(function* () {
+          // The domain gate has to be enforced here *as well as* at file level, because the
+          // function painter can otherwise route around it: a file's function mix SUPERSEDES
+          // its file-level facet in directory composition (extents.ts attributeFileBytes),
+          // and the working-set seeder function-paints every changed file with no user action
+          // at all. Without this an out-of-domain file — correctly greyed at file level —
+          // would still have its functions classified into drill-down facets and bleed them
+          // into every ancestor directory's composition, which is precisely the confusion
+          // drill-downs exist to prevent.
+          //
+          // Fail closed: a file the parent hasn't placed yet isn't function-painted either.
+          // Drill-in therefore lags the file-level sweep for a drill-down Lens, and catches
+          // up on the next pass once the parent's store covers the file.
+          let parent: Lens | undefined
+          if (lens.parent) {
+            const node = { id: ApertureExtract.nodeID(relPath), path: relPath }
+            const domain = yield* resolveDomain(lens, directory, projectID, [node], "fg")
+            if (!domain?.allowed.has(node.id)) return
+            parent = domain.parent
+          }
+          yield* AperturePainter.paintExtentsStale(
+            { storage, events, provider, config },
+            directory,
+            projectID,
+            relPath,
+            lens,
+            scope,
+            parent,
+          )
+        }).pipe(
           paintGate.withPermits(1),
           Effect.ensuring(
             Effect.sync(() => {
@@ -551,7 +740,7 @@ export const layer = Layer.effect(
     // Lenses compute their function tiles offline in finalize, so there's nothing to model-paint.
     const scheduleWorkingSetPaint = (directory: string, projectID: string) =>
       Effect.gen(function* () {
-        const lens = yield* ApertureLensStore.getActive(directory)
+        const lens = yield* activeUsable(directory, projectID)
         if (isDeterministic(lens)) return
         // No git work tree → no working set (and git.status would error). Bail quietly.
         if (!(yield* isRepoFor(directory))) return
@@ -693,7 +882,7 @@ export const layer = Layer.effect(
         // and its name travel out on the payload so the renderer needs no hard-coded
         // vocabulary. Switching Lenses re-paints from that Lens's own
         // (cached) store — no other Lens's work is touched.
-        const lens = yield* ApertureLensStore.getActive(ctx.directory)
+        const lens = yield* activeUsable(ctx.directory, ctx.project.id)
         // Whole-repo membership (full depth), needed both for directory composition and —
         // for the deterministic built-ins — as the file set whose facets we synthesize.
         const subtree = yield* subtreeFor(ctx.directory)
@@ -796,6 +985,12 @@ export const layer = Layer.effect(
                   changed: fileFacet,
                   unchanged: "unchanged",
                 })
+              } else if (lens.parent && store[fileId]?.facet === NONE_FACET) {
+                // Out of a drill-down's domain: the file is greyed at file level and the gate
+                // refuses to function-paint it, so paint its tiles the same "Other" grey
+                // rather than leaving them the *unpainted* grey — which would read as "not
+                // swept yet" and invite the user to wait for a paint that will never come.
+                facetByName = new Map(exs.map((e) => [e.name, NONE_FACET]))
               } else {
                 facetByName = new Map()
                 for (const e of exs) {
@@ -843,7 +1038,7 @@ export const layer = Layer.effect(
           // Re-read the active Lens each pass so a switch (which wakes this loop)
           // re-walks the repo painting for the *new* Lens; cached entries make a
           // re-walk of an already-painted Lens free.
-          const lens = yield* ApertureLensStore.getActive(directory)
+          const lens = yield* activeUsable(directory, projectID)
           // Deterministic built-ins are painted synchronously in finalize — there's nothing
           // for the whole-repo sweep to do. Park until a Lens switch (or file change)
           // wakes us; the next pass re-reads the active Lens and resumes the sweep if
@@ -875,7 +1070,21 @@ export const layer = Layer.effect(
             // scope "" — the facet store is keyed by stable node id, so a file painted
             // here is reused in every window it later appears in. The permit is held
             // only for the batch; the pause below runs without it so foreground wins.
-            yield* AperturePainter.paintStale({ storage, events, provider, config }, directory, projectID, "", slice, "bg", lens).pipe(
+            yield* Effect.gen(function* () {
+              // Resolved inside the permit; it may fill unpainted ancestors for a drill-down
+              // (never re-acquiring the gate — see resolveDomain).
+              const domain = yield* resolveDomain(lens, directory, projectID, slice, "bg")
+              yield* AperturePainter.paintStale(
+                { storage, events, provider, config },
+                directory,
+                projectID,
+                "",
+                slice,
+                "bg",
+                lens,
+                { domain },
+              )
+            }).pipe(
               paintGate.withPermits(1),
               Effect.catchCause((cause) =>
                 Effect.sync(() => log.error("background batch failed", { projectID, cause })),
@@ -1136,21 +1345,49 @@ export const layer = Layer.effect(
 
     const activeLens = Effect.fn("Aperture.activeLens")(function* () {
       const ctx = yield* InstanceState.context
-      return yield* ApertureLensStore.getActive(ctx.directory)
+      return yield* activeUsable(ctx.directory, ctx.project.id)
     })
 
     const createLens = Effect.fn("Aperture.createLens")(function* (input: CreateLensInput) {
       const ctx = yield* InstanceState.context
-      const lens = yield* ApertureLensStore.create(ctx.directory, input)
+
+      // Resolve the drill-down scope, if any, into ids. Everything here fails *loudly*: a
+      // drill-down whose scope silently mis-resolved would paint the wrong domain, which is
+      // exactly the confusion the feature exists to remove.
+      let parent: LensParent | undefined
+      if (input.parent) {
+        const available = yield* listAvailable(ctx.directory, ctx.project.id)
+        const target = resolveLens(available, input.parent.lens)
+        if (!target) return { status: "unknown-parent", parent: input.parent.lens } as const
+        const depth = orderForest(available).find((e) => e.lens.id === target.id)?.depth ?? 0
+        if (depth + 1 > MAX_LENS_DEPTH) return { status: "too-deep", max: MAX_LENS_DEPTH } as const
+        const facets: string[] = []
+        const unknown: string[] = []
+        for (const ref of input.parent.facets) {
+          // "Other" is a legitimate thing to drill into ("what did my Lens miss?"), and it
+          // is a real stored facet — but it is never in lens.facets, so match it by hand.
+          const id =
+            ref === NONE_FACET || ref.toLowerCase() === NONE_LABEL.toLowerCase()
+              ? NONE_FACET
+              : target.facets.find((f) => f.id === ref || f.label.toLowerCase() === ref.toLowerCase())?.id
+          if (!id) unknown.push(ref)
+          else if (!facets.includes(id)) facets.push(id)
+        }
+        if (unknown.length) return { status: "unknown-facet", facets: unknown } as const
+        if (facets.length === 0) return { status: "empty-scope" } as const
+        parent = { lens: target.id, facets }
+      }
+
+      const lens = yield* ApertureLensStore.create(ctx.directory, { ...input, parent })
       // Default: activate the new Lens (switch the view, start the painter on
       // it). When activate is false the Lens is only persisted — the active
       // Lens and its in-flight sweep are left untouched, so the user's current
       // view is undisturbed (the new one paints later if/when it is selected).
       if (input.activate !== false) {
-        yield* ApertureLensStore.setActive(ctx.directory,lens.id)
+        yield* ApertureLensStore.setActive(ctx.directory, lens.id)
         yield* onLensChanged(ctx.directory)
       }
-      return lens
+      return { status: "ok", lens } as const
     })
 
     const selectLens = Effect.fn("Aperture.selectLens")(function* (idOrName: string) {
@@ -1197,6 +1434,34 @@ export const layer = Layer.effect(
       const found = resolveLens(all, input.lens)
       if (!found) return { status: "not-found" } as const
       if (isBuiltinLens(found)) return { status: "builtin" } as const
+
+      // Refuse to drop a facet a drill-down is scoped to: its domain would name a facet that
+      // no longer exists, and it would quietly paint nothing forever. Merging the facet away
+      // is the supported path (mergeFacets re-scopes its children onto the survivor); this
+      // just names the dependents so they can be deleted or re-scoped first.
+      const children = yield* ApertureLensStore.childrenOf(ctx.directory, found.id)
+      if (input.facets && children.length) {
+        // Mirror resolveFacets' id-carrying rule: a facet survives when the edit names its
+        // id, or names its label (case-insensitively).
+        const surviving = new Set<string>()
+        for (const raw of input.facets) {
+          const carried =
+            (raw.id && found.facets.find((f) => f.id === raw.id)?.id) ??
+            found.facets.find((f) => f.label.toLowerCase() === raw.label.toLowerCase())?.id
+          if (carried) surviving.add(carried)
+        }
+        for (const child of children) {
+          // A scope on NONE_FACET ("Other") survives any edit — it isn't one of the Lens's
+          // own facets, so it can't be edited away.
+          const lost = child.parent!.facets.find((f) => f !== NONE_FACET && !surviving.has(f))
+          if (!lost) continue
+          const dependents = children
+            .filter((c) => c.parent!.facets.includes(lost))
+            .map((c) => c.name)
+          return { status: "facet-in-use", facet: lost, lenses: dependents } as const
+        }
+      }
+
       const result = yield* ApertureLensStore.update(ctx.directory, found.id, {
         name: input.name,
         description: input.description,
@@ -1212,6 +1477,13 @@ export const layer = Layer.effect(
       if (result.structural) {
         yield* ApertureSemanticStore.clear(storage, ctx.project.id, found.id)
         yield* ApertureSubfacetStore.clear(storage, ctx.project.id, found.id)
+        // Every drill-down beneath it was placed by facts that no longer hold — its files
+        // were bucketed in or out by a classification we just threw away. Clear them too;
+        // they refill as the parent repaints.
+        for (const descendant of yield* ApertureLensStore.descendantsOf(ctx.directory, found.id)) {
+          yield* ApertureSemanticStore.clear(storage, ctx.project.id, descendant.id)
+          yield* ApertureSubfacetStore.clear(storage, ctx.project.id, descendant.id)
+        }
       }
       yield* onLensChanged(ctx.directory)
       return { status: "ok", lens: result.lens, structural: result.structural } as const
@@ -1230,10 +1502,35 @@ export const layer = Layer.effect(
       const intoId = resolveFacet(into)
       if (!fromId) return { status: "unknown-facet", facet: from } as const
       if (!intoId) return { status: "unknown-facet", facet: into } as const
+      // Snapshot the drill-downs *before* the merge re-scopes them (lens-store rewrites any
+      // scope naming `from` onto `into`), so we can still see which side each one was on.
+      const children = yield* ApertureLensStore.childrenOf(ctx.directory, found.id)
       const updated = yield* ApertureLensStore.mergeFacets(ctx.directory, found.id, fromId, intoId)
       if (!updated) return { status: "not-found" } as const
       yield* ApertureSemanticStore.mergeFacet(storage, ctx.project.id, found.id, fromId, intoId)
       yield* ApertureSubfacetStore.mergeFacet(storage, ctx.project.id, found.id, fromId, intoId)
+
+      // Fold the merge through each drill-down's painted store. This is why entries carry
+      // `via`: a merge is deterministic and free for the Lens itself, and it stays free for
+      // its drill-downs too — no re-paint unless the merge actually moved the domain.
+      for (const child of children) {
+        const scope = child.parent!.facets
+        const hadFrom = scope.includes(fromId)
+        const hadInto = scope.includes(intoId)
+        if (!hadFrom && !hadInto) continue
+        // When the child was scoped to exactly one side, the merge *widens* its domain: the
+        // files witnessed by the other side were bucketed out (grey, `via` = that facet) and
+        // are now inside. Drop precisely those entries — deleting an entry is what re-opens
+        // a file for the next sweep — and leave every other grey alone, since those are
+        // genuine "fits no facet" results that cost tokens to produce. Must run BEFORE the
+        // remap below, which would otherwise make the two indistinguishable.
+        if (hadFrom !== hadInto)
+          yield* ApertureSemanticStore.dropWhereVia(storage, ctx.project.id, child.id, hadFrom ? intoId : fromId)
+        // Survivors' witnesses follow the fold, or `via` would name a facet that no longer
+        // exists and every one of those files would look stale on every sweep, forever.
+        yield* ApertureSemanticStore.remapVia(storage, ctx.project.id, child.id, fromId, intoId)
+      }
+
       yield* onLensChanged(ctx.directory)
       return { status: "ok", lens: updated, structural: false } as const
     })
@@ -1245,10 +1542,15 @@ export const layer = Layer.effect(
       if (!found) return { status: "not-found" } as const
       if (isBuiltinLens(found)) return { status: "builtin" } as const
       const activeId = yield* ApertureLensStore.getActiveId(ctx.directory)
-      yield* ApertureLensStore.remove(ctx.directory, found.id)
-      yield* ApertureSemanticStore.clear(storage, ctx.project.id, found.id)
-      yield* ApertureSubfacetStore.clear(storage, ctx.project.id, found.id)
-      if (activeId === found.id) yield* ApertureLensStore.setActive(ctx.directory,ARCHITECTURE_ID)
+      // Cascades: a drill-down's domain is defined by its parent's facets, so deleting the
+      // parent leaves it meaningless and unable to ever repaint. `remove` returns everything
+      // it took (the Lens and its whole subtree) so we can clear each one's painted stores.
+      const removed = yield* ApertureLensStore.remove(ctx.directory, found.id)
+      for (const id of removed) {
+        yield* ApertureSemanticStore.clear(storage, ctx.project.id, id)
+        yield* ApertureSubfacetStore.clear(storage, ctx.project.id, id)
+      }
+      if (removed.includes(activeId)) yield* ApertureLensStore.setActive(ctx.directory, ARCHITECTURE_ID)
       yield* onLensChanged(ctx.directory)
       const active = yield* ApertureLensStore.getActive(ctx.directory)
       return {
@@ -1291,9 +1593,13 @@ export const layer = Layer.effect(
       }
 
       // Resolve each requested ref (facet id or case-insensitive label) to a facet id;
-      // an empty request means every Facet in the Lens.
-      const resolveFacet = (ref: string) =>
-        resolved.facets.find((t) => t.id === ref || t.label.toLowerCase() === ref.toLowerCase())
+      // an empty request means every Facet in the Lens. "Other" is requestable by name even
+      // though it is not one of the Lens's facets — it is a real stored value, and asking
+      // "what did this Lens NOT cover?" is exactly how you decide whether to drill into it.
+      const resolveFacet = (ref: string): { id: string; label: string } | undefined =>
+        ref === NONE_FACET || ref.toLowerCase() === NONE_LABEL.toLowerCase()
+          ? { id: NONE_FACET, label: NONE_LABEL }
+          : resolved.facets.find((t) => t.id === ref || t.label.toLowerCase() === ref.toLowerCase())
       const requested = facets.length ? facets : resolved.facets.map((t) => t.id)
       const groups: { facet: string; label: string; paths: string[] }[] = []
       const unknownFacets: string[] = []

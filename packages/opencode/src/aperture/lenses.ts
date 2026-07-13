@@ -31,6 +31,22 @@ export type LensScope = "global" | "project"
 // Lens (architecture + all user Lenses).
 export type DeterministicKind = "git-changed" | "mtime-buckets" | "bus-factor"
 
+// A *drill-down* Lens's scope: the parent Lens it refines, plus the subset of that
+// parent's facets whose files form this Lens's domain. The painter only ever classifies
+// in-domain files; every other file in the repo is bucketed into NONE_FACET
+// deterministically (no model call), so a drill-down can never confusingly include a file
+// that wasn't in the facet it drilled into. `facets` may name NONE_FACET — "show me what
+// the parent Lens *didn't* cover" is a legitimate drill-down.
+export interface LensParent {
+  readonly lens: string
+  readonly facets: ReadonlyArray<string>
+}
+
+// How deep a drill-down chain may go (a root Lens is depth 0). Each level costs the
+// painter another gate pass per batch (an unpainted ancestor must be filled before the
+// child can be placed), so the chain is capped rather than unbounded.
+export const MAX_LENS_DEPTH = 3
+
 export interface Lens {
   readonly id: string
   readonly name: string
@@ -61,6 +77,9 @@ export interface Lens {
   // per file. A global config override (aperture.painter.context) can force one mode across
   // all Lenses for experimentation.
   readonly context?: "minimal" | "medium"
+  // Present only on a *drill-down* Lens: the parent Lens + the subset of its facets this
+  // Lens is scoped to (see LensParent). Absent on every root Lens, including all built-ins.
+  readonly parent?: LensParent
 }
 
 // --- palettes --------------------------------------------------------------
@@ -368,6 +387,94 @@ export function isDeterministic(lens: Pick<Lens, "deterministic">): boolean {
   return lens.deterministic !== undefined
 }
 
+// --- drill-down hierarchy ---------------------------------------------------
+
+export interface ForestEntry {
+  readonly lens: Lens
+  readonly depth: number
+  // The scope of the entry's *root* ancestor, not its own: a project drill-down of a
+  // built-in parent must group with that parent in the picker, or it gets torn out of the
+  // DFS order into a different section and rendered indented under nothing.
+  readonly rootScope: LensScope
+}
+
+// Order Lenses as a DFS forest: every Lens immediately followed by the drill-downs scoped
+// to it, so the picker and the ◀ ▶ cycle both walk parent → children.
+//
+// Total and cycle-safe. `lenses.json` is committable and hand-editable, so a Lens whose
+// parent is missing, loops, or exceeds MAX_LENS_DEPTH is emitted as a *root* rather than
+// dropped or recursed into — it stays visible so it can still be inspected and deleted, and
+// a hand-written cycle can never hang this. (Hiding an unusable Lens is `listAvailable`'s
+// job; this function must never lose one.)
+export function orderForest(lenses: ReadonlyArray<Lens>): ForestEntry[] {
+  const byId = new Map(lenses.map((l) => [l.id, l]))
+  // Walk up to the root. undefined = broken ancestry (missing parent / cycle / too deep).
+  const depthOf = (lens: Lens): number | undefined => {
+    const seen = new Set([lens.id])
+    let depth = 0
+    let cur = lens
+    while (cur.parent) {
+      const up = byId.get(cur.parent.lens)
+      if (!up || seen.has(up.id) || ++depth > MAX_LENS_DEPTH) return undefined
+      seen.add(up.id)
+      cur = up
+    }
+    return depth
+  }
+
+  const childrenOf = new Map<string, Lens[]>()
+  const roots: Lens[] = []
+  for (const lens of lenses) {
+    const depth = depthOf(lens)
+    if (lens.parent && depth !== undefined && depth > 0) {
+      const siblings = childrenOf.get(lens.parent.lens) ?? []
+      siblings.push(lens)
+      childrenOf.set(lens.parent.lens, siblings)
+      continue
+    }
+    roots.push(lens)
+  }
+
+  // Every child has a resolvable finite depth and exactly one parent, and the roots are
+  // precisely the Lenses with no usable parent — so the child graph is a forest and this
+  // terminates.
+  const out: ForestEntry[] = []
+  const walk = (lens: Lens, depth: number, rootScope: LensScope) => {
+    out.push({ lens, depth, rootScope })
+    for (const child of childrenOf.get(lens.id) ?? []) walk(child, depth + 1, rootScope)
+  }
+  for (const root of roots) walk(root, 0, root.scope)
+  return out
+}
+
+// Whether a file falls inside a drill-down's domain, given the file's entry in the PARENT's
+// facet store. `scope` is the drill-down's scoped parent-facet ids; `parentScope` is the
+// *parent's own* scope, present only when the parent is itself a drill-down.
+//
+// The second clause is what upholds the invariant that a drill-down only ever reads its
+// immediate parent's store. A parent's store greys two different populations into the same
+// NONE_FACET — "outside my domain" and "inside it but fits none of my facets" — and a
+// grandchild scoped to the parent's "Other" means only the second. Without `via` to tell
+// them apart, that grandchild would silently re-admit every file its grandparent excluded.
+// (Redundant, but harmless, when scoped to a real facet: those are never NONE_FACET.)
+export function inDomain(
+  entry: { readonly facet: string; readonly via?: string } | undefined,
+  scope: ReadonlySet<string>,
+  parentScope?: ReadonlySet<string>,
+): boolean {
+  if (!entry || !scope.has(entry.facet)) return false
+  if (!parentScope) return true
+  return entry.via !== undefined && parentScope.has(entry.via)
+}
+
+// The human labels of the parent facets a drill-down is scoped to (NONE_FACET reads as
+// "Other"). Used in the painter's domain note and in the Lens listing.
+export function scopeLabels(parent: Lens, facets: ReadonlyArray<string>): string[] {
+  return facets.map((id) =>
+    id === NONE_FACET ? NONE_LABEL : (parent.facets.find((f) => f.id === id)?.label ?? id),
+  )
+}
+
 // --- helpers ---------------------------------------------------------------
 
 export function isValidFacet(lens: Lens, id: unknown): id is string {
@@ -403,9 +510,23 @@ export function legend(lens: Lens): LegendEntry[] {
 // System prompt handed to the painter model: the Lens's role sentence, the
 // enumerated facet definitions, then the fixed echo/format instructions. Replaces the
 // previously hard-coded architectural-layer prose so any Lens can paint.
-export function buildSystemPrompt(lens: Lens): string {
+//
+// `parent` is the resolved parent Lens of a drill-down (pass it whenever `lens.parent` is
+// set). It adds a note telling the model that the files it is being shown are *already*
+// filtered to the parent's facets — the gate never sends it an out-of-domain file — so it
+// classifies *within* that set instead of re-litigating the parent's judgement.
+export function buildSystemPrompt(lens: Lens, parent?: Lens): string {
+  const scope =
+    lens.parent && parent
+      ? [
+          `Every file below already falls under ${scopeLabels(parent, lens.parent.facets)
+            .map((l) => `"${l}"`)
+            .join(", ")} of the "${parent.name}" Lens. That judgement is already made and files outside it are never shown to you, so do not re-apply or second-guess it — classify each file by which facet below it belongs to *within* that set.`,
+        ]
+      : []
   return [
     lens.prompt,
+    ...scope,
     "Facets:",
     ...lens.facets.map((t) => `- ${t.id}: ${t.description}`),
     `- ${NONE_FACET}: none of the above — the file is unrelated to every facet`,

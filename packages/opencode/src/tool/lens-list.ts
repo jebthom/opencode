@@ -1,6 +1,7 @@
 import { Effect, Schema } from "effect"
 import { Aperture } from "@/aperture/aperture"
 import { ApertureLensStore } from "@/aperture/lens-store"
+import { ApertureLenses } from "@/aperture/lenses"
 import * as Tool from "./tool"
 
 // Lists the Aperture Lenses available in this project (the global
@@ -25,10 +26,20 @@ export const LensListTool = Tool.define(
           const active = yield* aperture.activeLens()
           const palettes = ApertureLensStore.paletteSummary()
 
+          const byId = new Map(all.map((c) => [c.id, c]))
           const lenses = all.map((c) => {
             const marker = c.id === active.id ? " (active)" : ""
-            const facets = c.facets.map((t) => t.label).join(", ")
-            return `- ${c.name} [${c.id}] (${c.scope})${marker}: ${c.description}\n    facets: ${facets}`
+            // Facet *ids* as well as labels: a drill-down's scope names facet ids, so a
+            // listing that only showed labels couldn't be acted on.
+            const facets = c.facets.map((t) => `${t.label} [${t.id}]`).join(", ")
+            const lines = [`- ${c.name} [${c.id}] (${c.scope})${marker}: ${c.description}`]
+            if (c.parent) {
+              const parent = byId.get(c.parent.lens)
+              const scope = ApertureLenses.scopeLabels(parent ?? c, c.parent.facets).join(", ")
+              lines.push(`    drill-down of ${parent?.name ?? c.parent.lens} [${c.parent.lens}] — scoped to: ${scope}`)
+            }
+            lines.push(`    facets: ${facets}`)
+            return lines.join("\n")
           })
 
           return {

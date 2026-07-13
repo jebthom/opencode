@@ -48,6 +48,8 @@ const DeleteLensResult = Schema.Struct({
 })
 
 // One row in the Lens picker (A2): enough to list, group, and mark the active Lens.
+// Rows arrive in DFS-forest order — each Lens immediately followed by the drill-downs
+// scoped to it — so the picker renders the hierarchy by indenting on `depth` alone.
 const LensSummary = Schema.Struct({
   id: Schema.String,
   name: Schema.String,
@@ -56,6 +58,14 @@ const LensSummary = Schema.Struct({
   scope: Schema.Literals(["global", "project"]),
   builtin: Schema.Boolean,
   active: Schema.Boolean,
+  // Set on a drill-down: the id of the Lens whose facets define its domain.
+  parent: Schema.optional(Schema.String),
+  // Nesting depth (0 = root). Drives the picker's indent.
+  depth: Schema.Number,
+  // The scope of the ROOT ancestor, not this Lens's own. The picker groups on it, so a
+  // project drill-down of a built-in parent stays adjacent to that parent instead of being
+  // torn into the "Project" section and rendered indented under nothing.
+  rootScope: Schema.Literals(["global", "project"]),
 })
 
 // Activate a Lens by id or name (the searchable Lens picker / `/lens-switch`). The

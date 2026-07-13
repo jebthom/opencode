@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test"
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test"
 import { Effect } from "effect"
 import fs from "fs/promises"
 import os from "os"
@@ -70,11 +70,11 @@ describe("aperture lens-store (project-dir persistence)", () => {
 
   test("remove drops a user Lens from disk", async () => {
     const lens = await Effect.runPromise(ApertureLensStore.create(dir, { ...CREATE, name: "Temp" }))
-    expect(await Effect.runPromise(ApertureLensStore.remove(dir, lens.id))).toBe(true)
+    expect(await Effect.runPromise(ApertureLensStore.remove(dir, lens.id))).toEqual([lens.id])
     const all = await Effect.runPromise(ApertureLensStore.list(dir))
     expect(all.some((l) => l.id === lens.id)).toBe(false)
     // Removing a built-in (lives in code, not on disk) is a no-op.
-    expect(await Effect.runPromise(ApertureLensStore.remove(dir, ARCHITECTURE_ID))).toBe(false)
+    expect(await Effect.runPromise(ApertureLensStore.remove(dir, ARCHITECTURE_ID))).toEqual([])
   })
 
   test("context mode: medium persists, minimal is omitted (default)", async () => {
@@ -111,5 +111,104 @@ describe("aperture lens-store (project-dir persistence)", () => {
     const cosmetic = await Effect.runPromise(ApertureLensStore.update(dir, lens.id, { name: "Ctx renamed" }))
     expect(cosmetic?.structural).toBe(false)
     expect(cosmetic?.lens.context).toBe("medium")
+  })
+})
+
+// Drill-down Lenses: a Lens scoped to a subset of another Lens's facets.
+describe("aperture lens-store (drill-downs)", () => {
+  let dir: string
+  beforeEach(async () => {
+    dir = await fs.mkdtemp(path.join(os.tmpdir(), "aperture-drill-"))
+  })
+  afterEach(async () => {
+    await fs.rm(dir, { recursive: true, force: true })
+  })
+
+  // Build a parent and a drill-down scoped to one of its facets.
+  const withChild = async () => {
+    const parent = await Effect.runPromise(ApertureLensStore.create(dir, { ...CREATE, name: "Parent" }))
+    const child = await Effect.runPromise(
+      ApertureLensStore.create(dir, {
+        ...CREATE,
+        name: "Child",
+        parent: { lens: parent.id, facets: ["login"] },
+      }),
+    )
+    return { parent, child }
+  }
+
+  test("the scope persists to the committable JSON", async () => {
+    const { parent, child } = await withChild()
+    const onDisk = JSON.parse(await fs.readFile(path.join(dir, ".opencode", "aperture", "lenses.json"), "utf8"))
+    expect(onDisk[child.id].parent).toEqual({ lens: parent.id, facets: ["login"] })
+    // A root Lens carries no parent field at all.
+    expect("parent" in onDisk[parent.id]).toBe(false)
+  })
+
+  test("list() places a drill-down immediately after the Lens it drills into", async () => {
+    const { parent, child } = await withChild()
+    const all = await Effect.runPromise(ApertureLensStore.list(dir))
+    const ids = all.map((l) => l.id)
+    expect(ids.indexOf(child.id)).toBe(ids.indexOf(parent.id) + 1)
+    // Built-ins still lead the list (nothing here drills into one).
+    expect(all.slice(0, BUILTIN_LENSES.length)).toEqual([...BUILTIN_LENSES])
+  })
+
+  test("deleting a Lens cascades to every drill-down beneath it", async () => {
+    const { parent, child } = await withChild()
+    const grandchild = await Effect.runPromise(
+      ApertureLensStore.create(dir, { ...CREATE, name: "Grandchild", parent: { lens: child.id, facets: ["login"] } }),
+    )
+
+    const removed = await Effect.runPromise(ApertureLensStore.remove(dir, parent.id))
+    expect(removed.sort()).toEqual([parent.id, child.id, grandchild.id].sort())
+
+    const all = await Effect.runPromise(ApertureLensStore.list(dir))
+    expect(all.filter((l) => l.scope === "project")).toEqual([])
+  })
+
+  test("deleting a drill-down leaves its parent — and its parent's paint — alone", async () => {
+    const { parent, child } = await withChild()
+    expect(await Effect.runPromise(ApertureLensStore.remove(dir, child.id))).toEqual([child.id])
+    const all = await Effect.runPromise(ApertureLensStore.list(dir))
+    expect(all.some((l) => l.id === parent.id)).toBe(true)
+  })
+
+  test("merging the parent's facets re-scopes its drill-downs onto the survivor", async () => {
+    const { parent, child } = await withChild()
+    // The child is scoped to "login"; fold login into tokens.
+    await Effect.runPromise(ApertureLensStore.mergeFacets(dir, parent.id, "login", "tokens"))
+
+    const all = await Effect.runPromise(ApertureLensStore.list(dir))
+    const updated = all.find((l) => l.id === child.id)!
+    // Without this the child would point at a facet that no longer exists and paint nothing.
+    expect(updated.parent).toEqual({ lens: parent.id, facets: ["tokens"] })
+    expect(all.find((l) => l.id === parent.id)!.facets.map((f) => f.id)).toEqual(["tokens"])
+  })
+
+  test("a drill-down scoped to BOTH merged facets collapses to one, not a duplicate", async () => {
+    const parent = await Effect.runPromise(ApertureLensStore.create(dir, { ...CREATE, name: "P2" }))
+    const child = await Effect.runPromise(
+      ApertureLensStore.create(dir, {
+        ...CREATE,
+        name: "C2",
+        parent: { lens: parent.id, facets: ["login", "tokens"] },
+      }),
+    )
+    await Effect.runPromise(ApertureLensStore.mergeFacets(dir, parent.id, "login", "tokens"))
+    const all = await Effect.runPromise(ApertureLensStore.list(dir))
+    expect(all.find((l) => l.id === child.id)!.parent!.facets).toEqual(["tokens"])
+  })
+
+  test("childrenOf and descendantsOf walk the hierarchy", async () => {
+    const { parent, child } = await withChild()
+    const grandchild = await Effect.runPromise(
+      ApertureLensStore.create(dir, { ...CREATE, name: "GC", parent: { lens: child.id, facets: ["login"] } }),
+    )
+    expect((await Effect.runPromise(ApertureLensStore.childrenOf(dir, parent.id))).map((l) => l.id)).toEqual([child.id])
+    expect((await Effect.runPromise(ApertureLensStore.descendantsOf(dir, parent.id))).map((l) => l.id)).toEqual([
+      child.id,
+      grandchild.id,
+    ])
   })
 })

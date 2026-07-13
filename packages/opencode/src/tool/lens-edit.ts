@@ -98,6 +98,15 @@ export const LensEditTool = Tool.define(
                 metadata: {},
                 output: `Facet "${result.facet}" isn't in that Lens.`,
               }
+            case "facet-in-use":
+              return {
+                title: "Facet in use",
+                metadata: {},
+                output: [
+                  `Can't remove facet "${result.facet}": the drill-down Lens(es) ${result.lenses.map((l) => `"${l}"`).join(", ")} are scoped to it, and would be left with a domain that no longer exists.`,
+                  "Either keep that facet, fold it into another with lens_merge_facets (which re-scopes the drill-downs onto the survivor), or delete the drill-downs first.",
+                ].join(" "),
+              }
             case "ok":
               return {
                 title: `Edited ${result.lens.name}`,

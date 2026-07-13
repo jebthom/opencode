@@ -1,5 +1,5 @@
 import { Aperture } from "@/aperture/aperture"
-import { legend } from "@/aperture/lenses"
+import { legend, orderForest } from "@/aperture/lenses"
 import * as StudyLog from "@/aperture/study-log"
 import { Effect } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
@@ -36,13 +36,18 @@ export const apertureHandlers = HttpApiBuilder.group(InstanceHttpApi, "aperture"
     const listLenses = Effect.fn("ApertureHttpApi.listLenses")(function* () {
       const all = yield* aperture.lenses()
       const active = yield* aperture.activeLens()
-      return all.map((lens) => ({
+      // `all` is already in DFS-forest order; orderForest re-derives each Lens's depth and
+      // the scope of its root ancestor, which is what the picker indents and groups on.
+      return orderForest(all).map(({ lens, depth, rootScope }) => ({
         id: lens.id,
         name: lens.name,
         description: lens.description,
         scope: lens.scope,
         builtin: lens.scope === "global",
         active: lens.id === active.id,
+        ...(lens.parent ? { parent: lens.parent.lens } : {}),
+        depth,
+        rootScope,
       }))
     })
 

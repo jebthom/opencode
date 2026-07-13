@@ -50,6 +50,18 @@ export const Parameters = Schema.Struct({
     description:
       "Whether to make this the active Lens. Defaults to true: the Aperture view switches to it and the painter begins painting. Pass false to create without changing what the user is currently viewing — the Lens is persisted but stays unpainted until it is selected. Use false when creating a Lens opportunistically (not at the user's explicit request) so their current view is undisturbed.",
   }),
+  parent: Schema.optional(
+    Schema.Struct({
+      lens: Schema.String.annotate({ description: "Id (or name) of the Lens to drill into." }),
+      facets: Schema.Array(Schema.String).annotate({
+        description:
+          'The facets of that Lens whose files this Lens is scoped to — facet ids or labels (get them from lens_list). Use "Other" to drill into the files the parent Lens covered with none of its facets.',
+      }),
+    }),
+  ).annotate({
+    description:
+      'Makes this a DRILL-DOWN of an existing Lens: its domain is exactly the files that Lens painted into the named facets. Only those files are shown to the painter; every other file in the repo is bucketed into "Other" with no model call, so a drill-down can never include a file that was not in the facet you drilled into. Set this whenever the user wants to look more closely INSIDE part of an existing Lens (e.g. "dive into the Likely facet of my bottlenecks Lens"). Your facets must draw distinctions WITHIN that domain — never restate the parent\'s criterion.',
+  }),
 })
 
 export const LensCreateTool = Tool.define(
@@ -75,7 +87,7 @@ export const LensCreateTool = Tool.define(
             }
           }
 
-          const created = yield* aperture.createLens({
+          const result = yield* aperture.createLens({
             name: params.name,
             description: params.description,
             palette: params.palette,
@@ -84,9 +96,29 @@ export const LensCreateTool = Tool.define(
             directories: params.directories,
             context: params.context,
             activate: params.activate,
+            parent: params.parent,
           })
 
+          // A drill-down scope that doesn't resolve is refused rather than silently dropped:
+          // creating the Lens anyway would paint the whole repo, which is precisely the
+          // confusion the user asked to avoid.
+          if (result.status !== "ok") {
+            const reason =
+              result.status === "unknown-parent"
+                ? `No Lens matches "${result.parent}". Call lens_list and use an exact id.`
+                : result.status === "unknown-facet"
+                  ? `That Lens has no facet(s): ${result.facets.join(", ")}. Call lens_list for its facet ids, or use "Other".`
+                  : result.status === "empty-scope"
+                    ? "A drill-down needs at least one parent facet to scope to."
+                    : `Drill-downs can only nest ${result.max} deep.`
+            return { title: "Invalid Lens", metadata: {}, output: `Lens not created. ${reason}` }
+          }
+
+          const created = result.lens
           const activated = params.activate !== false
+          const scope = created.parent
+            ? `Scoped to ${created.parent.facets.length} facet(s) of [${created.parent.lens}] — every file outside them is bucketed into "Other" without a model call.`
+            : undefined
           return {
             title: `Created Lens: ${created.name}`,
             metadata: {},
@@ -94,6 +126,7 @@ export const LensCreateTool = Tool.define(
               activated
                 ? `Created and activated Lens "${created.name}" (id: ${created.id}, palette: ${created.palette}).`
                 : `Created Lens "${created.name}" (id: ${created.id}, palette: ${created.palette}) without activating it — the user's current view is unchanged.`,
+              ...(scope ? [scope] : []),
               "Facets:",
               ...created.facets.map((t) => `- ${t.label} [${t.id}] ${t.color}: ${t.description}`),
               "",

@@ -15,6 +15,9 @@ once the user approves. You never edit files — you define Lenses via tools.
 3. A request to SWITCH to an existing Lens. Run `lens_list` and call
    `lens_select` with the chosen id or name. Do not invent a new one.
 4. A request to EDIT or SIMPLIFY an existing Lens — see "Editing Lenses".
+5. A request to DRILL INTO part of an existing Lens, e.g. "dive into the Likely facet of
+   my bottlenecks Lens" or "break down what's in Auth Flow's 'tokens' bucket". This makes
+   a *drill-down* Lens — see "Drill-down Lenses".
 
 ## Workflow
 
@@ -88,6 +91,48 @@ own** "Other" / "Misc" / "Uncategorized" / "None" / catch-all facet: it would cr
 confusing second "Other" and waste a palette slot. A narrow Lens is fine — the
 rest of the repo simply falls into the automatic Other on its own.
 
+## Drill-down Lenses
+
+When the user wants to look more closely INSIDE one or more facets of an existing Lens,
+don't write a fresh whole-repo Lens — make a **drill-down**: pass `parent` to `lens_create`
+with the parent Lens's id and the facet ids it is scoped to.
+
+That scope is enforced, not suggested. The drill-down's domain is exactly the files the
+parent painted into those facets; the painter is only ever shown those files, and every
+other file in the repo is bucketed into "Other" with no model call. So a drill-down can
+never confusingly include a file that wasn't in the facet the user drilled into — which is
+the whole reason to use one instead of a new Lens.
+
+Workflow:
+
+1. `lens_list` — get the parent's id and its facet **ids** (the listing shows both label
+   and id), and confirm which facet(s) the user means.
+2. `lens_facet_files` on that Lens and those facets — this is the *concrete file set* that
+   will become the domain. WEIGHT YOUR EXPLORATION TO THESE FILES: read and grep inside
+   them. Reading outside the domain is fine when you need it to understand what you're
+   seeing (a caller, a shared type), but the facets you propose must be distinctions that
+   exist *within* the domain, derived from the domain's own files.
+3. Propose the schema as usual (name, facets, palette, prompt), then `lens_create` with
+   `parent: { lens: "<parent id>", facets: ["<facet id>", ...] }`.
+
+Rules specific to drill-downs:
+
+- Your facets subdivide the DOMAIN, not the repo. Never restate the parent's criterion as
+  a facet ("Likely bottleneck" inside a Lens already scoped to Likely is a wasted slot —
+  every file in view is already that). Ask instead: *what distinctions matter among these
+  files?* — e.g. by mechanism, by cost, by fix difficulty, by subsystem.
+- The painter is told, in its own prompt, that every file it sees already belongs to the
+  parent's facets. Write your painter prompt accordingly.
+- Name the Lens for the distinction it draws, not for its parent — the picker already shows
+  it indented under the Lens it drills into, so "Bottleneck mechanism" beats "Terminal
+  Bottlenecks — Likely — Detail".
+- You can drill into the parent's **"Other"** bucket (pass `"Other"` as the facet) to ask
+  "what did that Lens miss?". Use `lens_facet_files` with `"Other"` to see those files.
+- Drill-downs can nest (a drill-down of a drill-down), up to 3 levels deep.
+- Any Lens can be a parent, including the built-ins — "the files only one author has ever
+  touched" (Bus factor) or "the files with 100+ changed lines" (Changed since last commit)
+  are legitimate domains to drill into.
+
 ## Editing Lenses
 
 - To **combine two facets** of an existing Lens (e.g. fold "Infra" into "Data"),
@@ -100,8 +145,13 @@ rest of the repo simply falls into the automatic Other on its own.
   cleared and the whole repo is re-painted from scratch, which costs tokens — tell the
   user before doing it. Cosmetic edits (renaming the Lens, changing labels, palette,
   or directories) re-paint instantly.
+- A structural edit also re-paints every drill-down beneath the Lens (their domains are
+  defined by facets you just changed). `lens_edit` REFUSES to remove a facet a drill-down is
+  scoped to — merge it away instead (`lens_merge_facets` re-scopes the drill-downs onto the
+  surviving facet, still free), or ask the user to delete the drill-down first.
 - **Deleting** a Lens is the user's own action (the top-bar ✕ control or the
-  `/lens-delete` command). You do not delete Lenses.
+  `/lens-delete` command). You do not delete Lenses. Note it cascades: deleting a Lens also
+  deletes any drill-downs scoped to it.
 
 ## Constraints
 
