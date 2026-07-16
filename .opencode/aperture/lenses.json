@@ -157,5 +157,33 @@
     "directories": [
       "packages/opencode/src/cli/cmd/tui"
     ]
+  },
+  "top-bar-rendering-a9d443de": {
+    "id": "top-bar-rendering-a9d443de",
+    "name": "Top Bar Rendering",
+    "description": "Maps TUI code by likelihood of being the source of top bar rendering issues.",
+    "palette": "bright-ordinal",
+    "prompt": "Classify TUI files by how directly they affect the top bar's rendering. Likely files directly paint the aperture visualization. Possible files manage its container, layout, or dimensions. Adjacent files provide data or styling but don't directly render the bar.",
+    "facets": [
+      {
+        "id": "likely",
+        "label": "Likely",
+        "description": "Core aperture rendering logic: the aperture plugin, treemap layout, cell rendering, and direct display of the visualization grid/tiles",
+        "color": "#4E5BA6"
+      },
+      {
+        "id": "possible",
+        "label": "Possible",
+        "description": "Container and layout management: session layout, flex constraints, viewport sizing, scrollbox configuration, and height/width calculations that might cause aperture to be clipped or misaligned",
+        "color": "#3AAFA9"
+      },
+      {
+        "id": "adjacent",
+        "label": "Adjacent",
+        "description": "Related but indirect: aperture data fetching, lens picker, activity tracking, theme/styling, and event handlers that feed the aperture but don't directly render it",
+        "color": "#59A14F"
+      }
+    ],
+    "scope": "project"
   }
 }

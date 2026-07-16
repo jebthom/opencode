@@ -1,5 +1,13 @@
 import { describe, expect, it } from "bun:test"
-import { inDomain, orderForest, scopeLabels, buildSystemPrompt, NONE_FACET, MAX_LENS_DEPTH } from "@/aperture/lenses"
+import {
+  inDomain,
+  orderForest,
+  scopeLabels,
+  buildSystemPrompt,
+  dependsOnDeterministic,
+  NONE_FACET,
+  MAX_LENS_DEPTH,
+} from "@/aperture/lenses"
 import type { Lens } from "@/aperture/lenses"
 import { partitionByDomain, isStale } from "@/aperture/painter"
 import type { Domain } from "@/aperture/painter"
@@ -202,6 +210,61 @@ describe("orderForest", () => {
     const order = orderForest(chain)
     expect(order.length).toBe(chain.length)
     expect(Math.max(...order.map((e) => e.depth))).toBeLessThanOrEqual(MAX_LENS_DEPTH)
+  })
+})
+
+// Drives refresh's decision to drop the live-git/subtree caches. The case that matters is a
+// drill-down of git-changed: it is semantic (the model paints it) but its domain gate reads
+// the parent's store, which is recomputed from the repo every pass — so it depends on those
+// caches exactly as its parent does. Testing only the active Lens left such a child painting
+// against a pre-commit git status that ⟳ and the periodic poll could never clear.
+describe("dependsOnDeterministic", () => {
+  const det = (id: string): Lens => ({ ...lens(id, ["a", "b"]), scope: "global", deterministic: "git-changed" })
+  const byId = (lenses: Lens[]) => new Map(lenses.map((l) => [l.id, l]))
+
+  it("is true for a deterministic Lens itself", () => {
+    const gitChanged = det("git-changed")
+    expect(dependsOnDeterministic(gitChanged, byId([gitChanged]))).toBe(true)
+  })
+
+  it("is true for a drill-down of a deterministic Lens, which is itself semantic", () => {
+    const gitChanged = det("git-changed")
+    const child = lens("child", ["x"], { lens: "git-changed", facets: ["a"] })
+    expect(child.deterministic).toBeUndefined()
+    expect(dependsOnDeterministic(child, byId([gitChanged, child]))).toBe(true)
+  })
+
+  it("is true for a grandchild, whose parent fill still reaches live git state", () => {
+    const gitChanged = det("git-changed")
+    const child = lens("child", ["x"], { lens: "git-changed", facets: ["a"] })
+    const grandchild = lens("grandchild", ["y"], { lens: "child", facets: ["x"] })
+    expect(dependsOnDeterministic(grandchild, byId([gitChanged, child, grandchild]))).toBe(true)
+  })
+
+  it("is false for a purely semantic chain, which reads only the persisted store", () => {
+    const root = lens("root", ["a"])
+    const child = lens("child", ["x"], { lens: "root", facets: ["a"] })
+    expect(dependsOnDeterministic(child, byId([root, child]))).toBe(false)
+  })
+
+  it("is false — not hung — on a hand-written cycle in lenses.json", () => {
+    const a = lens("a", ["f"], { lens: "b", facets: ["f"] })
+    const b = lens("b", ["f"], { lens: "a", facets: ["f"] })
+    expect(dependsOnDeterministic(a, byId([a, b]))).toBe(false)
+  })
+
+  it("is false for an orphan whose parent was deleted", () => {
+    const orphan = lens("orphan", ["q"], { lens: "deleted-lens", facets: ["a"] })
+    expect(dependsOnDeterministic(orphan, byId([orphan]))).toBe(false)
+  })
+
+  it("stops at MAX_LENS_DEPTH rather than walking an over-deep chain to its root", () => {
+    const chain: Lens[] = [det("l0")]
+    for (let i = 1; i <= MAX_LENS_DEPTH + 1; i++)
+      chain.push(lens(`l${i}`, ["f"], { lens: `l${i - 1}`, facets: ["f"] }))
+    expect(dependsOnDeterministic(chain[chain.length - 1]!, byId(chain))).toBe(false)
+    // ...but a chain within the cap still finds the deterministic root.
+    expect(dependsOnDeterministic(chain[MAX_LENS_DEPTH]!, byId(chain))).toBe(true)
   })
 })
 

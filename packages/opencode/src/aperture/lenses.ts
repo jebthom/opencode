@@ -387,6 +387,33 @@ export function isDeterministic(lens: Pick<Lens, "deterministic">): boolean {
   return lens.deterministic !== undefined
 }
 
+// Whether a Lens's painted view depends on LIVE repo state (git status / filesystem
+// membership) rather than only on the persisted facet store: it is either deterministic
+// itself, or it drills into a chain that bottoms out in a deterministic Lens. A drill-down
+// is never `deterministic` itself — it is painted by the model — but its domain gate reads
+// its parent's store, and for a deterministic parent that store is recomputed from the repo
+// on every pass (see witnessStoreFor). So the caches feeding that computation must be
+// dropped before a fetch for such a child too, or it paints against a git state that has
+// moved on (e.g. an out-of-band `git commit`, which fires no file event).
+//
+// Cycle-safe and total, like orderForest: `lenses.json` is committable and hand-editable, so
+// a missing parent or a hand-written loop must never hang this. Broken ancestry stops the
+// walk and reports what was found so far — which is also the fail-safe direction, since such
+// a Lens can't paint a domain anyway.
+export function dependsOnDeterministic(lens: Lens, byId: ReadonlyMap<string, Lens>): boolean {
+  const seen = new Set([lens.id])
+  let cur: Lens = lens
+  let depth = 0
+  while (true) {
+    if (isDeterministic(cur)) return true
+    if (!cur.parent || ++depth > MAX_LENS_DEPTH) return false
+    const up = byId.get(cur.parent.lens)
+    if (!up || seen.has(up.id)) return false
+    seen.add(up.id)
+    cur = up
+  }
+}
+
 // --- drill-down hierarchy ---------------------------------------------------
 
 export interface ForestEntry {

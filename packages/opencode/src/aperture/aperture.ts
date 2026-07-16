@@ -25,7 +25,7 @@ import { AperturePainter } from "./painter"
 import { ApertureLensStore } from "./lens-store"
 import { ApertureDeterministic } from "./deterministic"
 import { Git } from "@/git"
-import { type Lens, type LensParent, type PaletteId, legend as lensLegend, orderForest, inDomain, NONE_FACET, NONE_HUE, NONE_LABEL, ARCHITECTURE, ARCHITECTURE_ID, BUS_FACTOR, BUS_FACTOR_ID, MAX_LENS_DEPTH, isBuiltinLens, isDeterministic } from "./lenses"
+import { type Lens, type LensParent, type PaletteId, legend as lensLegend, orderForest, inDomain, NONE_FACET, NONE_HUE, NONE_LABEL, ARCHITECTURE, ARCHITECTURE_ID, BUS_FACTOR, BUS_FACTOR_ID, MAX_LENS_DEPTH, isBuiltinLens, isDeterministic, dependsOnDeterministic } from "./lenses"
 
 // Server-side Aperture service (PLAN.md steps 1 + 2.5). Owns the deterministic
 // payload, but unlike step 1 the graph is a *2-level window* rooted at a scope
@@ -1195,16 +1195,22 @@ export const layer = Layer.effect(
       // directory) or it would never kick off.
       yield* startBackgroundPainter(ctx.directory, ctx.project.id)
       const norm = ApertureExtract.normalizeScope(scope ?? "")
-      // A deterministic built-in (mtime / git-changed) paints from live disk state that
-      // finalize reads via subtreeCache / gitStatusCache. Those caches otherwise only drop on
-      // a file event or turn completion, so a manual IDE edit while one is already on screen
-      // stays stale until the next turn. refresh is the path every TUI fetch takes — the
-      // turn-end refetch, the manual ⟳, and the periodic poll — so dropping the inputs here
-      // recomputes them fresh on each, picking up watcher-missed changes. The whole-repo walk
-      // + git status are cheap, and this only fires while a deterministic Lens is the
-      // active view; semantic Lenses read the persisted facet store and keep their caches.
-      const active = yield* ApertureLensStore.getActive(ctx.directory)
-      if (isDeterministic(active)) {
+      // A view painted from live repo state (see dependsOnDeterministic) reads that state via
+      // subtreeCache / gitStatusCache. Those caches otherwise only drop on a file event or turn
+      // completion, so a change that fires neither — a manual IDE edit, or a `git commit` in the
+      // user's own terminal (the watcher reports only .git/HEAD, which a commit doesn't touch) —
+      // stays stale until the next turn. refresh is the path every TUI fetch takes (the turn-end
+      // refetch, the manual ⟳, and the periodic poll), so dropping the inputs here recomputes
+      // them fresh on each. The whole-repo walk + git status are cheap.
+      //
+      // Resolved from ONE `list` rather than getActive + list: both read lenses.json off disk
+      // uncached, and this runs on every fetch. An unresolvable active id is left alone
+      // deliberately — getActive would fall back to architecture, which isn't deterministic and
+      // so wouldn't drop the caches either.
+      const activeId = yield* ApertureLensStore.getActiveId(ctx.directory)
+      const all = yield* ApertureLensStore.list(ctx.directory)
+      const active = all.find((l) => l.id === activeId)
+      if (active && dependsOnDeterministic(active, new Map(all.map((l) => [l.id, l])))) {
         subtreeCache.delete(ctx.directory)
         gitStatusCache.delete(ctx.directory)
       }
