@@ -41,6 +41,7 @@ import { ShellID } from "@/tool/shell/id"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Truncate } from "@/tool/truncate"
 import { Image } from "@/image/image"
+import { logAutoSession } from "@/util/debug-autosession"
 import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
 import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
@@ -267,6 +268,14 @@ export const layer = Layer.effect(
         ? yield* provider.getModel(ag.model.providerID, ag.model.modelID)
         : ((yield* provider.getSmallModel(input.providerID)) ??
           (yield* provider.getModel(input.providerID, input.modelID)))
+      logAutoSession({
+        where: "server.ensureTitle",
+        event: "generating",
+        sessionID: input.session.id,
+        titleProviderID: mdl.providerID,
+        titleModelID: mdl.id,
+        promptProviderID: input.providerID,
+      })
       const msgs = onlySubtasks
         ? [{ role: "user" as const, content: subtasks.map((p) => p.prompt).join("\n") }]
         : yield* MessageV2.toModelMessagesEffect(context, mdl)
@@ -1233,6 +1242,15 @@ export const layer = Layer.effect(
       "SessionPrompt.prompt",
     )(function* (input: PromptInput) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+      logAutoSession({
+        where: "server.prompt",
+        event: "received",
+        sessionID: input.sessionID,
+        messageID: input.messageID,
+        model: input.model,
+        agent: input.agent,
+        isDefaultTitle: Session.isDefaultTitle(session.title),
+      })
       yield* revert.cleanup(session)
       const message = yield* createUserMessage(input)
       yield* sessions.touch(input.sessionID)

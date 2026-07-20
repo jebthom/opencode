@@ -4,6 +4,7 @@ import { Cause, Clock, Duration, Effect, Schedule } from "effect"
 import { MessageV2 } from "./message-v2"
 import { iife } from "@/util/iife"
 import { isRecord } from "@/util/record"
+import { logAutoSession, safeError } from "@/util/debug-autosession"
 
 export type Err = ReturnType<NamedError["toObject"]>
 
@@ -182,6 +183,23 @@ export function policy(opts: {
     Effect.succeed((meta: Schedule.InputMetadata<unknown>) => {
       const error = opts.parse(meta.input)
       const retry = retryable(error, opts.provider)
+      const data = isRecord(error) && isRecord((error as { data?: unknown }).data) ? (error as { data: Record<string, unknown> }).data : undefined
+      logAutoSession({
+        where: "server.retry",
+        event: "classify",
+        provider: opts.provider,
+        attempt: meta.attempt,
+        willRetry: !!retry,
+        classifiedMessage: retry?.message ?? null,
+        errorName: isRecord(error) ? (error as { name?: unknown }).name : undefined,
+        statusCode: data?.statusCode,
+        providerMessage: data?.message,
+        // The provider's raw error JSON — the smoking gun (e.g. overloaded_error vs
+        // rate_limit_error vs invalid_request). Kept generous so it isn't truncated.
+        responseBody: typeof data?.responseBody === "string" ? data.responseBody.slice(0, 8000) : undefined,
+        responseHeaders: data?.responseHeaders,
+        rawError: safeError(error),
+      })
       if (!retry) return Cause.done(meta.attempt)
       return Effect.gen(function* () {
         const wait = delay(meta.attempt, SessionV1.APIError.isInstance(error) ? error : undefined)

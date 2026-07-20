@@ -54,6 +54,7 @@ import { DialogConfirm } from "./ui/dialog-confirm"
 import { ToastProvider, useToast } from "./ui/toast"
 import { createExit, ExitProvider, useExit, type Exit } from "./context/exit"
 import { Session as SessionApi } from "@/session/session"
+import { logAutoSession, safeError } from "@/util/debug-autosession"
 import { TuiEvent } from "./event"
 import { KVProvider, useKV } from "./context/kv"
 import { Provider } from "@/provider/provider"
@@ -537,6 +538,81 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
         toast.show({ message: "Failed to fork session", variant: "error" })
       }
     })
+  })
+
+  // Aperture: skip the minimal home/intro screen (logo + lone prompt). On a plain
+  // launch, create a session up front and jump straight into the full session
+  // interface. This mirrors the first-prompt flow (see component/prompt
+  // submitInner), which is what normally creates the session and navigates today.
+  //
+  // Skipped when the launch already targets a session (--continue / --session) or
+  // carries a --prompt (the home route auto-submits that, creating the session),
+  // and when no provider is configured yet (let the provider-setup dialog + home
+  // screen take over instead of hanging). The session is born with a
+  // "New session - <timestamp>" placeholder title that the server renames after
+  // the first message; launching and quitting without ever sending therefore
+  // leaves a placeholder session behind in the list — an accepted, minor residual.
+  let autoCreated = false
+  const [autoCreateFailed, setAutoCreateFailed] = createSignal(false)
+  const [sessionOpened, setSessionOpened] = createSignal(false)
+  createEffect(() => {
+    if (autoCreated) return
+    if (args.continue || args.sessionID || args.prompt) return
+    if (route.data.type !== "home") return
+    if (!sync.ready) return
+
+    // No providers configured — defer to the empty-provider dialog below and the
+    // normal home screen rather than blocking on a blank view.
+    if (sync.status === "complete" && sync.data.provider.length === 0) {
+      autoCreated = true
+      setAutoCreateFailed(true)
+      return
+    }
+
+    if (!local.model.ready) return
+    const model = local.model.current()
+    const agent = local.agent.current()
+    if (!model || !agent) return
+
+    autoCreated = true
+    const variant = local.model.variant.current()
+    logAutoSession({
+      where: "tui.autocreate",
+      event: "creating",
+      agent: agent.name,
+      model: { providerID: model.providerID, modelID: model.modelID, variant },
+    })
+    void sdk.client.session
+      .create({
+        agent: agent.name,
+        model: { providerID: model.providerID, id: model.modelID, variant },
+      })
+      .then((res) => {
+        if (res.error || !res.data) {
+          logAutoSession({ where: "tui.autocreate", event: "create-error", error: safeError(res.error) })
+          toast.show({ message: "Failed to open a new session", variant: "error" })
+          setAutoCreateFailed(true)
+          return
+        }
+        logAutoSession({ where: "tui.autocreate", event: "created", sessionID: res.data.id })
+        route.navigate({ type: "session", sessionID: res.data.id })
+        setSessionOpened(true)
+      })
+      .catch((error) => {
+        logAutoSession({ where: "tui.autocreate", event: "create-throw", error: safeError(error) })
+        toast.show({ message: "Failed to open a new session", variant: "error" })
+        setAutoCreateFailed(true)
+      })
+  })
+
+  // Hide the home/intro screen on a plain launch so it never flashes before we
+  // land in the auto-created session. Reveal the real home screen if the launch
+  // isn't a plain one, if auto-create was skipped/failed, or if we've already
+  // opened the session once (e.g. the session route bounced back to home).
+  const suppressHome = createMemo(() => {
+    if (args.continue || args.sessionID || args.prompt) return false
+    if (autoCreateFailed() || sessionOpened()) return false
+    return true
   })
 
   createEffect(
@@ -1083,7 +1159,9 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
         <box flexGrow={1} minHeight={0} flexDirection="column">
           <Switch>
             <Match when={route.data.type === "home"}>
-              <Home />
+              <Show when={!suppressHome()} fallback={<box flexGrow={1} minHeight={0} />}>
+                <Home />
+              </Show>
             </Match>
             <Match when={route.data.type === "session"}>
               <Show when={route.data.type === "session" ? route.data.sessionID : undefined} keyed>

@@ -43,6 +43,7 @@ import { TuiEvent } from "../../event"
 import { iife } from "@/util/iife"
 import { Locale } from "@/util/locale"
 import { errorMessage } from "@/util/error"
+import { logAutoSession } from "@/util/debug-autosession"
 import { formatDuration } from "@/util/format"
 import { createColors, createFrames } from "../../ui/spinner.ts"
 import { useDialog } from "@tui/ui/dialog"
@@ -1170,6 +1171,16 @@ export function Prompt(props: PromptProps) {
     }
 
     const messageID = MessageID.ascending()
+    logAutoSession({
+      where: "tui.submit",
+      event: "send",
+      sessionID,
+      wasNewSession: props.sessionID == null,
+      mode: store.mode,
+      agent: agent.name,
+      model: { providerID: selectedModel.providerID, modelID: selectedModel.modelID, variant },
+      messageID,
+    })
     const inputText = expandTrackedPastedText(
       store.prompt.input,
       input.extmarks.getAllForTypeId(promptPartTypeId).flatMap((extmark) => {
