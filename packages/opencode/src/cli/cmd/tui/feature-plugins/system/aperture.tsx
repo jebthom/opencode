@@ -96,6 +96,21 @@ const TOP_BAR_HEIGHT = 20
 // whether the horizontal scrollbar shows. Keep in sync with the JSX that uses them.
 const SCROLL_GAP = 2
 const BAR_PADDING_X = 2
+// Inter-item gap in the one-row legend strip. Named (not the literal 2) because the fit
+// test below has to reproduce the row's exact width to know when to trim — keep the JSX
+// gap prop and this constant the same.
+const LEGEND_GAP = 2
+// Even-trim floor for legend facet labels. The legend is a fixed single row that must
+// neither wrap (vertical space is scarce) nor clip; when the swatches + labels overflow
+// the bar width, every facet label is capped to a shared length — as large as still fits —
+// but never shorter than this: below it a label stops being recognisable. A trimmed label
+// renders LEGEND_LABEL_MIN columns (LEGEND_LABEL_MIN-1 chars + "…"). The lens name and the
+// fixed "Other"/"Non-code" labels are never trimmed; the hover line still shows a swatch's
+// full label, so trimming hides characters but loses no information.
+const LEGEND_LABEL_MIN = 6
+// A couple of columns held back from the fit test so ambiguous-width legend glyphs
+// (■ ◀ ▶ ⌄) a terminal may render two cells wide can't nudge the row past the edge.
+const LEGEND_SAFETY_PAD = 2
 // Cells moved per wheel notch when we redirect a vertical wheel into horizontal
 // scroll. Tiles are ~CHILD_W wide, so 1 cell/notch (the raw terminal delta) feels
 // sluggish; a small multiplier makes the bar pan at a comfortable speed.
@@ -421,6 +436,53 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     activeId()
     setConfirmingDelete(false)
     setCascade(0)
+  })
+  // Columns the leading lens-name cluster occupies (◀ name ▶ ⌄ [delete], inner gap 1), or
+  // 0 when there's no active Lens. Mirrors the JSX at the head of the legend row so the
+  // trim budget below matches what actually renders.
+  const lensClusterWidth = () => {
+    if (!activeName()) return 0
+    const items = [1, activeName().length, 1, 1] // ◀  name  ▶  ⌄
+    if (canDeleteActive()) items.push(deleteLabel().length) // ✕ / ✕ confirm? (+N …)
+    return items.reduce((a, b) => a + b, 0) + (items.length - 1) // + inner gap-1s
+  }
+  // Path-B legend fit: reproduce the one-row legend's rendered width and, when it overflows
+  // the bar, even-trim the facet labels to a shared cap (as large as fits, floored at
+  // LEGEND_LABEL_MIN) so the row neither wraps nor clips. Labels at or under the cap are left
+  // whole; longer ones are ellipsised. Only the facet labels are trimmable — the lens cluster
+  // and the fixed Other/Non-code swatches are counted as fixed overhead. Returns the legend
+  // entries with (possibly) shortened labels.
+  const trimmedLegend = createMemo(() => {
+    const entries = legendEntries()
+    // Top-level children of the legend row: optional lens cluster + one per entry + the two
+    // fixed swatches. Gaps sit between them.
+    const children = (activeName() ? 1 : 0) + entries.length + 2
+    const fixed =
+      lensClusterWidth() +
+      entries.length * 2 + // ■ + leading space on each entry (the label is the trimmable rest)
+      (2 + NONE_LABEL.length) + // "Other" swatch + label
+      (2 + UNTAGGED_LABEL.length) + // "Non-code" swatch + label
+      Math.max(0, children - 1) * LEGEND_GAP +
+      LEGEND_SAFETY_PAD
+    const budget = dimensions().width - BAR_PADDING_X * 2 - fixed
+    const maxLen = entries.reduce((m, e) => Math.max(m, e.label.length), 0)
+    // Largest shared cap whose trimmed-label total still fits the budget; never below the
+    // floor. sum(min(len, n)) is monotonic in n, so grow from the floor and stop when it
+    // no longer fits. A negative/tiny budget leaves cap at the floor (best effort).
+    let cap = LEGEND_LABEL_MIN
+    for (let n = LEGEND_LABEL_MIN; n <= maxLen; n++) {
+      const used = entries.reduce((s, e) => s + Math.min(e.label.length, n), 0)
+      if (used <= budget) cap = n
+      else break
+    }
+    // Carry the untrimmed text as `full` so a swatch can reveal it on hover (below) —
+    // trimming then hides characters without losing information.
+    if (cap >= maxLen) return entries.map((e) => ({ ...e, full: e.label }))
+    return entries.map((e) => ({
+      ...e,
+      full: e.label,
+      label: e.label.length > cap ? e.label.slice(0, cap - 1) + "…" : e.label,
+    }))
   })
   const colorByFacet = createMemo(() => new Map(legendEntries().map((e) => [e.facet, e.color])))
   // A facet id → colour: the NONE_FACET escape paints the "Other" grey; a real facet paints
@@ -791,7 +853,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
 
       {/* Legend: the fixed architectural-layer vocabulary the async painter paints
           with. Stable row so the swatches don't move as nodes get (re)tagged. */}
-      <box flexDirection="row" gap={2} height={1} flexShrink={0}>
+      <box flexDirection="row" gap={LEGEND_GAP} height={1} flexShrink={0}>
         {/* Active Lens name flanked by ◀/▶ arrows that step (and loop)
             through the available Lenses, the click-driven sibling of /lens. */}
         <Show when={activeName()}>
@@ -827,9 +889,16 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
             </Show>
           </box>
         </Show>
-        <For each={legendEntries()}>
+        <For each={trimmedLegend()}>
           {(entry) => (
-            <box flexDirection="row" flexShrink={0}>
+            // Hovering a swatch surfaces the untrimmed facet name in the hover line, so an
+            // ellipsised label still tells you what it stands for.
+            <box
+              flexDirection="row"
+              flexShrink={0}
+              onMouseOver={() => setHovered(entry.full)}
+              onMouseOut={() => setHovered(undefined)}
+            >
               <text fg={resolveColor(theme(), entry.color)} wrapMode="none">
                 ■
               </text>

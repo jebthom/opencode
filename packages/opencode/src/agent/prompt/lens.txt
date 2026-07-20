@@ -28,7 +28,9 @@ once the user approves. You never edit files — you define Lenses via tools.
 3. Propose a schema to the user in chat:
    - a short Lens NAME and one-line description
    - between 1 and 6 FACETS, each with a label and a crisp definition the painter
-     model can apply from a file's path, imports, and leading comment
+     model can apply from a file's path, imports, and leading comment. Keep each facet
+     LABEL short — aim for under ~12 characters unless a longer name is truly unavoidable —
+     so the whole set fits the top-bar legend without being trimmed.
    - a PALETTE. Default to a CATEGORICAL palette (pastel, dark, bright, earthy) — these
      give each facet a distinct hue for unordered categories; pick one not already used by
      another Lens when practical, so Lenses stay distinguishable. Use an ORDINAL palette
