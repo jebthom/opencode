@@ -101,6 +101,13 @@ export const LensInfo = Schema.Struct({
   id: Schema.String,
   name: Schema.String,
   legend: Schema.Array(LegendEntry),
+  // True for the built-in Lenses whose facets are computed deterministically from the
+  // repo (git-changed / edit-recency / bus-factor) rather than by the painter. Lets a
+  // client suppress editor-gutter painting for these: two are fundamentally file-level,
+  // and git-changed duplicates VSCode's own diff gutter while its whole-file function
+  // strips bury the added/removed markers. The TUI ignores it (it still tiles their
+  // composition/extents); the VSCode extension skips gutter paint when it's set.
+  deterministic: Schema.optional(Schema.Boolean),
 })
 export type LensInfo = typeof LensInfo.Type
 

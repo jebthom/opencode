@@ -107,7 +107,17 @@ export function activate(context: vscode.ExtensionContext) {
     const url = `${baseUrl()}/aperture?drill=${encodeURIComponent(relPath)}&scope=${encodeURIComponent(scope)}`
     const res = await fetch(url, { headers: { "x-opencode-directory": dir } })
     if (!res.ok) return undefined
-    const data = (await res.json()) as { nodes?: GraphNode[]; extents?: Record<string, Extent[]> }
+    const data = (await res.json()) as {
+      nodes?: GraphNode[]
+      extents?: Record<string, Extent[]>
+      lens?: { id: string; deterministic?: boolean }
+    }
+    // Deterministic built-in Lenses (Changed since last commit, Edit recency, Bus factor)
+    // don't paint the gutter: git-changed duplicates VSCode's own diff gutter (and its
+    // whole-file strips bury the added/removed markers), and the other two are file-level.
+    // Returning undefined here both skips painting and clears any strips left from a
+    // previously-active painted Lens.
+    if (data.lens?.deterministic) return undefined
     // `extents` is keyed by file node id and carries EVERY drilled file still in the
     // window — not just the one we asked for. Select by this file's node id; taking the
     // first entry would paint a sibling's extents onto the current file.

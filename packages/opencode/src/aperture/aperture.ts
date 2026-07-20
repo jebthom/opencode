@@ -939,6 +939,9 @@ export const layer = Layer.effect(
           id: lens.id,
           name: lens.name,
           legend: lensLegend(lens),
+          // Signals a deterministic built-in (git/mtime, no painter) so a client can
+          // suppress editor-gutter painting for it — see LensInfo in payload.ts.
+          ...(det ? { deterministic: true } : {}),
         }
         // Drill-in (A5): attach function-level tiles for every file that has been
         // drilled in this directory AND is in the current window — not just the file the
