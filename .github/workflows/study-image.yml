@@ -1,0 +1,64 @@
+name: study-image
+
+# Builds the frozen Aperture image the user-study codespaces run on.
+#
+# Manual only — this is a study artifact, not CI. Every run records the exact Aperture SHA it
+# froze in the job summary, so the image tag stays traceable back to source after Aperture
+# moves on. Push the branch first: the Dockerfile clones this repo at APERTURE_SHA.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Friendly tag for the image, e.g. study1"
+        required: true
+        default: study1
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/aperture-study/aperture-study
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve Aperture SHA
+        id: resolve
+        run: echo "sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/study.Dockerfile
+          push: true
+          build-args: |
+            APERTURE_SHA=${{ steps.resolve.outputs.sha }}
+          tags: |
+            ${{ env.IMAGE }}:${{ inputs.tag }}
+            ${{ env.IMAGE }}:${{ steps.resolve.outputs.sha }}
+
+      - name: Record what was frozen
+        run: |
+          {
+            echo "## Aperture study image"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Aperture SHA | \`${{ steps.resolve.outputs.sha }}\` |"
+            echo "| Ref | \`${{ github.ref_name }}\` |"
+            echo "| Tags | \`${{ env.IMAGE }}:${{ inputs.tag }}\`<br>\`${{ env.IMAGE }}:${{ steps.resolve.outputs.sha }}\` |"
+            echo
+            echo "Copy the SHA into the study record alongside the participant materials."
+          } >> "$GITHUB_STEP_SUMMARY"
