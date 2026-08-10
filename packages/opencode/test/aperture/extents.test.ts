@@ -8,6 +8,7 @@ import {
   parseHunkRanges,
   subNodeID,
   PREAMBLE,
+  WHOLE,
   type Extent,
   type FileComposition,
 } from "@/aperture/extents"
@@ -33,13 +34,32 @@ describe("aperture extents (sub-file resolution)", () => {
     expect(extentsOf("")).toEqual([])
   })
 
-  test("declaration-free file is a single whole-file preamble tile", () => {
-    const content = "const a = 1\nconsole.log(a)\n"
-    // No top-level *declaration keyword at column 0* beyond `const a` — wait, const a IS one.
+  test("declaration-free file is a single whole-file tile", () => {
     const noDecl = "1 + 1\nconsole.log('hi')"
     const extents = extentsOf(noDecl)
-    expect(extents).toEqual([{ name: PREAMBLE, startLine: 1, endLine: 2 }])
+    expect(extents).toEqual([{ name: WHOLE, startLine: 1, endLine: 2 }])
     assertTiles(extents, 2)
+  })
+
+  test('"file" granularity is always exactly one whole-file extent', () => {
+    const content = ["import x", "function a() {}", "function b() {}"].join("\n")
+    expect(extentsOf(content, "declaration").map((e) => e.name)).toEqual([PREAMBLE, "a", "b"])
+    expect(extentsOf(content, "file")).toEqual([{ name: WHOLE, startLine: 1, endLine: 3 }])
+    assertTiles(extentsOf(content, "file"), 3)
+    // An empty file has no extents at either granularity.
+    expect(extentsOf("", "file")).toEqual([])
+  })
+
+  test("a declaration cut that yields fewer than two extents collapses to WHOLE", () => {
+    // The two granularities must agree on such a file, so promoting it to declaration
+    // granularity never repaints the same span under a different name.
+    const oneDecl = ["function only() {", "  return 1", "}"].join("\n")
+    expect(extentsOf(oneDecl, "declaration")).toEqual(extentsOf(oneDecl, "file"))
+    const noDecl = "1 + 1"
+    expect(extentsOf(noDecl, "declaration")).toEqual(extentsOf(noDecl, "file"))
+    // Two declarations is the first cut that actually refines.
+    const twoDecls = ["function a() {}", "function b() {}"].join("\n")
+    expect(extentsOf(twoDecls, "declaration").map((e) => e.name)).toEqual(["a", "b"])
   })
 
   test("imports + functions: preamble then one extent per declaration, tiling exactly", () => {
@@ -67,18 +87,20 @@ describe("aperture extents (sub-file resolution)", () => {
   })
 
   test("a declaration on line 1 produces no preamble", () => {
-    const content = ["function only() {", "  return 1", "}"].join("\n")
+    // Two declarations, so the <2-extent collapse to WHOLE doesn't mask the result.
+    const content = ["function only() {", "  return 1", "}", "const after = 1"].join("\n")
     const extents = extentsOf(content)
-    expect(extents.map((e) => e.name)).toEqual(["only"])
-    assertTiles(extents, 3)
+    expect(extents.map((e) => e.name)).toEqual(["only", "after"])
+    assertTiles(extents, 4)
   })
 
   test("indented (non-top-level) declarations are ignored", () => {
-    const content = ["class Outer {", "  method() {}", "  const inner = 1", "}"].join("\n")
+    const content = ["class Outer {", "  method() {}", "  const inner = 1", "}", "const after = 1"].join("\n")
     const extents = extentsOf(content)
-    // Only the top-level `class Outer` counts; the class is one unit.
-    expect(extents.map((e) => e.name)).toEqual(["Outer"])
-    assertTiles(extents, 4)
+    // Only the top-level `class Outer` and `const after` count; the class is one unit,
+    // and neither `method` nor the indented `inner` becomes an extent.
+    expect(extents.map((e) => e.name)).toEqual(["Outer", "after"])
+    assertTiles(extents, 5)
   })
 
   test("python def/class at column 0 are recognised", () => {
@@ -123,7 +145,13 @@ describe("aperture extents (sub-file resolution)", () => {
 
     test("aggregates painted functions by facet; unpainted count toward subtree only", () => {
       // a,b → "core"; c unpainted; preamble unpainted.
-      const comp = fileComposition(content, new Map([["a", "core"], ["b", "core"]]))
+      const comp = fileComposition(
+        content,
+        new Map([
+          ["a", "core"],
+          ["b", "core"],
+        ]),
+      )
       expect(comp.weights).toEqual([{ facet: "core", count: 2, bytes: comp.weights[0]!.bytes }])
       expect(comp.totalCount).toBe(2)
       // All four extents (preamble + a + b + c) make up the subtree.
@@ -134,7 +162,14 @@ describe("aperture extents (sub-file resolution)", () => {
     })
 
     test("a mixed file yields multiple weights in stable facet order", () => {
-      const comp = fileComposition(content, new Map([["a", "zeta"], ["b", "alpha"], ["c", "alpha"]]))
+      const comp = fileComposition(
+        content,
+        new Map([
+          ["a", "zeta"],
+          ["b", "alpha"],
+          ["c", "alpha"],
+        ]),
+      )
       expect(comp.weights.map((w) => w.facet)).toEqual(["alpha", "zeta"])
       expect(comp.weights.find((w) => w.facet === "alpha")!.count).toBe(2)
       expect(comp.totalCount).toBe(3)

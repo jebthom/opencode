@@ -24,6 +24,19 @@ export interface Extent {
 // Residual head before the first declaration (imports, top-level statements).
 export const PREAMBLE = "(preamble)"
 
+// The whole file as a single extent — the *coarse* granularity, and what a file's
+// facet used to be before painting was unified (O3). A cold file is cut this way and
+// costs exactly what file-level painting cost; an interesting one is re-cut per
+// declaration. Distinct from PREAMBLE, which is only ever the head of a file that has
+// declarations after it.
+export const WHOLE = "(file)"
+
+// How finely to cut a file. "file" is the cheap floor (one extent, one classification);
+// "declaration" is the refinement the interest heuristics promote a file to. Both are
+// edit-stable: WHOLE has no line dependence at all, and a declaration's name survives
+// edits above it. See PLAN.md O3.
+export type Granularity = "file" | "declaration"
+
 // A top-level declaration is one whose keyword sits at column 0 (no indentation),
 // exported or not. Covers TS/JS (function/const/let/var/class/interface/type/enum)
 // and Python (def/class). We only need the *name* and the start line, never the
@@ -37,13 +50,20 @@ function lineCount(content: string): number {
   return content.split("\n").length
 }
 
-// The extents of `content`, in file order, tiling [1, lineCount] exactly. Returns
-// [] for an empty file. A file with no top-level declaration yields a single
-// whole-file extent named PREAMBLE (the caller may treat that as "file-level
-// suffices" and skip sub-file painting).
-export function extentsOf(content: string): Extent[] {
+// The extents of `content` at `granularity`, in file order, tiling [1, lineCount]
+// exactly. Returns [] for an empty file.
+//
+// At "declaration" granularity the result collapses back to the single WHOLE extent
+// whenever the cut would yield fewer than two — a file with no top-level declaration,
+// or one whose only declaration starts at line 1. That makes the two granularities
+// *coincide exactly* on such files rather than naming the same span two different
+// ways, so promoting a file to declaration granularity can never repaint it for no
+// gain, and demoting can never happen at all.
+export function extentsOf(content: string, granularity: Granularity = "declaration"): Extent[] {
   const total = lineCount(content)
   if (total === 0) return []
+  const whole = [{ name: WHOLE, startLine: 1, endLine: total }]
+  if (granularity === "file") return whole
 
   // Collect (1-based start line, name) for every top-level declaration, keeping
   // names unique within the file so each maps to a distinct sub-node id.
@@ -60,7 +80,7 @@ export function extentsOf(content: string): Extent[] {
     starts.push({ line: i + 1, name })
   }
 
-  if (starts.length === 0) return [{ name: PREAMBLE, startLine: 1, endLine: total }]
+  if (starts.length === 0) return whole
 
   const extents: Extent[] = []
   // Preamble: everything before the first declaration (omitted when a declaration
@@ -71,13 +91,18 @@ export function extentsOf(content: string): Extent[] {
     const endLine = i + 1 < starts.length ? starts[i + 1]!.line - 1 : total
     extents.push({ name: starts[i]!.name, startLine, endLine })
   }
-  return extents
+  // A single declaration spanning the whole file is the same span as WHOLE; name it
+  // that way so the two granularities agree (see the note above).
+  return extents.length < 2 ? whole : extents
 }
 
 // The exact text of an extent (1-based inclusive lines), used as the per-function
 // staleness key so an unchanged function spends nothing on re-drill.
 export function extentText(content: string, extent: Extent): string {
-  return content.split("\n").slice(extent.startLine - 1, extent.endLine).join("\n")
+  return content
+    .split("\n")
+    .slice(extent.startLine - 1, extent.endLine)
+    .join("\n")
 }
 
 // A file's facet *mix*, measured from the spread of its function facets weighted by
@@ -94,8 +119,14 @@ export interface FileComposition {
   readonly subtreeBytes: number
 }
 
-export function fileComposition(content: string, facetByName: ReadonlyMap<string, string>): FileComposition {
-  const extents = extentsOf(content)
+export function fileComposition(
+  content: string,
+  facetByName: ReadonlyMap<string, string>,
+  // Must match the granularity `facetByName` was keyed at, or no extent name will match
+  // and the mix comes out empty.
+  granularity: Granularity = "declaration",
+): FileComposition {
+  const extents = extentsOf(content, granularity)
   // Per-line byte length *including* its line terminator (all lines but the last,
   // which has none when the file lacks a trailing newline). Summing an extent's
   // lines this way attributes every byte of the file exactly once, so the extents
@@ -232,7 +263,13 @@ export function parseHunkRanges(patch: string): Array<[number, number]> {
 // the file's own node id (which hashes the bare path). Stable across edits that
 // move the declaration's lines, so its painted facet survives reformatting.
 export function subNodeID(relPath: string, name: string): string {
-  return "n_" + createHash("sha256").update(relPath + "#" + name).digest("hex").slice(0, 16)
+  return (
+    "n_" +
+    createHash("sha256")
+      .update(relPath + "#" + name)
+      .digest("hex")
+      .slice(0, 16)
+  )
 }
 
 export * as ApertureExtents from "./extents"

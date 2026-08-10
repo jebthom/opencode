@@ -18,23 +18,33 @@ import { type Lens, isAssignableFacet, facetEnumIds, buildSystemPrompt, NONE_FAC
 import { ApertureExtract } from "./extract"
 import { ApertureExtents } from "./extents"
 
-// Semantic painter (PLAN.md step 4). Given the file nodes of a viewed scope, it
-// infers one facet per file with a small/fast model and writes the
-// result to the per-project semantic store. It is the *only* place tokens are
-// spent in the Aperture feature.
+// Semantic painter. Given the files of a viewed scope, it infers a facet per *extent*
+// with a small/fast model, writes them to the per-project sub-facet store, and derives
+// each file's own facet from the result. It is the *only* place tokens are spent in the
+// Aperture feature, and since O3 the only painter at all — file-level painting is not a
+// separate pass but the coarse end of this one.
 //
-// Frugality is the whole point and comes from two rules:
-//   1. Stale-only — a file is (re)painted only when it has no stored entry or its
-//      content hash changed. Re-displaying unchanged files spends nothing.
-//   2. Minimal context — by default the model sees only the path, parsed import
-//      specifiers, and the leading comment; agent-authored code is rarely named
-//      pathologically, so that's usually enough to place a file. A Lens whose facets
-//      need the code's *shape* (e.g. "code smells", "god files") opts into `medium`,
-//      which adds a cheap structural skeleton — exported names, the file's line count,
-//      and each top-level declaration's signature + length — never a function body, so
-//      cost scales with declaration count, not file size. The mode is per-Lens
-//      (Lens.context); a global config override (aperture.painter.context) can force one
-//      mode across all Lenses for experimentation.
+// Granularity is the cost dial (PLAN.md O3). A file is cut either into ONE whole-file
+// extent — described exactly as file-level painting described it, at exactly its price —
+// or into one extent per top-level declaration, which measured ~5.8x. Which one it gets
+// is decided by granularityOf from the config dial plus the caller's interest signal, so
+// always-on painting costs the old floor and only files in view / edited / in the working
+// set pay the refinement. Nothing classifies a file independently of its extents, which
+// is what makes it impossible for a file's colour to contradict its parts'.
+//
+// Frugality otherwise comes from two rules:
+//   1. Stale-only, per extent — an extent is (re)painted only when it has no stored entry
+//      or its own text changed, so an edit to one function repaints that function and
+//      nothing else, and re-displaying unchanged code spends nothing.
+//   2. Minimal context — a fine block is a declaration's signature + leading comment; a
+//      coarse block is the path, parsed import specifiers, and the leading comment.
+//      Agent-authored code is rarely named pathologically, so that's usually enough to
+//      place a file. A Lens whose facets need the code's *shape* (e.g. "code smells",
+//      "god files") opts into `medium`, which adds a cheap structural skeleton — exported
+//      names, the file's line count, and each top-level declaration's signature + length —
+//      never a function body, so cost scales with declaration count, not file size. The
+//      mode is per-Lens (Lens.context); a global config override (aperture.painter.context)
+//      can force one mode across all Lenses for experimentation.
 //
 // Failure is soft: any read/model/parse error leaves existing semantics intact
 // and publishes nothing, so the structure bar always keeps working.
@@ -43,11 +53,8 @@ const log = Log.create({ service: "aperture.painter" })
 
 // Caps so a large window can never blow up a prompt or a single request: read at
 // most this many stale files per pass, binned into dir-coherent groups of at most
-// FACET_BATCH files and classified with up to FACET_FANOUT model calls in flight.
+// EXTENT_BATCH block-weight and classified with up to FACET_FANOUT model calls in flight.
 const MAX_PER_PASS = 960
-// Max files per directory bin: a directory with more is split into same-dir chunks
-// of this size (see splitDirs). Each chunk is one model call.
-const FACET_BATCH = 30
 // Default number of dir-bins classified concurrently within a single pass. The perf
 // sweep (the dirsplit eval harness under perf/) proved dirsplit fastest with no
 // throttling, and on a ~2400-file repo at minimal context a sweep uses only ~26% req /
@@ -70,6 +77,23 @@ const MAX_COMMENT_CHARS = 240
 const MAX_SKELETON_DECLS = 40
 const SKELETON_SIG_CHARS = 120
 
+// Bin budget in *block weight* rather than file count (O3), replacing the flat
+// 30-files-per-bin of the pre-merge file painter. A coarse block is a whole file
+// (describeFile — imports + comment, optionally a skeleton); a fine block is one
+// declaration's signature + leading comment, roughly half that. Weighting them 2:1
+// against a budget of 60 makes a coarse-only bin exactly those same 30 files, so the
+// whole-repo sweep's prompts and per-call latency are unchanged by the merge, while a
+// fine bin carries ~60 declarations for a comparable input size.
+const EXTENT_BATCH = 60
+const COARSE_BLOCK_WEIGHT = 2
+const FINE_BLOCK_WEIGHT = 1
+// Secondary cap, on extents rather than files: MAX_PER_PASS alone can't bound a pass
+// whose files are cut per-declaration. Truncation is on FILE boundaries so a file is
+// never half-painted, and the dropped tail simply stays stale for the next trigger.
+// A coarse pass can't reach this (MAX_PER_PASS files × 1 extent each < 2400), which is
+// why the background sweep's BG_BATCH contract with MAX_PER_PASS still holds.
+const MAX_EXTENTS_PER_PASS = 2400
+
 export interface FileNode {
   readonly id: string
   readonly path: string
@@ -91,17 +115,17 @@ export interface Domain {
   readonly allowed: ReadonlySet<string>
 }
 
-// Whether a node needs (re)deciding: never painted, its content changed, or — for a
-// drill-down — the parent moved it to a different facet. That last case is invisible to a
-// content hash (the file didn't change, its *domain* did), which is why entries carry `via`.
-export function isStale(
-  entry: ApertureSemanticStore.Entry | undefined,
-  hash: string,
-  witness: string | undefined,
-): boolean {
-  if (!entry) return true
-  if (entry.hash !== hash) return true
-  return witness !== undefined && entry.via !== witness
+// Whether a drill-down's parent has MOVED this file to a different facet since it was
+// last painted. Invisible to a content hash — the file didn't change, its *domain* did —
+// which is why entries carry `via`. It forces every extent of the file to repaint,
+// because their facets were chosen under a domain that no longer holds.
+//
+// Content staleness is NOT this function's job: since O3 that is decided per extent, by
+// the extent's own content hash, so an edit to one function repaints only that function.
+// Absence is likewise not "moved" — a never-painted file has no extents stored either, so
+// it is already stale by hash and needs no special case here.
+export function domainMoved(entry: ApertureSemanticStore.Entry | undefined, witness: string | undefined): boolean {
+  return witness !== undefined && entry !== undefined && entry.via !== witness
 }
 
 export interface Partition<T> {
@@ -144,6 +168,19 @@ export interface PaintOptions {
   // fill forced by a drill-down). Study logging attributes the spend to both, so a
   // drill-down's true cost — its own paint plus the ancestor fills it forced — is visible.
   readonly trigger?: string
+  // What put these files in the interest set — "drill" | "working-set" | "window" |
+  // "file-changed" | "lens-switch" | "sweep". Recorded so the cost of each trigger is
+  // attributable, which is what makes widening the granularity dial an evidence-based
+  // call. Distinct from `trigger` above, which names a *Lens*, not a reason.
+  readonly source?: string
+}
+
+// A file to paint, and whether the caller considers it interesting enough to cut per
+// declaration. The painter turns that into a granularity — honouring the high-water rule
+// that a file already cut finely is never coarsened back (see granularityOf).
+export interface PaintTarget {
+  readonly node: FileNode
+  readonly interested?: boolean
 }
 
 export interface Deps {
@@ -172,50 +209,127 @@ function buildFacetSchema(lens: Lens) {
 // and background (whole-repo sweep) requests can be told apart after the fact.
 export type Origin = "fg" | "bg"
 
-// Paint any stale file node in `fileNodes` and persist the result. Requires only
-// FSUtil from context (provided at the fork site); all other services are passed
+// Paint any stale *extent* of any file in `targets` and persist the result. Requires
+// only FSUtil from context (provided at the fork site); all other services are passed
 // in so callers keep a clean `R = never` return type.
+//
+// Since O3 this is the ONLY painter. The unit of work is an extent, and a file's
+// granularity decides how many extents it has: a cold file is one WHOLE extent described
+// exactly as file-level painting described it (same prompt, same cost), an interesting
+// one is cut per declaration. A file's own facet is never classified independently — it
+// is *derived* from the extent mix in the post-pass below, which is what makes it
+// impossible for a file's colour and its parts' colours to disagree.
 export const paintStale = Effect.fn("Aperture.paintStale")(function* (
   deps: Deps,
   directory: string,
   projectID: string,
-  scope: string,
-  fileNodes: ReadonlyArray<FileNode>,
+  // The viewed windows to invalidate once tiles are coloured. Plural because a file at
+  // a/b/c.ts is drawn in window "a" as well as "a/b" (VIEW_DEPTH is 2), so publishing
+  // only to its own parent directory under-notifies.
+  scopes: ReadonlyArray<string>,
+  targets: ReadonlyArray<PaintTarget>,
   origin: Origin,
   lens: Lens,
   options: PaintOptions = {},
 ) {
-  if (fileNodes.length === 0) return
-  const { domain, publish = true, trigger } = options
+  if (targets.length === 0) return
+  const { domain, publish = true, trigger, source } = options
 
   const store = yield* ApertureSemanticStore.read(deps.storage, projectID, lens.id)
+  const subStore = yield* ApertureSubfacetStore.read(deps.storage, projectID, lens.id)
+  // Read for the granularity high-water mark as well as the write below: a file already
+  // cut per-declaration has a mix with more than one extent in it.
+  const priorMixes = yield* ApertureSubfacetStore.readMixes(deps.storage, projectID, lens.id)
+  const granularityMode = yield* painterGranularity(deps.config)
 
-  // Read + hash each candidate, keeping only those whose content changed (or were
-  // never painted). Files we can't read are simply skipped.
+  // Read each candidate. Files we can't read are simply skipped.
   const fs = yield* FSUtil.Service
   const read = yield* Effect.forEach(
-    fileNodes,
-    (node) =>
-      fs
-        .readFileStringSafe(path.join(directory, node.path))
-        .pipe(
-          Effect.map((content) => ({ node, content }) as { node: FileNode; content: string | undefined }),
-          Effect.orElseSucceed(() => ({ node, content: undefined as string | undefined })),
-        ),
+    targets,
+    (target) =>
+      fs.readFileStringSafe(path.join(directory, target.node.path)).pipe(
+        Effect.map((content) => ({ target, content }) as { target: PaintTarget; content: string | undefined }),
+        Effect.orElseSucceed(() => ({ target, content: undefined as string | undefined })),
+      ),
     { concurrency: READ_CONCURRENCY },
   )
 
-  const stale = read
-    .filter((r): r is { node: FileNode; content: string } => typeof r.content === "string")
-    .map((r) => ({ ...r, hash: hashContent(r.content) }))
-    // Keyed on the witness as well as the content hash: when a parent re-paints a file into
-    // a different facet the file's *content* is unchanged, so a hash-only check would freeze
-    // it at a facet its domain no longer supports.
-    .filter((r) => isStale(store[r.node.id], r.hash, domain?.witness.get(r.node.id)))
+  // Cut each readable file into extents once (the regex walk is re-run three times a pass
+  // otherwise) and note whether its whole classification has to be re-opened because its
+  // domain moved under it.
+  const files = read
+    .filter((r): r is { target: PaintTarget; content: string } => typeof r.content === "string")
     .slice(0, MAX_PER_PASS)
+    .map((r) => {
+      const node = r.target.node
+      const granularity = granularityOf(r.target, priorMixes, granularityMode)
+      return {
+        node,
+        content: r.content,
+        hash: hashContent(r.content),
+        granularity,
+        extents: ApertureExtents.extentsOf(r.content, granularity),
+        reopen: domainMoved(store[node.id], domain?.witness.get(node.id)),
+        // Witnessed by the parent, but by a facet outside this drill-down's scope. Read
+        // from the domain rather than from the pass's bucketing, because it has to hold on
+        // a pass where the file has nothing stale left to bucket: it may still carry
+        // sub-facets from when it WAS in domain, and deriving a facet from those would
+        // quietly undo the NONE that greys it (and bleed them into every ancestor's
+        // composition, which is precisely what a drill-down exists to prevent).
+        outOfDomain: domain !== undefined && domain.witness.has(node.id) && !domain.allowed.has(node.id),
+      }
+    })
+
+  // Flatten to the extent work list, budgeted on file boundaries so a file is never left
+  // half-painted purely by truncation. Records carry the FILE's node, which is what lets
+  // splitDirs bin them dir-coherently and partitionByDomain gate them by file.
+  const budgeted: typeof files = []
+  let extentCount = 0
+  for (const file of files) {
+    if (extentCount >= MAX_EXTENTS_PER_PASS) break
+    budgeted.push(file)
+    extentCount += file.extents.length
+  }
+  if (budgeted.length < files.length)
+    yield* appendPerfEvent(directory, origin, "truncated", {
+      reason: "extent-budget",
+      painted: budgeted.length,
+      dropped: files.length - budgeted.length,
+    })
+
+  const byNode = new Map(budgeted.map((f) => [f.node.id, f]))
+  const reopened = new Set(budgeted.filter((f) => f.reopen).map((f) => f.node.id))
+  const stale = budgeted
+    .flatMap((file) =>
+      file.extents.map((extent) => {
+        const coarse = extent.name === ApertureExtents.WHOLE
+        const text = coarse ? file.content : ApertureExtents.extentText(file.content, extent)
+        return {
+          node: file.node,
+          name: extent.name,
+          // A coarse block is labelled with the bare path, exactly as file-level painting
+          // labelled it; only a per-declaration block carries the `#name` suffix.
+          label: coarse ? file.node.path : `${file.node.path}#${extent.name}`,
+          id: ApertureExtents.subNodeID(file.node.path, extent.name),
+          content: file.content,
+          coarse,
+          text,
+          hash: hashContent(text),
+        }
+      }),
+    )
+    // Stale-only, per extent: an edit to one declaration repaints that declaration and
+    // nothing else. `reopen` overrides it for the whole file when its domain moved.
+    .filter((r) => reopened.has(r.node.id) || subStore[r.id]?.hash !== r.hash)
 
   if (stale.length === 0) {
-    yield* appendPerfEvent(directory, origin, "skip", { reason: "no-stale", candidates: fileNodes.length })
+    // Nothing to classify, but a file's mix may still be missing or stale (it is
+    // re-derived every pass, free, so a file painted before mixes existed heals itself).
+    // Publish only if that backfill actually changed something, or the self-heal becomes
+    // a paint→refetch→paint cycle.
+    yield* appendPerfEvent(directory, origin, "skip", { reason: "no-stale", candidates: targets.length })
+    const changed = yield* syncDerived(deps, projectID, lens, budgeted, subStore, store, domain)
+    if (changed && publish) yield* publishInvalidated(deps, directory, scopes)
     return
   }
 
@@ -233,8 +347,16 @@ export const paintStale = Effect.fn("Aperture.paintStale")(function* (
   //                   would be permanent: the entry's hash would match forever after, and
   //                   the file would never be reconsidered.
   const { classify: classifiable, bucket, skip } = partitionByDomain(stale, domain)
+  // An out-of-domain file gets NO extents (finalize greys its tiles deterministically) and
+  // one NONE entry at file level. Keyed by file, so the several extents a file contributes
+  // to `bucket` collapse to the one entry its file deserves.
   const direct: ApertureSemanticStore.Store = {}
-  for (const r of bucket) direct[r.node.id] = { facet: NONE_FACET, hash: r.hash, via: domain!.witness.get(r.node.id)! }
+  for (const r of bucket)
+    direct[r.node.id] = {
+      facet: NONE_FACET,
+      hash: byNode.get(r.node.id)!.hash,
+      via: domain!.witness.get(r.node.id)!,
+    }
   if (domain)
     yield* appendPerfEvent(directory, origin, "domain", {
       lens: lens.id,
@@ -247,7 +369,7 @@ export const paintStale = Effect.fn("Aperture.paintStale")(function* (
   const context = yield* contextMode(deps.config, lens)
   const language = classifiable.length === 0 ? undefined : yield* resolveLanguage(deps.provider)
   if (classifiable.length > 0 && !language) {
-    log.info("no small model available; skipping paint pass", { projectID, scope })
+    log.info("no small model available; skipping paint pass", { projectID, scopes })
     yield* appendPerfEvent(directory, origin, "skip", { reason: "no-language", stale: classifiable.length })
     // The out-of-domain bucketing below needs no model, so it still lands.
   }
@@ -255,22 +377,29 @@ export const paintStale = Effect.fn("Aperture.paintStale")(function* (
   const facetSchema = buildFacetSchema(lens)
   const system = buildSystemPrompt(lens, domain?.parent)
 
-  // Path → its hash so we can record freshness on whatever the model returns.
-  const hashByPath = new Map(classifiable.map((r) => [r.node.path, r.hash]))
-  const idByPath = new Map(classifiable.map((r) => [r.node.path, r.node.id]))
+  // Block label → the extent it belongs to, so the model's echo maps back to a sub-node
+  // id. A coarse block's label is the bare path; a fine one's is `path#name`.
+  const byLabel = new Map(classifiable.map((r) => [r.label, r]))
 
-  // Dir-coherent binning (the "dirsplit" perf-eval winner): one bin per directory,
-  // big dirs split into same-dir chunks of FACET_BATCH — maximally coherent prompts.
-  // Bins are classified up to `fanout`-wide; a single failed bin soft-fails to "paint
-  // nothing" (catch inside the worker) without interrupting its siblings.
-  const bins = language ? splitDirs(classifiable, FACET_BATCH) : []
+  // Dir-coherent binning (the "dirsplit" perf-eval winner): one bin per directory, big
+  // dirs split into same-dir chunks — maximally coherent prompts. Budgeted by block
+  // weight rather than record count so a coarse-only bin is still exactly FACET_BATCH
+  // files. Bins are classified up to `fanout`-wide; a single failed bin soft-fails to
+  // "paint nothing" (catch inside the worker) without interrupting its siblings.
+  const bins = language
+    ? splitDirs(classifiable, EXTENT_BATCH, (r) => (r.coarse ? COARSE_BLOCK_WEIGHT : FINE_BLOCK_WEIGHT))
+    : []
   const fanout = yield* painterConcurrency(deps.config)
   const classifyBin = (bin: typeof classifiable) =>
     Effect.gen(function* () {
-      const blocks = bin.map((r) => describeFile(r.node.path, r.content, context)).join("\n\n")
+      const blocks = bin
+        .map((r) =>
+          r.coarse ? describeFile(r.node.path, r.content, context) : describeExtent(r.node.path, r.name, r.text),
+        )
+        .join("\n\n")
       const { files: assignments, usage } = yield* classifyWithRetry(language!, blocks, facetSchema, system, lens).pipe(
         Effect.catchCause((cause) => {
-          log.error("classify failed", { projectID, scope, cause })
+          log.error("classify failed", { projectID, scopes, cause })
           return Effect.succeed<ClassifyResult>(EMPTY_CLASSIFY)
         }),
       )
@@ -278,11 +407,13 @@ export const paintStale = Effect.fn("Aperture.paintStale")(function* (
     })
   const results = yield* Effect.forEach(bins, classifyBin, { concurrency: fanout })
 
-  // Sequential post-pass: the perf log's byte counter (writePerfLine) and the painted
-  // store are written here, not inside the concurrent workers, so the fan-out
-  // never races the counter or interleaves appends. Seeded with the out-of-domain
-  // bucketing so both halves land in one atomic upsert and one invalidation.
-  const painted: ApertureSemanticStore.Store = { ...direct }
+  // Sequential post-pass: the perf log's byte counter (writePerfLine) and every store
+  // write happen here, not inside the concurrent workers, so the fan-out never races the
+  // counter or interleaves appends — and each store is written exactly once per pass
+  // however many bins the pass spanned. That is what decouples bin boundaries from file
+  // boundaries: a bin may span several files, and a file several bins, with no effect on
+  // the writes below.
+  const painted: ApertureSubfacetStore.Store = {}
   let painterInput = 0
   let painterOutput = 0
   for (const { blocks, assignments, usage } of results) {
@@ -290,161 +421,165 @@ export const paintStale = Effect.fn("Aperture.paintStale")(function* (
     painterOutput += usage.outputTokens
     yield* appendPerfLog(directory, origin, lens.id, blocks, assignments)
     for (const a of assignments) {
-      const id = idByPath.get(a.path)
-      const hash = hashByPath.get(a.path)
-      if (!id || !hash) continue
-      // Carry the witness onto the entry so a later parent re-paint re-opens this file.
-      const via = domain?.witness.get(id)
-      painted[id] = { facet: a.facet, hash, ...(via !== undefined ? { via } : {}) }
+      const record = byLabel.get(a.path)
+      if (!record) continue
+      painted[record.id] = { facet: a.facet, hash: record.hash }
     }
   }
 
   // Aperture study logging: painter token spend, kept separate from conversation
   // tokens. Attributed to the most-recently-active session (painter is not
   // session-scoped). `trigger` is set when this pass is an ancestor fill forced by a
-  // drill-down, so the drill-down's true cost isn't hidden in its parent's column.
+  // drill-down, so the drill-down's true cost isn't hidden in its parent's column;
+  // `source` names the interest heuristic that scheduled it, and `extents`/`files` are
+  // what make the granularity dial's cost measurable.
   if (painterInput > 0 || painterOutput > 0)
     yield* StudyLog.recordPainter({
       origin,
       lens: lens.id,
+      files: budgeted.length,
+      extents: classifiable.length,
+      coarse: classifiable.filter((r) => r.coarse).length,
       inputTokens: painterInput,
       outputTokens: painterOutput,
+      ...(source ? { source } : {}),
       ...(trigger && trigger !== lens.id ? { trigger } : {}),
     })
 
-  const count = Object.keys(painted).length
-  if (count === 0) return
+  if (Object.keys(painted).length > 0) yield* ApertureSubfacetStore.upsert(deps.storage, projectID, lens.id, painted)
+  if (Object.keys(direct).length > 0) yield* ApertureSemanticStore.upsert(deps.storage, projectID, lens.id, direct)
 
-  yield* ApertureSemanticStore.upsert(deps.storage, projectID, lens.id, painted)
-  log.info("painted", { projectID, scope, lens: lens.id, count })
+  // Derive each file's mix and its file-level facet from the extents now on record.
+  const changed = yield* syncDerived(
+    deps,
+    projectID,
+    lens,
+    budgeted,
+    { ...subStore, ...painted },
+    { ...store, ...direct },
+    domain,
+  )
+  log.info("painted", {
+    projectID,
+    lens: lens.id,
+    files: budgeted.length,
+    extents: Object.keys(painted).length,
+  })
   if (!publish) return
-
   // Only now that something actually changed do we nudge the live view to refetch
   // and re-merge — the guard that keeps a paint→refetch→paint cycle from forming
-  // (the next pass finds matching hashes and publishes nothing). Attach the location
-  // explicitly: this runs in a forked fiber with no ambient Location.Service, so
-  // without it the HTTP /event SSE filter (event.location.directory === instance
-  // .directory) drops the event and the VSCode extension never refetches.
-  yield* deps.events.publish(ApertureEvent.Event.Invalidated, { scope }, { location: { directory: AbsolutePath.make(directory) } }).pipe(Effect.ignore)
+  // (the next pass finds matching hashes and publishes nothing).
+  if (changed || Object.keys(direct).length > 0) yield* publishInvalidated(deps, directory, scopes)
 }, Effect.provide(FSUtil.defaultLayer))
 
-// --- sub-file (drill-in) painter -------------------------------------------
+// A file's granularity: the configured dial, the caller's interest signal, OR — the
+// high-water rule — the fact that it is already cut per declaration, which the stored mix
+// records as more than one extent. Inferred rather than stored, and monotone: a file is
+// never coarsened back, so granularity can't oscillate and paint is never thrown away
+// twice. That last clause holds even at "file", where the dial only stops NEW promotions;
+// re-coarsening an already-fine file would cost tokens to lose information.
+export function granularityOf(
+  target: PaintTarget,
+  mixes: ApertureSubfacetStore.Mixes,
+  mode: GranularityMode,
+): ApertureExtents.Granularity {
+  if (mode === "declaration") return "declaration"
+  if (mode === "interest" && target.interested) return "declaration"
+  return (mixes[target.node.path]?.subtreeCount ?? 0) > 1 ? "declaration" : "file"
+}
 
-// Paint the top-level declarations of a single drilled-into file (A5). The unit of
-// work is a function-level extent (extents.ts), classified with the *same* Lens
-// vocabulary as file-level painting but minimal per-function context (signature +
-// leading comment). Stale-only by the extent's content hash, so re-drilling an
-// unedited file spends nothing. Writes the per-function facet store; soft-fails to
-// "paint nothing". Strictly a drill-in refinement — never on the critical path of
-// defining or filling a Lens (see docs/codegraph-subfile-resolution.md). The caller
-// schedules this on the shared single-permit gate at drill-in priority.
-export const paintExtentsStale = Effect.fn("Aperture.paintExtentsStale")(function* (
+// The cost dial (aperture.painter.granularity). "file" paints every file once as a whole —
+// the floor, priced exactly like the pre-O3 file-level pass. "interest" additionally
+// promotes files the user is looking at, editing, or has uncommitted changes in.
+// "declaration" promotes the whole repository (~5.8x).
+export type GranularityMode = "file" | "interest" | "declaration"
+
+function painterGranularity(config: Config.Interface) {
+  return config.get().pipe(
+    Effect.map((cfg) => {
+      const mode = cfg.aperture?.painter?.granularity
+      return (mode === "file" || mode === "declaration" ? mode : "interest") as GranularityMode
+    }),
+    Effect.catchCause(() => Effect.succeed("interest" as GranularityMode)),
+  )
+}
+
+// Re-derive each file's byte-weighted facet mix AND its file-level facet from the extents
+// on record, and persist both. This is the projection that makes a file's colour a pure
+// function of its parts: `attributeFileBytes` is the very function directory composition
+// uses, so a file's tile and its band in the parent directory's treemap cannot disagree.
+// Nothing else writes a painted file's facet.
+//
+// Run for every file in the pass, not just repainted ones — it costs no tokens — so a file
+// painted before mixes existed, or whose extents shifted without any one of them changing,
+// heals itself. Returns whether anything actually changed, which is the guard that stops
+// that self-heal becoming a paint→refetch→paint cycle.
+const syncDerived = (
   deps: Deps,
-  directory: string,
   projectID: string,
-  relPath: string,
   lens: Lens,
-  // Scope to publish the invalidation for once tiles are coloured — the window the
-  // user is viewing, so the drilled band live-fills regardless of the file's own dir.
-  scope: string,
-  // The resolved parent Lens when `lens` is a drill-down, for the prompt's domain note.
-  // The domain *gate* is the caller's job (scheduleExtentPaint refuses to function-paint an
-  // out-of-domain file at all), so by the time we get here the file is known in-domain.
-  parent?: Lens,
-) {
-  const fs = yield* FSUtil.Service
-  const content = yield* fs
-    .readFileStringSafe(path.join(directory, relPath))
-    .pipe(Effect.orElseSucceed(() => undefined as string | undefined))
-  if (typeof content !== "string") return
-
-  // A file with no top-level declaration (a single whole-file preamble tile) needs
-  // no function painting — file-level already suffices there.
-  const paintable = ApertureExtents.extentsOf(content).filter((e) => e.name !== ApertureExtents.PREAMBLE)
-  if (paintable.length === 0) return
-
-  const store = yield* ApertureSubfacetStore.read(deps.storage, projectID, lens.id)
-
-  // Fold the file's function facets into a byte-weighted mix and persist it. Directory
-  // composition attributes this file's bytes to its *function* facets from that mix
-  // (superseding the coarser file-level facet), and it can't recompute it at read time —
-  // that would mean re-reading every file in the repo on every payload read. We have the
-  // content here, so we measure it here. Re-derived on every pass, not just when a
-  // function was repainted, so a file painted before mixes existed — or one whose extents
-  // shifted without any function's text changing — heals without spending a token.
-  const syncMix = (entries: ApertureSubfacetStore.Store) =>
-    Effect.gen(function* () {
+  files: ReadonlyArray<{
+    readonly node: FileNode
+    readonly content: string
+    readonly hash: string
+    readonly granularity: ApertureExtents.Granularity
+    readonly extents: ReadonlyArray<ApertureExtents.Extent>
+    readonly outOfDomain: boolean
+  }>,
+  entries: ApertureSubfacetStore.Store,
+  semantics: ApertureSemanticStore.Store,
+  domain: Domain | undefined,
+) =>
+  Effect.gen(function* () {
+    const mixes: ApertureSubfacetStore.Mixes = {}
+    const derived: ApertureSemanticStore.Store = {}
+    for (const file of files) {
+      if (file.outOfDomain) {
+        // Grey, wholly and durably. An EMPTY mix is not the same as no mix: it makes
+        // `attributeFileBytes` fall back to the file-level facet (the NONE just written)
+        // for all of the file's bytes, so any mix left over from when it was in domain
+        // stops contributing to its directory's composition.
+        mixes[file.node.path] = { weights: [], totalCount: 0, totalBytes: 0, subtreeCount: 0, subtreeBytes: 0 }
+        continue
+      }
       const facetByName = new Map<string, string>()
-      for (const extent of ApertureExtents.extentsOf(content)) {
-        const entry = entries[ApertureExtents.subNodeID(relPath, extent.name)]
+      for (const extent of file.extents) {
+        const entry = entries[ApertureExtents.subNodeID(file.node.path, extent.name)]
         if (entry) facetByName.set(extent.name, entry.facet)
       }
-      const mix = ApertureExtents.fileComposition(content, facetByName)
-      return yield* ApertureSubfacetStore.upsertMix(deps.storage, projectID, lens.id, relPath, mix)
-    })
-
-  const stale = paintable
-    .map((extent) => {
-      const text = ApertureExtents.extentText(content, extent)
-      return { extent, id: ApertureExtents.subNodeID(relPath, extent.name), text, hash: hashContent(text) }
-    })
-    .filter((r) => store[r.id]?.hash !== r.hash)
-  if (stale.length === 0) {
-    // Nothing to paint, but the mix may still be missing or stale. Publish only if that
-    // backfill actually changed something, so the paint→refetch→paint guard still holds.
-    const mixChanged = yield* syncMix(store)
-    yield* appendPerfEvent(directory, "fg", "skip", { reason: "no-stale-extents", file: relPath })
-    if (mixChanged)
-      yield* deps.events
-        .publish(ApertureEvent.Event.Invalidated, { scope }, { location: { directory: AbsolutePath.make(directory) } })
-        .pipe(Effect.ignore)
-    return
-  }
-
-  const language = yield* resolveLanguage(deps.provider)
-  if (!language) return
-
-  const facetSchema = buildFacetSchema(lens)
-  const system = buildSystemPrompt(lens, parent)
-  // Each extent is one classify "block", labelled `relPath#name` so the model echoes
-  // an identifier that maps back to the sub-node id.
-  const blocks = stale.map((r) => describeExtent(relPath, r.extent.name, r.text)).join("\n\n")
-  const idByLabel = new Map(stale.map((r) => [`${relPath}#${r.extent.name}`, r.id]))
-  const hashByLabel = new Map(stale.map((r) => [`${relPath}#${r.extent.name}`, r.hash]))
-
-  const { files: assignments, usage } = yield* classifyWithRetry(language, blocks, facetSchema, system, lens).pipe(
-    Effect.catchCause((cause) => {
-      log.error("classify extents failed", { projectID, file: relPath, cause })
-      return Effect.succeed<ClassifyResult>(EMPTY_CLASSIFY)
-    }),
-  )
-  yield* appendPerfLog(directory, "fg", lens.id, blocks, assignments)
-  // Aperture study logging: drill-in (function-level) painter token spend.
-  yield* StudyLog.recordPainter({
-    origin: "fg",
-    lens: lens.id,
-    scope: relPath,
-    inputTokens: usage.inputTokens,
-    outputTokens: usage.outputTokens,
+      if (facetByName.size === 0) continue
+      const mix = ApertureExtents.fileComposition(file.content, facetByName, file.granularity)
+      mixes[file.node.path] = mix
+      // No independent file-level facet to fall back on any more, so the remainder (an
+      // unpainted extent) is simply not attributed and the plurality of what IS painted
+      // wins. A half-painted file therefore shows its dominant known facet rather than grey.
+      const dominant = ApertureExtents.attributeFileBytes(Buffer.byteLength(file.content), mix, undefined).dominant
+      if (dominant === undefined) continue
+      const via = domain?.witness.get(file.node.id)
+      derived[file.node.id] = { facet: dominant, hash: file.hash, ...(via !== undefined ? { via } : {}) }
+    }
+    const mixChanged = yield* ApertureSubfacetStore.upsertMixes(deps.storage, projectID, lens.id, mixes)
+    const facetChanged = Object.entries(derived).filter(
+      ([id, entry]) => JSON.stringify(semantics[id]) !== JSON.stringify(entry),
+    )
+    if (facetChanged.length > 0)
+      yield* ApertureSemanticStore.upsert(deps.storage, projectID, lens.id, Object.fromEntries(facetChanged))
+    return mixChanged.length > 0 || facetChanged.length > 0
   })
 
-  const painted: ApertureSubfacetStore.Store = {}
-  for (const a of assignments) {
-    const id = idByLabel.get(a.path)
-    const hash = hashByLabel.get(a.path)
-    if (!id || !hash) continue
-    painted[id] = { facet: a.facet, hash }
-  }
-  if (Object.keys(painted).length === 0) return
-
-  yield* ApertureSubfacetStore.upsert(deps.storage, projectID, lens.id, painted)
-  yield* syncMix({ ...store, ...painted })
-  log.info("painted extents", { projectID, file: relPath, lens: lens.id, count: Object.keys(painted).length })
-  // Nudge the viewed scope to re-merge the drilled file's now-coloured tiles. Attach
-  // the location (forked fiber → no ambient Location.Service) or the HTTP /event SSE
-  // filter drops it and the extension's drilled file never fills in.
-  yield* deps.events.publish(ApertureEvent.Event.Invalidated, { scope }, { location: { directory: AbsolutePath.make(directory) } }).pipe(Effect.ignore)
-}, Effect.provide(FSUtil.defaultLayer))
+// Nudge every viewed window to refetch. The location is attached explicitly: this runs in
+// a forked fiber with no ambient Location.Service, so without it the HTTP /event SSE
+// filter (event.location.directory === instance.directory) drops the event and the VSCode
+// extension never refetches.
+const publishInvalidated = (deps: Deps, directory: string, scopes: ReadonlyArray<string>) =>
+  Effect.forEach(
+    new Set(scopes),
+    (scope) =>
+      deps.events
+        .publish(ApertureEvent.Event.Invalidated, { scope }, { location: { directory: AbsolutePath.make(directory) } })
+        .pipe(Effect.ignore),
+    { discard: true },
+  )
 
 // Minimal per-extent context: its path label, the declaration's signature (first
 // non-blank line), and any leading comment. Mirrors the file-level `minimal` mode.
@@ -592,7 +727,8 @@ const classifyWithRetry = (
 
 function isRateLimitError(error: unknown): boolean {
   const raw = (error as { error?: unknown })?.error ?? error
-  const status = (raw as { statusCode?: unknown; status?: unknown })?.statusCode ?? (raw as { status?: unknown })?.status
+  const status =
+    (raw as { statusCode?: unknown; status?: unknown })?.statusCode ?? (raw as { status?: unknown })?.status
   if (status === 429 || status === 503 || status === 529) return true
   const message = (raw as { message?: unknown })?.message
   if (typeof message !== "string") return false
@@ -651,10 +787,13 @@ export function describeFile(rel: string, content: string, mode: "minimal" | "me
     if (exports.length) lines.push(`exports: ${exports.slice(0, 20).join(", ")}`)
     lines.push(`lines: ${lineCount(capped)}`)
     // Top-level declarations only (the preamble — imports/top-level code before the first
-    // declaration — is already covered by imports/comment). Each becomes one skeleton
-    // line: its signature (first non-blank line) + its span, so a long function or a file
-    // with too many responsibilities is visible at a glance.
-    const decls = ApertureExtents.extentsOf(capped).filter((e) => e.name !== ApertureExtents.PREAMBLE)
+    // declaration — is already covered by imports/comment; WHOLE means the file has no
+    // declarations to skeletonize). Each becomes one skeleton line: its signature (first
+    // non-blank line) + its span, so a long function or a file with too many
+    // responsibilities is visible at a glance.
+    const decls = ApertureExtents.extentsOf(capped).filter(
+      (e) => e.name !== ApertureExtents.PREAMBLE && e.name !== ApertureExtents.WHOLE,
+    )
     if (decls.length) {
       lines.push("decls:")
       for (const e of decls.slice(0, MAX_SKELETON_DECLS)) {
@@ -698,7 +837,8 @@ function leadingComment(content: string): string {
   return out.join(" ").slice(0, MAX_COMMENT_CHARS)
 }
 
-const EXPORT_DECL = /^export\s+(?:default\s+)?(?:async\s+)?(?:function|const|let|class|interface|type|enum)\s+([A-Za-z0-9_$]+)/gm
+const EXPORT_DECL =
+  /^export\s+(?:default\s+)?(?:async\s+)?(?:function|const|let|class|interface|type|enum)\s+([A-Za-z0-9_$]+)/gm
 const EXPORT_LIST = /^export\s*\{([^}]*)\}/gm
 
 function exportedNames(content: string): string[] {
@@ -730,10 +870,21 @@ function posixDir(p: string): string {
 }
 
 // "dirsplit" binning (the perf-eval winner): one bin per immediate directory,
-// never merging across directories; a directory with more than `maxFiles` files is
-// split into ceil(n/maxFiles) same-directory chunks. Every bin is thus files from a
-// single directory — coherent prompts — and the union of bins is exactly the input.
-export function splitDirs<T extends { readonly node: FileNode }>(records: ReadonlyArray<T>, maxFiles: number): T[][] {
+// never merging across directories; a directory whose records exceed `budget` is split
+// into same-directory chunks. Every bin is thus records from a single directory —
+// coherent prompts — and the union of bins is exactly the input.
+//
+// `weightOf` lets the budget be measured in prompt blocks rather than records, so bins
+// stay a consistent prompt size when a coarse (whole-file) block and a fine
+// (per-declaration) block cost different amounts. It defaults to 1, i.e. plain record
+// count. A record heavier than the whole budget still gets a bin of its own rather than
+// being dropped. Sorting by path keeps binning deterministic, and Array.sort is stable,
+// so several records from one file stay in file order.
+export function splitDirs<T extends { readonly node: FileNode }>(
+  records: ReadonlyArray<T>,
+  budget: number,
+  weightOf: (record: T) => number = () => 1,
+): T[][] {
   const byDir = new Map<string, T[]>()
   for (const r of records) {
     const d = posixDir(r.node.path)
@@ -743,10 +894,20 @@ export function splitDirs<T extends { readonly node: FileNode }>(records: Readon
   }
   const bins: T[][] = []
   for (const dirFiles of byDir.values()) {
-    const sorted = [...dirFiles].sort((a, b) =>
-      a.node.path < b.node.path ? -1 : a.node.path > b.node.path ? 1 : 0,
-    )
-    for (let i = 0; i < sorted.length; i += maxFiles) bins.push(sorted.slice(i, i + maxFiles))
+    const sorted = [...dirFiles].sort((a, b) => (a.node.path < b.node.path ? -1 : a.node.path > b.node.path ? 1 : 0))
+    let bin: T[] = []
+    let weight = 0
+    for (const r of sorted) {
+      const w = weightOf(r)
+      if (bin.length > 0 && weight + w > budget) {
+        bins.push(bin)
+        bin = []
+        weight = 0
+      }
+      bin.push(r)
+      weight += w
+    }
+    if (bin.length > 0) bins.push(bin)
   }
   return bins
 }

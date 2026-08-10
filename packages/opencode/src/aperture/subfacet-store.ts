@@ -59,40 +59,49 @@ export const upsert = (
     .update<Store>(key(projectID, lensID), (draft) => {
       for (const [id, entry] of Object.entries(entries)) draft[id] = entry
     })
-    .pipe(Effect.catch(() => storage.write(key(projectID, lensID), entries)), Effect.ignore)
+    .pipe(
+      Effect.catch(() => storage.write(key(projectID, lensID), entries)),
+      Effect.ignore,
+    )
 
 // Every file's mix, or empty when nothing has been function-painted yet.
 export const readMixes = (storage: Storage.Interface, projectID: string, lensID: string): Effect.Effect<Mixes> =>
   storage.read<Mixes>(mixKey(projectID, lensID)).pipe(Effect.catch(() => Effect.succeed<Mixes>({})))
 
-// Store one file's mix, reporting whether it actually changed. The caller uses that to
-// decide whether to invalidate the view: the painter re-derives the mix on every pass
-// (cheap, no tokens) so a file painted before mixes existed heals itself, and publishing
-// unconditionally would turn that into a paint→refetch→paint cycle.
-export const upsertMix = (
+// Store many files' mixes in ONE read-modify-write, reporting which paths actually
+// changed. The caller uses that to decide whether to invalidate the view: the painter
+// re-derives the mix for every file in a pass (cheap, no tokens) so a file painted before
+// mixes existed heals itself, and publishing unconditionally would turn that into a
+// paint→refetch→paint cycle.
+//
+// Batched because `storage.update` takes a write lock: one call per file meant N lock
+// acquisitions per pass, which a whole-repo pass can't afford.
+export const upsertMixes = (
   storage: Storage.Interface,
   projectID: string,
   lensID: string,
-  relPath: string,
-  mix: Mix,
-): Effect.Effect<boolean> =>
+  mixes: Mixes,
+): Effect.Effect<ReadonlyArray<string>> =>
   Effect.gen(function* () {
-    let changed = false
+    const changed: string[] = []
     const apply = (draft: Mixes) => {
-      if (JSON.stringify(draft[relPath]) === JSON.stringify(mix)) return
-      draft[relPath] = mix
-      changed = true
+      for (const [relPath, mix] of Object.entries(mixes)) {
+        if (JSON.stringify(draft[relPath]) === JSON.stringify(mix)) continue
+        draft[relPath] = mix
+        changed.push(relPath)
+      }
     }
-    yield* storage
-      .update<Mixes>(mixKey(projectID, lensID), apply)
-      .pipe(
-        Effect.catch(() => {
-          const fresh: Mixes = {}
-          apply(fresh)
-          return storage.write(mixKey(projectID, lensID), fresh)
-        }),
-        Effect.ignore,
-      )
+    yield* storage.update<Mixes>(mixKey(projectID, lensID), apply).pipe(
+      Effect.catch(() => {
+        // Missing doc: `apply` already ran against the (discarded) draft, so reset the
+        // tally before rebuilding from scratch or a path would be reported twice.
+        changed.length = 0
+        const fresh: Mixes = {}
+        apply(fresh)
+        return storage.write(mixKey(projectID, lensID), fresh)
+      }),
+      Effect.ignore,
+    )
     return changed
   })
 

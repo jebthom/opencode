@@ -1,207 +1,505 @@
-# Aperture
+# Aperture — Sprint 2 (post-study revision)
 
-A persistent, fast, high-altitude **View** of the repository that an agent
-paints with user-defined **Lenses** (each a set of **Facets**) during planning,
-prompting, exploration, and review. Structure is deterministic (directory tree +
-syntax, stable ids, cached layout) so it never reflows distractingly; semantics
-are malleable and async — an agent attaches a Facet (and its hue) to each file
-over time. The first idiom is a wide top-bar above the chat showing a 2-level
-window of the View that the user can drill into.
+A persistent, fast, high-altitude **View** of the repository that an agent paints
+with user-defined **Lenses** (each a set of **Facets**). Structure is
+deterministic (directory tree + syntax, stable ids, cached layout) so it never
+reflows distractingly; semantics are malleable and async.
 
-A recent large speedup of Facet painting changed how people will engage with
-Aperture: Lenses are now cheap enough to **define-and-explore live** rather than
-wait on a slow background paint. This shifts the final sprint to two archetypal
-workflows — **Sensemaking** (understand an existing repo) and **Building**
-(create a new feature) — and the work below is organized around them.
+Sprint 1 (rename to Aperture, Sensemaking + Building workflows, sub-file
+resolution, VSCode gutter) is complete and archived at
+`docs/plan-archive/2026-08-10-sprint-1-rename-and-workflows.md`. That document
+remains the reference for what exists and why.
 
-## Vocabulary
+This plan comes out of a round of formative studies. It is deliberately written
+before all details are settled: its job is to **order the work and split it up**,
+and to record which decisions are still open so they get made deliberately rather
+than by accident during implementation.
 
-The project was previously "codegraph". It is now **Aperture**, with renamed
-domain terms throughout:
+---
 
-| Old | New |
+## What the studies changed
+
+Three findings reshape the design:
+
+1. **The top bar is trying to be a file browser and shouldn't be.** We're plugged
+   into VSCode; recreating a folder tree in the terminal duplicates a better tool.
+   What *was* valuable was the **aggregation** — seeing a directory's facet
+   make-up at a glance. Keep the aggregation, drop the file list, push file-level
+   viewing into the editor.
+2. **A Lens is being used for two different jobs.** Some Lenses **partition** the
+   codebase (every file gets one of N facets — an overview). Others are
+   **binary/ternary probes** aimed at a single concern, used to scope a piece of
+   work. These want different painting granularity, different interactions, and
+   arguably different cost models. We now name them separately.
+3. **Colour identity is not surviving the terminal.** Participants on Mac and
+   Linux saw hues collapse toward each other. Real, and it needs fixing before
+   the final experiment — but it's a rendering-fidelity bug, not a design
+   question, and it blocks nothing else. Deferred to the end of the sprint
+   (Track C) so the design work gets the thinking time.
+
+## Vocabulary added this sprint
+
+| Term | Meaning |
 | --- | --- |
-| codegraph (feature, dir `codegraph/`, `CodeGraph.Service`, slot `codegraph_top`, env `OPENCODE_CODEGRAPH_LAYOUT`, route `/codegraph*`, event `codegraph.invalidated`, config `codegraph.*`) | **Aperture** / **View** |
-| tag collection / `TagCollection` / "collection" | **Lens** |
-| tag (a semantic category) / `TagDef` | **Facet** |
-| the graph / top-bar visualization | **View** |
-| `/tag` command, `tag` agent | **`/lens`**, **lens** agent |
-| a Facet's color | **hue** (term unchanged) |
+| **Overview Lens** | The existing Lens: partitions the codebase, ~4–6 facets, whole-repo paint, aggregated in the top bar. |
+| **Search Lens** | A narrow binary/ternary Lens probing one concern. Painted at **line level**, populated opportunistically by Explore/Build agents rather than by a sweep. |
+| **Line tag** | A syntax-anchored line-or-range facet assignment, the Search Lens's unit of data. |
+| **Activity View** | A block/waffle rendering of an agent's read/edit/write actions, coloured by the active Lens. |
 
-Rename decisions (recorded here, executed as Task 0):
-- **Clean break.** Rename wire/persistence strings too — storage keys, config
-  keys, the env var, HTTP routes, the `*.invalidated` event, the
-  `tag_collection_*` tool names, and the SDK gen. Accept orphaned cached Views /
-  Lenses; the project is pre-release, so no migration shim.
-- **Lenses become project-scoped on disk.** Today they persist in global durable
-  KV keyed by projectID (`["codegraph", projectID, "collections"]`). Move them
-  into the project directory so a Lens is shareable/committable and an agent can
-  read it directly (this underpins Sensemaking task **A3**). The clean break was
-  going to touch these keys anyway.
-- **"tagger".** The engine that paints Facets — decide during the refactor
-  whether to keep the name or rename to "painter". The renames that matter for
-  the contract are the data-model symbols (`TagCollection`→Lens, `TagDef`→Facet,
-  stored `tag`→`facet`); the engine name is cosmetic, so flag it but don't block.
+---
 
-## Final sprint
+## Tracks
 
-The sprint leads with the rename, then is framed by the two workflows. Each
-workflow lists a short example dialogue, then the concrete tasks it requires.
+Four tracks. **O** (Overview Lens) is refinement of shipped surfaces. **S**
+(Search Lens) is the largest new build and holds the hardest design question.
+**G** (Activity View) is additive and the most experiment-shaped. **C** (colour)
+is self-contained repair work, parked until the design tracks are through.
 
-### Task 0 — Rename refactor (Aperture / View / Lens / Facet, clean break)
+```
+O3 (always-extent) ──┬──► O1 (top bar simplify)
+                     ├──► O2 (VSCode file-browser pips)
+                     └──► S1 …
+O4 (legend filter) ──────────────────────────────► shared with S4
 
-Mechanical except for the project-scope Lens storage move. Touch points
-(inventoried):
-- Core: dir `codegraph/`, `CodeGraph.Service`, `payload.ts`, `extract.ts`,
-  `tagger.ts`, `collections.ts` + `collection-store.ts` (+ the storage-location
-  move), `semantic-store.ts`, `deterministic.ts`, `event.ts`, `semantics.ts`,
-  `treemap.ts`, `activity.ts`, `dump.ts`.
-- Tools: `tool/tag-collection-{create,list,select,edit,merge-tags}.ts`, the
-  `/tag-delete` command, and their tool-name strings; `tool/registry.ts`.
-- Agent / command / prompts: `agent/agent.ts` (`tag` agent), `agent/prompt/tag.txt`,
-  `command/index.ts` + `command/template/tag.txt`, the `session/system.ts`
-  build/plan tagging-awareness block.
-- TUI: `feature-plugins/system/codegraph.tsx` (+ `codegraph-activity.ts`), the
-  `codegraph_top` slot (`plugin/src/tui.ts`), `OPENCODE_CODEGRAPH_LAYOUT`,
-  slot placement in `routes/session/index.tsx`, plugin id in `plugin/internal.ts`.
-- HTTP / SDK: `server/routes/instance/httpapi/{groups,handlers}/codegraph.ts`,
-  `server.ts`/`api.ts` registration, the `/codegraph*` routes, the
-  `codegraph.invalidated` event, regenerate `packages/sdk/js` gen.
-- Config: `core/src/v1/config/config.ts` (`codegraph.tagger.*`).
-- Tests under `test/codegraph/`.
+S1 (line-tag store) ──► S2 (agent tool) ──► S3 (line painting) ──► S5 (open-all)
 
-### Workflow A — Sensemaking Flow (understand an existing repo)
+G1 (activity data) ──► G2 (block render) ──► G3 (placement/timeline)
 
-Example dialogue:
-> **User:** What are the UI/UX features and components in this repo?
-> *(agent suggests a UI/UX Lens, paints it while exploring)*
-> **User:** I want a more detailed look at the TUI components.
-> *(agent suggests a TUI Lens)*
-> **User:** Okay, `<component-a>` is what I'm interested in — what can you tell
-> me about those files? How do they solve this problem?
-> *(agent lists the files carrying that Facet and explores them, writes an
-> overview of each file's concern)*
-> **User:** Let's investigate `<file-a>` together.
+                                         C1 (colour fidelity) ──► deferred, independent
+```
 
-Tasks:
-- **A1 — Paint + explore in parallel.** ✅ DONE. Guidance in the Aperture-awareness
-  block (`session/system.ts`): on a sensemaking question, call `lens_create` first
-  (paint is backgrounded, returns at once) then explore in the same turn — the Lens
-  fills in while exploration runs, instead of serially.
-- **A2 — A new way of organizing Lenses.** ✅ DONE (settled: **searchable picker**).
-  New `listLenses`/`selectLens` HTTP routes + SDK; a `DialogSelect`-based Lens picker
-  (`aperture-lens-picker.tsx`) grouped Project/Built-in with fuzzy filter + active
-  marker, opened from the command palette (`/lens-switch`) or a `⌄` affordance in the
-  legend. The ◀/▶ cycle stays for quick adjacent switching.
-- **A3 — View + Lenses live in the project, with agent access.** ✅ DONE. Lens
-  defs + active pointer persist to `.opencode/aperture/`; `lens_facet_files` tool
-  lists files by Facet (`aperture.facetFiles`). Paint results stay in global KV.
-- **A4 — Navigate the view to a path (was: click-to-navigate from chat).** ✅ DONE,
-  via a different mechanism. The original clickable-chat-path approach was **reverted**:
-  in this TUI an inline text run is a `TextNodeRenderable` with no mouse events, so a path
-  nested inside a tool title / markdown reply can't be made clickable (confirmed against
-  the renderer; coordinate hit-testing on the container also failed in the live layout).
-  Navigation now lives entirely in the top-bar nav row (⟳ ⌖ ⌂ ◀ breadcrumb): the
-  breadcrumb crumbs are clickable to jump between scope levels, and a new **⌖ "go to path"
-  button** opens `api.ui.DialogPrompt` prefilled with the current scope — typing or pasting
-  a repo-relative path re-roots the view (a pasted *file* path roots at its parent dir). So
-  a path mentioned in chat is reached by copy-paste into the prompt rather than a click on
-  the chat text. The nav bus (`aperture-nav.ts`) and clickable `PathLink` were removed;
-  `PathLink` now just renders the path as plain text.
-- **A5 — On-demand function-level Facets (drill-in sub-file resolution).** ✅ DONE
-  (Phase 1 data + Phase 2 TUI). Drill-in-gated, line-delimited extents (no parsing,
-  `extents.ts`), per-function store (`subfacet-store.ts`, global KV), payload v7
-  `extents`, drill-in paint lane on the single permit, `drill` HTTP route + SDK.
-  TUI (column layout): clicking a file paints its bar as a positional band of its
-  function extents. Auto-refresh on edit (hash-scoped) + deterministic git-changed
-  function painting via diff hunks. Followed `docs/codegraph-subfile-resolution.md`.
+---
 
-- **A6 (extension, deferred) — Surface function-level Facets in the editor (VSCode).**
-  *[Logged, NOT this pass — revisit after A1/A2/A4.]* Resolves guardrail #2 (no code
-  reader in the TUI): annotate the real editor instead. Most data already exists —
-  the `drill` route returns per-function `{name, range, facet, hue}`; `lenses.json`
-  carries facet→colour. Likely additive inside the existing `sdks/vscode/` extension
-  (`sst-dev.opencode`). Key insight: store only `name→facet` on disk and recompute
-  line ranges live in the extension (edit-robust); "drill" maps to *the focused file*.
-  Open decision: HTTP-live via the `drill` route (primary) vs. a committable on-disk
-  snapshot vs. both.
+## Track O — Overview Lens improvements
 
-### Workflow B — Building Flow (create a new feature)
+The existing Lens, refined. All four are changes to shipped surfaces.
 
-Example dialogue:
-> **User:** I want to create `<feature-x>`.
-> *(plan agent plans the feature and suggests a Lens)*
-> **User:** Yeah that sounds great.
-> *(build agent creates the Lens first, writes the task-tracking list, then works
-> through the tasks; on completion, summarizes the build referencing the Lens)*
+### O3 — Extent-level painting by default *(do first in this track)*
 
-Tasks:
-- **B1 — Plan suggests a Lens with the plan.** The plan agent proposes a Lens
-  alongside the feature plan (the two-way channel already supports opportunistic
-  Lens creation; confirm/extend for this flow).
-- **B2 — Build creates the Lens first, then the task list, then works.** Sequence
-  the build agent: Lens → task-tracking list → execution.
-- **B3 — Task list references the Lens / hues.** Task-tracking items reference the
-  Lens and its Facet hues; the build summary references the Lens too. (This
-  supersedes the old plan-overlay idea — see Parked.)
+Sequenced first because it unifies the data model that O1 and O2 both read, and
+because it fixes a live bug.
 
-## Completed features & components (reference)
+**Motivation.** Participants found it confusing when a file's colour changed —
+which happened because file-level facets and drill-in extent-level facets are
+two separate stores that can disagree (`semantic-store.ts` vs
+`subfacet-store.ts`). Painting extents always makes the file's colour a true
+aggregation of its parts, so it changes only when its contents change.
 
-Everything below is built and in place (terms updated; the prior "what diverged"
-narrative is dropped — this is the catalog of what exists).
+**Work:** move extent painting off the drill-in gate; make a file's file-level
+facet **derived** from its extent mix rather than independently painted; retire
+or demote the conflicting file-level path.
 
-- **View structure extractor** (`extract.ts`) — deterministic scoped 2-level
-  window walk (one glob per layer, bounded by `MAX_FILES`/`MAX_FILE_BYTES`/
-  `READ_CONCURRENCY`); stable content-hash node ids (`n_` + sha256(path)), sorted
-  nodes/edges/layout so identical disk state ⇒ byte-identical payload; whole-repo
-  DFS enumerator (`listFilesDfs`) for the background painter; relative-import
-  parsing (TS/JS + Python), intra-repo edges only.
-- **Facet painter** (`painter.ts` + drivers in `aperture.ts`) — small/fast-model
-  painter assigning one Facet per file from the active Lens's vocabulary via
-  structured output. Two drivers (**foreground** viewed-window + boundary,
-  **background** whole-repo DFS sweep) share one `Semaphore(1)` so the API is
-  never hit concurrently; frugality (stale-only by content hash, minimal
-  context); soft-fail leaves existing Facets intact; 429/overload backoff;
-  deterministic per-batch perf trace (`perf/painter.log`).
-- **Lens system** (`lenses.ts`, `lens-store.ts`) — data model
-  (categorical palettes, `MAX_FACETS = 6`, the `none` escape Facet, system-prompt
-  builder, closed enum); durable per-project store + active pointer;
-  additive-only creates (fresh id per Lens, existing results never mutated/lost);
-  `/lens` agent + command + tools (list / create / select / edit / merge / delete).
-- **Deterministic built-in Lenses** (`deterministic.ts`) — `GIT_CHANGED`
-  (changed-since-last-commit from `git status`) and `MTIME_RECENCY` (six
-  equal-span mtime buckets, cool→warm); computed from the repo with no model
-  call (zero tokens, always fresh); availability-gated (git Lens hidden outside a
-  work tree).
-- **Two-way agent channel** (`session/system.ts`, `session/prompt.ts`) — a
-  Aperture-awareness block injected for the `build`/`plan` agents only; lets a
-  primary agent *show* the user something by introducing/switching a Lens; the
-  opportunistic path delegates to the lens subagent and uses an `activate` flag so
-  it doesn't disturb the current view.
-- **Renderer — top-bar View** (`feature-plugins/system/aperture.tsx`) — `grid`
-  and `column` layouts (column default), treemap composition blocks encoding
-  subtree make-up, scrollable bar, kind-by-corner-shape, hue paint with
-  structural fallback, mouse navigation + breadcrumb, legend with ◀/▶ Lens
-  cycle. Lives above chat in the `aperture_top` slot; hidden for subagent
-  sessions / short terminals.
-- **Edges** (`extract.ts`, `payload.ts`, `aperture.tsx`) — containment
-  connectors (parent→child drops), in-window import **hover-highlight**
-  (adjacency map, neighbors tinted by their own hue), and one-hop **boundary
-  tiles** for off-window relative imports (bounded `fs.stat` resolution, click to
-  re-root). Follow-ups parked.
-- **Activity / agent tracking (basic)** (`activity.ts`, `aperture-activity.ts`)
-  — per-turn action glyphs (read=circle, create=square, edit=diamond),
-  agent-colored, solid on the touched file and outline propagated up its
-  directories; hover shows agent/action/relative-time; resets per prompt.
-  Graceful no-op when the experimental event system is off. Polish parked.
-- **Live update model** (`aperture.ts`) — recompute-on-display (TUI always
-  fetches `refresh=true`), visibility-gated invalidation (only cached scopes
-  whose window contains a changed file), shell-mutation catch-all refetch.
-- **Wiring** — HTTP payload channel `GET /aperture` + Lens cycle/delete
-  endpoints; the `aperture.invalidated` event (server → TUI); SDK gen; durable
-  KV layout (structure caches, Lens store namespaced per Lens id). Payload is the
-  stable contract — bump `PAYLOAD_VERSION` whenever the extractor's output shape
-  changes (currently 6).
+**The cost question was the crux.** Whole-repo function-level tagging measured at
+roughly **5.8× the cost and 2× the wall time** of file-level (output-dominated
+and structural, so it won't shrink much with prompt tuning). Always-on across a
+large repo therefore looked unaffordable.
+
+**Resolved — always-on, with *granularity* as the cost dial rather than
+*coverage*.** ✅ Implemented.
+
+Every file is extent-painted, always. A cold file is cut into exactly **one
+whole-file extent**, which is the old file-level paint — same `describeFile`
+prompt, same 30-file bins, same price — re-homed into the extent store.
+Interesting files are re-cut **per top-level declaration**. So the cost floor
+equals what we already paid, and the 5.8× applies only to promoted files.
+
+The file/extent dichotomy disappears because there is only ever one
+classification of a file; the question is only how finely it was cut.
+
+- `paintStale` and `paintExtentsStale` **merged into one painter** whose unit of
+  work is an extent. File-level painting as an independent classification is
+  retired.
+- The **semantic store is now a derived projection** of the extent mix, written
+  only by that painter via `attributeFileBytes(...).dominant` — the very function
+  directory composition uses, so a file's tile and its band in the parent's
+  treemap cannot disagree. It is kept (not deleted) because `resolveDomain`
+  reads the *parent* Lens's store to compute a drill-down's domain, boundary
+  tiles need facets for out-of-window files, and bus-factor persists there.
+- **Promotion is monotone and inferred, not stored**: a mix with more than one
+  extent *is* the "already fine" flag (`subtreeCount > 1`), and a file is never
+  coarsened back. `extentsOf` collapses a declaration cut of fewer than two
+  extents to the whole-file name, so the two granularities coincide exactly and
+  promotion never repaints a span under a different name.
+- Interest set: in-window files, edited files, the git working set, and open
+  editor tabs (the extension already drills those). Dial:
+  `aperture.painter.granularity` = `"file"` | `"interest"` (default) |
+  `"declaration"`.
+- Scheduling batches: one drainer fiber per directory over a pending set, with
+  the single paint permit acting as the debounce (no timer). Ten warmed editor
+  tabs become one pass.
+
+*Rejected:* a middle "declaration group" tier (merge adjacent declarations to a
+byte budget). Group names are not edit-stable — an edit mid-file shifts every
+boundary below it and changes the downstream sub-node ids, forcing repaints that
+per-declaration granularity would not. If the working set proves too expensive,
+drop it from the interest set rather than adding an unstable tier.
+
+**Done when:** a file's colour is a stable function of its content ✅; the
+file/extent conflict is unreproducible ✅; the cost of the chosen policy on this
+repo is measured and recorded — `opencode debug aperture-cost` breaks painter
+spend down by lens / trigger / coarse-vs-fine blocks; **the measurement run at
+each dial setting is still outstanding.**
+
+### O1 — Simplify the top bar: drop files, keep aggregation
+
+Remove the file-level tier from the top bar and focus it on the
+**waffle/treemap directory** representation — the aggregation participants
+actually valued. File-level viewing moves into VSCode (O2 + existing gutter).
+
+This is a real reduction in `feature-plugins/system/aperture.tsx`: the column
+layout's per-file tiles, and the interactions that only made sense on them, come
+out. Kept: directory composition blocks, breadcrumb navigation, the legend.
+
+**Open — the dimensions are for experiment, not decision-by-fiat.** What
+replaces the file tier: more directory depth? A larger waffle with finer
+granularity? Facet-major rather than directory-major layout? Build the reduction
+first so there's something to iterate on, then trial variants.
+
+**Coupled requirement:** better linking into VSCode for file viewing. The `⌖`
+go-to-path prompt and `tui.file.open` event exist; clicking a directory block
+should be able to reveal it in the editor, and the editor should be the place
+files are read.
+
+### O2 — Paint the VSCode file browser
+
+Add a pip/glyph in the VSCode Explorer showing each file's facet, so visual
+search works in the file tree — this is what the top bar's file tier was
+partly doing, relocated to where files belong.
+
+**Mechanism:** `vscode.FileDecorationProvider` in `sdks/aperture-vscode`. It
+gives a badge (1–2 chars) plus a colour per URI, which is exactly the pip shape.
+Colour must come from a `ThemeColor`, so extend the existing
+`THEME_ROLE_COLORS` approach — arbitrary hex is not available here, which
+constrains how many facets are distinguishable. Don't wait on Track C for this;
+proceed with the theme-role mapping, and note the constraint so C1 accounts for
+the Explorer pips (a second, differently-limited palette) when it lands.
+
+**Server work:** today the extension fetches per-file
+(`GET /aperture?drill=…&scope=…`). A tree decoration needs **bulk** file→facet
+for a whole directory, ideally the whole repo. Add a compact endpoint returning
+`{path: facet}` plus the legend, cached and invalidated off
+`aperture.invalidated`. Note the sprint-1 lesson: `aperture.invalidated` must
+carry a location or the extension misses repaints.
+
+**Done when:** opening a repo with an active Lens shows facet pips throughout
+the Explorer, updating within a couple of seconds of a repaint.
+
+### O4 — Filter facets by clicking the legend
+
+Clicking a legend entry toggles that facet **off** — off-state renders as a
+neutral grey/dark-brown rather than disappearing, so structure is preserved and
+the remaining facets pop. Supports visual search ("show me only the parsing
+code").
+
+Client-side only: a set of suppressed facet ids in the renderer, applied at the
+hue-resolution boundary (`hueOf` and the composition/treemap weights). No
+server, no repaint. Multi-select, with a clear "reset" affordance.
+
+Shared with Search Lenses (**S4** is the same code path, less useful there) —
+build once, in `aperture.tsx`.
+
+**Open:** whether off-facets keep their area in the treemap (preserves layout
+stability, which is a core Aperture value) or collapse (maximises contrast for
+what remains). Default to preserving area; layout stability is the thing we've
+consistently protected.
+
+---
+
+## Track S — Search Lenses (new)
+
+The largest new build. A Search Lens is a narrow binary/ternary probe used to
+scope a piece of work — participants created these spontaneously and wanted them
+at **line level**, which the VSCode gutter appears to promise.
+
+**The key insight that makes this affordable:** we do not sweep. Line-level
+painting across a whole codebase would be slow and expensive, but we already run
+Explore and Build agents that read the code as part of their normal work. Give
+them a **deterministic tool** to tag specific lines in specific files as they go,
+and the Search Lens fills in as a by-product of work that was happening anyway.
+
+Note the difference in kind from an Overview Lens: participants are often hunting
+**specific usages**, which may not sit inside a named extent at all. Line tags
+are therefore not a finer grade of extents — they're a separate, sparser layer,
+with the compensating benefit of binding directly to syntax.
+
+### S1 — Line-tag data model with syntax anchoring *(the hard part)*
+
+A line tag must **survive edits elsewhere in the file**. A raw line number is
+worthless the moment anything above it changes.
+
+Anchor candidates, to be evaluated:
+- **Enclosing symbol + offset within it** — reuses `extents.ts` (already
+  computes named, line-delimited extents and stable `subNodeID(relPath, name)`
+  hashes) and degrades gracefully: if the symbol survives, the tag survives.
+  Weak for top-level/config code with no enclosing symbol.
+- **Content hash of the tagged line(s)** + a search window — robust to movement,
+  breaks on edit of the line itself, ambiguous when the line text recurs.
+- **Tree-sitter node path** — most principled, and OpenTUI already bundles
+  tree-sitter (`TreeSitterClient`), but ties us to per-language grammars.
+- **Composite:** symbol + line-content hash + line number as a tiebreak, with a
+  documented resolution order and an explicit "lost" state.
+
+Recommendation: composite, since each anchor fails in a different direction and
+the resolver can fall through. Make "lost" a first-class outcome — a stale tag
+that silently paints the wrong line is worse than one that reports itself gone.
+
+**Store:** new `line-tag-store.ts`, per-project, per-Lens, alongside
+`subfacet-store.ts`. Unlike the sweep results these are **expensive to
+regenerate** (they encode an agent's reasoning, not a re-runnable classification)
+— so persist them in the **project directory** with the Lens defs, not global KV.
+That also makes a Search Lens shareable and committable, which is the natural
+extension of the sprint-1 decision to project-scope Lenses.
+
+**Payload:** new optional `lineTags` keyed by file node id, derived at the read
+boundary like `extents`/`composition`. Bump `PAYLOAD_VERSION` to 8.
+
+**Open:** whether a Search Lens is a distinct type on the Lens model or an
+Overview Lens with a flag. Leaning distinct type — different paint policy,
+different interactions, different persistence, and the picker should group them
+separately.
+
+### S2 — Deterministic tagging tool for Explore/Build agents
+
+New tool `lens_tag_lines` (mirroring `tool/lens-facet-files.ts` conventions,
+registered in `tool/registry.ts`): takes a file path, a line or range, a facet id
+from the active Search Lens, and an optional note. Deterministic — no model call,
+it just resolves the anchor and writes the store.
+
+**Prompt work:** the Aperture-awareness block in `session/system.ts` must teach
+agents *when* to call it. The goal is that answering "where do we handle X?"
+leaves a persistent, paintable Search Lens behind. Applies to Explore as well as
+build/plan, which is a widening of the current injection (Aperture awareness is
+currently injected for `build`/`plan` only).
+
+**Also needed:** creating a Search Lens should be as light as creating an
+Overview Lens — a binary probe shouldn't require the full Lens-design flow.
+
+### S3 — Line-level painting in the editor and the View
+
+Extend `sdks/aperture-vscode` to paint line tags as gutter strips. The decoration
+machinery is already there (`decorationFor`, per-hue reused decoration types) —
+the change is fetching `lineTags` alongside `extents`, and painting a
+Search Lens's sparse tags rather than an Overview Lens's exhaustive extents.
+Anchors resolve **in the extension** against live buffer content, which is the
+edit-robust choice already established for extents.
+
+In the TUI, a Search Lens's file/directory blocks show hit density rather than a
+partition — the visual question is "where are the hits", not "what is this made
+of".
+
+### S4 — Legend filtering for Search Lenses
+
+Falls out of **O4**. Less useful on a binary Lens; no extra work expected beyond
+confirming it behaves on 2–3 facet Lenses.
+
+### S5 — Open all files carrying a facet
+
+Participants wanted richer interaction with a Lens: from the legend, open every
+file with a given facet. Cap at **8–10 files** with a clear indication when the
+set was truncated (and, ideally, an ordering rule better than alphabetical —
+most tags, or most recently tagged).
+
+Each file should open **scrolled to its first tagged line**, which is the payoff
+for S1's anchoring. Mechanism: extend the existing `tui.file.open` event
+(TUI → server → extension) with an optional line, and have the extension reveal
+that range.
+
+The file set comes from `lens_facet_files` / the bulk endpoint added in O2.
+
+---
+
+## Track G — Activity View (agent activity as blocks)
+
+Bind agent activity to the same block/lens vocabulary as the rest of Aperture,
+so a user can see **at a glance whether the agent visited the concerns they
+expected**. Today's activity display is per-turn glyphs on the file tree
+(`activity.ts`, `aperture-activity.ts`) — informative but not readable as a
+shape.
+
+### G1 — Activity data model
+
+Per-turn, per-agent read/edit/write actions with the facet of each touched file
+under the **currently active Lens** — so switching Lens recolours history
+without re-recording it. Activity is in-memory today; this needs at least
+per-session durability to be readable as a timeline.
+
+### G2 — Block rendering
+
+A treemap/waffle of the turn's actions, coloured by active-Lens facet.
+
+**Reads are less important than edits and writes.** Reads aggregate into one
+block, optionally expandable to per-file; edits and writes are always expanded.
+This is the core information-density decision and should survive contact with
+the experiment.
+
+### G3 — Placement and timeline orientation
+
+Either the right sidebar (vertical timeline, turns building downward) or the top
+bar (horizontal). **Replacing the overview is possible but likely confusing** —
+the two answer different questions, and a user mid-task wants both.
+
+Structure: each turn builds along the timeline axis; within a turn, read / edit /
+write (and sub-agent r/e/w) build orthogonally.
+
+The sidebar is the safer default — it doesn't contend with the Overview Lens for
+the top bar, and vertical suits an append-only log. But this is explicitly for
+experiment; build the block renderer (G2) so it is orientation-agnostic and try
+both.
+
+Slot template: `feature-plugins/sidebar/files.tsx`. A new host slot may be
+needed in `packages/plugin/src/tui.ts` (only `aperture_top` exists today).
+
+---
+
+## Track C — Colour fidelity (deferred)
+
+Parked until the design tracks are through — it blocks nothing and is repair
+work, not a design question. It does need to land **before the final
+experiment**, since the hue encoding is the whole visual contract. Good work for
+a day when the open decisions above need thinking time rather than typing.
+
+Most of the diagnosis is already done (below), so picking it up cold is cheap.
+
+### C1 — Diagnose and fix hue collapse in 256-colour terminals
+
+**Symptom.** On some Mac and Linux terminals, distinct Lens hues render as near-
+identical colours; participants could not tell facets apart and were confused
+about what the View was showing.
+
+**Leading hypothesis, established by reading the renderer** (OpenTUI core 0.3.1,
+`index-jx0p1c2f.js`):
+
+- `CliRenderer.shouldSyncNativePaletteState()` returns true iff the terminal
+  advertises `ansi256` **and not** `rgb`.
+- When true, OpenTUI queries the terminal's *actual* palette over **OSC 4** and
+  pushes those 256 RGBA entries into the native renderer
+  (`rendererSetPaletteState`). All output RGB is then quantised onto **the
+  terminal theme's own colours** — Solarized, Nord, Dracula, Terminal.app
+  defaults — not the standard xterm-256 colour cube.
+- Our palettes in `aperture/lenses.ts` are hand-tuned to be safe against the
+  **standard cube** (see the comment at `lenses.ts:133` and the "no … collapses
+  to grey" test). That guarantee simply does not hold against an arbitrary
+  themed palette, which typically offers far fewer distinct hues. Hence
+  "projected into a different space, which flattened differences."
+- Fallback only kicks in when OSC 4 detection *fails*
+  (`normalizeTerminalPalette` → `getFallbackAnsi256Palette`), so a terminal that
+  answers honestly is the *worse* case.
+
+**Why it hit Mac/Linux and not us:** whether `rgb` is set comes from the native
+`getTerminalCapabilities`. `COLORTERM=truecolor` is commonly lost over ssh, is
+not set by several Linux terminal defaults, and Terminal.app genuinely has no
+truecolor. tmux is explicitly special-cased in OpenTUI and is a strong suspect
+for a second, independent path to the same failure.
+
+**Work:**
+
+1. **Diagnostic first.** Add `opencode debug aperture-colors` (extend
+   `cli/cmd/debug/index.ts`, which already reports `TERM`/`TERM_PROGRAM`): print
+   detected capabilities (`rgb`, `ansi256`, multiplexer), whether native palette
+   sync is active, the detected OSC-4 palette, and — for each facet of the active
+   Lens — the requested hex next to the colour it will actually resolve to, plus
+   pairwise perceptual distance (CIEDE2000) between resolved facet colours.
+   Everything else in this task is guesswork without this.
+2. **Survey.** Run the diagnostic across the terminals a participant might
+   plausibly use: macOS Terminal.app, iTerm2, Ghostty, WezTerm, Alacritty,
+   GNOME Terminal, Konsole, xterm, VSCode integrated terminal, each bare and
+   under tmux, each local and over ssh. Record capabilities + minimum pairwise
+   distance in a table checked into `docs/`.
+3. **Fix, in priority order:**
+   - *Prefer truecolor where it's actually available.* Determine whether `rgb`
+     is being under-detected (env not propagated, tmux passthrough, missing
+     `COLORTERM`) and correct detection or set it ourselves where safe.
+     Recovering truecolor makes the whole problem vanish for most terminals.
+   - *When genuinely 256-only, choose facet colours against the detected
+     palette instead of assuming the cube.* Resolve facet hues at render time by
+     maximising minimum perceptual distance among the terminal's real entries,
+     rather than shipping fixed hex and hoping. This is the substantive change
+     and belongs next to the palette definitions in `lenses.ts`.
+   - *Guarantee a floor.* If the detected palette cannot separate N facets
+     acceptably, fall back to a redundant encoding rather than lying: reduce to
+     fewer facets visually, or add a texture/glyph channel. Silently flattening
+     is the worst outcome.
+4. **Regression test.** Replace/extend the current cube-only test with one that
+   takes a palette as input and asserts a minimum pairwise distance, then run it
+   over the palettes captured in the survey.
+
+**Open decisions:** whether to fix detection upstream in OpenTUI or work around
+it locally; whether the fallback encoding is fewer-facets or texture.
+
+**Done when:** every terminal in the survey table shows all facets of a 6-facet
+Lens as mutually distinguishable, verified by the diagnostic and by eye on at
+least one real Mac and one real Linux machine.
+
+---
+
+## Suggested ordering
+
+**Immediately, in parallel:**
+- **O3** — unblocks the rest of Track O and informs S1.
+- **S1** — the anchoring design is the long pole of the sprint; start the design
+  early even if implementation waits.
+
+**Then:** O1 and O2 (both read O3's unified data; independent of each other, one
+is TUI and one is extension, so they split cleanly across people). O4 whenever
+convenient — it's small, self-contained, and immediately useful.
+
+**Then:** S2 → S3 → S5 in sequence, all gated on S1.
+
+**Track G** is independent throughout and can run alongside from the start. It's
+the most speculative track, so it should not block the others.
+
+**Track C** is deferred: pick up C1 on a low-momentum day, or when the design
+tracks are blocked on a decision. It must land before the final experiment, so it
+shouldn't slide past the point where there's no slack left.
+
+**Natural split by surface:**
+- *Terminal renderer* (`aperture.tsx`): O1, O4, G2, G3
+- *VSCode extension* (`sdks/aperture-vscode`): O2, S3, S5's reveal path
+- *Server/data* (`aperture/`, tools, payload): O3, S1, S2, G1, the bulk endpoint
+- *Cross-cutting, deferred*: C1
+
+---
+
+## Open decisions (to be made deliberately)
+
+| # | Decision | Track |
+| --- | --- | --- |
+| 1 | ~~Extent painting always-on vs. widened heuristic, given ~5.8× cost~~ — **decided:** always-on, with granularity (not coverage) as the cost dial; one painter, one classification per file, semantic store demoted to a derived projection | O3 ✅ |
+| 2 | What dimension replaces the file tier in the top bar | O1 |
+| 3 | Whether filtered-off facets keep their treemap area | O4 |
+| 4 | Line-tag anchoring mechanism (composite recommended) | S1 |
+| 5 | Search Lens as a distinct type on the model vs. a flag | S1 |
+| 6 | Activity View in the sidebar vs. the top bar | G3 |
+| 7 | Whether to fix truecolor detection upstream in OpenTUI or locally | C1 *(deferred)* |
+
+---
+
+## Carried forward from Sprint 1
+
+### ⚠️ Catastrophic failure mode
+
+Symptom: Aperture runs fine, then RAM climbs without bound (~30MB/s) while
+completely idle; the top bar never paints; CPU is busy.
+
+Root cause: a slot renderer that reads a `createResource` accessor **directly in
+the render/tracking scope**. In SolidJS, calling the accessor while the resource
+is in its **error** state re-throws synchronously inside render, tripping the
+slot's error boundary, which re-renders, which re-reads, which throws again.
+Every cycle allocates. Gating with `<Show when={graph()?.nodes.length > 0}>` is
+the same trap — the condition calls the accessor.
+
+Fix: never call a resource accessor unguarded in render. Check `resource.error`
+first and return a fallback *without* calling the accessor; route every read
+through a helper that short-circuits on error. Keep the bar frame always mounted
+at fixed height rather than gating it behind `<Show>`.
+
+Why it hid: the loop needs the resource in error AND something driving
+re-renders. **A bug that reproduces only in busy directories is the tell.**
+
+Localizing render/leak bugs: dewire the data path → hardcode a static bar → add
+back the fetch + a count readout → add back the per-node `For` with guarded
+reads. Bisect one variable at a time. Isolate the instance under test (scratch
+dir / worktree) so your own edits don't confound the reading.
 
 ### Architecture: four separated concerns
 
@@ -215,133 +513,95 @@ narrative is dropped — this is the catalog of what exists).
 
 The payload (#3) is the seam: the extractor and painter never know whether the
 View is a top-bar or a sidebar, so layout placement is low-commitment and
-reversible.
+reversible. **This is why Track G's placement question is cheap to defer.**
 
-## Parked (not this sprint)
-
-- **Plan-overlay** (old step 8) — dashed proposed-file blocks parsed from plan
-  markdown. Superseded by **B3** (the task list references the Lens directly).
-- **Agent-tracking polish** (old step 7) — multi-agent legend, sub-agent grouping
-  under the spawner, richer reactive hover. Basic glyphs already landed.
-- **Edges follow-ups** (old step 6) — per-child boundary tiles, incoming
-  cross-window edges, routed in-window connector lines. Core edges done.
-- **Full-screen zoom route** (old step 5) — detail route for a single
-  node/subgraph.
-
-Other non-blocking follow-ups kept on the back burner: durable provenance +
-timeline (activity is in-memory today), deeper edge extraction (LSP-backed
-call/type edges, path-alias resolution), and background-sweep re-walk cost
-(skip-ahead cursor / wake-scoped re-walk on large mostly-painted repos).
-
-## ⚠️ Catastrophic failure mode (learned the hard way)
-
-Symptom: Aperture runs fine for a while, then RAM climbs without bound
-(~30MB/s, seen via VmmemWSL) while completely idle — no prompting, no
-navigation. The top bar never paints. CPU is busy.
-
-Root cause: a slot renderer that reads a `createResource` accessor **directly in
-the render/tracking scope**. In SolidJS, calling the accessor (`graph()`) while
-the resource is in its **error** state *re-throws synchronously inside render*.
-That trips the slot's error boundary (see @opentui/solid `Slot`, which
-re-renders on a version signal and reports via `onPluginError`), which
-re-renders, which re-reads, which throws again — a tight render → catch →
-re-render loop. Every cycle allocates, so memory grows unbounded. Gating UI with
-`<Show when={(graph()?.nodes.length ?? 0) > 0}>` is the same trap: the condition
-calls the accessor.
-
-Why it hid: the loop only runs when the resource is in error AND something keeps
-re-rendering. A small/idle directory produces little store churn; the opencode
-tree (LSP, watcher, snapshots) drives constant re-renders, so the same code there
-leaks fast. **A bug that reproduces only in busy directories is the tell.**
-
-Fix (in `feature-plugins/system/aperture.tsx`): never call a resource accessor
-unguarded in render. Check `resource.error` first and return a fallback *without*
-calling the accessor; route every read through a helper that short-circuits on
-error (`const nodes = () => graph.error ? [] : graph()?.nodes ?? []`, and
-`hueOf`/`summary` likewise). Keep the bar frame always mounted (fixed height)
-rather than gating it behind `<Show when={graph()...}>`.
-
-How it was localized (use this for render/leak bugs): dewire the data path →
-hardcode a static bar → add back the fetch + a count readout only → add back the
-per-node `For` with guarded reads. Bisecting one variable at a time beats reading
-code. Also isolate the instance-under-test (scratch dir / git worktree) so your
-own edits don't confound the memory reading.
-
-Two upstream contributors, both fixed: (1) the extractor used to walk `**/*` and
-read every file (node_modules included) — now single-layer/scoped with caps; (2)
-a stale durable cache from an old extractor was served because `PAYLOAD_VERSION`
-wasn't bumped — bump the version whenever the payload shape or extractor
-semantics change.
-
-## Frozen reference — verified extension points
+### Frozen reference — verified extension points
 
 TUI stack: TypeScript + SolidJS + OpenTUI under
 `packages/opencode/src/cli/cmd/tui/` (NOT Go/bubbletea). OpenTUI runs a 60fps
-flexbox render loop; you mutate SolidJS signals, never write a draw loop.
+flexbox render loop; you mutate SolidJS signals, never write a draw loop. Mouse
+is first-class (`onMouseDown/Up/Over/Out/Move`, `onClick`).
 
-UI extension surfaces: routes (full-screen), slots (named injection points),
-dialogs (modals). opencode's own UI is built as internal "feature-plugins"
-(`feature-plugins/`) using the same public `TuiPluginApi` a third party gets.
+Note: this repo has **two** front-ends — `bun dev .` runs the terminal TUI
+(`cli/cmd/tui`), not the SolidJS `packages/app`. Confirm which before editing UI.
 
-Mouse is first-class: `<box>`/`<text>` accept onMouseDown/Up/Over/Out/Move +
-onClick. The View bar uses onMouseDown for drill-in/navigation; more examples at
-`sidebar/files.tsx`, `routes/session/index.tsx`.
-
-Aperture files (post Task 0 rename):
+Aperture files:
 - Server: `packages/opencode/src/aperture/` — `payload.ts` (contract),
-  `extract.ts` (deterministic walk, carries file mtime), `aperture.ts` (service:
-  cache + window math + events + painter drivers), `painter.ts` (Facet paint),
-  `semantic-store.ts`, `semantics.ts` (built-in layer hue vocabulary),
-  `lenses.ts` + `lens-store.ts` (Lens model + store),
-  `deterministic.ts` (git/mtime built-in compute), `event.ts`
-  (`aperture.invalidated`), `dump.ts` (CLI verify).
-- HTTP: `server/routes/instance/httpapi/groups/aperture.ts` (+ `handlers/`,
-  registered in `server.ts` and `api.ts`).
-- TUI: `feature-plugins/system/aperture.tsx` (+ `aperture-activity.ts`);
-  registered in `cli/cmd/tui/plugin/internal.ts`; slot placed in
-  `routes/session/index.tsx`.
+  `extract.ts` (deterministic walk), `aperture.ts` (service: cache + window math
+  + events + painter drivers), `painter.ts`, `extents.ts` (line-delimited
+  function extents), `semantic-store.ts` (file-level facets),
+  `subfacet-store.ts` (function-level facets), `semantics.ts`, `lenses.ts` +
+  `lens-store.ts`, `deterministic.ts` (git/mtime/bus-factor built-ins),
+  `event.ts`, `dump.ts`, `study-log.ts`.
+- Tools: `tool/lens-{create,list,select,edit,merge-facets,facet-files}.ts`,
+  registered in `tool/registry.ts`.
+- HTTP: `server/routes/instance/httpapi/groups/aperture.ts` (+ `handlers/`),
+  registered in `server.ts` and `api.ts`. Routes: `get`, `lens/cycle`,
+  `lens/delete`, `lens/list`, `lens/select`, `interaction`.
+- TUI: `feature-plugins/system/aperture.tsx` (+ `aperture-activity.ts`,
+  `aperture-lens-picker.tsx`); registered in `cli/cmd/tui/plugin/internal.ts`;
+  slot placed in `routes/session/index.tsx`.
+- VSCode: `sdks/aperture-vscode/src/extension.ts` (gutter strips via
+  `createTextEditorDecorationType`, SSE on `/event`, `tui.file.open` reveal).
 - Tests: `packages/opencode/test/aperture/`.
 
-Slots:
-- Host slot map: `packages/plugin/src/tui.ts` (`TuiHostSlotMap` — `aperture_top`).
-- Slot placement / top-bar height + visibility math: `routes/session/index.tsx`.
-- Sidebar slot template: `feature-plugins/sidebar/files.tsx`.
-- Full-screen route template: `feature-plugins/system/diff-viewer.tsx`.
+Slots: host slot map at `packages/plugin/src/tui.ts` (`TuiHostSlotMap` —
+currently only `aperture_top`); placement + height/visibility math in
+`routes/session/index.tsx`; sidebar template `feature-plugins/sidebar/files.tsx`;
+full-screen route template `feature-plugins/system/diff-viewer.tsx`.
 
-Events (server → TUI):
-- `aperture.invalidated`: defined in `aperture/event.ts`; registered by
-  importing that module from the route group (before `api.ts` snapshots the
-  EventV2 registry into the SDK union). TUI subscribes via
-  `api.event.on("aperture.invalidated", …)`.
-- File events feeding invalidation: `file.edited` (`packages/core/src/filesystem.ts`),
-  `file.watcher.updated` (`packages/core/src/filesystem/watcher.ts`).
-- `session.next.shell.ended` (experimental) — the shell-mutation refetch.
-
-HTTP payload channel:
-- `GET /aperture?scope=&refresh=` → `AperturePayload.Payload`. Middleware:
-  InstanceContext + WorkspaceRouting + Authorization. Consumed via
-  `api.client.aperture.get(...)`. SDK types regenerate into
-  `packages/sdk/js/src/v2/gen/`.
+Events (server → TUI): `aperture.invalidated` (defined in `aperture/event.ts`,
+registered by importing that module from the route group before `api.ts`
+snapshots the EventV2 registry into the SDK union). **It must carry a location**
+— the VSCode extension is the only HTTP-SSE consumer and silently misses
+repaints otherwise. Feeding it: `file.edited` (`packages/core/src/filesystem.ts`),
+`file.watcher.updated` (`filesystem/watcher.ts`),
+`session.next.shell.ended` (experimental shell-mutation refetch).
 
 Persistence:
-- Durable KV: `packages/opencode/src/storage/storage.ts` (string[] keys).
-  Current keys: structure caches under `["aperture", projectID, "structure",
-  scopeKey]`; Lenses under `["aperture", projectID, "lenses"]`; active
-  pointer under `["aperture", projectID, "active-lens"]`; Facet results
-  namespaced per Lens id. `storage.update` is atomic read-modify-write under a
-  write lock. **(A3 still moves Lens persistence into the project directory.)**
+- Project directory (`.opencode/aperture/`): Lens defs (`lenses.json`) + active
+  pointer (`active.json`). Shareable/committable, agent-readable. **Line tags
+  join these (S1).**
+- Durable KV (`storage/storage.ts`, string[] keys): structure caches under
+  `["aperture", projectID, "structure", scopeKey]`; file facets and sub-file
+  facets namespaced per Lens id. Large, churny, free to regenerate.
+  `storage.update` is atomic read-modify-write under a write lock.
+- Bus-factor is persisted to the semantic store and background-refreshed
+  HEAD-keyed (not computed inline like git-changed/mtime) — computing it inline
+  blocked cold-open for ~10s.
 - Per-open-project in-memory state: the service's `caches` Map keyed by
-  directory; cleaned via `registerDisposer` on instance disposal.
+  directory, cleaned via `registerDisposer`.
 
-Provider / model (painter):
-- `provider.defaultModel` → `getSmallModel(providerID)` → `getLanguage(small)`.
-  Returns undefined when no small model is available; the painter then skips the
-  pass. Provider/Config are provided to the Aperture layer (forked painter keeps
-  R = never, mirroring `Agent.defaultLayer`).
+Painter: `provider.defaultModel` → `getSmallModel(providerID)` →
+`getLanguage(small)`; returns undefined when no small model exists and the
+painter skips the pass. Foreground (viewed window) and background (whole-repo
+DFS) drivers share one `Semaphore(1)`. Dir-coherent bins + wide fan-out — see
+the concurrency notes before changing constants. Perf trace: `perf/painter.log`.
 
-Config:
-- Schema: `packages/core/src/v1/config/config.ts` — `aperture.painter.context`
-  ("minimal" | "medium") and `aperture.painter.concurrency`. JSONC supported.
+Config: `packages/core/src/v1/config/config.ts` — `aperture.painter.context`
+("minimal" | "medium"), `aperture.painter.concurrency`. JSONC supported.
+
+`PAYLOAD_VERSION` is currently **7**; bump it whenever the payload shape or
+extractor semantics change (a stale cache from an older extractor being served
+was a real, hard-to-find bug). S1 takes it to 8.
 
 Module/style conventions: see `AGENTS.md` (flat exports + self-reexport, Effect
 v4 rules, snake_case Drizzle, run `bun typecheck` from package dirs).
+
+---
+
+## Parked
+
+- **Plan-overlay** — dashed proposed-file blocks parsed from plan markdown;
+  superseded by task lists referencing the Lens.
+- **Edges follow-ups** — per-child boundary tiles, incoming cross-window edges,
+  routed in-window connector lines. Core edges done. Note that O1's removal of
+  the file tier may retire parts of this outright.
+- **Full-screen zoom route** — detail route for a single node/subgraph.
+- **Durable provenance + timeline** — partly absorbed by G1.
+- **Deeper edge extraction** — LSP-backed call/type edges, path-alias resolution.
+- **Background-sweep re-walk cost** — skip-ahead cursor / wake-scoped re-walk on
+  large mostly-painted repos. Worth revisiting if O3 lands as always-on.
+- **Sprint-1 diagnostic logging** — `perf/autosession.log` instrumentation from
+  the auto-create-session work should be stripped once the "Provider is
+  overloaded" chat bug is resolved.

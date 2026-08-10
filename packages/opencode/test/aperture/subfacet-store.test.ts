@@ -112,29 +112,57 @@ describe("aperture subfacet-store (function-level facets)", () => {
       expect(await run(ApertureSubfacetStore.readMixes(iface, PID, LENS))).toEqual({})
     })
 
-    test("upsertMix reports a change on first write and on a real change, not on a rewrite", async () => {
+    test("upsertMixes reports a change on first write and on a real change, not on a rewrite", async () => {
       const { iface } = memStorage()
       // First write (doc doesn't exist yet — the update→write fallback path).
-      expect(await run(ApertureSubfacetStore.upsertMix(iface, PID, LENS, "src/a.ts", mix("login")))).toBe(true)
+      expect(await run(ApertureSubfacetStore.upsertMixes(iface, PID, LENS, { "src/a.ts": mix("login") }))).toEqual([
+        "src/a.ts",
+      ])
       // Identical re-derivation: no change, so the painter publishes nothing and the
       // paint→refetch→paint guard holds.
-      expect(await run(ApertureSubfacetStore.upsertMix(iface, PID, LENS, "src/a.ts", mix("login")))).toBe(false)
-      expect(await run(ApertureSubfacetStore.upsertMix(iface, PID, LENS, "src/a.ts", mix("tokens")))).toBe(true)
+      expect(await run(ApertureSubfacetStore.upsertMixes(iface, PID, LENS, { "src/a.ts": mix("login") }))).toEqual([])
+      expect(await run(ApertureSubfacetStore.upsertMixes(iface, PID, LENS, { "src/a.ts": mix("tokens") }))).toEqual([
+        "src/a.ts",
+      ])
       expect(await run(ApertureSubfacetStore.readMixes(iface, PID, LENS))).toEqual({ "src/a.ts": mix("tokens") })
+    })
+
+    test("a batch reports exactly the paths that changed, and writes them all", async () => {
+      const { iface } = memStorage()
+      await run(
+        ApertureSubfacetStore.upsertMixes(iface, PID, LENS, { "src/a.ts": mix("login"), "src/b.ts": mix("login") }),
+      )
+      // a unchanged, b changed, c new — only the latter two are reported, but all three
+      // are present afterwards. This is what lets one pass invalidate once, correctly.
+      const changed = await run(
+        ApertureSubfacetStore.upsertMixes(iface, PID, LENS, {
+          "src/a.ts": mix("login"),
+          "src/b.ts": mix("tokens"),
+          "src/c.ts": mix("login"),
+        }),
+      )
+      expect([...changed].sort()).toEqual(["src/b.ts", "src/c.ts"])
+      expect(await run(ApertureSubfacetStore.readMixes(iface, PID, LENS))).toEqual({
+        "src/a.ts": mix("login"),
+        "src/b.ts": mix("tokens"),
+        "src/c.ts": mix("login"),
+      })
     })
 
     test("mergeFacet folds a file's weights, summing a collision back into one weight", async () => {
       const { iface } = memStorage()
       await run(
-        ApertureSubfacetStore.upsertMix(iface, PID, LENS, "src/a.ts", {
-          weights: [
-            { facet: "login", count: 1, bytes: 60 },
-            { facet: "tokens", count: 2, bytes: 40 },
-          ],
-          totalCount: 3,
-          totalBytes: 100,
-          subtreeCount: 3,
-          subtreeBytes: 100,
+        ApertureSubfacetStore.upsertMixes(iface, PID, LENS, {
+          "src/a.ts": {
+            weights: [
+              { facet: "login", count: 1, bytes: 60 },
+              { facet: "tokens", count: 2, bytes: 40 },
+            ],
+            totalCount: 3,
+            totalBytes: 100,
+            subtreeCount: 3,
+            subtreeBytes: 100,
+          },
         }),
       )
       await run(ApertureSubfacetStore.mergeFacet(iface, PID, LENS, "login", "tokens"))
@@ -144,7 +172,7 @@ describe("aperture subfacet-store (function-level facets)", () => {
 
     test("clear drops mixes with the facets they were derived from", async () => {
       const { iface } = memStorage()
-      await run(ApertureSubfacetStore.upsertMix(iface, PID, LENS, "src/a.ts", mix("login")))
+      await run(ApertureSubfacetStore.upsertMixes(iface, PID, LENS, { "src/a.ts": mix("login") }))
       await run(ApertureSubfacetStore.clear(iface, PID, LENS))
       expect(await run(ApertureSubfacetStore.readMixes(iface, PID, LENS))).toEqual({})
     })

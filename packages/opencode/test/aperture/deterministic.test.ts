@@ -16,7 +16,13 @@ describe("deterministic git-changed", () => {
   test("tags only files in the working-tree change set as changed, bridging the repo prefix", () => {
     // git reports repo-root-relative paths; the directory's prefix maps subtree paths onto them.
     const store = ApertureDeterministic.computeStore("git-changed", subtree, {
-      git: { prefix: "pkg/app/", changed: new Map([["pkg/app/src/a.ts", 3], ["pkg/app/src/c.ts", 40]]) },
+      git: {
+        prefix: "pkg/app/",
+        changed: new Map([
+          ["pkg/app/src/a.ts", 3],
+          ["pkg/app/src/c.ts", 40],
+        ]),
+      },
     })
     expect(store["n1"]!.facet).toBe(CH_1)
     expect(store["n2"]!.facet).toBe("unchanged")
@@ -25,7 +31,14 @@ describe("deterministic git-changed", () => {
 
   test("buckets a changed file by its line churn (added + deleted)", () => {
     const store = ApertureDeterministic.computeStore("git-changed", subtree, {
-      git: { prefix: "", changed: new Map([["src/a.ts", 0], ["src/b.ts", 24], ["src/c.ts", 500]]) },
+      git: {
+        prefix: "",
+        changed: new Map([
+          ["src/a.ts", 0],
+          ["src/b.ts", 24],
+          ["src/c.ts", 500],
+        ]),
+      },
     })
     expect(store["n1"]!.facet).toBe(CH_1) // churn 0 (e.g. mode-only) → smallest band
     expect(store["n2"]!.facet).toBe(CH_10) // 24 → 10–24 band
@@ -35,7 +48,16 @@ describe("deterministic git-changed", () => {
   test("bucket edges are lower-inclusive of the next band (9→<10, 10→10-24, 50→50-99, 100→100+)", () => {
     const edges = [file("a", "a.ts"), file("b", "b.ts"), file("c", "c.ts"), file("d", "d.ts"), file("e", "e.ts")]
     const store = ApertureDeterministic.computeStore("git-changed", edges, {
-      git: { prefix: "", changed: new Map([["a.ts", 9], ["b.ts", 10], ["c.ts", 49], ["d.ts", 50], ["e.ts", 100]]) },
+      git: {
+        prefix: "",
+        changed: new Map([
+          ["a.ts", 9],
+          ["b.ts", 10],
+          ["c.ts", 49],
+          ["d.ts", 50],
+          ["e.ts", 100],
+        ]),
+      },
     })
     expect(store["a"]!.facet).toBe(CH_1)
     expect(store["b"]!.facet).toBe(CH_10)
@@ -52,7 +74,7 @@ describe("deterministic git-changed", () => {
     expect(atRoot["n1"]!.facet).toBe("unchanged")
     // Missing git info → everything unchanged rather than throwing.
     const none = ApertureDeterministic.computeStore("git-changed", subtree, {})
-    expect(Object.values(none).every((e) => e.facet ==="unchanged")).toBe(true)
+    expect(Object.values(none).every((e) => e.facet === "unchanged")).toBe(true)
   })
 })
 
@@ -78,7 +100,7 @@ describe("deterministic mtime buckets", () => {
   test("all-equal mtime collapses to one colour; missing mtime (0) is treated as oldest", () => {
     const equal = [file("a", "a.ts", 5), file("b", "b.ts", 5), file("c", "c.ts", 5)]
     const store = ApertureDeterministic.computeStore("mtime-buckets", equal, undefined)
-    expect(Object.values(store).every((e) => e.facet ===RECENCY_FACET_IDS[0])).toBe(true)
+    expect(Object.values(store).every((e) => e.facet === RECENCY_FACET_IDS[0])).toBe(true)
 
     // A file whose platform reports no mtime (0) is bucketed as oldest, not as a 1970 outlier
     // that would stretch the range over real files. The range is set by the real mtimes only.

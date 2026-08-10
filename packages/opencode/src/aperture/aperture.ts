@@ -25,7 +25,25 @@ import { AperturePainter } from "./painter"
 import { ApertureLensStore } from "./lens-store"
 import { ApertureDeterministic } from "./deterministic"
 import { Git } from "@/git"
-import { type Lens, type LensParent, type PaletteId, legend as lensLegend, orderForest, inDomain, NONE_FACET, NONE_HUE, NONE_LABEL, ARCHITECTURE, ARCHITECTURE_ID, BUS_FACTOR, BUS_FACTOR_ID, MAX_LENS_DEPTH, isBuiltinLens, isDeterministic, dependsOnDeterministic } from "./lenses"
+import {
+  type Lens,
+  type LensParent,
+  type PaletteId,
+  legend as lensLegend,
+  orderForest,
+  inDomain,
+  NONE_FACET,
+  NONE_HUE,
+  NONE_LABEL,
+  ARCHITECTURE,
+  ARCHITECTURE_ID,
+  BUS_FACTOR,
+  BUS_FACTOR_ID,
+  MAX_LENS_DEPTH,
+  isBuiltinLens,
+  isDeterministic,
+  dependsOnDeterministic,
+} from "./lenses"
 
 // Server-side Aperture service (PLAN.md steps 1 + 2.5). Owns the deterministic
 // payload, but unlike step 1 the graph is a *2-level window* rooted at a scope
@@ -76,6 +94,11 @@ const BG_BATCH_DELAY = "250 millis"
 // function paint. Above the cap the proactive pass is skipped; those files still paint
 // on-demand when drilled.
 const WORKING_SET_PAINT_CAP = 200
+// Files handed to one batched extent pass. Sized to roughly one fan-out wave so a slice
+// doesn't hold the single paint permit long enough to stall a foreground pass; the drainer
+// releases the permit and pauses between slices. Must not exceed the painter's own
+// per-pass file cap (MAX_PER_PASS) or the tail of a slice would be silently dropped.
+const EXTENT_DRAIN_BATCH = 240
 
 // Storage key: ["aperture", <projectID>, "structure", <scopeKey>]. Per project
 // and per scope so each navigated directory keeps its own durable subgraph.
@@ -165,7 +188,11 @@ export type FacetFilesOutcome =
   | {
       readonly status: "ok"
       readonly lens: { readonly id: string; readonly name: string }
-      readonly groups: ReadonlyArray<{ readonly facet: string; readonly label: string; readonly paths: ReadonlyArray<string> }>
+      readonly groups: ReadonlyArray<{
+        readonly facet: string
+        readonly label: string
+        readonly paths: ReadonlyArray<string>
+      }>
       readonly unknownFacets: ReadonlyArray<string>
     }
   | { readonly status: "not-found" }
@@ -468,14 +495,17 @@ export const layer = Layer.effect(
             { storage, events, provider, config },
             directory,
             projectID,
-            "",
-            pending,
+            [""],
+            // Coarse: the fill only has to place these files in the parent's domain, which
+            // is a whole-file question. Any of them the child then paints finely is
+            // promoted on its own account.
+            pending.map((node) => ({ node })),
             origin,
             parent,
             // Silent: this writes the *parent's* store, which isn't the one being viewed, and
             // our own pass publishes a moment later anyway. `trigger` keeps the spend
             // attributable to the drill-down that forced it.
-            { domain: parentDomain, publish: false, trigger: lens.id },
+            { domain: parentDomain, publish: false, trigger: lens.id, source: "parent-fill" },
           ).pipe(
             Effect.catchCause((cause) =>
               Effect.sync(() => log.error("parent fill failed", { lens: lens.id, parent: parent.id, cause })),
@@ -593,20 +623,17 @@ export const layer = Layer.effect(
     yield* Effect.addFinalizer(() => Effect.sync(off))
 
     // FS failures degrade to an empty payload rather than crashing the UI.
-    const compute = Effect.fn("Aperture.compute")(
-      function* (directory: string, projectID: string, scope: string) {
-        const payload = yield* ApertureExtract.extract(directory, { scope }).pipe(
-          Effect.catch((cause) => {
-            log.error("extract failed", { projectID, scope, cause })
-            return Effect.succeed(empty)
-          }),
-        )
-        yield* storage.write(storageKey(projectID, scope), payload).pipe(Effect.ignore)
-        log.info("computed", { projectID, scope, nodes: payload.nodes.length, edges: payload.edges.length })
-        return payload
-      },
-      Effect.provide(FSUtil.defaultLayer),
-    )
+    const compute = Effect.fn("Aperture.compute")(function* (directory: string, projectID: string, scope: string) {
+      const payload = yield* ApertureExtract.extract(directory, { scope }).pipe(
+        Effect.catch((cause) => {
+          log.error("extract failed", { projectID, scope, cause })
+          return Effect.succeed(empty)
+        }),
+      )
+      yield* storage.write(storageKey(projectID, scope), payload).pipe(Effect.ignore)
+      log.info("computed", { projectID, scope, nodes: payload.nodes.length, edges: payload.edges.length })
+      return payload
+    }, Effect.provide(FSUtil.defaultLayer))
 
     // The structure cache (container.scopes + storage) stays pure: semantics are
     // merged onto a copy at the read boundary from the separate per-project store,
@@ -638,9 +665,17 @@ export const layer = Layer.effect(
         // painted even though it falls outside the current window. The store is keyed
         // by stable node id, so this paint is reused when the file is later viewed
         // in-window. stale-only dedup in the painter keeps the extra files cheap.
-        const fileNodes = [...nodes.filter((n) => n.kind === "file"), ...boundaries.filter((b) => b.kind === "file")].map(
-          (n) => ({ id: n.id, path: n.path }),
-        )
+        // In-window files are the widest of the O3 interest heuristics: the user is looking
+        // at them, so they are promoted to per-declaration granularity (subject to the
+        // aperture.painter.granularity dial). Boundary targets are NOT — they are one-hop
+        // references drawn as a single tile, not code in view, so they stay at the cheap
+        // whole-file floor.
+        const fileNodes = [
+          ...nodes
+            .filter((n) => n.kind === "file")
+            .map((n) => ({ node: { id: n.id, path: n.path }, interested: true })),
+          ...boundaries.filter((b) => b.kind === "file").map((b) => ({ node: { id: b.id, path: b.path } })),
+        ]
         if (fileNodes.length === 0) return
         // Key by Lens too: a foreground pass for a freshly-switched Lens
         // must not be deduped against an in-flight pass for the previous one.
@@ -651,84 +686,145 @@ export const layer = Layer.effect(
         // resolveDomain), so the ancestor fill it may trigger is serialized with every other
         // painter pass rather than racing them on the API.
         yield* Effect.gen(function* () {
-          const domain = yield* resolveDomain(lens, directory, projectID, fileNodes, "fg")
+          const domain = yield* resolveDomain(
+            lens,
+            directory,
+            projectID,
+            fileNodes.map((t) => t.node),
+            "fg",
+          )
           yield* AperturePainter.paintStale(
             { storage, events, provider, config },
             directory,
             projectID,
-            scope,
+            publishScopes(directory, scope),
             fileNodes,
             "fg",
             lens,
-            { domain },
+            { domain, source: "window" },
           )
-        }).pipe(
-          paintGate.withPermits(1),
-          Effect.ensuring(Effect.sync(() => inFlight.delete(key))),
+        }).pipe(paintGate.withPermits(1), Effect.ensuring(Effect.sync(() => inFlight.delete(key))), Effect.forkDetach)
+      })
+
+    // Promote files to per-declaration granularity (O3). Forked onto the *shared*
+    // single-permit gate, so the API is never hit concurrently with the background sweep.
+    //
+    // Callers enqueue; ONE drainer fiber per directory does the work. That is what
+    // coalesces a burst — the ten `?drill=` requests the VSCode extension makes when it
+    // warms ten editor tabs become one pass — and it needs no timer, because the single
+    // permit already serialises everything: whatever piled up while the previous slice
+    // held the permit goes out in the next one.
+    const extentInFlight = new Set<string>()
+    // relPath → the interest heuristic that queued it. Per file, not per drain, so a slice
+    // that coalesces several triggers reports all of them: attributing a coalesced pass to
+    // whichever trigger happened to start the drainer would make the per-trigger cost
+    // measurements (the whole point of recording `source`) misleading.
+    const extentPending = new Map<string, Map<string, string>>()
+    const extentDraining = new Set<string>()
+
+    const scheduleExtentPaint = (
+      directory: string,
+      projectID: string,
+      relPaths: ReadonlyArray<string>,
+      scope: string,
+      source: string,
+    ) =>
+      Effect.gen(function* () {
+        if (relPaths.length === 0) return
+        // Remember the files so a later edit re-refreshes their tiles (onFileChanged).
+        let files = drilledFiles.get(directory)
+        if (!files) drilledFiles.set(directory, (files = new Set()))
+        for (const rel of relPaths) files.add(rel)
+        const lens = yield* activeUsable(directory, projectID)
+        // Deterministic built-ins are fully computed; nothing to model-paint.
+        if (isDeterministic(lens)) return
+        let pending = extentPending.get(directory)
+        if (!pending) extentPending.set(directory, (pending = new Map()))
+        // Per-file dedup against what a slice is already painting, preserved from the
+        // pre-batch scheduler.
+        for (const rel of relPaths)
+          if (!extentInFlight.has(JSON.stringify([directory, rel, lens.id]))) pending.set(rel, source)
+        if (pending.size === 0 || extentDraining.has(directory)) return
+        extentDraining.add(directory)
+        yield* drainExtentPaints(directory, projectID, scope).pipe(
+          Effect.catchCause((cause) => Effect.sync(() => log.error("extent drain failed", { projectID, cause }))),
+          Effect.ensuring(Effect.sync(() => extentDraining.delete(directory))),
           Effect.forkDetach,
         )
       })
 
-    // Drill-in (A5) function-level paint. Forked onto the *shared* single-permit
-    // gate, so the API is never hit concurrently with the foreground/background
-    // file painters. `drillActive` is bumped around the schedule so the background
-    // loop yields the permit between batches to the more-recent user action —
-    // approximating the `drill-in > foreground > background` priority without a
-    // second gate. Deduped per (directory, file, lens) while a pass is in flight.
-    const extentInFlight = new Set<string>()
-    const scheduleExtentPaint = (directory: string, projectID: string, relPath: string, scope: string) =>
+    const drainExtentPaints = (directory: string, projectID: string, scope: string) =>
       Effect.gen(function* () {
-        // Remember the file so a later edit re-refreshes its tiles (onFileChanged).
-        let files = drilledFiles.get(directory)
-        if (!files) drilledFiles.set(directory, (files = new Set()))
-        files.add(relPath)
-        const lens = yield* activeUsable(directory, projectID)
-        // Deterministic built-ins are fully computed; nothing to model-paint.
-        if (isDeterministic(lens)) return
-        const key = JSON.stringify([directory, relPath, lens.id])
-        if (extentInFlight.has(key)) return
-        extentInFlight.add(key)
-        drillActive.add(directory)
-        yield* Effect.gen(function* () {
-          // The domain gate has to be enforced here *as well as* at file level, because the
-          // function painter can otherwise route around it: a file's function mix SUPERSEDES
-          // its file-level facet in directory composition (extents.ts attributeFileBytes),
-          // and the working-set seeder function-paints every changed file with no user action
-          // at all. Without this an out-of-domain file — correctly greyed at file level —
-          // would still have its functions classified into drill-down facets and bleed them
-          // into every ancestor directory's composition, which is precisely the confusion
-          // drill-downs exist to prevent.
-          //
-          // Fail closed: a file the parent hasn't placed yet isn't function-painted either.
-          // Drill-in therefore lags the file-level sweep for a drill-down Lens, and catches
-          // up on the next pass once the parent's store covers the file.
-          let parent: Lens | undefined
-          if (lens.parent) {
-            const node = { id: ApertureExtract.nodeID(relPath), path: relPath }
-            const domain = yield* resolveDomain(lens, directory, projectID, [node], "fg")
-            if (!domain?.allowed.has(node.id)) return
-            parent = domain.parent
-          }
-          yield* AperturePainter.paintExtentsStale(
-            { storage, events, provider, config },
-            directory,
-            projectID,
-            relPath,
-            lens,
-            scope,
-            parent,
+        while ((extentPending.get(directory)?.size ?? 0) > 0) {
+          // Re-read the Lens each slice (like backgroundLoop) so switching mid-drain takes
+          // effect on the next one rather than painting into the previous Lens's store.
+          const lens = yield* activeUsable(directory, projectID)
+          if (isDeterministic(lens)) return
+          const pending = extentPending.get(directory)!
+          const entries = [...pending].slice(0, EXTENT_DRAIN_BATCH)
+          const slice = entries.map(([rel]) => rel)
+          const source = [...new Set(entries.map(([, s]) => s))].sort().join("+")
+          for (const rel of slice) pending.delete(rel)
+          const keys = slice.map((rel) => JSON.stringify([directory, rel, lens.id]))
+          for (const key of keys) extentInFlight.add(key)
+          // Held around the PERMIT, not the whole drainer: the background sweep parks while
+          // this is set, and once the interest set is wide a drainer is nearly always alive,
+          // so holding it for the drainer's lifetime would starve the sweep outright. One
+          // drainer per directory also means no overlapping add/delete, which is what made
+          // this a race when it was a plain Set shared by concurrent per-file passes.
+          drillActive.add(directory)
+          yield* Effect.gen(function* () {
+            // The domain gate is enforced here as well as inside the painter because a
+            // file's function mix SUPERSEDES its file-level facet in directory composition
+            // (extents.ts attributeFileBytes). One resolve for the whole slice: resolveDomain
+            // already takes a node array, and the domain's `parent` is a property of the
+            // Lens, not of a file — so this also collapses N ancestor fills into one. It
+            // runs inside the permit and never re-acquires it (see resolveDomain).
+            //
+            // Fail closed: a file the parent hasn't placed yet isn't function-painted
+            // either. Promotion therefore lags the sweep for a drill-down Lens, and catches
+            // up once the parent's store covers the file.
+            const nodes = slice.map((rel) => ({ id: ApertureExtract.nodeID(rel), path: rel }))
+            const domain = yield* resolveDomain(lens, directory, projectID, nodes, "fg")
+            const targets = (lens.parent ? nodes.filter((n) => domain?.allowed.has(n.id)) : nodes).map((node) => ({
+              node,
+              // `interested` is what promotes to per-declaration granularity — the whole
+              // point of a drill / edit / working-set / in-window trigger.
+              interested: true,
+            }))
+            if (targets.length === 0) return
+            yield* AperturePainter.paintStale(
+              { storage, events, provider, config },
+              directory,
+              projectID,
+              publishScopes(directory, scope),
+              targets,
+              "fg",
+              lens,
+              { domain, source },
+            )
+          }).pipe(
+            paintGate.withPermits(1),
+            Effect.ensuring(
+              Effect.sync(() => {
+                for (const key of keys) extentInFlight.delete(key)
+                drillActive.delete(directory)
+              }),
+            ),
           )
-        }).pipe(
-          paintGate.withPermits(1),
-          Effect.ensuring(
-            Effect.sync(() => {
-              extentInFlight.delete(key)
-              drillActive.delete(directory)
-            }),
-          ),
-          Effect.forkDetach,
-        )
+          // Outside the permit, so a queued foreground pass wins it between slices — the
+          // same fairness pattern the background loop uses.
+          if ((extentPending.get(directory)?.size ?? 0) > 0) yield* Effect.sleep(BG_BATCH_DELAY)
+        }
       })
+
+    // Every window that should refetch after a paint: the scope that triggered it plus every
+    // window currently being viewed. A file at a/b/c.ts is drawn in window "a" as well as
+    // "a/b" (VIEW_DEPTH is 2), so publishing only to its own parent directory silently
+    // misses viewers. Mirrors the invalidation broadcasts elsewhere in this service.
+    const publishScopes = (directory: string, scope: string) => [
+      ...new Set([scope, ...(caches.get(directory)?.scopes.keys() ?? [])]),
+    ]
 
     // Proactively function-paint the git working set (files with uncommitted changes) under
     // the active Lens, so their tiles are ready before the user looks — the deterministic
@@ -752,7 +848,7 @@ export const layer = Layer.effect(
         const subtree = yield* subtreeFor(directory)
         const workingSet = subtree.filter((f) => git.changed.has(git.prefix + f.path)).map((f) => f.path)
         if (workingSet.length === 0 || workingSet.length > WORKING_SET_PAINT_CAP) return
-        for (const rel of workingSet) yield* scheduleExtentPaint(directory, projectID, rel, parentScope(rel))
+        yield* scheduleExtentPaint(directory, projectID, workingSet, "", "working-set")
       })
 
     // Re-paint every already-function-painted file under the now-active Lens. Function tiles
@@ -760,9 +856,7 @@ export const layer = Layer.effect(
     // its drilled files would render bare until re-painted. Mirrors the file-level policy —
     // active Lens only, never a fan-out over every Lens (see aperture-a5 lens decision).
     const repaintDrilledFiles = (directory: string, projectID: string) =>
-      Effect.gen(function* () {
-        for (const rel of drilledFiles.get(directory) ?? []) yield* scheduleExtentPaint(directory, projectID, rel, parentScope(rel))
-      })
+      scheduleExtentPaint(directory, projectID, [...(drilledFiles.get(directory) ?? [])], "", "lens-switch")
 
     // Fork a best-effort proactive paint (working-set seed / lens repaint) into the service
     // scope so it never blocks a fetch and its failure only logs; the inner per-file
@@ -827,7 +921,11 @@ export const layer = Layer.effect(
           const container = caches.get(directory)
           for (const scope of container?.scopes.keys() ?? [])
             yield* events
-              .publish(ApertureEvent.Event.Invalidated, { scope }, { location: { directory: AbsolutePath.make(directory) } })
+              .publish(
+                ApertureEvent.Event.Invalidated,
+                { scope },
+                { location: { directory: AbsolutePath.make(directory) } },
+              )
               .pipe(Effect.ignore)
         }).pipe(Effect.ensuring(Effect.sync(() => busFactorInFlight.delete(directory))))
       })
@@ -853,7 +951,9 @@ export const layer = Layer.effect(
         if (Object.keys(subStore).length === 0) return
         const mixes = yield* ApertureSubfacetStore.readMixes(storage, projectID, lens.id)
         const subtree = yield* subtreeFor(directory)
-        let written = 0
+        // Derive every missing mix first, then write them all in one locked update — a
+        // per-file write would take the storage write lock once per subtree file.
+        const derived: ApertureSubfacetStore.Mixes = {}
         for (const file of subtree) {
           if (mixes[file.path]) continue
           const content = yield* readFileText(directory, file.path)
@@ -864,15 +964,19 @@ export const layer = Layer.effect(
             if (entry) facetByName.set(extent.name, entry.facet)
           }
           if (facetByName.size === 0) continue
-          const mix = ApertureExtents.fileComposition(content, facetByName)
-          if (yield* ApertureSubfacetStore.upsertMix(storage, projectID, lens.id, file.path, mix)) written++
+          derived[file.path] = ApertureExtents.fileComposition(content, facetByName)
         }
-        if (written === 0) return
-        log.info("backfilled function mixes", { projectID, lens: lens.id, files: written })
+        const written = yield* ApertureSubfacetStore.upsertMixes(storage, projectID, lens.id, derived)
+        if (written.length === 0) return
+        log.info("backfilled function mixes", { projectID, lens: lens.id, files: written.length })
         const container = caches.get(directory)
         for (const viewed of container?.scopes.keys() ?? [])
           yield* events
-            .publish(ApertureEvent.Event.Invalidated, { scope: viewed }, { location: { directory: AbsolutePath.make(directory) } })
+            .publish(
+              ApertureEvent.Event.Invalidated,
+              { scope: viewed },
+              { location: { directory: AbsolutePath.make(directory) } },
+            )
             .pipe(Effect.ignore)
       })
 
@@ -900,7 +1004,11 @@ export const layer = Layer.effect(
             ? yield* deterministicStoreFor(lens, ctx.directory, subtree)
             : yield* ApertureSemanticStore.read(storage, ctx.project.id, lens.id)
         if (busFactor)
-          yield* forkProactivePaint("bus-factor refresh failed", ctx.project.id, refreshBusFactor(ctx.directory, ctx.project.id))
+          yield* forkProactivePaint(
+            "bus-factor refresh failed",
+            ctx.project.id,
+            refreshBusFactor(ctx.directory, ctx.project.id),
+          )
         const colorByFacet = new Map(lens.facets.map((t) => [t.id, t.color]))
         const semantics: Record<string, AperturePayload.Semantic> = {}
         // The store holds only the semantic (facet); hue/facets are derived here, so
@@ -909,7 +1017,11 @@ export const layer = Layer.effect(
         // once that target has been painted.
         const applySemantic = (id: string) => {
           const entry = store[id]
-          if (entry) semantics[id] = { facets: [entry.facet], hue: entry.facet === NONE_FACET ? NONE_HUE : colorByFacet.get(entry.facet) }
+          if (entry)
+            semantics[id] = {
+              facets: [entry.facet],
+              hue: entry.facet === NONE_FACET ? NONE_HUE : colorByFacet.get(entry.facet),
+            }
         }
         for (const node of structure.nodes) applySemantic(node.id)
         for (const boundary of structure.boundaries ?? []) applySemantic(boundary.id)
@@ -930,7 +1042,12 @@ export const layer = Layer.effect(
         const composition = computeComposition(structure.nodes, subtree, store, mixes, lens)
         // Fill in the mixes of files function-painted before this ran (see backfillMixes):
         // forked, so the view renders from what's persisted now and re-merges when it lands.
-        if (!det) yield* forkProactivePaint("mix backfill failed", ctx.project.id, backfillMixes(ctx.directory, ctx.project.id, lens))
+        if (!det)
+          yield* forkProactivePaint(
+            "mix backfill failed",
+            ctx.project.id,
+            backfillMixes(ctx.directory, ctx.project.id, lens),
+          )
         // Deterministic Lenses are fully painted above; only semantic ones schedule
         // the foreground painter for the in-window files + boundary targets.
         if (!det)
@@ -973,7 +1090,14 @@ export const layer = Layer.effect(
               const fileId = idByPath.get(file)!
               const content = yield* readFileText(ctx.directory, file)
               if (content === undefined) continue
-              const exs = ApertureExtents.extentsOf(content)
+              // Cut at the granularity the STORE reflects, or no extent name would match:
+              // a file the painter cut coarsely has one entry keyed WHOLE, not one per
+              // declaration. The mix records which (more than one extent ⇒ finely cut) —
+              // the same high-water rule the painter applies. Deterministic Lenses carry no
+              // mix and derive their tiles from the diff, so they always cut per declaration.
+              const granularity: ApertureExtents.Granularity =
+                det || (mixes[file]?.subtreeCount ?? 0) > 1 ? "declaration" : "file"
+              const exs = ApertureExtents.extentsOf(content, granularity)
               // name → facet id for this file's extents.
               let facetByName: Map<string, string>
               if (det) {
@@ -1066,7 +1190,10 @@ export const layer = Layer.effect(
           // Always-written diagnostic so a bg loop that produces no request lines is
           // still visible in the perf log (distinguishes "loop never ran" from
           // "ran but every slice was already painted / no model").
-          yield* AperturePainter.appendPerfEvent(directory, "bg", "pass-start", { files: ordered.length, lens: lens.id })
+          yield* AperturePainter.appendPerfEvent(directory, "bg", "pass-start", {
+            files: ordered.length,
+            lens: lens.id,
+          })
           let interrupted = false
           for (let cursor = 0; cursor < ordered.length; cursor += BG_BATCH) {
             const slice = ordered.slice(cursor, cursor + BG_BATCH)
@@ -1081,11 +1208,15 @@ export const layer = Layer.effect(
                 { storage, events, provider, config },
                 directory,
                 projectID,
-                "",
-                slice,
+                [""],
+                // The sweep is the coarse FLOOR: one whole-file extent each, which costs
+                // exactly what file-level painting cost. Files the interest heuristics have
+                // already promoted keep their per-declaration cut (granularityOf), so a
+                // re-walk never coarsens them back.
+                slice.map((node) => ({ node })),
                 "bg",
                 lens,
-                { domain },
+                { domain, source: "sweep" },
               )
             }).pipe(
               paintGate.withPermits(1),
@@ -1186,7 +1317,7 @@ export const layer = Layer.effect(
       // Kick the drill-in paint pass (top priority) so not-yet-painted functions fill
       // in, then return the window payload with the file's current tiles attached. The
       // paint completion invalidates `norm` (the viewed scope) so the band live-fills.
-      yield* scheduleExtentPaint(ctx.directory, ctx.project.id, rel, norm)
+      yield* scheduleExtentPaint(ctx.directory, ctx.project.id, [rel], norm, "drill")
       return yield* finalize(ctx, norm, structure, rel)
     })
 
@@ -1257,7 +1388,7 @@ export const layer = Layer.effect(
         // fall through to keep their tiles current. Invalidate the file's own directory window;
         // viewers of it refetch and re-merge.
         if (isPaintableSource(rel) || drilledFiles.get(directory)?.has(rel))
-          yield* scheduleExtentPaint(directory, container.projectID, rel, parentScope(rel))
+          yield* scheduleExtentPaint(directory, container.projectID, [rel], parentScope(rel), "file-changed")
       })
 
     yield* Effect.forkScoped(
@@ -1292,18 +1423,28 @@ export const layer = Layer.effect(
         // A turn may have changed the working set via shell ops that fire no file event
         // (mv/rm/scaffolding, git add/commit); with the git cache dropped above, re-seed the
         // working-set function paint so the current changed slice stays covered.
-        yield* forkProactivePaint("working-set seed failed", container.projectID, scheduleWorkingSetPaint(directory, container.projectID))
+        yield* forkProactivePaint(
+          "working-set seed failed",
+          container.projectID,
+          scheduleWorkingSetPaint(directory, container.projectID),
+        )
         // A turn may have committed (HEAD moved) — recompute the bus-factor store in the
         // background so the next view is a cheap read rather than a ~10s walk, even when it
         // isn't the active Lens. HEAD-gated, so a turn that didn't commit costs only a rev-parse.
-        yield* forkProactivePaint("bus-factor refresh failed", container.projectID, refreshBusFactor(directory, container.projectID))
+        yield* forkProactivePaint(
+          "bus-factor refresh failed",
+          container.projectID,
+          refreshBusFactor(directory, container.projectID),
+        )
       })
     yield* Effect.forkScoped(
-      events.subscribe(SessionStatus.Event.Status).pipe(
-        Stream.runForEach((event) =>
-          event.data.status.type === "idle" ? onSessionIdle(event.location) : Effect.void,
+      events
+        .subscribe(SessionStatus.Event.Status)
+        .pipe(
+          Stream.runForEach((event) =>
+            event.data.status.type === "idle" ? onSessionIdle(event.location) : Effect.void,
+          ),
         ),
-      ),
     )
 
     // Re-paint every viewed scope after the active Lens changes: mark each
@@ -1319,7 +1460,13 @@ export const layer = Layer.effect(
             // Attach the location: this runs in a forked fiber with no ambient
             // Location.Service, so without it the HTTP /event SSE filter drops the
             // event and the VSCode extension never refetches the freshly-switched Lens.
-            yield* events.publish(ApertureEvent.Event.Invalidated, { scope }, { location: { directory: AbsolutePath.make(directory) } }).pipe(Effect.ignore)
+            yield* events
+              .publish(
+                ApertureEvent.Event.Invalidated,
+                { scope },
+                { location: { directory: AbsolutePath.make(directory) } },
+              )
+              .pipe(Effect.ignore)
           }
           // Function tiles are per-(lens, extent-hash), so the freshly-selected Lens has an
           // empty sub-facet store. Two forked passes fill it (both stale-skipped, deduped, and
@@ -1408,7 +1555,7 @@ export const layer = Layer.effect(
       const needle = idOrName.toLowerCase()
       const found = all.find((c) => c.id === idOrName || c.name.toLowerCase() === needle)
       if (!found) return undefined
-      yield* ApertureLensStore.setActive(ctx.directory,found.id)
+      yield* ApertureLensStore.setActive(ctx.directory, found.id)
       yield* onLensChanged(ctx.directory)
       return found
     })
@@ -1425,7 +1572,7 @@ export const layer = Layer.effect(
       // An unresolved active id (-1) starts from the head so a click still moves.
       const base = idx === -1 ? 0 : idx
       const next = all[(base + (direction === "next" ? 1 : len - 1)) % len]!
-      yield* ApertureLensStore.setActive(ctx.directory,next.id)
+      yield* ApertureLensStore.setActive(ctx.directory, next.id)
       yield* onLensChanged(ctx.directory)
       return { id: next.id, name: next.name, legend: lensLegend(next) }
     })
@@ -1464,9 +1611,7 @@ export const layer = Layer.effect(
           // own facets, so it can't be edited away.
           const lost = child.parent!.facets.find((f) => f !== NONE_FACET && !surviving.has(f))
           if (!lost) continue
-          const dependents = children
-            .filter((c) => c.parent!.facets.includes(lost))
-            .map((c) => c.name)
+          const dependents = children.filter((c) => c.parent!.facets.includes(lost)).map((c) => c.name)
           return { status: "facet-in-use", facet: lost, lenses: dependents } as const
         }
       }
@@ -1587,7 +1732,11 @@ export const layer = Layer.effect(
           ? yield* deterministicStoreFor(resolved, ctx.directory, subtree)
           : yield* ApertureSemanticStore.read(storage, ctx.project.id, resolved.id)
       if (busFactor)
-        yield* forkProactivePaint("bus-factor refresh failed", ctx.project.id, refreshBusFactor(ctx.directory, ctx.project.id))
+        yield* forkProactivePaint(
+          "bus-factor refresh failed",
+          ctx.project.id,
+          refreshBusFactor(ctx.directory, ctx.project.id),
+        )
 
       // The store is keyed by stable node id (an un-invertible path hash), so recover
       // paths by joining against the repo file listing.
@@ -1725,7 +1874,9 @@ export function computeComposition(
     const byFacet = painted.get(id)
     // Weights in the Lens's facet order so the payload is stable and the
     // renderer's colour bands are consistent.
-    const weights = byFacet ? order.filter((t) => byFacet.has(t)).map((facet) => ({ facet, ...byFacet.get(facet)! })) : []
+    const weights = byFacet
+      ? order.filter((t) => byFacet.has(t)).map((facet) => ({ facet, ...byFacet.get(facet)! }))
+      : []
     const totalCount = weights.reduce((sum, w) => sum + w.count, 0)
     const totalBytes = weights.reduce((sum, w) => sum + w.bytes, 0)
     result[id] = { weights, totalCount, totalBytes, subtreeCount: s.count, subtreeBytes: s.bytes }

@@ -185,5 +185,54 @@
       }
     ],
     "scope": "project"
+  },
+  "textbox-input-debug-5622a8b3": {
+    "id": "textbox-input-debug-5622a8b3",
+    "name": "Textbox & Input Debug",
+    "description": "Maps TUI code by its role in textbox functionality—from core input rendering and event handling to state management and integrations.",
+    "palette": "bright",
+    "prompt": "Classify TUI files by their role in textbox functionality: core input mechanics, event handling and keyboard, text state management, autocomplete/suggestions, rendering and display, or features that use text input.",
+    "facets": [
+      {
+        "id": "core-input",
+        "label": "Core Input",
+        "description": "The main prompt component, textarea rendering, and low-level input mechanics (prompt/index.tsx, TextareaRenderable, @opentui integration)",
+        "color": "#4E79A7"
+      },
+      {
+        "id": "events",
+        "label": "Events",
+        "description": "Keyboard event capture, key bindings, clipboard handling, and input event dispatch (event.ts, keymap, clipboard.ts)",
+        "color": "#F28E2B"
+      },
+      {
+        "id": "state",
+        "label": "State",
+        "description": "Text state management, undo/redo, history, stash, and prompt value mutation (prompt/history.tsx, prompt/part.ts, prompt/stash.tsx, store operations)",
+        "color": "#59A14F"
+      },
+      {
+        "id": "completion",
+        "label": "Completion",
+        "description": "Autocomplete, suggestions, traits detection, and contextual features (prompt/autocomplete.tsx, prompt/traits.ts, prompt/cwd.ts)",
+        "color": "#E15759"
+      },
+      {
+        "id": "rendering",
+        "label": "Rendering",
+        "description": "Visual rendering, styling, cursor position, selection, and terminal dimension handling (border components, spinner, theme context)",
+        "color": "#B07AA1"
+      },
+      {
+        "id": "features",
+        "label": "Features",
+        "description": "Feature plugins and dialogs that embed text input (feature-plugins/*, dialogs that use prompt or text input)",
+        "color": "#EDC948"
+      }
+    ],
+    "scope": "project",
+    "directories": [
+      "packages/opencode/src/cli/cmd/tui"
+    ]
   }
 }

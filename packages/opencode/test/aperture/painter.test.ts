@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test"
-import { splitDirs, describeFile } from "@/aperture/painter"
+import { splitDirs, describeFile, granularityOf } from "@/aperture/painter"
+import type { ApertureSubfacetStore } from "@/aperture/subfacet-store"
 
 // Records mirror the painter's stale shape; splitDirs only reads `node.path`.
 const rec = (path: string) => ({ node: { id: path, path } })
@@ -61,6 +62,44 @@ describe("splitDirs", () => {
     const b = splitDirs(recs(...[...paths].reverse()), 30).map((b) => b.map((r) => r.node.path))
     expect(a).toEqual(b)
   })
+
+  // O3: bins are budgeted in prompt-block weight, not record count, so a coarse
+  // (whole-file) block and a fine (per-declaration) block can share a budget.
+  describe("weighted binning", () => {
+    it("fills a bin to the weight budget, not the record count", () => {
+      // 8 records of weight 2 against a budget of 6 → bins of 3 records each.
+      const paths = Array.from({ length: 8 }, (_, i) => `d/f${i}.ts`)
+      const bins = splitDirs(recs(...paths), 6, () => 2)
+      expect(bins.map((b) => b.length)).toEqual([3, 3, 2])
+    })
+
+    it("makes a coarse-only bin exactly 30 files at the extent budget", () => {
+      // The claim the whole O3 cost story rests on: at weight 2 against EXTENT_BATCH=60,
+      // an all-coarse pass bins 30 files per model call — the pre-merge file-painter batch.
+      const paths = Array.from({ length: 90 }, (_, i) => `d/f${String(i).padStart(2, "0")}.ts`)
+      const bins = splitDirs(recs(...paths), 60, () => 2)
+      expect(bins.map((b) => b.length)).toEqual([30, 30, 30])
+    })
+
+    it("mixes weights within a bin without exceeding the budget", () => {
+      // Alternating coarse (2) and fine (1) against a budget of 4.
+      const paths = Array.from({ length: 6 }, (_, i) => `d/f${i}.ts`)
+      const weightOf = (r: { node: { path: string } }) => (Number(r.node.path.match(/f(\d)/)![1]) % 2 === 0 ? 2 : 1)
+      const bins = splitDirs(recs(...paths), 4, weightOf)
+      for (const bin of bins) expect(bin.reduce((s, r) => s + weightOf(r), 0)).toBeLessThanOrEqual(4)
+      expect(bins.flat().length).toBe(6)
+    })
+
+    it("gives a record heavier than the whole budget its own bin rather than dropping it", () => {
+      const bins = splitDirs(recs("d/a.ts", "d/b.ts"), 1, () => 5)
+      expect(bins.map((b) => b.map((r) => r.node.path))).toEqual([["d/a.ts"], ["d/b.ts"]])
+    })
+
+    it("defaults to plain record count when no weight is given", () => {
+      const paths = Array.from({ length: 5 }, (_, i) => `d/f${i}.ts`)
+      expect(splitDirs(recs(...paths), 2).map((b) => b.length)).toEqual([2, 2, 1])
+    })
+  })
 })
 
 describe("describeFile", () => {
@@ -113,5 +152,44 @@ describe("describeFile", () => {
   it("medium on a declaration-free file emits no decls section", () => {
     const out = describeFile("src/data.json", '{ "a": 1 }', "medium")
     expect(out).not.toContain("decls:")
+  })
+})
+
+// O3's cost dial. Every file is painted at least as one whole-file extent (the floor,
+// priced like the pre-O3 file-level pass); the dial decides which files are additionally
+// re-cut per top-level declaration, which measured ~5.8x.
+describe("granularityOf", () => {
+  const target = (path: string, interested?: boolean) => ({ node: { id: path, path }, interested })
+  // A stored mix records how many extents the file was last cut into; >1 means "finely".
+  const mixes = (path: string, subtreeCount: number): ApertureSubfacetStore.Mixes => ({
+    [path]: { weights: [], totalCount: 0, totalBytes: 0, subtreeCount, subtreeBytes: 100 },
+  })
+  const none: ApertureSubfacetStore.Mixes = {}
+
+  it("defaults an uninteresting, never-painted file to the whole-file floor", () => {
+    expect(granularityOf(target("a.ts"), none, "interest")).toBe("file")
+  })
+
+  it("promotes an interesting file only in 'interest' mode", () => {
+    expect(granularityOf(target("a.ts", true), none, "interest")).toBe("declaration")
+    expect(granularityOf(target("a.ts", true), none, "file")).toBe("file")
+  })
+
+  it("promotes everything in 'declaration' mode, interesting or not", () => {
+    expect(granularityOf(target("a.ts"), none, "declaration")).toBe("declaration")
+    expect(granularityOf(target("a.ts", true), none, "declaration")).toBe("declaration")
+  })
+
+  it("is monotone: an already-finely-cut file is never coarsened back", () => {
+    // Not interesting, and the dial is at its cheapest — it still stays fine, because
+    // re-coarsening would spend tokens to LOSE information.
+    expect(granularityOf(target("a.ts"), mixes("a.ts", 7), "file")).toBe("declaration")
+    expect(granularityOf(target("a.ts"), mixes("a.ts", 7), "interest")).toBe("declaration")
+  })
+
+  it("treats a single-extent mix as the coarse floor, not as prior fine cutting", () => {
+    // extentsOf collapses a <2-extent declaration cut to WHOLE, so subtreeCount === 1 is
+    // exactly the coarse case and must not read as "already promoted".
+    expect(granularityOf(target("a.ts"), mixes("a.ts", 1), "interest")).toBe("file")
   })
 })

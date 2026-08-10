@@ -62,13 +62,25 @@ describe("aperture lenses", () => {
     // The xterm-256 palette: 16 system colours, a 6×6×6 colour cube, then a 24-step grey ramp.
     const cubeLevel = (i: number) => (i === 0 ? 0 : 55 + 40 * i)
     const xterm256: [number, number, number][] = [
-      [0, 0, 0], [128, 0, 0], [0, 128, 0], [128, 128, 0], [0, 0, 128], [128, 0, 128],
-      [0, 128, 128], [192, 192, 192], [128, 128, 128], [255, 0, 0], [0, 255, 0], [255, 255, 0],
-      [0, 0, 255], [255, 0, 255], [0, 255, 255], [255, 255, 255],
+      [0, 0, 0],
+      [128, 0, 0],
+      [0, 128, 0],
+      [128, 128, 0],
+      [0, 0, 128],
+      [128, 0, 128],
+      [0, 128, 128],
+      [192, 192, 192],
+      [128, 128, 128],
+      [255, 0, 0],
+      [0, 255, 0],
+      [255, 255, 0],
+      [0, 0, 255],
+      [255, 0, 255],
+      [0, 255, 255],
+      [255, 255, 255],
     ]
     for (let r = 0; r < 6; r++)
-      for (let g = 0; g < 6; g++)
-        for (let b = 0; b < 6; b++) xterm256.push([cubeLevel(r), cubeLevel(g), cubeLevel(b)])
+      for (let g = 0; g < 6; g++) for (let b = 0; b < 6; b++) xterm256.push([cubeLevel(r), cubeLevel(g), cubeLevel(b)])
     for (let i = 0; i < 24; i++) xterm256.push([8 + 10 * i, 8 + 10 * i, 8 + 10 * i])
 
     const nearest = (hex: string): [number, number, number] => {
@@ -239,7 +251,13 @@ describe("aperture payload v7", () => {
       edges: [],
       semantics: { n1: { facets: ["auth"], hue: "#4E79A7" } },
       composition: {
-        d1: { weights: [{ facet: "auth", count: 1, bytes: 10 }], totalCount: 1, totalBytes: 10, subtreeCount: 1, subtreeBytes: 10 },
+        d1: {
+          weights: [{ facet: "auth", count: 1, bytes: 10 }],
+          totalCount: 1,
+          totalBytes: 10,
+          subtreeCount: 1,
+          subtreeBytes: 10,
+        },
       },
       lens: { id: "auth-x", name: "Auth", legend: [{ facet: "auth", label: "Auth", color: "#4E79A7" }] },
     }

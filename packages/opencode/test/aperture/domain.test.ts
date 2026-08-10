@@ -9,7 +9,7 @@ import {
   MAX_LENS_DEPTH,
 } from "@/aperture/lenses"
 import type { Lens } from "@/aperture/lenses"
-import { partitionByDomain, isStale } from "@/aperture/painter"
+import { partitionByDomain, domainMoved } from "@/aperture/painter"
 import type { Domain } from "@/aperture/painter"
 
 // The drill-down domain gate: a Lens scoped to a subset of another Lens's facets. The
@@ -103,7 +103,9 @@ describe("the containment invariant", () => {
 
     // What it *should* admit, walking the whole chain.
     const viaFullChain = Object.entries(child)
-      .filter(([id, e]) => inDomain(grandparent[id as keyof typeof grandparent], grandparentScope) && e.facet === NONE_FACET)
+      .filter(
+        ([id, e]) => inDomain(grandparent[id as keyof typeof grandparent], grandparentScope) && e.facet === NONE_FACET,
+      )
       .map(([id]) => id)
 
     expect(viaParentOnly).toEqual(viaFullChain)
@@ -124,10 +126,7 @@ describe("partitionByDomain", () => {
 
   it("never hands an out-of-domain file to the model", () => {
     const stale = [node("in"), node("out")]
-    const { classify, bucket, skip } = partitionByDomain(
-      stale,
-      domain(["in"], { in: "likely", out: "unlikely" }),
-    )
+    const { classify, bucket, skip } = partitionByDomain(stale, domain(["in"], { in: "likely", out: "unlikely" }))
     expect(classify.map((r) => r.node.id)).toEqual(["in"])
     expect(bucket.map((r) => r.node.id)).toEqual(["out"])
     expect(skip).toEqual([])
@@ -152,20 +151,25 @@ describe("partitionByDomain", () => {
   })
 })
 
-describe("isStale", () => {
+describe("domainMoved", () => {
   it("re-opens a file whose parent moved it to another facet, though its content is identical", () => {
     const painted = { facet: "cpu", hash: "h1", via: "likely" }
-    expect(isStale(painted, "h1", "likely")).toBe(false)
-    expect(isStale(painted, "h1", "unlikely")).toBe(true)
-  })
-
-  it("still re-opens on a content change, and treats an unpainted node as stale", () => {
-    expect(isStale({ facet: "cpu", hash: "h1", via: "likely" }, "h2", "likely")).toBe(true)
-    expect(isStale(undefined, "h1", "likely")).toBe(true)
+    expect(domainMoved(painted, "likely")).toBe(false)
+    expect(domainMoved(painted, "unlikely")).toBe(true)
   })
 
   it("ignores `via` for a root Lens", () => {
-    expect(isStale({ facet: "domain", hash: "h1" }, "h1", undefined)).toBe(false)
+    expect(domainMoved({ facet: "domain", hash: "h1" }, undefined)).toBe(false)
+    expect(domainMoved({ facet: "cpu", hash: "h1", via: "likely" }, undefined)).toBe(false)
+  })
+
+  it("is not concerned with content or with a never-painted file", () => {
+    // Content staleness is decided per extent since O3, so a changed file is NOT
+    // "domain moved" — only the extents that actually changed repaint.
+    expect(domainMoved({ facet: "cpu", hash: "h1", via: "likely" }, "likely")).toBe(false)
+    // A never-painted file has no extents stored either, so it is already stale by hash
+    // and needs no forced re-open.
+    expect(domainMoved(undefined, "likely")).toBe(false)
   })
 })
 
@@ -205,8 +209,7 @@ describe("orderForest", () => {
 
   it("treats a chain deeper than MAX_LENS_DEPTH as broken instead of nesting it", () => {
     const chain: Lens[] = [lens("l0", ["f"])]
-    for (let i = 1; i <= MAX_LENS_DEPTH + 1; i++)
-      chain.push(lens(`l${i}`, ["f"], { lens: `l${i - 1}`, facets: ["f"] }))
+    for (let i = 1; i <= MAX_LENS_DEPTH + 1; i++) chain.push(lens(`l${i}`, ["f"], { lens: `l${i - 1}`, facets: ["f"] }))
     const order = orderForest(chain)
     expect(order.length).toBe(chain.length)
     expect(Math.max(...order.map((e) => e.depth))).toBeLessThanOrEqual(MAX_LENS_DEPTH)
@@ -260,8 +263,7 @@ describe("dependsOnDeterministic", () => {
 
   it("stops at MAX_LENS_DEPTH rather than walking an over-deep chain to its root", () => {
     const chain: Lens[] = [det("l0")]
-    for (let i = 1; i <= MAX_LENS_DEPTH + 1; i++)
-      chain.push(lens(`l${i}`, ["f"], { lens: `l${i - 1}`, facets: ["f"] }))
+    for (let i = 1; i <= MAX_LENS_DEPTH + 1; i++) chain.push(lens(`l${i}`, ["f"], { lens: `l${i - 1}`, facets: ["f"] }))
     expect(dependsOnDeterministic(chain[chain.length - 1]!, byId(chain))).toBe(false)
     // ...but a chain within the cap still finds the deterministic root.
     expect(dependsOnDeterministic(chain[MAX_LENS_DEPTH]!, byId(chain))).toBe(true)

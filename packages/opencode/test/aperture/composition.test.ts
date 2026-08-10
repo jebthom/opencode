@@ -20,7 +20,13 @@ const LENS: Lens = {
   scope: "project",
 }
 
-const DIR = { id: "d_1", path: "src/prompt-input", kind: "directory" as const, size: 0, position: { layer: 0, index: 0 } }
+const DIR = {
+  id: "d_1",
+  path: "src/prompt-input",
+  kind: "directory" as const,
+  size: 0,
+  position: { layer: 0, index: 0 },
+}
 const nodes = [DIR]
 
 // A 100-byte file: one 60-byte function, a 40-byte preamble.
@@ -88,7 +94,13 @@ describe("computeComposition (directory treemap weights)", () => {
       ``,
     ].join("\n")
     // What the drill-in painter persists after painting the two functions.
-    const measured = fileComposition(content, new Map([["render", "hot"], ["measure", "cold"]]))
+    const measured = fileComposition(
+      content,
+      new Map([
+        ["render", "hot"],
+        ["measure", "cold"],
+      ]),
+    )
     const real = { id: "n_a", path: "src/prompt-input/a.ts", size: Buffer.byteLength(content) }
     const comp = computeComposition(
       nodes,
