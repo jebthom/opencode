@@ -3,27 +3,43 @@ import type { MouseEvent, ScrollBoxRenderable } from "@opentui/core"
 import { RGBA } from "@opentui/core"
 import { useTerminalDimensions } from "@opentui/solid"
 import type { InternalTuiPlugin } from "../../plugin/internal"
-import { createEffect, createMemo, createResource, createSignal, For, on, onCleanup, Show } from "solid-js"
+import { createEffect, createMemo, createResource, createSignal, For, onCleanup, Show } from "solid-js"
 import { DIRECTORY_HUE } from "@/aperture/semantics"
 import { NONE_FACET, NONE_HUE, NONE_LABEL, UNTAGGED_HUE, UNTAGGED_LABEL, BUILTIN_LENS_IDS } from "@/aperture/lenses"
 import { allocateCells, buildGrid, coalesce } from "@/aperture/treemap"
-import { ACTION_GLYPH, ACTION_LABEL, ACTIONS, type Action, type ActivityEntry, type Fill, type Style } from "@/aperture/activity"
+import {
+  ACTION_GLYPH,
+  ACTION_LABEL,
+  ACTIONS,
+  type Action,
+  type ActivityEntry,
+  type Fill,
+  type Style,
+} from "@/aperture/activity"
 import { createActivityTracker } from "./aperture-activity"
 import { openLensPicker, fetchLenses, drillDownsOf } from "./aperture-lens-picker"
 
 const id = "internal:aperture"
 
-// Step 2.5 renderer (PLAN.md): a persistent top-bar that draws a 2-level window
-// of the deterministic Aperture view and lets the user drill into directories.
+// The Aperture top bar (PLAN.md): a persistent strip that draws the deterministic
+// Aperture view as *directory composition blocks* and lets the user walk the tree.
 //
-// The bar is rooted at a `scope` (a repo-relative directory, "" = repo root). It
-// shows the scope's direct children as bordered boxes (layer 0) and their
-// children as smaller boxes (layer 1). Clicking a directory box re-roots the
-// view at it; a root button, an up button, and a clickable breadcrumb walk back
-// out. Data is fetched per scope from api.client.aperture.get({ scope }); when
-// the server reports a file change inside the viewed scope (aperture.invalidated)
-// we refetch just that scope, so the visible view stays live without recomputing
-// graphs nobody is looking at.
+// The bar is rooted at a `scope` (a repo-relative directory, "" = repo root) and shows
+// the scope's direct child directories as bordered treemap blocks. Clicking a block
+// re-roots the view at it *and* reveals that directory in the editor's file tree
+// (`tui.directory.reveal`); a root button, an up button, and a clickable breadcrumb
+// walk back out without touching the editor. Data is fetched per scope from
+// api.client.aperture.get({ scope }); when the server reports a file change inside the
+// viewed scope (aperture.invalidated) we refetch just that scope, so the visible view
+// stays live without recomputing graphs nobody is looking at.
+//
+// O1 removed the second tier: there is no per-directory child list, so a directory's
+// contents are legible only through its block's composition. What the bar still draws
+// per-file is the scope's *own* files, as a packed grid of one-line tiles (see
+// `fileColumns`) — each the filename over a band of that file's facet mix. That band is
+// the finest-grained facet reading anywhere in the product: finer than the directory
+// treemap, which averages a file into its parent, and finer than the VSCode Explorer pip,
+// which carries one colour and so can only ever report a file's dominant facet.
 
 type GraphNode = {
   id: string
@@ -35,9 +51,10 @@ type GraphNode = {
 
 type GraphEdge = { from: string; to: string; kind: string }
 
-// Per-directory recursive subtree composition (server-merged, see payload.ts). The
-// treemap paints a directory from these per-layer weights; `count` and `bytes` are
-// both carried so TREEMAP_METRIC can switch which one drives cell area.
+// Per-node composition (server-merged, see payload.ts): a directory's recursive subtree
+// mix, or a file's own mix as a subtree of one. The treemap paints a block from these
+// weights and a file tile paints its band from them; `count` and `bytes` are both carried
+// so TREEMAP_METRIC can switch which one drives cell area.
 type FacetWeight = { facet: string; count: number; bytes: number }
 // `total*` cover only the painted files in `weights`; `subtree*` cover every descendant
 // file. A fully-unpainted directory has zero `total*` but non-zero `subtree*`, so its
@@ -55,11 +72,6 @@ type Composition = {
 // importing node. An edge's `to` may reference a boundary id.
 type GraphBoundary = { id: string; path: string; kind: "file" | "directory" }
 
-// One sub-file (function-level) tile for a drilled-into file (A5): a top-level
-// declaration's line span with its own facet/hue. `facet`/`hue` are absent until the
-// drill-in painter colours the function. Present only for the drilled file.
-type GraphExtent = { name: string; startLine: number; endLine: number; facet?: string; hue?: string }
-
 type Graph = {
   version: number
   nodes: GraphNode[]
@@ -69,32 +81,77 @@ type Graph = {
   composition?: Record<string, Composition>
   // The active Lens + legend (facet → label + colour), merged in server-side.
   lens?: { id: string; name: string; legend: readonly { facet: string; label: string; color: string }[] }
-  // Function-level tiles keyed by *file* node id, present only for the drilled file.
-  extents?: Record<string, readonly GraphExtent[]>
 }
 
-// Layout mode for the top bar. "grid" = the current wide block-over-child-grid
-// layout; "column" = a narrow top-layer treemap with children stacked as a single
-// borderless column beneath (see the COLUMN_* constants below). Defaults to "grid" so
-// the current view is preserved; flip the constant (or set OPENCODE_APERTURE_LAYOUT=column)
-// to try the alternative.
-const APERTURE_LAYOUT: "grid" | "column" = process.env["OPENCODE_APERTURE_LAYOUT"] === "grid" ? "grid" : "column"
+// --- block dimensions ------------------------------------------------------
+// A block is a grid of CELL_W-wide cells, `COLUMN_ROWS` tall, whose *area* is the
+// directory's size against its biggest sibling. Width is not a separate quantity: it is
+// however many columns those cells occupy (`buildGrid` fills the bottom row first and grows
+// upward, so a block is a bottom-aligned rectangle). That identity is the point — a block
+// is never wider than the colour inside it, so there is no blank right-hand margin.
+const COLUMN_COLS_MIN = 2 // → 6 terminal cols outer
+const COLUMN_COLS_MAX = 6 // → 14 terminal cols outer
+const COLUMN_ROWS = 6
+// TREEMAP_METRIC picks whether file count or byte size drives cell area — both are carried
+// in the payload, so flipping this is a one-line change. CELL_W is how many terminal columns
+// one cell spans (2 reads as a roughly square block).
+const TREEMAP_METRIC: "bytes" | "count" = "bytes"
+const CELL_W = 2
+// The cell budget a full-size block gets. Absolute rather than derived from a per-block
+// column count, which is what breaks the circularity: cells are chosen first, and the
+// column count falls out of them.
+const BLOCK_CELL_CAP = COLUMN_COLS_MAX * COLUMN_ROWS
+// Cells for a directory of `size` against the biggest sibling. sqrt so small directories
+// stay visible (area, not length, carries the comparison) and floored at 1 so anything with
+// bytes at all paints something.
+function scaleCells(size: number, max: number, cap: number) {
+  return max <= 0 || size <= 0 ? 0 : Math.max(1, Math.min(cap, Math.round(cap * Math.sqrt(size / max))))
+}
+// Border-inclusive footprint of a `cols`-cell-wide block.
+const columnOuterW = (cols: number) => cols * CELL_W + 2
 
-// +1 row over the graph's own budget so the horizontal scrollbar lives below the
-// tiles without stealing a row of node detail. A directory header is a label row over
-// an up-to-MAX_ROWS treemap *wrapped in a border* (so it's a legible box even when
-// empty), over an up-to-CHILD_ROWS-tall child grid; bump this further if MAX_ROWS or
-// CHILD_ROWS grows. Column mode used to run taller to fit more of its single child column
-// before it clipped, but now that list scrolls in place (COLUMN_CHILD_WINDOW + the ↑/↓
-// "+N" markers), so this is the base height for both layouts. Column mode then adds one
-// row *only when the horizontal scrollbar is actually showing* (see scrollbarVisible): the
-// column fills the whole height, so the scrollbar would otherwise paint over the last child
-// / bottom "+N" marker — but when the bar fits without scrolling, that row is reclaimed.
-const TOP_BAR_HEIGHT = 20
+// --- file grid -------------------------------------------------------------
+// The scope's own files, drawn as a packed grid of one-line tiles rather than aggregated
+// into a single block. A tile is a border around one row: the filename written over a band
+// of the file's *facet mix*, so a facet holding a minority of the file still shows — which
+// the VSCode Explorer pip structurally cannot do, since a FileDecoration carries one colour
+// and therefore only ever reports the dominant facet.
+//
+// Height is the whole reason this is a grid: laid out in a single row (as the old file tier
+// was) the tiles left most of the strip empty, because ordering was preserved at all costs.
+// Grouping the files together frees us to wrap them, so the grid fills the height a
+// directory block already occupies and the strip gets shorter instead of longer.
+const FILE_TILE_H = 3 // top border + one content row + bottom border
+// Inner width is FILE_TILE_W − 2 = 12 characters. The single knob to turn if filenames read
+// as too clipped or the grid as too sparse.
+const FILE_TILE_W = 14
+// A directory block's total height: its label row, its border, and its treemap. The file
+// grid is sized to match so the two kinds of column are the same height and the bar's
+// budget doesn't depend on which one the scope happens to contain.
+const BLOCK_H = 1 + 2 + COLUMN_ROWS
+// Tiles per grid column — derived, so raising COLUMN_ROWS keeps the two aligned instead of
+// silently overflowing the strip. At COLUMN_ROWS = 6 this is exactly 3.
+const FILE_GRID_ROWS = Math.max(1, Math.floor(BLOCK_H / FILE_TILE_H))
+
+// The bar's base height, and the budget every other vertical constant is cut from: the
+// four header rows (title / nav / legend / actions), one block (a label row over a
+// COLUMN_ROWS-tall treemap wrapped in a 2-row border), and the bar's own bottom border.
+// One row is added on top *only while the horizontal scrollbar is actually showing* (see
+// scrollbarVisible) — the block fills the whole height, so the scrollbar would otherwise
+// paint over its bottom border, but when the strip fits, that row goes back to the
+// conversation. Dropping the file tier (O1) took this from 20 to 14; if you want to spend
+// the space back, spend it on COLUMN_ROWS. NB: `routes/session/index.tsx` hides the bar
+// outright on short terminals using its own literal — move that with this.
+const TOP_BAR_HEIGHT = 4 + BLOCK_H + 1
 // Inter-column gap in the scroll strip (the scrollbox's contentOptions gap) and the bar's
 // own horizontal padding — both feed the content-width vs viewport-width test that decides
 // whether the horizontal scrollbar shows. Keep in sync with the JSX that uses them.
-const SCROLL_GAP = 2
+//
+// Zero: blocks pack against each other exactly as the file tiles do, so the strip has one
+// density rather than two. Adjacent borders sharing a column is what makes a row of small
+// directories read as a row rather than as scattered boxes. Block labels are trimmed one
+// column short (see the render) so neighbouring names still can't collide.
+const SCROLL_GAP = 0
 const BAR_PADDING_X = 2
 // Inter-item gap in the one-row legend strip. Named (not the literal 2) because the fit
 // test below has to reproduce the row's exact width to know when to trim — keep the JSX
@@ -112,7 +169,7 @@ const LEGEND_LABEL_MIN = 6
 // (■ ◀ ▶ ⌄) a terminal may render two cells wide can't nudge the row past the edge.
 const LEGEND_SAFETY_PAD = 2
 // Cells moved per wheel notch when we redirect a vertical wheel into horizontal
-// scroll. Tiles are ~CHILD_W wide, so 1 cell/notch (the raw terminal delta) feels
+// scroll. Blocks are ~10 cols wide, so 1 cell/notch (the raw terminal delta) feels
 // sluggish; a small multiplier makes the bar pan at a comfortable speed.
 const HSCROLL_STEP = 3
 // How often (ms) to poll-refresh the view for changes nothing tells us about — files
@@ -120,90 +177,6 @@ const HSCROLL_STEP = 3
 // they'd otherwise only surface on navigation or a manual ⟳. Recompute is a cheap scoped
 // walk, so a low-frequency poll keeps the view honest without meaningful cost.
 const REFRESH_POLL_MS = 5000
-// Children are drawn in a compact CHILD_COLS×CHILD_ROWS grid (filled left→right,
-// top→bottom) rather than one long row, so a directory stays glanceable. MAX_CHILDREN
-// is the grid's capacity; a directory with more than that collapses its extras into a
-// single "…" tile pinned to the bottom-right cell.
-const CHILD_COLS = 3
-const CHILD_ROWS = 2
-const MAX_CHILDREN = CHILD_COLS * CHILD_ROWS
-const MAX_LABEL = 16
-const MAX_CHILD_LABEL = 7
-// Sentinel occupying the child grid's bottom-right cell when a directory holds more
-// than MAX_CHILDREN children; rendered as the clickable "…" expander.
-const OVERFLOW = Symbol("overflow")
-// Fixed tile widths (step 6). Children and their containment drops share CHILD_W
-// so a `│` drop always centers over its child regardless of label length; boundary
-// tiles + their drops share TILE_W likewise. Fixed widths are what make the purely
-// visual connector edges align without per-tile column math.
-const CHILD_W = 10
-const TILE_W = 3
-
-// Treemap painting. A directory is drawn as a grid of layer-colored cells (wrapped
-// in a border so it reads as a box even when empty) whose area approximates its
-// subtree's composition. MAX_ROWS caps the layer-0 block height (it grows
-// horizontally instead); switch it to 4 for a taller block (watch the
-// TOP_BAR_HEIGHT budget). TREEMAP_METRIC picks whether file count or byte size
-// drives cell area — both are carried in the payload, so flipping this is a
-// one-line change. CELL_W is how many terminal columns one cell spans (2 reads as
-// a roughly square block). A layer-0 block grows to the footprint of a full
-// CHILD_COLS-wide child-grid row (minus its own border, so a directory and its grid
-// line up); a
-// layer-1 child directory paints a single-row composition bar *inside* the child
-// tile's border, so CHILD_INNER_COLS is the child width less its two border cols.
-const MAX_ROWS = 3
-const TREEMAP_METRIC: "bytes" | "count" = "bytes"
-const CELL_W = 2
-// Widest a layer-0 treemap can get: the footprint of a full CHILD_COLS-wide child
-// grid row, so the block lines up with the grid beneath it.
-const TREEMAP_MAX_COLS = Math.floor((CHILD_COLS * CHILD_W + (CHILD_COLS - 1) - 2) / CELL_W)
-// Inner treemap columns for a layer-0 block sitting over a child grid whose top row
-// is `tiles` tiles wide. The block lines up with that row: each tile is CHILD_W wide
-// with a 1-col gap between, the block adds a 2-col border, and one cell spans CELL_W
-// cols — so inner cols = (footprint − border) / CELL_W. Floored at one tile so a
-// directory whose children are all ignored (0 visible tiles) reads as a small box
-// rather than a full-width grey bar, and capped at the full grid-row footprint so a
-// normal directory is unchanged.
-function treemapColsFor(tiles: number) {
-  const t = Math.max(1, tiles)
-  const footprint = t * CHILD_W + (t - 1) // tiles + inter-tile gaps
-  return Math.max(1, Math.min(TREEMAP_MAX_COLS, Math.floor((footprint - 2) / CELL_W)))
-}
-
-// --- column-mode dimensions (APERTURE_LAYOUT === "column") -----------------
-// A block's *width* encodes the directory's size: it scales between COLUMN_COLS_MIN and
-// COLUMN_COLS_MAX treemap cells (each CELL_W terminal cols wide) by sqrt(subtree /
-// biggest-sibling) — the same scaling the grid treemap uses for cell count. At CELL_W=2
-// the outer width (cells*CELL_W + 2 border) runs 8 cols (3 cells) … 14 cols (6 cells).
-// COLUMN_ROWS is the block height. All three are first-guess values meant to be tuned.
-const COLUMN_COLS_MIN = 3 // → 8 terminal cols outer
-const COLUMN_COLS_MAX = 6 // → 14 terminal cols outer
-const COLUMN_ROWS = 6
-// Visible child rows in a column before the list scrolls in place. Derived from the base
-// budget so it tracks the constants it depends on: TOP_BAR_HEIGHT less the outer bottom
-// border (1), the four header rows (title / nav / legend / actions), and the layer-0 block
-// above the list (label 1 + border 2 + COLUMN_ROWS). The scrollbar row isn't subtracted
-// here — it's added to the bar height only when the scrollbar shows, so the window stays
-// fixed. A list longer than this captures the wheel and pages in place; a shorter one lets
-// the wheel bubble out to the sideways pan.
-const COLUMN_CHILD_WINDOW = TOP_BAR_HEIGHT - 1 - 4 - (1 + 2 + COLUMN_ROWS)
-// When a layer has fewer than this many items there's plenty of horizontal room, so every
-// block is drawn at max width instead of being shrunk by size (the fill still scales, so
-// byte size stays legible). Tune to taste.
-const COLUMN_FEW_THRESHOLD = 10
-// Per-directory block width in cells: max when the layer is sparse (itemCount below the
-// threshold), otherwise scaled by subtree size against the biggest sibling, clamped to the
-// min/max.
-function columnColsFor(subtree: number, maxSubtree: number, itemCount: number) {
-  if (itemCount < COLUMN_FEW_THRESHOLD) return COLUMN_COLS_MAX
-  if (maxSubtree <= 0 || subtree <= 0) return COLUMN_COLS_MIN
-  return Math.max(COLUMN_COLS_MIN, Math.min(COLUMN_COLS_MAX, Math.round(COLUMN_COLS_MAX * Math.sqrt(subtree / maxSubtree))))
-}
-// Border-inclusive footprint of a `cols`-cell-wide block; child bars match it.
-const columnOuterW = (cols: number) => cols * CELL_W + 2
-// Layer-0 *files* have no subtree to size by, so they render at a fixed narrow width.
-// Defaults to the min block width; change this one constant to widen file tiles.
-const COLUMN_FILE_W = columnOuterW(COLUMN_COLS_MIN) // = 8 terminal cols
 
 // Cell sentinel for an empty / fully-untagged directory: painted light grey so the
 // bordered box reads as a real-but-uninhabited directory rather than a black void. The
@@ -211,9 +184,9 @@ const COLUMN_FILE_W = columnOuterW(COLUMN_COLS_MIN) // = 8 terminal cols
 // trimmed kebab-case and can never start with a space), so don't "tidy" it to "grey".
 const GREY_CELL = " grey"
 
-// Kind is encoded by corner shape only, leaving border/background colors free
-// for the future semantic-painting layer: directories get square corners, files
-// get rounded ones. Both stay full, paintable boxes.
+// Directory blocks and file tiles share one corner set. Kind used to be encoded by corner
+// shape (files rounded), which is redundant now that the two are different shapes in
+// different parts of the strip.
 const SQUARE_CORNERS = {
   topLeft: "┌",
   topRight: "┐",
@@ -227,8 +200,6 @@ const SQUARE_CORNERS = {
   rightT: "┤",
   cross: "┼",
 }
-const ROUNDED_CORNERS = { ...SQUARE_CORNERS, topLeft: "╭", topRight: "╮", bottomLeft: "╰", bottomRight: "╯" }
-const cornersFor = (kind: GraphNode["kind"]) => (kind === "directory" ? SQUARE_CORNERS : ROUNDED_CORNERS)
 
 // An ephemeral overlay glyph drawn on a node tile (Foundation A). Later steps
 // fill these in: agent tracking (step 7) emits read/edit/write/create with an
@@ -244,46 +215,6 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   // fits the viewport (see scrollbarVisible / barHeight below).
   const dimensions = useTerminalDimensions()
   const [scope, setScope] = createSignal("")
-  // The file (repo-relative path) the user has drilled into for function-level paint
-  // (A5), or undefined. Sent as `drill` on the fetch; the server returns the file's
-  // `extents` and schedules the drill-in painter. Clicking a file toggles it.
-  const [drilledFile, setDrilledFile] = createSignal<string | undefined>(undefined)
-  const toggleDrill = (path: string) =>
-    setDrilledFile((cur) => {
-      const next = cur === path ? undefined : path
-      logInteraction(next === undefined ? "tile.undrill" : "tile.drill", path)
-      // On enable only (a deliberate click into a file), announce a host "reveal file"
-      // intent so an editor host (e.g. the Aperture VSCode extension) can open it. Gated
-      // to the enable edge so poll/invalidation refetches (which re-send `drill`) never
-      // re-trigger an open. Fire-and-forget: a failed publish must not break the click.
-      if (next !== undefined) void props.api.client.tui.openFile({ path: next })
-      return next
-    })
-  // Navigating the directory tree clears the drilled file (its tiles belong to the
-  // view you left). Deferred so it doesn't fire on mount.
-  createEffect(on(scope, () => setDrilledFile(undefined), { defer: true }))
-
-  // Layer-0 directories whose child row is expanded past MAX_CHILDREN to show all
-  // children (the unlimited horizontal strip makes this cheap). Keyed by node id.
-  // Reset on every scope change so navigating the tree always lands on the compact
-  // 4-children + "…" view; horizontal scrolling doesn't touch scope, so an expanded
-  // directory stays expanded while you pan.
-  const [expanded, setExpanded] = createSignal(new Set<string>())
-  // Column mode (APERTURE_LAYOUT === "column"): per-layer-0 vertical scroll offset for
-  // a child list taller than COLUMN_CHILD_WINDOW. Keyed by node id; a wheel over the list
-  // shifts the visible window row-by-row in place rather than panning the bar sideways
-  // (see onChildScroll). Reset on scope change like `expanded` so navigation always lands
-  // at the top of each list; panning doesn't touch scope, so an offset survives a pan.
-  const [childOffset, setChildOffset] = createSignal(new Map<string, number>())
-  createEffect(() => {
-    scope()
-    setExpanded(new Set<string>())
-    setChildOffset(new Map<string, number>())
-  })
-  const expand = (id: string) => {
-    logInteraction("tile.expand", id)
-    setExpanded((prev) => new Set(prev).add(id))
-  }
   // Foundation A hover-info line: what a node tile / link shows when pointed at.
   // Cleared on mouse-out so the header falls back to the summary. Set as a plain
   // string so any feature (node detail, edge target, …) can drive it uniformly.
@@ -304,15 +235,15 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   // is cheap, and this keeps a drilled-into view consistent with its parent (a
   // child that changed/vanished is reflected the moment you open it). The server
   // cache + invalidation still spare recompute for scopes nobody is viewing.
+  //
+  // No `drill` is sent any more (O1): the bar doesn't draw files, so it has no file to
+  // ask for function-level extents about. Nothing is lost — the VSCode extension drills
+  // every visible/open editor to paint its gutter, which is what schedules the fine paint
+  // now, and O3's interest set already covers open tabs.
   const [graph, { refetch }] = createResource(
-    () => ({ directory: props.api.state.path.directory, scope: scope(), drill: drilledFile() }),
+    () => ({ directory: props.api.state.path.directory, scope: scope() }),
     async (key) => {
-      const result = await props.api.client.aperture.get(
-        // `drill` (when set) makes the server attach the file's function-level extents
-        // and schedule the drill-in paint pass; it supersedes refresh server-side.
-        { scope: key.scope, refresh: "true", ...(key.drill ? { drill: key.drill } : {}) },
-        { throwOnError: true },
-      )
+      const result = await props.api.client.aperture.get({ scope: key.scope, refresh: "true" }, { throwOnError: true })
       return result.data as Graph
     },
   )
@@ -386,23 +317,47 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
 
   // Aperture research/study logging: record a top-bar interaction (a click in the
   // view) to the per-session study log, interleaved with the agent's prompts/tool
-  // calls. `interaction` is the type id (e.g. "lens.cycle", "tile.drill"); `detail`
+  // calls. `interaction` is the type id (e.g. "lens.cycle", "dir.reveal"); `detail`
   // is an optional target (e.g. the path navigated to). Fire-and-forget — a logging
-  // failure must never break a click.
+  // failure must never break a click. (`drill` is no longer sent: with the file tier
+  // gone there is no drilled file, and tile.drill/tile.undrill have left the log with it.)
   const logInteraction = (interaction: string, detail?: string) => {
     void props.api.client.aperture.interaction({
       sessionID: props.session_id,
       interaction,
       scope: scope(),
-      ...(drilledFile() ? { drill: drilledFile() } : {}),
       lens: activeId(),
       ...(detail !== undefined ? { detail } : {}),
     })
   }
-  // Navigate the directory tree by clicking a tile — logs the navigation then re-roots.
+  // Navigate the directory tree — logs the navigation then re-roots. Used on its own by
+  // the breadcrumb / ⌂ / ◀ controls, which deliberately do *not* disturb the editor.
   const navigateScope = (path: string) => {
     logInteraction("tile.navigate", path)
     setScope(path)
+  }
+  // Reveal a directory in the editor's file tree. This is the link the file tier used to
+  // provide: the bar no longer lists files, so the way to get from "this part of the repo
+  // looks interesting" to the files themselves is to open it where files belong. The host
+  // (the Aperture VSCode extension) listens for `tui.directory.reveal` and runs
+  // revealInExplorer, which expands the parent chain, scrolls the folder into view and
+  // focuses it — focus moving to the Explorer is intended, since you asked to go there.
+  // Fire-and-forget: no editor attached, or a failed publish, must not break the click.
+  const revealDirectory = (path: string) => {
+    logInteraction("dir.reveal", path)
+    void props.api.client.tui.revealDirectory({ path })
+  }
+  // Clicking a directory block does both: re-root the bar *and* reveal it in the editor.
+  const openDirectory = (path: string) => {
+    navigateScope(path)
+    revealDirectory(path)
+  }
+  // Clicking a file tile opens it in the editor. The bar has no file view of its own to
+  // drill into any more — the tile already shows the whole file's facet band — so the only
+  // thing left to want from a click is the file itself.
+  const openFile = (path: string) => {
+    logInteraction("file.open", path)
+    void props.api.client.tui.openFile({ path })
   }
 
   // Delete the active Lens via the ✕ control. Two-step: the first click arms a
@@ -500,78 +455,38 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   const edgeList = () => (graph.error ? [] : (graph()?.edges ?? []))
   const compositionOf = (nodeID: string) => (graph.error ? undefined : graph()?.composition?.[nodeID])
 
-  // A parent (layer-0) directory's multi-row treemap scales its cell count against the
-  // biggest sibling at the same layer (by *whole-subtree* size, tagged or not), so the
-  // largest block fills the grid and the rest read at their true proportion — a few
-  // tagged files never inflate a directory to full size. (Child directories paint a
-  // fixed-width bar that fills their tile, so they don't need this.)
-  const maxDirSubtreeAt = (layer: number) => {
-    let max = 0
-    for (const n of nodes()) {
-      if (n.kind !== "directory" || n.position.layer !== layer) continue
-      const c = compositionOf(n.id)
-      if (c) max = Math.max(max, metricSubtree(c))
-    }
-    return max
-  }
-  const maxDirSubtree0 = createMemo(() => maxDirSubtreeAt(0))
+  // The blocks in the strip: the scope's direct child *directories*, in payload order.
+  // Layer-1 is no longer read at all — the bar shows one level, and what's below it is
+  // legible through each block's composition rather than through a child list (O1).
+  const dirNodes = createMemo(() =>
+    nodes()
+      .filter((n) => n.position.layer === 0 && n.kind === "directory")
+      .toSorted((a, b) => a.position.index - b.position.index),
+  )
 
-  // File tiles paint their layer color as the tile *background* with dark text/glyphs
-  // (vs the old colored text). Untagged files keep the muted-text, no-background look
-  // until the sweep tags them.
-  const fileTagged = (id: string) => !!hueOf(id)
-  const fileBg = (id: string) => {
-    const hue = hueOf(id)
-    return hue ? resolveColor(theme(), hue) : undefined
-  }
-  const fileFg = (id: string) => (fileTagged(id) ? theme().background : theme().textMuted)
-  // Column-mode file row: the file's single layer color (or panel bg when untagged)
-  // spread across `width` columns, so a file paints as a flat 1-row bar matching the
-  // borderless child-directory bars beside it (childDirColors' file analogue).
-  const fileRowColors = (id: string, width: number): (TuiThemeCurrent["text"] | undefined)[] => {
-    // A drilled-into file (the only one the server sends extents for) paints as a
-    // positional band of its functions; every other file is its single flat hue.
-    const ex = extentsForId(id)
-    if (ex && ex.length) return fileExtentColors(ex, width)
-    return Array.from({ length: width }, () => fileBg(id))
-  }
-  // Guarded extents accessor — never call the resource in its error state (the
-  // documented render→catch→re-render leak, PLAN.md).
-  const extentsForId = (id: string) => (graph.error ? undefined : graph()?.extents?.[id])
-  // Lay a drilled file's extents across `width` columns in file order: each segment
-  // sized by its line span, coloured by its facet (grey until the function is painted),
-  // so the bar reads as a left-to-right strip of where each concept lives in the file.
-  const fileExtentColors = (
-    extents: readonly GraphExtent[],
-    width: number,
-  ): (TuiThemeCurrent["text"] | undefined)[] => {
-    const bands = extents.map((e) => ({ key: e.facet ?? GREY_CELL, value: Math.max(1, e.endLine - e.startLine + 1) }))
-    const alloc = allocateCells(bands, width)
-    const flat: TuiThemeCurrent["text"][] = []
-    for (const a of alloc) for (let i = 0; i < a.n; i++) flat.push(colorFor(a.key))
-    while (flat.length < width) flat.push(theme().backgroundPanel)
-    return flat
-  }
-  // The extent band for a file id at `width`, or undefined when it isn't the drilled
-  // file. Drives the grid FileTile's drilled-state strip.
-  const bandForFile = (id: string, width: number) => {
-    const ex = extentsForId(id)
-    return ex && ex.length ? fileExtentColors(ex, width) : undefined
-  }
-  // Whole-subtree size of a node (0 when it has no composition yet), the metric the
-  // column-mode block width scales by (same denominator as maxDirSubtree0).
-  const subtreeOf = (id: string) => {
-    const c = compositionOf(id)
-    return c ? metricSubtree(c) : 0
-  }
-  // Parent directory blocks carry their name in a label row; it brightens on hover.
-  const dirLabelFg = (node: GraphNode) => (hoveredId() === node.id ? theme().accent : theme().textMuted)
+  // The scope's own files, as grid columns of FILE_GRID_ROWS tiles each.
+  //
+  // Sorted alphabetically and filled *column-major*, so reading order is down a column then
+  // right — the direction the strip scrolls. Alphabetical rather than payload order because
+  // grouping the files together is what buys the wrapping in the first place: once they are
+  // no longer interleaved with directories there is nothing left for payload order to mean,
+  // and alphabetical is what makes a name findable by eye.
+  const fileColumns = createMemo(() => {
+    const files = nodes()
+      .filter((n) => n.position.layer === 0 && n.kind === "file")
+      .toSorted((a, b) => basename(a.path).localeCompare(basename(b.path)))
+    const columns: GraphNode[][] = []
+    for (let i = 0; i < files.length; i += FILE_GRID_ROWS) columns.push(files.slice(i, i + FILE_GRID_ROWS))
+    return columns
+  })
 
-  // Per-character background colors for a child directory's name row: the *whole-subtree*
-  // composition spread across `width` columns — each tag takes its byte-proportion and the
-  // not-yet-tagged / non-code remainder fills the rest in grey, so the bar starts all grey
-  // and tags only ever occupy their true share as the sweep fills in.
-  const childDirColors = (id: string, width: number): (TuiThemeCurrent["text"] | undefined)[] => {
+  // Per-character background colours for a node's one-row band: its composition spread
+  // across `width` columns, each facet taking its byte-proportion and the not-yet-painted /
+  // non-code remainder filling the rest in grey. Used by the file tiles, which is why a
+  // file now needs a `composition` entry of its own (see computeComposition) — painting from
+  // `semantics[id].hue` would flatten it back to the single dominant facet the Explorer pip
+  // is already stuck with, and losing that distinction is the reason the grid exists.
+  const bandColors = (id: string, width: number): (TuiThemeCurrent["text"] | undefined)[] => {
     const comp = compositionOf(id)
     const bands = comp ? compositionBands(comp) : []
     if (bands.length === 0) return Array.from({ length: width }, () => resolveColor(theme(), UNTAGGED_HUE))
@@ -581,6 +496,24 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     while (flat.length < width) flat.push(theme().backgroundPanel)
     return flat
   }
+
+  // A block's treemap scales its cell count against the biggest sibling (by *whole-subtree*
+  // size, tagged or not), so the largest block fills its grid and the rest read at their
+  // true proportion — a few tagged files never inflate a directory to full size.
+  // Directories only: the file grid is a fixed-size layout, so it neither scales against
+  // this denominator nor belongs in it.
+  const maxDirSubtree0 = createMemo(() => {
+    let max = 0
+    for (const n of nodes()) {
+      if (n.kind !== "directory" || n.position.layer !== 0) continue
+      const c = compositionOf(n.id)
+      if (c) max = Math.max(max, metricSubtree(c))
+    }
+    return max
+  })
+
+  // Blocks carry their name in a label row; it brightens on hover.
+  const dirLabelFg = (node: GraphNode) => (hoveredId() === node.id ? theme().accent : theme().textMuted)
 
   // Which node tile the mouse is over, for the in-window import highlight. Kept
   // separate from the `hovered` info-line string so the highlight survives when a
@@ -663,62 +596,76 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     return ACTIONS.filter((a) => byAction.has(a)).map((a) => byAction.get(a)!)
   }
 
+  // A file's facet mix as text — the band spelled out, since a 14-column strip of colour
+  // can show that a file is mixed without saying what it is mixed *of*. Same reading the
+  // VSCode Explorer pip puts in its tooltip.
+  const describeMix = (id: string) => {
+    const comp = compositionOf(id)
+    if (!comp) return undefined
+    const total = metricSubtree(comp)
+    if (total <= 0 || comp.weights.length === 0) return undefined
+    const labelOf = (facet: string) =>
+      facet === NONE_FACET ? NONE_LABEL : (legendEntries().find((e) => e.facet === facet)?.label ?? facet)
+    const parts = comp.weights.map((w) => `${labelOf(w.facet)} ${Math.round((metricValue(w) / total) * 100)}%`)
+    const untagged = total - metricTotal(comp)
+    if (untagged > 0) parts.push(`${UNTAGGED_LABEL} ${Math.round((untagged / total) * 100)}%`)
+    return parts.join(" · ")
+  }
+
   // Hover text for a node: its path/size, plus the latest action on it this turn.
   const hoverNode = (node: GraphNode) => {
-    const base = describeNode(node)
+    const mix = node.kind === "file" ? describeMix(node.id) : undefined
+    const base = mix ? `${describeNode(node)} · ${mix}` : describeNode(node)
     // List out-of-window import targets so a dependency that left the window is
     // still legible even though it can't be drawn as an in-window highlight.
     const outs = boundariesFor().get(node.id) ?? []
     const withOut = outs.length ? `${base} · →${outs.map((b) => basename(b.path)).join(" ")}` : base
     const entries = activity.entriesFor(node.path)
     const latest = entries[entries.length - 1]
-    return latest
-      ? `${withOut} · ${latest.agent} ${ACTION_LABEL[latest.action]} ${relTime(latest.timestamp)}`
-      : withOut
+    return latest ? `${withOut} · ${latest.agent} ${ACTION_LABEL[latest.action]} ${relTime(latest.timestamp)}` : withOut
   }
 
-  // Layer-0 nodes are the squares; layer-1 nodes hang under their parent (grouped
-  // by path prefix). Memoized on the node set so it recomputes only on new data.
-  const tree = createMemo(() => {
-    const all = nodes()
-    const layer0 = all.filter((n) => n.position.layer === 0).toSorted((a, b) => a.position.index - b.position.index)
-    const byParent = new Map<string, GraphNode[]>()
-    for (const n of all) {
-      if (n.position.layer !== 1) continue
-      const bucket = byParent.get(posixDir(n.path)) ?? []
-      bucket.push(n)
-      byParent.set(posixDir(n.path), bucket)
-    }
-    for (const bucket of byParent.values()) bucket.sort((a, b) => a.position.index - b.position.index)
-    // Full child list per layer-0 node; how many actually render is decided at draw
-    // time from the per-directory expanded state (see the `shownChildren` accessor).
-    return layer0.map((node) => ({ node, children: byParent.get(node.path) ?? [] }))
-  })
-
-  // One layer-0 column's terminal-width footprint (column mode), the single source shared by
-  // the render below and the content-width sum that decides whether the horizontal scrollbar
-  // shows. Directories take their size-scaled block width; files the fixed/sparse file width
-  // — mirroring the cols()/fileW() the render uses, so the two never drift.
-  const columnWidth = (node: GraphNode) =>
-    node.kind === "directory"
-      ? columnOuterW(columnColsFor(subtreeOf(node.id), maxDirSubtree0(), tree().length))
-      : tree().length < COLUMN_FEW_THRESHOLD
-        ? columnOuterW(COLUMN_COLS_MAX)
-        : COLUMN_FILE_W
+  // How many cells a directory's treemap paints. Everything about a block's size derives
+  // from this one number — the grid it draws and the width of the box around it — so the
+  // box cannot end up wider than its contents. Previously width was scaled separately from
+  // cell count, and a "there's horizontal room, so draw everything full-size" rule sat on
+  // top of it; between them a small directory got a big empty box.
+  const blockCells = (id: string) => {
+    const comp = compositionOf(id)
+    const bands = comp ? compositionBands(comp) : []
+    // Nothing under it the painter sees as code: one grey cell, so the box still reads as a
+    // real-but-uninhabited directory rather than vanishing.
+    if (!comp || bands.length === 0) return 1
+    // Floor at the band count so every facet actually present gets at least one cell — a
+    // real facet is never an invisible sliver.
+    return Math.min(
+      BLOCK_CELL_CAP,
+      Math.max(scaleCells(metricSubtree(comp), maxDirSubtree0(), BLOCK_CELL_CAP), bands.length),
+    )
+  }
+  // ...and the columns those cells occupy, which is the block's width. `buildGrid` lays the
+  // same count into ceil(cells / rows) columns, so this matches what actually gets drawn;
+  // the clamp only bites at the very bottom, where a sub-one-column directory is widened to
+  // the COLUMN_COLS_MIN floor so it stays a legible box.
+  const blockCols = (id: string) =>
+    Math.max(COLUMN_COLS_MIN, Math.min(COLUMN_COLS_MAX, Math.ceil(blockCells(id) / COLUMN_ROWS)))
+  const blockWidth = (id: string) => columnOuterW(blockCols(id))
 
   // Whether the strip overflows the viewport horizontally — i.e. whether OpenTUI will draw
   // the horizontal scrollbar on the scrollbox's bottom row. Computed from data + terminal
   // width rather than read off the renderable (no per-frame polling, no layout-timing race):
-  // the strip's width is the sum of the column footprints plus the inter-column gaps, and the
-  // viewport is the full-width bar less its own horizontal padding. Column mode only.
+  // the strip's width is the sum of the block footprints plus the inter-block gaps, and the
+  // viewport is the full-width bar less its own horizontal padding.
+  // The file grid is one strip child however many columns it holds, so it contributes its
+  // whole packed width but only one gap.
   const contentWidth = createMemo(() => {
-    const items = tree()
-    if (items.length === 0) return 0
-    return items.reduce((sum, it) => sum + columnWidth(it.node), 0) + SCROLL_GAP * (items.length - 1)
+    const widths = dirNodes().map((n) => blockWidth(n.id))
+    const columns = fileColumns().length
+    if (columns > 0) widths.push(columns * FILE_TILE_W)
+    if (widths.length === 0) return 0
+    return widths.reduce((a, b) => a + b, 0) + SCROLL_GAP * (widths.length - 1)
   })
-  const scrollbarVisible = createMemo(
-    () => APERTURE_LAYOUT === "column" && contentWidth() > dimensions().width - BAR_PADDING_X * 2,
-  )
+  const scrollbarVisible = createMemo(() => contentWidth() > dimensions().width - BAR_PADDING_X * 2)
   // Bar height: the base budget, plus the one reserved scrollbar row only while the scrollbar
   // is actually showing — so a strip that fits gives the row back to the conversation below.
   const barHeight = () => TOP_BAR_HEIGHT + (scrollbarVisible() ? 1 : 0)
@@ -970,357 +917,62 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
           trackOptions: { foregroundColor: theme().textMuted, backgroundColor: theme().backgroundPanel },
         }}
       >
-        <For each={tree()}>
-          {(item) => {
-            // Column layout: only the top-layer directory is drawn richly, as a
-            // size-scaled treemap block; its children hang beneath as a single borderless
-            // column of 1-row composition bars (no drops, no grid, no separators). Children
-            // past the bottom edge are clipped by the scrollbox.
-            if (APERTURE_LAYOUT === "column") {
-              const cols = () => columnColsFor(subtreeOf(item.node.id), maxDirSubtree0(), tree().length)
-              // The column footprint comes from the shared columnWidth (kept under the outerW
-              // / fileW names the markup already uses): for a directory it's the size-scaled
-              // block width columnOuterW(cols()), for a file the fixed/sparse file width. Both
-              // resolve item.node by kind, matching the Show that gates where each is used.
-              const outerW = () => columnWidth(item.node)
-              const fileW = () => columnWidth(item.node)
-              // In-place vertical scroll for a child list taller than the window. When the
-              // list overflows, a wheel over it pages the visible slice instead of panning
-              // the bar; a "+N" marker stands in for the children hidden above / below. A
-              // non-overflowing list keeps offset 0, shows everything, and lets the wheel
-              // bubble out to the sideways pan (see onChildScroll).
-              const total = item.children.length
-              const overflow = total > COLUMN_CHILD_WINDOW
-              // Largest offset that still fills the window: at the bottom a top marker eats
-              // one row, so the last page shows COLUMN_CHILD_WINDOW-1 children ending on the
-              // final child. Clamped so a refetch that shrinks the list can't strand it.
-              const maxOffset = Math.max(0, total - COLUMN_CHILD_WINDOW + 1)
-              const offset = () => (overflow ? Math.min(childOffset().get(item.node.id) ?? 0, maxOffset) : 0)
-              // A top marker costs a row when scrolled; the rest hold children, less one more
-              // for a bottom marker whenever the remaining children don't all fit.
-              const aboveHidden = () => offset()
-              const capacity = () => COLUMN_CHILD_WINDOW - (offset() > 0 ? 1 : 0)
-              const childrenShown = () => {
-                const remaining = total - offset()
-                return remaining <= capacity() ? remaining : capacity() - 1
-              }
-              const visibleChildren = () => item.children.slice(offset(), offset() + childrenShown())
-              const belowHidden = () => total - (offset() + childrenShown())
-              const onChildScroll = (event: MouseEvent) => {
-                const dir = event.scroll?.direction
-                if (dir !== "up" && dir !== "down") return
-                if (!overflow) return // let the wheel bubble out to the horizontal pan
-                event.stopPropagation()
-                const step = event.scroll?.delta ?? 1
-                const next = Math.max(0, Math.min(maxOffset, offset() + (dir === "down" ? step : -step)))
-                setChildOffset(new Map(childOffset()).set(item.node.id, next))
-              }
-              return (
+        {/* One block per child directory, then the loose-files aggregate. There is no
+            second tier: a directory's files are already summed into its treemap, so the
+            child list the bar used to draw beneath each block was showing the same bytes
+            twice at the cost of six rows of height (O1). */}
+        <For each={dirNodes()}>
+          {(node) => (
+            <DirBlock
+              // One column short of the block, so that with SCROLL_GAP at 0 two neighbouring
+              // labels always have a space between them instead of running together.
+              label={truncate(basename(node.path), blockWidth(node.id) - 1)}
+              labelFg={() => dirLabelFg(node)}
+              rows={COLUMN_ROWS}
+              cells={blockCells(node.id)}
+              width={blockWidth(node.id)}
+              borderColor={() => borderColorFor(node)}
+              composition={() => compositionOf(node.id)}
+              colorFor={colorFor}
+              overlays={() => overlaysFor(node)}
+              theme={theme}
+              onDrill={() => openDirectory(node.path)}
+              onEnter={() => enterNode(node)}
+              onLeave={() => leaveNode()}
+            />
+          )}
+        </For>
+        {/* The scope's own files, packed into a grid rather than aggregated into one block.
+            Each tile is the filename over a band of that file's facet mix, so a minority
+            facet stays visible — the thing a single aggregate block averages away and the
+            Explorer pip cannot show at all (one colour per FileDecoration ⇒ dominant only).
+            The whole grid is a single strip child, so its tiles pack tight against each
+            other while the strip's gap still separates it from the directory blocks. */}
+        <Show when={fileColumns().length > 0}>
+          <box flexDirection="row" flexShrink={0}>
+            <For each={fileColumns()}>
+              {(column) => (
                 <box flexDirection="column" flexShrink={0}>
-                  <Show
-                    when={item.node.kind === "directory"}
-                    fallback={
+                  <For each={column}>
+                    {(node) => (
                       <FileTile
-                        label={truncate(basename(item.node.path), fileW())}
-                        kind={item.node.kind}
-                        width={fileW()}
-                        bg={() => fileBg(item.node.id)}
-                        fg={() => fileFg(item.node.id)}
-                        borderColor={() => borderColorFor(item.node)}
-                        overlays={() => overlaysFor(item.node)}
+                        label={basename(node.path)}
+                        width={FILE_TILE_W}
+                        colors={(w) => bandColors(node.id, w)}
+                        borderColor={() => borderColorFor(node)}
+                        overlays={() => overlaysFor(node)}
                         theme={theme}
-                        onEnter={() => enterNode(item.node)}
+                        onOpen={() => openFile(node.path)}
+                        onEnter={() => enterNode(node)}
                         onLeave={() => leaveNode()}
-                        onDrill={() => toggleDrill(item.node.path)}
-                        bandColors={(w) => bandForFile(item.node.id, w)}
                       />
-                    }
-                  >
-                    <DirBlock
-                      label={truncate(basename(item.node.path), outerW())}
-                      labelFg={() => dirLabelFg(item.node)}
-                      showLabel={true}
-                      rows={COLUMN_ROWS}
-                      maxCols={cols()}
-                      width={outerW()}
-                      borderColor={() => borderColorFor(item.node)}
-                      composition={() => compositionOf(item.node.id)}
-                      colorFor={colorFor}
-                      // Fill scales by byte size against the biggest sibling (like the grid
-                      // treemap): a smaller directory paints fewer cells (bottom-aligned,
-                      // the rest left empty) rather than filling its whole box.
-                      maxSubtree={maxDirSubtree0}
-                      overlays={() => overlaysFor(item.node)}
-                      theme={theme}
-                      onDrill={() => navigateScope(item.node.path)}
-                      onEnter={() => enterNode(item.node)}
-                      onLeave={() => leaveNode()}
-                    />
-                  </Show>
-                  <box flexDirection="column" flexShrink={0} onMouseScroll={onChildScroll}>
-                    {/* "↑ +N" stand-in for children scrolled off the top of the window: the
-                        arrow points to where the hidden children are, the count says how
-                        many. Same idea (pointing down) at the bottom for children below. */}
-                    <Show when={aboveHidden() > 0}>
-                      <box width={outerW()} height={1} flexShrink={0}>
-                        <text fg={theme().textMuted} wrapMode="none">
-                          {"↑ +" + aboveHidden()}
-                        </text>
-                      </box>
-                    </Show>
-                    <For each={visibleChildren()}>
-                      {(cell) => {
-                        // Agent-action glyphs (read/create/edit) ride the end of the row, as
-                        // they do on the grid layout's ChildDirTile/FileTile. The name bar
-                        // shrinks by the glyph count so the composition fill stays put and the
-                        // glyphs sit flush at the right edge of the column's footprint.
-                        const overlays = () => overlaysFor(cell)
-                        const nameWidth = () => Math.max(0, outerW() - overlays().length)
-                        return (
-                          <box
-                            width={outerW()}
-                            flexDirection="row"
-                            flexShrink={0}
-                            onMouseDown={() => (cell.kind === "directory" ? navigateScope(cell.path) : toggleDrill(cell.path))}
-                            onMouseOver={() => enterNode(cell)}
-                            onMouseOut={() => leaveNode()}
-                          >
-                            <Show
-                              when={cell.kind === "directory"}
-                              fallback={
-                                <NameRow
-                                  name={truncate(basename(cell.path), nameWidth())}
-                                  width={nameWidth()}
-                                  colors={() => fileRowColors(cell.id, nameWidth())}
-                                  textColor={() => fileFg(cell.id)}
-                                  theme={theme}
-                                />
-                              }
-                            >
-                              <NameRow
-                                name={truncate(basename(cell.path), nameWidth())}
-                                width={nameWidth()}
-                                colors={() => childDirColors(cell.id, nameWidth())}
-                                textColor={() => theme().background}
-                                theme={theme}
-                              />
-                            </Show>
-                            <OverlayRow overlays={overlays} theme={theme} />
-                          </box>
-                        )
-                      }}
-                    </For>
-                    <Show when={belowHidden() > 0}>
-                      <box width={outerW()} height={1} flexShrink={0}>
-                        <text fg={theme().textMuted} wrapMode="none">
-                          {"↓ +" + belowHidden()}
-                        </text>
-                      </box>
-                    </Show>
-                  </box>
-                </box>
-              )
-            }
-            const bnds = boundariesFor().get(item.node.id) ?? []
-            const shownBnds = bnds.slice(0, MAX_CHILDREN)
-            const bndOverflow = bnds.length - MAX_CHILDREN
-            const hasChildren = item.children.length > 0
-            // A "…" tile only appears once there are *more* than MAX_CHILDREN children
-            // (so a directory with exactly a full grid shows every child), and clicking
-            // it expands the grid in place. When collapsed past capacity we surrender
-            // the grid's last cell to "…", so only MAX_CHILDREN-1 real children show.
-            const collapsed = () => !expanded().has(item.node.id) && item.children.length > MAX_CHILDREN
-            const shownChildren = () => (collapsed() ? item.children.slice(0, MAX_CHILDREN - 1) : item.children)
-            const overflow = () => item.children.length - shownChildren().length
-            // Grid cells: the shown children, plus the "…" sentinel pinned last
-            // (bottom-right) when collapsed, chunked into CHILD_COLS-wide rows.
-            const cells = (): (GraphNode | typeof OVERFLOW)[] =>
-              collapsed() ? [...shownChildren(), OVERFLOW] : [...shownChildren()]
-            const childRows = () => {
-              const all = cells()
-              const rows: (GraphNode | typeof OVERFLOW)[][] = []
-              for (let i = 0; i < all.length; i += CHILD_COLS) rows.push(all.slice(i, i + CHILD_COLS))
-              return rows
-            }
-            // Only the top grid row carries containment drops; the block lines up with
-            // the grid's width (its top row), not the directory's full child count — so
-            // an all-ignored directory shrinks to a small box.
-            const topRow = () => childRows()[0] ?? []
-            const dirMaxCols = () => treemapColsFor(topRow().length)
-            return (
-              <box flexDirection="column" flexShrink={0} gap={0}>
-                <Show
-                  when={item.node.kind === "directory"}
-                  fallback={
-                    <FileTile
-                      label={truncate(basename(item.node.path), MAX_LABEL)}
-                      kind={item.node.kind}
-                      topSpacer={2}
-                      bg={() => fileBg(item.node.id)}
-                      fg={() => fileFg(item.node.id)}
-                      borderColor={() => borderColorFor(item.node)}
-                      overlays={() => overlaysFor(item.node)}
-                      theme={theme}
-                      onEnter={() => enterNode(item.node)}
-                      onLeave={() => leaveNode()}
-                      onDrill={() => toggleDrill(item.node.path)}
-                      bandColors={(w) => bandForFile(item.node.id, w)}
-                    />
-                  }
-                >
-                  <DirBlock
-                    label={truncate(basename(item.node.path), MAX_LABEL)}
-                    labelFg={() => dirLabelFg(item.node)}
-                    showLabel={true}
-                    rows={MAX_ROWS}
-                    maxCols={dirMaxCols()}
-                    borderColor={() => borderColorFor(item.node)}
-                    composition={() => compositionOf(item.node.id)}
-                    colorFor={colorFor}
-                    maxSubtree={maxDirSubtree0}
-                    overlays={() => overlaysFor(item.node)}
-                    theme={theme}
-                    onDrill={() => navigateScope(item.node.path)}
-                    onEnter={() => enterNode(item.node)}
-                    onLeave={() => leaveNode()}
-                  />
-                </Show>
-
-                {/* Containment edges: one white │ drop per *top-row* child only. The
-                    lower grid row hangs directly beneath with no drop, so its tiles
-                    read as the parent's children (siblings of the top row) rather than
-                    grandchildren. Drops mirror the grid's fixed CHILD_W + gap so each
-                    aligns to its child regardless of label length. */}
-                <Show when={hasChildren}>
-                  <box flexDirection="row" gap={1} height={1} flexShrink={0}>
-                    <For each={topRow()}>
-                      {() => (
-                        <box width={CHILD_W} alignItems="center" flexShrink={0}>
-                          <text fg={theme().text} wrapMode="none">
-                            │
-                          </text>
-                        </box>
-                      )}
-                    </For>
-                  </box>
-                </Show>
-
-                {/* Child grid: CHILD_COLS-wide rows stacked top→bottom. Clicking the
-                    bottom-right "…" expands every child into the grid in place (extra
-                    rows). No collapse affordance by design — navigating away resets
-                    every directory to compact. */}
-                <box flexDirection="column" flexShrink={0}>
-                  <For each={childRows()}>
-                    {(row) => (
-                      <box flexDirection="row" gap={1} flexShrink={0}>
-                        <For each={row}>
-                          {(cell) =>
-                            cell === OVERFLOW ? (
-                              <box
-                                width={CHILD_W}
-                                border
-                                customBorderChars={SQUARE_CORNERS}
-                                borderColor={theme().border}
-                                flexShrink={0}
-                                onMouseDown={() => expand(item.node.id)}
-                                onMouseOver={() => setHovered(`+${overflow()} more in ${basename(item.node.path)}/`)}
-                                onMouseOut={() => setHovered(undefined)}
-                              >
-                                <text fg={theme().accent} wrapMode="none">
-                                  …
-                                </text>
-                              </box>
-                            ) : (
-                              <box width={CHILD_W} flexShrink={0}>
-                                <Show
-                                  when={cell.kind === "directory"}
-                                  fallback={
-                                    <FileTile
-                                      label={truncate(basename(cell.path), MAX_CHILD_LABEL)}
-                                      kind={cell.kind}
-                                      width={CHILD_W}
-                                      bg={() => fileBg(cell.id)}
-                                      fg={() => fileFg(cell.id)}
-                                      borderColor={() => borderColorFor(cell)}
-                                      overlays={() => overlaysFor(cell)}
-                                      theme={theme}
-                                      onEnter={() => enterNode(cell)}
-                                      onLeave={() => leaveNode()}
-                                      onDrill={() => toggleDrill(cell.path)}
-                                      bandColors={(w) => bandForFile(cell.id, w)}
-                                    />
-                                  }
-                                >
-                                  <ChildDirTile
-                                    name={truncate(basename(cell.path), CHILD_W - 2)}
-                                    width={CHILD_W}
-                                    colors={() => childDirColors(cell.id, CHILD_W - 2)}
-                                    textColor={() => theme().background}
-                                    borderColor={() => borderColorFor(cell)}
-                                    overlays={() => overlaysFor(cell)}
-                                    theme={theme}
-                                    onDrill={() => navigateScope(cell.path)}
-                                    onEnter={() => enterNode(cell)}
-                                    onLeave={() => leaveNode()}
-                                  />
-                                </Show>
-                              </box>
-                            )
-                          }
-                        </For>
-                      </box>
                     )}
                   </For>
                 </box>
-
-                {/* Out-of-window imports (step 6): white │ drops into a row of
-                    boundary tiles, each a square colored by the target's layer hue.
-                    Click a tile to re-root at the target's directory. */}
-                <Show when={shownBnds.length > 0}>
-                  <box flexDirection="row" gap={1} height={1} flexShrink={0}>
-                    <For each={shownBnds}>
-                      {() => (
-                        <box width={TILE_W} alignItems="center" flexShrink={0}>
-                          <text fg={theme().text} wrapMode="none">
-                            │
-                          </text>
-                        </box>
-                      )}
-                    </For>
-                  </box>
-                  <box flexDirection="row" gap={1} flexShrink={0}>
-                    <For each={shownBnds}>
-                      {(b) => (
-                        <box
-                          width={TILE_W}
-                          alignItems="center"
-                          flexShrink={0}
-                          onMouseDown={() => {
-                            logInteraction("boundary.nav", posixDir(b.path))
-                            setScope(posixDir(b.path))
-                          }}
-                          onMouseOver={() => setHovered(b.path)}
-                          onMouseOut={() => setHovered(undefined)}
-                        >
-                          <text fg={hueColor(theme(), hueOf(b.id), "file")} wrapMode="none">
-                            ▪
-                          </text>
-                        </box>
-                      )}
-                    </For>
-                    <Show when={bndOverflow > 0}>
-                      <box width={TILE_W} alignItems="center" flexShrink={0}>
-                        <text fg={theme().textMuted} wrapMode="none">
-                          …
-                        </text>
-                      </box>
-                    </Show>
-                  </box>
-                </Show>
-              </box>
-            )
-          }}
-        </For>
+              )}
+            </For>
+          </box>
+        </Show>
       </scrollbox>
     </box>
   )
@@ -1356,23 +1008,22 @@ function OverlayRow(props: {
 
 // --- treemap layer ---------------------------------------------------------
 
-// A directory rendered as its subtree's composition: an optional clickable label
-// over a *bordered* grid of layer-colored cells. The border frames the block so it
-// reads as a real directory even when empty (an empty/untagged subtree paints solid
-// grey rather than vanishing into the panel). The whole block re-roots on click.
-// Layer-0 blocks show a label and grow to MAX_ROWS tall; layer-1 children drop the
-// label and paint a single-row composition bar inside the child tile's border.
+// A directory rendered as its subtree's composition: a clickable label over a
+// *bordered* grid of layer-colored cells. The border frames the block so it reads as a
+// real directory even when empty (an empty/untagged subtree paints solid grey rather
+// than vanishing into the panel). The whole block is the click target.
+//
+// `cells` and `width` are computed together by the caller from one number, so the box is
+// exactly as wide as the cells it holds — see `blockCells`/`blockCols`.
 function DirBlock(props: {
   label: string
   labelFg: () => TuiThemeCurrent["text"]
-  showLabel: boolean
   rows: number
-  maxCols: number
+  cells: number
   width?: number
   borderColor: () => TuiThemeCurrent["text"]
   composition: () => Composition | undefined
   colorFor: (key: string | null) => TuiThemeCurrent["text"]
-  maxSubtree: () => number
   overlays: () => Overlay[]
   theme: () => TuiThemeCurrent
   onDrill: () => void
@@ -1387,21 +1038,24 @@ function DirBlock(props: {
       onMouseOver={() => props.onEnter()}
       onMouseOut={() => props.onLeave()}
     >
-      <Show when={props.showLabel}>
-        <box flexDirection="row" gap={1} flexShrink={0}>
-          <text fg={props.labelFg()} wrapMode="none">
-            {props.label}
-          </text>
-          <OverlayRow overlays={props.overlays} theme={props.theme} />
-        </box>
-      </Show>
-      <box border customBorderChars={SQUARE_CORNERS} borderColor={props.borderColor()} width={props.width} flexShrink={0}>
+      <box flexDirection="row" gap={1} flexShrink={0}>
+        <text fg={props.labelFg()} wrapMode="none">
+          {props.label}
+        </text>
+        <OverlayRow overlays={props.overlays} theme={props.theme} />
+      </box>
+      <box
+        border
+        customBorderChars={SQUARE_CORNERS}
+        borderColor={props.borderColor()}
+        width={props.width}
+        flexShrink={0}
+      >
         <TreemapBlock
           composition={props.composition}
           colorFor={props.colorFor}
           rows={props.rows}
-          maxCols={props.maxCols}
-          maxSubtree={props.maxSubtree}
+          cells={props.cells}
           theme={props.theme}
         />
       </box>
@@ -1409,38 +1063,26 @@ function DirBlock(props: {
   )
 }
 
-// The colored grid itself, painted *inside* the directory's border. Cell count scales
-// (sqrt, so small dirs stay visible) against the biggest sibling's *whole-subtree* size
-// and is capped to maxCols × rows; cells are split across the tag bands plus a trailing
-// grey band for the not-yet-tagged / non-code remainder, by largest-remainder rounding,
-// laid out in fixed-order bands bottom-aligned (the footing stays full, growth appears
-// on top). So a directory reads at its true size, starts all grey, and each tag only
-// occupies its real byte-proportion as the sweep fills in — rather than a handful of
-// tagged files painting the whole block.
+// The colored grid itself, painted *inside* the directory's border. `cells` — the block's
+// area, decided by the caller so the surrounding box can be sized to match — is split
+// across the tag bands plus a trailing grey band for the not-yet-tagged / non-code
+// remainder, by largest-remainder rounding, laid out in fixed-order bands bottom-aligned
+// (the footing stays full, growth appears on top). So a directory reads at its true size,
+// starts all grey, and each tag only occupies its real byte-proportion as the sweep fills
+// in — rather than a handful of tagged files painting the whole block.
 function TreemapBlock(props: {
   composition: () => Composition | undefined
   colorFor: (key: string | null) => TuiThemeCurrent["text"]
   rows: number
-  maxCols: number
-  maxSubtree: () => number
+  cells: number
   theme: () => TuiThemeCurrent
 }) {
-  // Cells to paint for a directory of `size`, scaled (sqrt, floored at 1 when it has
-  // any size) against the biggest sibling and capped to the grid.
-  const scaleCells = (size: number, max: number, cap: number) =>
-    max <= 0 || size <= 0 ? 0 : Math.max(1, Math.min(cap, Math.round(cap * Math.sqrt(size / max))))
   const grid = createMemo(() => {
     const comp = props.composition()
-    const cap = props.maxCols * props.rows
     const bands = comp ? compositionBands(comp) : []
     // No descendant source files: keep the bordered box non-empty with one grey cell.
     if (bands.length === 0) return buildGrid([GREY_CELL], props.rows)
-    // Size by whole-subtree against the biggest sibling, but floor at the band count
-    // (capped) so every present tag gets at least one cell — a real tag is never an
-    // invisible sliver, even when its byte-proportion would round to zero.
-    const subtree = comp ? metricSubtree(comp) : 0
-    const cellCount = Math.min(cap, Math.max(scaleCells(subtree, props.maxSubtree(), cap), bands.length))
-    const alloc = allocateCells(bands, cellCount)
+    const alloc = allocateCells(bands, props.cells)
     const flat: string[] = []
     for (const a of alloc) for (let i = 0; i < a.n; i++) flat.push(a.key)
     // Degenerate (e.g. only zero-byte files): keep the bordered box non-empty.
@@ -1464,88 +1106,23 @@ function TreemapBlock(props: {
   )
 }
 
-// A file tile: dark label + glyphs over a layer-colored fill, painted on an *inner*
-// box so the color sits inside the border ring (matching the in-painted directory
-// treemaps) rather than under it. Untagged files have no fill and keep muted text.
-// `topSpacer` pushes a parent-layer file down so its tile lines up with sibling
-// directories (which carry a name row + top border above their treemap).
+// A file tile: one bordered row, the filename in dark text over a band of the file's own
+// facet mix. The band is the point — it is the finest-grained facet reading in the product,
+// finer than the directory treemap (which averages the file into its parent) and finer than
+// the VSCode Explorer pip (one colour, so dominant-only). Clicking opens the file.
 function FileTile(props: {
   label: string
-  kind: GraphNode["kind"]
-  width?: number
-  topSpacer?: number
-  bg: () => TuiThemeCurrent["text"] | undefined
-  fg: () => TuiThemeCurrent["text"]
-  borderColor: () => TuiThemeCurrent["text"]
-  overlays: () => Overlay[]
-  theme: () => TuiThemeCurrent
-  onEnter: () => void
-  onLeave: () => void
-  // Click to drill into the file's function-level paint (A5); absent for boundary
-  // probes / non-drillable tiles.
-  onDrill?: () => void
-  // When the file is drilled, builds a per-column band of its function extents (A5)
-  // for the given inner width; the tile then paints that strip instead of its
-  // single-hue fill. Returns undefined when the file isn't drilled.
-  bandColors?: (width: number) => (TuiThemeCurrent["text"] | undefined)[] | undefined
-}) {
-  const band = () => props.bandColors?.(nameWidth())
-  const nameWidth = () => Math.max(0, (props.width ?? 0) - 2 - props.overlays().length)
-  return (
-    <box flexDirection="column" flexShrink={0}>
-      <Show when={(props.topSpacer ?? 0) > 0}>
-        <box height={props.topSpacer} flexShrink={0} />
-      </Show>
-      <box
-        border
-        customBorderChars={cornersFor(props.kind)}
-        borderColor={props.borderColor()}
-        width={props.width}
-        flexShrink={0}
-        onMouseDown={() => props.onDrill?.()}
-        onMouseOver={() => props.onEnter()}
-        onMouseOut={() => props.onLeave()}
-      >
-        <Show
-          when={band()?.length}
-          fallback={
-            <box backgroundColor={props.bg()} flexDirection="row" gap={1} flexShrink={0}>
-              <text fg={props.fg()} wrapMode="none">
-                {props.label}
-              </text>
-              <OverlayRow overlays={props.overlays} theme={props.theme} color={props.fg} />
-            </box>
-          }
-        >
-          <box flexDirection="row" height={1} flexShrink={0}>
-            <NameRow name={props.label} width={nameWidth()} colors={() => band()!} textColor={props.fg} theme={props.theme} />
-            <OverlayRow overlays={props.overlays} theme={props.theme} />
-          </box>
-        </Show>
-      </box>
-    </box>
-  )
-}
-
-// A child-layer directory tile: a single bordered row whose name is painted in dark
-// text *over* the directory's composition — each character cell carries the color of
-// the layer at that column (or solid grey when nothing under it is tagged), so a
-// child directory still reads its make-up behind its name. Drilling re-roots. When
-// files beneath it saw activity this turn, the rightmost cells of the row carry the
-// containment (outline) glyphs, so the name shrinks just enough to make room.
-function ChildDirTile(props: {
-  name: string
   width: number
-  colors: () => (TuiThemeCurrent["text"] | undefined)[]
-  textColor: () => TuiThemeCurrent["text"]
+  colors: (width: number) => (TuiThemeCurrent["text"] | undefined)[]
   borderColor: () => TuiThemeCurrent["text"]
   overlays: () => Overlay[]
   theme: () => TuiThemeCurrent
-  onDrill: () => void
+  onOpen: () => void
   onEnter: () => void
   onLeave: () => void
 }) {
-  // Inner cols (width − border) shared between the name and the glyph strip.
+  // Inner cols (width − border) shared between the name and the activity glyph strip, so
+  // the glyphs sit flush right and the band keeps its full width behind the name.
   const nameWidth = () => Math.max(0, props.width - 2 - props.overlays().length)
   return (
     <box
@@ -1554,22 +1131,30 @@ function ChildDirTile(props: {
       borderColor={props.borderColor()}
       width={props.width}
       flexShrink={0}
-      onMouseDown={() => props.onDrill()}
+      onMouseDown={() => props.onOpen()}
       onMouseOver={() => props.onEnter()}
       onMouseOut={() => props.onLeave()}
     >
       <box flexDirection="row" height={1} flexShrink={0}>
-        <NameRow name={props.name} width={nameWidth()} colors={props.colors} textColor={props.textColor} theme={props.theme} />
+        <NameRow
+          name={truncate(props.label, nameWidth())}
+          width={nameWidth()}
+          colors={() => props.colors(nameWidth())}
+          // Dark text over the band, the same treatment the directory bars used: every band
+          // colour (facet hues and the untagged grey alike) is a light fill, so the label
+          // reads against all of them without having to know which facet it landed on.
+          textColor={() => props.theme().background}
+          theme={props.theme}
+        />
         <OverlayRow overlays={props.overlays} theme={props.theme} />
       </box>
     </box>
   )
 }
 
-// One inner row of `width` character cells: each shows the name's character (or a
-// space) in `textColor` over the per-column background from `colors` (undefined →
-// panel). The per-character split is what lets dark text sit over a multi-color
-// composition bar.
+// One inner row of `width` character cells: each shows the name's character (or a space) in
+// `textColor` over the per-column background from `colors` (undefined → panel). The
+// per-character split is what lets dark text sit over a multi-colour composition band.
 function NameRow(props: {
   name: string
   width: number
@@ -1643,11 +1228,6 @@ function scopeFromInput(input: string): string {
   const segs = trimmed.split("/")
   if ((segs[segs.length - 1] ?? "").lastIndexOf(".") > 0) segs.pop()
   return segs.join("/")
-}
-
-function posixDir(p: string) {
-  const i = p.lastIndexOf("/")
-  return i === -1 ? "" : p.slice(0, i)
 }
 
 function truncate(s: string, max: number) {

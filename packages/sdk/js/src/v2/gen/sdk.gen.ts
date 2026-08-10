@@ -8,6 +8,8 @@ import type {
   ApertureCycleLensResponses,
   ApertureDeleteLensErrors,
   ApertureDeleteLensResponses,
+  ApertureFacetMapErrors,
+  ApertureFacetMapResponses,
   ApertureGetErrors,
   ApertureGetResponses,
   ApertureInteractionErrors,
@@ -263,6 +265,8 @@ import type {
   TuiOpenThemesResponses,
   TuiPublishErrors,
   TuiPublishResponses,
+  TuiRevealDirectoryErrors,
+  TuiRevealDirectoryResponses,
   TuiSelectSessionErrors,
   TuiSelectSessionResponses,
   TuiShowToastErrors,
@@ -699,6 +703,36 @@ export class Aperture extends HeyApiClient {
     )
     return (options?.client ?? this.client).get<ApertureGetResponses, ApertureGetErrors, ThrowOnError>({
       url: "/aperture",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Get the whole-repo facet map
+   *
+   * Every painted source file in the repo with its facet mix under the active Lens, for bulk file-tree decoration.
+   */
+  public facetMap<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<ApertureFacetMapResponses, ApertureFacetMapErrors, ThrowOnError>({
+      url: "/aperture/facets",
       ...options,
       ...params,
     })
@@ -5638,6 +5672,43 @@ export class Tui extends HeyApiClient {
     )
     return (options?.client ?? this.client).post<TuiOpenFileResponses, TuiOpenFileErrors, ThrowOnError>({
       url: "/tui/open-file",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Reveal directory in host editor
+   *
+   * Publish an intent for the host editor to reveal a directory in its file tree.
+   */
+  public revealDirectory<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      path?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "path" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<TuiRevealDirectoryResponses, TuiRevealDirectoryErrors, ThrowOnError>({
+      url: "/tui/reveal-directory",
       ...options,
       ...params,
       headers: {

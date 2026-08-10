@@ -65,6 +65,7 @@ export type Event =
   | EventTuiToastShow2
   | EventTuiSessionSelect2
   | EventTuiFileOpen
+  | EventTuiDirectoryReveal
   | EventMcpToolsChanged
   | EventMcpBrowserOpenFailed
   | EventSessionStatus
@@ -1319,6 +1320,16 @@ export type GlobalEvent = {
       }
     | {
         id: string
+        type: "tui.directory.reveal"
+        properties: {
+          /**
+           * Repo-relative path of the directory to reveal; empty string = the workspace root
+           */
+          path: string
+        }
+      }
+    | {
+        id: string
         type: "mcp.tools.changed"
         properties: {
           server: string
@@ -1938,6 +1949,7 @@ export type Config = {
     painter?: {
       context?: "minimal" | "medium"
       concurrency?: number
+      granularity?: "file" | "interest" | "declaration"
     }
   }
 }
@@ -4461,6 +4473,17 @@ export type EventTuiFileOpen = {
   }
 }
 
+export type EventTuiDirectoryReveal = {
+  id: string
+  type: "tui.directory.reveal"
+  properties: {
+    /**
+     * Repo-relative path of the directory to reveal; empty string = the workspace root
+     */
+    path: string
+  }
+}
+
 export type EventMcpToolsChanged = {
   id: string
   type: "mcp.tools.changed"
@@ -5029,6 +5052,7 @@ export type ApertureGetResponses = {
         label: string
         color: string
       }>
+      deterministic?: boolean
     }
     extents?: {
       [key: string]: Array<{
@@ -5043,6 +5067,52 @@ export type ApertureGetResponses = {
 }
 
 export type ApertureGetResponse = ApertureGetResponses[keyof ApertureGetResponses]
+
+export type ApertureFacetMapData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/aperture/facets"
+}
+
+export type ApertureFacetMapErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ApertureFacetMapError = ApertureFacetMapErrors[keyof ApertureFacetMapErrors]
+
+export type ApertureFacetMapResponses = {
+  /**
+   * Every painted file in the repo with its facet mix
+   */
+  200: {
+    lens: {
+      id: string
+      name: string
+      legend: Array<{
+        facet: string
+        label: string
+        color: string
+      }>
+      deterministic?: boolean
+    }
+    facets: Array<string>
+    files: {
+      [key: string]: Array<{
+        f: number
+        p: number
+      }>
+    }
+  }
+}
+
+export type ApertureFacetMapResponse = ApertureFacetMapResponses[keyof ApertureFacetMapResponses]
 
 export type ApertureCycleLensData = {
   body?: never
@@ -5076,6 +5146,7 @@ export type ApertureCycleLensResponses = {
       label: string
       color: string
     }>
+    deterministic?: boolean
   }
 }
 
@@ -5115,6 +5186,7 @@ export type ApertureDeleteLensResponses = {
         label: string
         color: string
       }>
+      deterministic?: boolean
     }
   }
 }
@@ -5151,6 +5223,9 @@ export type ApertureListLensesResponses = {
     scope: "global" | "project"
     builtin: boolean
     active: boolean
+    parent?: string
+    depth: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    rootScope: "global" | "project"
   }>
 }
 
@@ -5190,6 +5265,7 @@ export type ApertureSelectLensResponses = {
         label: string
         color: string
       }>
+      deterministic?: boolean
     }
   }
 }
@@ -9378,6 +9454,39 @@ export type TuiOpenFileResponses = {
 }
 
 export type TuiOpenFileResponse = TuiOpenFileResponses[keyof TuiOpenFileResponses]
+
+export type TuiRevealDirectoryData = {
+  body?: {
+    /**
+     * Repo-relative path of the directory to reveal; empty string = the workspace root
+     */
+    path: string
+  }
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/tui/reveal-directory"
+}
+
+export type TuiRevealDirectoryErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type TuiRevealDirectoryError = TuiRevealDirectoryErrors[keyof TuiRevealDirectoryErrors]
+
+export type TuiRevealDirectoryResponses = {
+  /**
+   * Directory reveal intent published successfully
+   */
+  200: boolean
+}
+
+export type TuiRevealDirectoryResponse = TuiRevealDirectoryResponses[keyof TuiRevealDirectoryResponses]
 
 export type TuiPublishData = {
   body?: EventTuiPromptAppend | EventTuiCommandExecute | EventTuiToastShow | EventTuiSessionSelect

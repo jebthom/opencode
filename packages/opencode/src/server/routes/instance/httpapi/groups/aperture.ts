@@ -68,6 +68,22 @@ const LensSummary = Schema.Struct({
   rootScope: Schema.Literals(["global", "project"]),
 })
 
+// Whole-repo file → facet mix under the active Lens (O2). The bulk counterpart to the
+// per-file `drill` the editor gutter uses: the VSCode Explorer decorates every row of the
+// file tree, so it needs one fetch that answers for the whole repo.
+//
+// Each file's *whole* mix ships rather than a pre-reduced dominant facet — a client
+// filtering to one facet needs that facet's share, not the file's plurality winner. `f`
+// indexes into `facets`; `p` is an integer percent of the file's attributed bytes,
+// descending. Files with nothing painted are omitted.
+const FacetMapResult = Schema.Struct({
+  lens: AperturePayload.LensInfo,
+  // Facet ids in legend order, with the "Other" facet appended (it is a real stored value
+  // but never a Lens facet, so it needs an index without polluting the legend).
+  facets: Schema.Array(Schema.String),
+  files: Schema.Record(Schema.String, Schema.Array(Schema.Struct({ f: Schema.Int, p: Schema.Int }))),
+})
+
 // Activate a Lens by id or name (the searchable Lens picker / `/lens-switch`). The
 // repaint rides the aperture.invalidated event the switch publishes; this returns the
 // resolved Lens, or "not-found" when the id/name doesn't match an available Lens.
@@ -105,6 +121,19 @@ export const ApertureApi = HttpApi.make("aperture")
             identifier: "aperture.get",
             summary: "Get Aperture view",
             description: "Retrieve the deterministic Aperture payload for the active instance.",
+          }),
+        ),
+      )
+      .add(
+        HttpApiEndpoint.get("facetMap", `${root}/facets`, {
+          query: Schema.Struct({ ...WorkspaceRoutingQueryFields }),
+          success: described(FacetMapResult, "Every painted file in the repo with its facet mix"),
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "aperture.facetMap",
+            summary: "Get the whole-repo facet map",
+            description:
+              "Every painted source file in the repo with its facet mix under the active Lens, for bulk file-tree decoration.",
           }),
         ),
       )

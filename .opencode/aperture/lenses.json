@@ -127,37 +127,6 @@
     ],
     "scope": "project"
   },
-  "terminal-performance-bottlenecks-7d814bd7": {
-    "id": "terminal-performance-bottlenecks-7d814bd7",
-    "name": "Terminal Performance Bottlenecks",
-    "description": "Maps TUI code by likelihood of causing terminal lag—from core render/event loops to features and utilities.",
-    "palette": "bright-ordinal",
-    "prompt": "Classify each file by how directly it impacts terminal responsiveness and frame rate. Files in core event loops, render pipes, and animation frames are \"Likely\"; feature plugins and dialogs are \"Possible\"; utilities and config are \"Adjacent\".",
-    "facets": [
-      {
-        "id": "likely",
-        "label": "Likely",
-        "description": "Core rendering loops, animation frames, event handling, and plugin runtime that directly drive screen updates and input processing.",
-        "color": "#4E5BA6"
-      },
-      {
-        "id": "possible",
-        "label": "Possible",
-        "description": "Feature-specific plugins, contexts, and UI dialogs that update frequently or have complex state.",
-        "color": "#3AAFA9"
-      },
-      {
-        "id": "adjacent",
-        "label": "Adjacent",
-        "description": "Configuration, utility helpers, and less-frequently-rendered components.",
-        "color": "#59A14F"
-      }
-    ],
-    "scope": "project",
-    "directories": [
-      "packages/opencode/src/cli/cmd/tui"
-    ]
-  },
   "top-bar-rendering-a9d443de": {
     "id": "top-bar-rendering-a9d443de",
     "name": "Top Bar Rendering",
@@ -234,5 +203,33 @@
     "directories": [
       "packages/opencode/src/cli/cmd/tui"
     ]
+  },
+  "terminal-bottlenecks-f4f273b4": {
+    "id": "terminal-bottlenecks-f4f273b4",
+    "name": "Terminal Bottlenecks",
+    "description": "Identifies likely locations of critical performance bottlenecks—database operations, external I/O, and data processing.",
+    "palette": "bright",
+    "prompt": "Classify each file by the type of terminal bottleneck it's most likely to contain. Categorize as Database & Persistence if it handles SQL queries, ORM operations, schema definitions, or migrations. Categorize as External I/O if it makes HTTP requests, calls LLM providers, or integrates with external services. Categorize as Data Processing if it performs serialization, parsing, searching, fuzzy matching, or algorithmic data transformations. A file may touch multiple areas; choose the bottleneck that would be most critical if that file became slow.",
+    "facets": [
+      {
+        "id": "database-persistence",
+        "label": "Database & Persistence",
+        "description": "SQL queries, ORM operations, schema definitions, migrations, and direct database access. Files dealing with data persistence and query execution.",
+        "color": "#4E79A7"
+      },
+      {
+        "id": "external-i-o",
+        "label": "External I/O",
+        "description": "API requests, HTTP calls, LLM provider integrations, and external service communications. Files that make blocking network or third-party calls.",
+        "color": "#F28E2B"
+      },
+      {
+        "id": "data-processing",
+        "label": "Data Processing",
+        "description": "Serialization, parsing (JSON, imports, Git data), searching, fuzzy matching, and compute-heavy transformations. Files with algorithmic work on data.",
+        "color": "#59A14F"
+      }
+    ],
+    "scope": "project"
   }
 }

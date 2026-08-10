@@ -60,4 +60,17 @@ export const TuiEvent = {
       path: Schema.String.annotate({ description: "Repo-relative path of the file to reveal" }),
     },
   }),
+  // The directory counterpart of FileOpen: "show this directory in the host editor's file
+  // tree". Published when the user clicks a directory block in the Aperture top bar. Since
+  // the bar stopped drawing files (PLAN O1), this is the link between the aggregated view
+  // in the terminal and the files themselves in the editor — the extension runs
+  // revealInExplorer, which expands the parent chain and scrolls the folder into view.
+  DirectoryReveal: EventV2.define({
+    type: "tui.directory.reveal",
+    schema: {
+      path: Schema.String.annotate({
+        description: "Repo-relative path of the directory to reveal; empty string = the workspace root",
+      }),
+    },
+  }),
 }

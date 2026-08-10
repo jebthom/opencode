@@ -90,6 +90,16 @@ export const tuiHandlers = HttpApiBuilder.group(InstanceHttpApi, "tui", (handler
       return true
     })
 
+    // Publishing from inside the request means EventV2Bridge stamps the event's `location`
+    // from the ambient instance, which is what lets it past the /event SSE filter to the
+    // extension. (A publish from a forked fiber would have to pass the location itself.)
+    const revealDirectory = Effect.fn("TuiHttpApi.revealDirectory")(function* (ctx: {
+      payload: typeof TuiEvent.DirectoryReveal.data.Type
+    }) {
+      yield* events.publish(TuiEvent.DirectoryReveal, ctx.payload)
+      return true
+    })
+
     const publish = Effect.fn("TuiHttpApi.publish")(function* (ctx: { payload: typeof TuiPublishPayload.Type }) {
       if (ctx.payload.type === TuiEvent.PromptAppend.type)
         yield* events.publish(TuiEvent.PromptAppend, ctx.payload.properties)
@@ -131,6 +141,7 @@ export const tuiHandlers = HttpApiBuilder.group(InstanceHttpApi, "tui", (handler
       .handle("executeCommand", executeCommand)
       .handle("showToast", showToast)
       .handle("openFile", openFile)
+      .handle("revealDirectory", revealDirectory)
       .handle("publish", publish)
       .handle("selectSession", selectSession)
       .handle("controlNext", controlNext)

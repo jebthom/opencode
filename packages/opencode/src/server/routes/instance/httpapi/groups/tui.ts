@@ -44,6 +44,7 @@ export const TuiPaths = {
   executeCommand: `${root}/execute-command`,
   showToast: `${root}/show-toast`,
   openFile: `${root}/open-file`,
+  revealDirectory: `${root}/reveal-directory`,
   publish: `${root}/publish`,
   selectSession: `${root}/select-session`,
   controlNext: `${root}/control/next`,
@@ -158,6 +159,17 @@ export const TuiApi = HttpApi.make("tui")
             identifier: "tui.openFile",
             summary: "Reveal file in host editor",
             description: "Publish an intent for the host editor to open/reveal a file.",
+          }),
+        ),
+        HttpApiEndpoint.post("revealDirectory", TuiPaths.revealDirectory, {
+          query: WorkspaceRoutingQuery,
+          payload: TuiEvent.DirectoryReveal.data,
+          success: described(Schema.Boolean, "Directory reveal intent published successfully"),
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "tui.revealDirectory",
+            summary: "Reveal directory in host editor",
+            description: "Publish an intent for the host editor to reveal a directory in its file tree.",
           }),
         ),
         HttpApiEndpoint.post("publish", TuiPaths.publish, {

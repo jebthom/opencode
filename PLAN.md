@@ -56,10 +56,11 @@ Four tracks. **O** (Overview Lens) is refinement of shipped surfaces. **S**
 is self-contained repair work, parked until the design tracks are through.
 
 ```
-O3 (always-extent) ──┬──► O1 (top bar simplify)
-                     ├──► O2 (VSCode file-browser pips)
-                     └──► S1 …
+O3 ✅ (always-extent) ┬──► O1 ✅ (top bar simplify)
+                      ├──► O2 ✅ (VSCode file-browser pips)
+                      └──► S1 …
 O4 (legend filter) ──────────────────────────────► shared with S4
+                     └──► also drives O2's `focus` (Explorer pips)
 
 S1 (line-tag store) ──► S2 (agent tool) ──► S3 (line painting) ──► S5 (open-all)
 
@@ -140,49 +141,217 @@ repo is measured and recorded — `opencode debug aperture-cost` breaks painter
 spend down by lens / trigger / coarse-vs-fine blocks; **the measurement run at
 each dial setting is still outstanding.**
 
-### O1 — Simplify the top bar: drop files, keep aggregation
+### O1 — Simplify the top bar: drop files, keep aggregation ✅
 
 Remove the file-level tier from the top bar and focus it on the
 **waffle/treemap directory** representation — the aggregation participants
 actually valued. File-level viewing moves into VSCode (O2 + existing gutter).
+**Implemented.**
 
-This is a real reduction in `feature-plugins/system/aperture.tsx`: the column
-layout's per-file tiles, and the interactions that only made sense on them, come
-out. Kept: directory composition blocks, breadcrumb navigation, the legend.
+**Resolved — the *child list* goes, and files return as a packed grid.** The
+reduction went further than "drop the file tiles": the per-directory child list
+came out entirely, so the bar is one row of directory blocks plus a grid of the
+scope's own files. Multi-level visibility is lost except through aggregation,
+which is the trade that buys the simplicity and the height. `aperture.tsx` went
+from ~1750 to ~1200 lines.
 
-**Open — the dimensions are for experiment, not decision-by-fiat.** What
-replaces the file tier: more directory depth? A larger waffle with finer
-granularity? Facet-major rather than directory-major layout? Build the reduction
-first so there's something to iterate on, then trial variants.
+- **Deleted:** `ChildDirTile`, the child-list scroll window (`childOffset` /
+  `COLUMN_CHILD_WINDOW` / the `↑ +N` markers), and the whole drill cluster —
+  `drilledFile`, `toggleDrill`, `extentsForId`, `fileExtentColors`,
+  `bandForFile`, `fileBg`/`fileFg`. The TUI no longer sends `drill=`, so it no
+  longer schedules a drill-in paint; the extension already drills every
+  visible/open editor, so nothing is lost. (`FileTile`/`NameRow` were deleted and
+  then reinstated in simpler form for the grid — see below.)
 
-**Coupled requirement:** better linking into VSCode for file viewing. The `⌖`
-go-to-path prompt and `tui.file.open` event exist; clicking a directory block
-should be able to reveal it in the editor, and the editor should be the place
-files are read.
+- **Server: `composition` widened from per-directory to per-node.** A file tile's
+  band needs the file's own facet mix, which nothing shipped: `computeComposition`
+  filtered to `kind === "directory"`. It now also emits an entry per in-window
+  *file* node — a subtree of one — from the **same `attributeFileBytes` call** the
+  directory bands are built from, so a file's tile, its slice of its parent's
+  treemap and its Explorer pip are three renderings of one attribution. Bounded by
+  the window (tens of nodes), not the repo, which is why this is affordable inline
+  where `/aperture/facets` needs a bulk endpoint to say the same thing repo-wide.
+  Composition is derived at the read boundary, not cached in the structure, so
+  **no `PAYLOAD_VERSION` bump**. Covered by four new cases in
+  `test/aperture/facet-map.test.ts`, including that file entries survive a window
+  with no directories — the leaf case they exist for, and the one an early
+  `if (dirs.length === 0) return {}` would have silently eaten.
+- **Also deleted: the `grid` layout.** It was reachable only via
+  `OPENCODE_APERTURE_LAYOUT=grid` and doubled the surface of every edit. With it
+  went the boundary-tile strip, the `OVERFLOW` expander and the `expanded` state
+  — so the parked "Edges follow-ups" item shrinks: `edges`/`boundaries` now feed
+  only the hover adjacency tint, a candidate for a later trim.
+- **Files come back as a packed grid, not an aggregate.** The first cut collapsed
+  a scope's own files into one synthetic composition block. That was wrong twice
+  over: it averaged away per-file granularity, and it left *no* surface anywhere
+  showing a file's minority facets — the VSCode Explorer pip is structurally
+  dominant-only (a `FileDecoration` carries one colour), so a facet could appear
+  in the aggregate and be invisible in both the tile and the editor.
 
-### O2 — Paint the VSCode file browser
+  Instead the scope's files are drawn as **one-line tiles in a packed grid**:
+  filename in dark text over a band of that file's *own facet mix*, sorted
+  alphabetically and filled column-major, `FILE_GRID_ROWS` (= 3) tall so the grid
+  is exactly as tall as a directory block. This is the finest-grained facet
+  reading in the product — finer than the directory treemap, which averages the
+  file into its parent, and finer than the Explorer pip. It also restores
+  **click-to-open** (`tui.file.open`), which the aggregate had lost.
+
+  The old file tier's problem was never the tiles; it was laying them in a single
+  row to preserve payload ordering, which wasted most of the strip's height.
+  Grouping the files is what buys the wrapping — once they aren't interleaved
+  with directories, payload order means nothing and alphabetical is what makes a
+  name findable.
+
+  Measured on `packages/opencode/src/aperture` (0 child directories, 16 files):
+  **9 of 16 are multi-facet**, and `painter.ts` carries four — `external-i-o`
+  34%, `data-processing` 22%, `database-persistence` 5%, unrelated 39%. Its
+  Explorer pip shows only the last of those.
+
+  A flat directory of 200 files scrolls a long way, and that is left uncapped on
+  purpose: grouping the files at the end preserves directory navigation whatever
+  the count, alphabetical order makes a specific name findable, and colour makes
+  visual search work — which is more than the Explorer offers for the same
+  directory. Hiding files behind a "+N more" would give all three up.
+
+- **Block size now follows painted area, and only painted area.** Width used to be
+  scaled *separately* from cell count, with a "fewer than `COLUMN_FEW_THRESHOLD`
+  items ⇒ draw every block at max width" rule on top. Between them a small
+  directory got a big empty box — most visibly at `packages/opencode/test/cli`,
+  where all seven children rendered full-size regardless of their real sizes.
+
+  Now one number, `blockCells`, decides everything: cells come from
+  `sqrt(subtree / biggest-sibling)` on an absolute `BLOCK_CELL_CAP` budget
+  (floored at the band count so every present facet keeps a cell), and the width
+  is `ceil(cells / COLUMN_ROWS)` — which is exactly what `buildGrid` draws. A box
+  can no longer be wider than its contents. `COLUMN_COLS_MIN` 3 → 2 and
+  `SCROLL_GAP` 2 → 0, so blocks pack at the same density as the file tiles; block
+  labels are trimmed one column short so neighbouring names can't collide.
+
+  | scope | strip width before → after |
+  | --- | --- |
+  | `packages/opencode/test/cli` | 112 → 60 cols |
+  | `packages/opencode/src` | 396 → 248 cols |
+  | repo root | 76 → 50 cols |
+- **Height: `TOP_BAR_HEIGHT` 20 → 14**, now derived (`4 + (1 + 2 + COLUMN_ROWS) +
+  1`) rather than a magic number. `routes/session/index.tsx`'s short-terminal gate
+  moved 20 → 16 with it — on a 20-row terminal the old bar was 100% of the screen.
+
+**Coupled requirement — done, in the directory idiom.** New `tui.directory.reveal`
+event (`cli/cmd/tui/event.ts` → `groups/tui.ts` → `handlers/tui.ts` → SSE →
+extension) carrying a repo-relative path, `""` = workspace root. Published from an
+HTTP handler, so `EventV2Bridge` stamps `location` automatically and it clears the
+`/event` SSE filter.
+
+**Opening a directory means revealing a child of it, not the directory.** This is
+the one genuinely non-obvious part of O1 and it cost two wrong attempts, so the
+mechanism is worth recording. `revealInExplorer` takes any in-workspace URI with
+**no file/folder discrimination** (verified in VSCode's current `fileCommands.ts`;
+the old folder regression microsoft/vscode#160504 is closed) — but it leaves the
+target folder **collapsed**, so clicking `src/` rooted the TUI inside src while the
+Explorer still showed it shut.
+
+The reason is in `ExplorerView.selectResource`, which walks *down* from the root:
+
+```ts
+while (item && item.resource.toString() !== resource.toString()) {
+  await this.tree.expand(item)
+```
+
+It expands each ancestor and stops the moment it reaches the target, so the target
+itself is never expanded. Revealing something *inside* `src` makes `src` an
+ancestor, and the same loop opens it. So `revealDirectory` reveals
+`firstVisibleChild(dir)` and then re-reveals `dir` to put the highlight back where
+the TUI is rooted (revealing a folder never collapses it, so the sequence is
+idempotent).
+
+*Rejected:* `list.expand`, which looks like the obvious fix. It acts on the list
+service's last-focused list, and on an already-open folder it walks focus onto the
+first child rather than doing nothing — and in practice it did not expand at all.
+There is no API to query expansion state (microsoft/vscode#327242).
+
+*Caveat:* `firstVisibleChild` honours `files.exclude` (literal `**/`-prefixed names
+only) but not `explorer.excludeGitIgnore`. Picking a hidden entry makes the reveal
+a no-op, degrading to the old collapsed behaviour rather than misbehaving.
+
+*Deliberate choices:* only **directory blocks** reveal — breadcrumbs, ⌂ and ◀
+re-root the TUI without disturbing the editor, so backtracking doesn't yank the
+Explorer around. The loose-files block reveals the current scope and does *not*
+navigate (there is nothing to navigate into), which is what keeps the editor link
+alive at leaves. `revealInExplorer` also **focuses** the Explorer, moving the
+cursor out of the terminal; that is accepted rather than worked around, since
+clicking a directory is a request to go look at it.
+
+*Study-log note:* `tile.drill` / `tile.undrill` are gone and `drill` no longer
+rides every interaction; `dir.reveal` is new. Interaction data changes shape here.
+
+**Kept for S5:** `tui.file.open` and the extension's `revealFile` — the TUI is no
+longer its publisher, but S5 is specified to consume it extended with a line.
+
+**Still open (now with something to iterate on):** taller `COLUMN_ROWS`,
+facet-major layout, more directory depth.
+
+### O2 — Paint the VSCode file browser ✅
 
 Add a pip/glyph in the VSCode Explorer showing each file's facet, so visual
 search works in the file tree — this is what the top bar's file tier was
-partly doing, relocated to where files belong.
+partly doing, relocated to where files belong. **Implemented.**
 
-**Mechanism:** `vscode.FileDecorationProvider` in `sdks/aperture-vscode`. It
-gives a badge (1–2 chars) plus a colour per URI, which is exactly the pip shape.
-Colour must come from a `ThemeColor`, so extend the existing
-`THEME_ROLE_COLORS` approach — arbitrary hex is not available here, which
-constrains how many facets are distinguishable. Don't wait on Track C for this;
-proceed with the theme-role mapping, and note the constraint so C1 accounts for
-the Explorer pips (a second, differently-limited palette) when it lands.
+**Mechanism:** `vscode.FileDecorationProvider` in `sdks/aperture-vscode`, which
+gives one `ThemeColor` and a ≤2-char badge *rendered in that same colour* per
+URI. That budget — one colour, one glyph — is the whole design constraint: a
+multi-colour pip row is not available in the API.
 
-**Server work:** today the extension fetches per-file
-(`GET /aperture?drill=…&scope=…`). A tree decoration needs **bulk** file→facet
-for a whole directory, ideally the whole repo. Add a compact endpoint returning
-`{path: facet}` plus the legend, cached and invalidated off
-`aperture.invalidated`. Note the sprint-1 lesson: `aperture.invalidated` must
-carry a location or the extension misses repaints.
+**Resolved — the ThemeColor constraint does NOT limit facet distinguishability.**
+The original worry (arbitrary hex unavailable ⇒ few distinguishable facets) turned
+out to be false, because Aperture's colour universe is *closed*: `assignColors`
+(`lenses.ts`) is the only path that ever colours a facet and always takes
+`PALETTES[palette].colors[i]`. That is 38 distinct hexes across all 7 palettes plus
+the built-ins' hardcoded ramps, so we contribute **one colour id per exact hex**
+(`#4E79A7` → `aperture.c4E79A7`), generated from `lenses.ts` by
+`sdks/aperture-vscode/script/gen-colors.ts`. The pip is therefore the Lens's
+*actual* legend hue for every Lens and every palette, not an approximation.
+Theme-role tokens (the architecture Lens, `NONE_HUE`/`UNTAGGED_HUE`) still fall
+through `THEME_ROLE_COLORS`. **C1 accordingly inherits the TUI's palettes verbatim
+— there is no second, differently-limited Explorer palette to account for.** The
+one cost: a contributed colour is a fixed hex, not theme-adaptive, so a `dark`
+Lens reads low-contrast on a light editor theme (the tradeoff the TUI already has).
+
+**Multi-facet encoding — colour says *which*, glyph says *how much*.** Since O3
+every file is extent-painted, so files routinely span several facets. Colour = the
+focused facet; badge = a shade glyph for its byte share (`█` ≥85% · `▓` 60–85% ·
+`▒` 35–60% · `░` <35%); tooltip = the full breakdown. A pure file reads as a solid
+pip, a grab-bag file as a faint one, at identical width.
+
+**The `focus` parameter is the seam O4/S4 plug into.** The server ships each file's
+*whole* mix, never a pre-reduced dominant, and the client-side reduction is a pure
+function of (mix, focus facet). No focus ⇒ the plurality facet, which equals
+`attributeFileBytes(...).dominant` so the pip and the TUI tile cannot disagree. A
+focus set ⇒ that facet's share, and files without it lose their decoration
+entirely. So legend filtering only ever changes what `focus` is — it never touches
+this encoding. Set today by an `aperture.focusFacet` QuickPick; O4/S4 should drive
+it from the TUI's legend filter over SSE instead.
+
+**Server work:** `Aperture.facetMap` + `GET /aperture/facets` — whole-repo
+`{path: [{f, p}]}` (facet index, percent) plus the legend. ~150KB for 2265 files.
+Attribution runs through the same `attributeFileBytes` the directory treemap uses.
+Extracted `facetStoreFor` for the lens→store branch (including bus-factor's
+read-don't-compute trap) now shared by `finalize` / `facetFiles` / `facetMap`, and
+`computeFacetMapFiles` as a pure exported function so the reduction is tested
+against `computeComposition` in `test/aperture/facet-map.test.ts`.
+
+**Flicker trap, found only by running it.** Firing `onDidChangeFileDecorations`
+with `undefined` means "every decoration changed" — VSCode drops its whole cache
+and re-queries every visible row, which paints the tree bare for the round trip.
+Combined with an unconditional poll that was a full-tree flicker on a timer. Fixes:
+compare the raw response body and bail before firing (the server's output is
+byte-stable for an unchanged repo, verified), fire a **URI list** for partial
+changes and reserve `undefined` for a genuine re-colouring, and give the map its
+own slower poll (20s) since repaints arrive pushed over SSE.
 
 **Done when:** opening a repo with an active Lens shows facet pips throughout
-the Explorer, updating within a couple of seconds of a repaint.
+the Explorer, updating within a couple of seconds of a repaint. ✅ — verified live
+against this repo (2265 painted files, 149 multi-facet), and the pips coexist with
+git's own `M`/`U` badges rather than being suppressed by them.
 
 ### O4 — Filter facets by clicking the legend
 
@@ -197,6 +366,12 @@ server, no repaint. Multi-select, with a clear "reset" affordance.
 
 Shared with Search Lenses (**S4** is the same code path, less useful there) —
 build once, in `aperture.tsx`.
+
+**Also feeds the Explorer.** O2's pips already take a `focus` facet and already
+render "not this facet" as no decoration; the suppressed-facet set built here
+should be pushed to the extension (over SSE, alongside `aperture.invalidated`)
+rather than left to O2's stopgap QuickPick, so filtering the top bar filters the
+file tree in the same gesture.
 
 **Open:** whether off-facets keep their area in the treemap (preserves layout
 stability, which is a core Aperture value) or collapse (maximises contrast for
@@ -434,14 +609,17 @@ least one real Mac and one real Linux machine.
 
 ## Suggested ordering
 
-**Immediately, in parallel:**
-- **O3** — unblocks the rest of Track O and informs S1.
+**Done:** O3, then O2, then O1. O2 was taken before O1 deliberately — O1's premise
+is that file-level viewing *moves into VSCode*, so stripping the top bar's file tier
+before the Explorer could show facets would have left no file-level facet view
+anywhere. O2 also produced the bulk endpoint S5 is specified to consume.
+
+**Immediately:**
 - **S1** — the anchoring design is the long pole of the sprint; start the design
   early even if implementation waits.
 
-**Then:** O1 and O2 (both read O3's unified data; independent of each other, one
-is TUI and one is extension, so they split cleanly across people). O4 whenever
-convenient — it's small, self-contained, and immediately useful.
+O4 whenever convenient — it's small, self-contained, immediately useful, and now
+has a second consumer: it should drive O2's Explorer `focus` as well as the TUI.
 
 **Then:** S2 → S3 → S5 in sequence, all gated on S1.
 
@@ -465,7 +643,8 @@ shouldn't slide past the point where there's no slack left.
 | # | Decision | Track |
 | --- | --- | --- |
 | 1 | ~~Extent painting always-on vs. widened heuristic, given ~5.8× cost~~ — **decided:** always-on, with granularity (not coverage) as the cost dial; one painter, one classification per file, semantic store demoted to a derived projection | O3 ✅ |
-| 2 | What dimension replaces the file tier in the top bar | O1 |
+| 1b | ~~How the Explorer pip carries colour + a multi-facet mix under VSCode's one-colour/one-glyph budget~~ — **decided:** one contributed colour id per exact palette hex (exact legend hue, no facet-count limit); colour = focused facet, shade glyph = its byte share; `focus` a parameter, defaulting to dominant | O2 ✅ |
+| 2 | ~~What dimension replaces the file tier in the top bar~~ — **decided:** the child list goes, leaving one row of directory blocks; the scope's own files return as a packed alphabetical grid of one-line tiles, each banded by its *own* facet mix (the only surface that shows a file's minority facets — the Explorer pip is dominant-only) | O1 ✅ |
 | 3 | Whether filtered-off facets keep their treemap area | O4 |
 | 4 | Line-tag anchoring mechanism (composite recommended) | S1 |
 | 5 | Search Lens as a distinct type on the model vs. a flag | S1 |
@@ -536,13 +715,15 @@ Aperture files:
 - Tools: `tool/lens-{create,list,select,edit,merge-facets,facet-files}.ts`,
   registered in `tool/registry.ts`.
 - HTTP: `server/routes/instance/httpapi/groups/aperture.ts` (+ `handlers/`),
-  registered in `server.ts` and `api.ts`. Routes: `get`, `lens/cycle`,
-  `lens/delete`, `lens/list`, `lens/select`, `interaction`.
+  registered in `server.ts` and `api.ts`. Routes: `get`, `facets` (O2's bulk
+  whole-repo file→facet-mix map), `lens/cycle`, `lens/delete`, `lens/list`,
+  `lens/select`, `interaction`.
 - TUI: `feature-plugins/system/aperture.tsx` (+ `aperture-activity.ts`,
   `aperture-lens-picker.tsx`); registered in `cli/cmd/tui/plugin/internal.ts`;
   slot placed in `routes/session/index.tsx`.
 - VSCode: `sdks/aperture-vscode/src/extension.ts` (gutter strips via
-  `createTextEditorDecorationType`, SSE on `/event`, `tui.file.open` reveal).
+  `createTextEditorDecorationType`, SSE on `/event`, `tui.file.open` reveal,
+  `tui.directory.reveal` → `revealInExplorer`).
 - Tests: `packages/opencode/test/aperture/`.
 
 Slots: host slot map at `packages/plugin/src/tui.ts` (`TuiHostSlotMap` —
@@ -557,6 +738,15 @@ snapshots the EventV2 registry into the SDK union). **It must carry a location**
 repaints otherwise. Feeding it: `file.edited` (`packages/core/src/filesystem.ts`),
 `file.watcher.updated` (`filesystem/watcher.ts`),
 `session.next.shell.ended` (experimental shell-mutation refetch).
+
+Events (TUI → host editor): `tui.file.open` and `tui.directory.reveal`, both
+defined in `cli/cmd/tui/event.ts`, routed `groups/tui.ts` → `handlers/tui.ts`.
+Published from inside an HTTP handler, so `EventV2Bridge` stamps `location`
+automatically — only forked-fiber publishes (the painter) must pass it. A TUI
+plugin has no emit API: `TuiEventBus` is subscribe-only, so publishing means
+calling `props.api.client.tui.*`. Adding an event needs
+`bun run --cwd packages/sdk/js build` to regenerate the client method and the
+`Event` union; the VSCode extension parses raw SSE JSON and needs no SDK change.
 
 Persistence:
 - Project directory (`.opencode/aperture/`): Lens defs (`lenses.json`) + active

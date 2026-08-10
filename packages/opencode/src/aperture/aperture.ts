@@ -197,6 +197,23 @@ export type FacetFilesOutcome =
     }
   | { readonly status: "not-found" }
 
+// Whole-repo file → facet mix under the active Lens (O2), the bulk counterpart to the
+// per-file `drill` the editor gutter uses. Feeds the VSCode Explorer's facet pips, where
+// one fetch has to answer for every row in the file tree.
+//
+// It ships each file's *whole* mix rather than a pre-reduced dominant facet: a client
+// filtering to one facet needs that facet's share, not the file's plurality winner, and
+// baking the reduction in here would make legend filtering (O4/S4) a server round-trip.
+// Weights are `{f, p}` — an index into `facets`, and an integer percent of the file's
+// attributed bytes — which keeps a ~2300-file repo's payload small enough to refetch on
+// every invalidation. Files with nothing painted are omitted entirely.
+export interface FacetMap {
+  readonly lens: AperturePayload.LensInfo
+  // Facet ids in legend order, with NONE_FACET appended, so `f` indexes into this.
+  readonly facets: ReadonlyArray<string>
+  readonly files: Record<string, ReadonlyArray<{ readonly f: number; readonly p: number }>>
+}
+
 export interface Interface {
   // Cached payload for `scope` (default repo root); computes + persists on a miss
   // or when the scope has been marked dirty by a file change in its window.
@@ -232,6 +249,9 @@ export interface Interface {
   // labels (empty = every Facet in the Lens). Returns not-found when the Lens is
   // unknown. Used by the `lens_facet_files` tool for sensemaking.
   readonly facetFiles: (lens: string | undefined, facets: ReadonlyArray<string>) => Effect.Effect<FacetFilesOutcome>
+  // Every painted file in the repo with its facet mix, under the active Lens (O2).
+  // Bulk source for the VSCode Explorer's file decorations — see FacetMap.
+  readonly facetMap: () => Effect.Effect<FacetMap>
   // Drill into a file (A5): like `get`, but the payload also carries `extents` —
   // the file's function-level tiles, coloured from the per-function store — and a
   // drill-in paint pass is scheduled at top priority to fill any not-yet-painted
@@ -930,6 +950,25 @@ export const layer = Layer.effect(
         }).pipe(Effect.ensuring(Effect.sync(() => busFactorInFlight.delete(directory))))
       })
 
+    // A Lens's file-level facet store as a *reader* sees it — the three-way branch shared
+    // by finalize, facetFiles and facetMap. The cheap deterministic built-ins (git-changed /
+    // mtime) are computed inline from the repo: no painter, no tokens, always fresh.
+    // Everything else reads the persisted store.
+    //
+    // Bus-factor is the trap it exists to contain: it is deterministic but its store is
+    // *persisted* precisely because computing it means a whole-history `git log` (~10s), so
+    // it must be read, not computed, and its background HEAD-keyed refresh kicked so a
+    // stale/empty store self-heals without blocking the read.
+    const facetStoreFor = (lens: Lens, directory: string, projectID: string) =>
+      Effect.gen(function* () {
+        if (lens.deterministic === "bus-factor") {
+          yield* forkProactivePaint("bus-factor refresh failed", projectID, refreshBusFactor(directory, projectID))
+          return yield* ApertureSemanticStore.read(storage, projectID, lens.id)
+        }
+        if (isDeterministic(lens)) return yield* deterministicStoreFor(lens, directory, yield* subtreeFor(directory))
+        return yield* ApertureSemanticStore.read(storage, projectID, lens.id)
+      })
+
     // --- function-mix backfill (background, once per Lens) -------------------
     // A file's mix is measured by the drill-in painter, so a file function-painted before
     // mixes existed — or in a previous process, since the painter only revisits files the
@@ -993,22 +1032,10 @@ export const layer = Layer.effect(
         // Deterministic built-ins (git-changed / mtime-buckets) compute their facets from the
         // repo instead of reading the persisted store: no painter, no tokens, always fresh.
         const det = isDeterministic(lens)
-        // Bus-factor is deterministic but *expensive* (a whole-history git log), so unlike the
-        // cheap git-changed/mtime built-ins it isn't computed inline here — its facets are
-        // persisted in the semantic store (like a painted Lens) and refreshed in the background
-        // keyed by HEAD (refreshBusFactor). Reading it is a cheap store read; the fork below
-        // fills it on first ever view and self-heals a stale store, non-blocking.
-        const busFactor = lens.deterministic === "bus-factor"
-        const store =
-          det && !busFactor
-            ? yield* deterministicStoreFor(lens, ctx.directory, subtree)
-            : yield* ApertureSemanticStore.read(storage, ctx.project.id, lens.id)
-        if (busFactor)
-          yield* forkProactivePaint(
-            "bus-factor refresh failed",
-            ctx.project.id,
-            refreshBusFactor(ctx.directory, ctx.project.id),
-          )
+        // Bus-factor is deterministic but *expensive*, so it reads its persisted store and
+        // self-heals in the background rather than computing inline — facetStoreFor owns that
+        // distinction for every reader.
+        const store = yield* facetStoreFor(lens, ctx.directory, ctx.project.id)
         const colorByFacet = new Map(lens.facets.map((t) => [t.id, t.color]))
         const semantics: Record<string, AperturePayload.Semantic> = {}
         // The store holds only the semantic (facet); hue/facets are derived here, so
@@ -1722,21 +1749,10 @@ export const layer = Layer.effect(
       const resolved = lens ? resolveLens(all, lens) : yield* ApertureLensStore.getActive(ctx.directory)
       if (!resolved) return { status: "not-found" } as const
 
-      // Same store source as finalize: cheap deterministic built-ins compute their facets
-      // from the repo inline; bus-factor and semantic Lenses read the persisted store (the
-      // former filled in the background — kick a refresh so a stale/empty one self-heals).
+      // Same store source as finalize (facetStoreFor), for the Lens named here rather than
+      // the active one.
       const subtree = yield* subtreeFor(ctx.directory)
-      const busFactor = resolved.deterministic === "bus-factor"
-      const store =
-        isDeterministic(resolved) && !busFactor
-          ? yield* deterministicStoreFor(resolved, ctx.directory, subtree)
-          : yield* ApertureSemanticStore.read(storage, ctx.project.id, resolved.id)
-      if (busFactor)
-        yield* forkProactivePaint(
-          "bus-factor refresh failed",
-          ctx.project.id,
-          refreshBusFactor(ctx.directory, ctx.project.id),
-        )
+      const store = yield* facetStoreFor(resolved, ctx.directory, ctx.project.id)
 
       // The store is keyed by stable node id (an un-invertible path hash), so recover
       // paths by joining against the repo file listing.
@@ -1775,6 +1791,40 @@ export const layer = Layer.effect(
       return { status: "ok", lens: { id: resolved.id, name: resolved.name }, groups, unknownFacets } as const
     })
 
+    // Whole-repo file → facet mix under the active Lens (O2). The bulk counterpart to
+    // `drill`: the VSCode Explorer has to decorate every row of the file tree, which one
+    // fetch per file can't serve.
+    //
+    // Attribution goes through the SAME `attributeFileBytes` the directory treemap uses, so
+    // an Explorer pip and the tile above it can never disagree — the class of bug O3 existed
+    // to kill. See the FacetMap type for why the whole mix ships instead of a dominant.
+    const facetMap = Effect.fn("Aperture.facetMap")(function* () {
+      const ctx = yield* InstanceState.context
+      const lens = yield* activeUsable(ctx.directory, ctx.project.id)
+      const subtree = yield* subtreeFor(ctx.directory)
+      const store = yield* facetStoreFor(lens, ctx.directory, ctx.project.id)
+      // Deterministic Lenses carry no function-level mix (see finalize), so every file
+      // attributes whole to its file-level facet.
+      const mixes = isDeterministic(lens)
+        ? {}
+        : yield* ApertureSubfacetStore.readMixes(storage, ctx.project.id, lens.id)
+
+      // NONE_FACET is appended rather than being part of the legend: it is a real stored
+      // value ("Other — not this Lens") but never a Lens facet, so it needs an index the
+      // client can resolve without it polluting the legend the swatch row draws.
+      const facets = [...lens.facets.map((t) => t.id), NONE_FACET]
+      return {
+        facets,
+        files: computeFacetMapFiles(subtree, store, mixes, facets),
+        lens: {
+          id: lens.id,
+          name: lens.name,
+          legend: lensLegend(lens),
+          ...(isDeterministic(lens) ? { deterministic: true } : {}),
+        },
+      }
+    })
+
     return Service.of({
       get: (scope) => load(scope),
       refresh: (scope) => refresh(scope),
@@ -1787,6 +1837,7 @@ export const layer = Layer.effect(
       mergeFacets: (lens, from, into) => mergeFacets(lens, from, into),
       deleteLens: (idOrName) => deleteLens(idOrName),
       facetFiles: (lens, facets) => facetFiles(lens, facets),
+      facetMap: () => facetMap(),
       drill: (file, scope) => drill(file, scope),
     })
   }),
@@ -1822,8 +1873,9 @@ function orderByDirectories(
 
 // --- composition -----------------------------------------------------------
 
-// Per-directory subtree composition: for every directory node, tally its descendant
-// source files by painted facet into a count + byte sum. A file under nested
+// Per-node composition, keyed by node id. For every *directory* node, tally its descendant
+// source files by painted facet into a count + byte sum; for every in-window *file* node,
+// its own facet mix as a subtree of one (see the tail of the function). A file under nested
 // directories counts toward each of its in-window ancestors (each directory reflects
 // its own full subtree). Every descendant file also feeds the directory's `subtree*`
 // totals regardless of painting, so a directory with no painted files still reports its
@@ -1844,28 +1896,31 @@ export function computeComposition(
   lens: Lens,
 ): Record<string, AperturePayload.Composition> {
   const dirs = nodes.filter((n) => n.kind === "directory").map((d) => ({ id: d.id, prefix: d.path + "/" }))
-  if (dirs.length === 0) return {}
   const painted = new Map<string, Map<string, { count: number; bytes: number }>>()
   const subtree = new Map<string, { count: number; bytes: number }>()
-  for (const file of files) {
-    const attribution = ApertureExtents.attributeFileBytes(file.size, mixes[file.path], store[file.id]?.facet)
-    for (const dir of dirs) {
-      if (!file.path.startsWith(dir.prefix)) continue
-      const s = subtree.get(dir.id) ?? { count: 0, bytes: 0 }
-      s.count += 1
-      s.bytes += file.size
-      subtree.set(dir.id, s)
-      if (attribution.weights.length === 0) continue
-      let byFacet = painted.get(dir.id)
-      if (!byFacet) painted.set(dir.id, (byFacet = new Map()))
-      for (const weight of attribution.weights) {
-        const w = byFacet.get(weight.facet) ?? { count: 0, bytes: 0 }
-        if (weight.facet === attribution.dominant) w.count += 1
-        w.bytes += weight.bytes
-        byFacet.set(weight.facet, w)
+  // Skipped when the window holds no directories — a leaf scope, where only the per-file
+  // entries below have anything to say. (Not an early return: that used to drop the file
+  // entries too, which is exactly the case they exist for.)
+  if (dirs.length > 0)
+    for (const file of files) {
+      const attribution = ApertureExtents.attributeFileBytes(file.size, mixes[file.path], store[file.id]?.facet)
+      for (const dir of dirs) {
+        if (!file.path.startsWith(dir.prefix)) continue
+        const s = subtree.get(dir.id) ?? { count: 0, bytes: 0 }
+        s.count += 1
+        s.bytes += file.size
+        subtree.set(dir.id, s)
+        if (attribution.weights.length === 0) continue
+        let byFacet = painted.get(dir.id)
+        if (!byFacet) painted.set(dir.id, (byFacet = new Map()))
+        for (const weight of attribution.weights) {
+          const w = byFacet.get(weight.facet) ?? { count: 0, bytes: 0 }
+          if (weight.facet === attribution.dominant) w.count += 1
+          w.bytes += weight.bytes
+          byFacet.set(weight.facet, w)
+        }
       }
     }
-  }
   // Emit an entry for every directory that has any descendant file, even when none
   // are painted (empty `weights`) — that's the grey case the renderer sizes by subtree.
   const order = [...lens.facets.map((t) => t.id), NONE_FACET]
@@ -1880,6 +1935,77 @@ export function computeComposition(
     const totalCount = weights.reduce((sum, w) => sum + w.count, 0)
     const totalBytes = weights.reduce((sum, w) => sum + w.bytes, 0)
     result[id] = { weights, totalCount, totalBytes, subtreeCount: s.count, subtreeBytes: s.bytes }
+  }
+  // ...and one for every in-window *file* node, so the TUI can paint a file tile as its own
+  // facet band rather than a single dominant hue. Built from the same `attributeFileBytes`
+  // call the directory bands above are built from, so a file's tile, its slice of the
+  // parent's treemap and its Explorer pip are three renderings of one attribution — the
+  // agreement O3's single-classification model exists to guarantee.
+  //
+  // Bounded by the *window* (tens of nodes), not the repo: `nodes` is the 2-layer view,
+  // whereas `files` above is whole-subtree membership. This is what makes it affordable to
+  // ship a mix per file here when `/aperture/facets` needs a separate bulk endpoint to do
+  // the same thing repo-wide.
+  for (const node of nodes) {
+    if (node.kind !== "file") continue
+    const attribution = ApertureExtents.attributeFileBytes(node.size, mixes[node.path], store[node.id]?.facet)
+    const bytesByFacet = new Map(attribution.weights.map((w) => [w.facet, w.bytes] as const))
+    // Re-ordered from attributeFileBytes's facet-*id* order into the Lens's facet order, so
+    // a file's band and its parent directory's treemap lay their colours down in the same
+    // sequence and the legend reads left-to-right across both.
+    const weights = order
+      .filter((facet) => bytesByFacet.has(facet))
+      .map((facet) => ({
+        facet,
+        // `count` means "files" throughout a Composition, so the file counts once, toward
+        // the facet holding most of its bytes — the same convention as the directory loop.
+        count: facet === attribution.dominant ? 1 : 0,
+        bytes: bytesByFacet.get(facet)!,
+      }))
+    const totalBytes = weights.reduce((sum, w) => sum + w.bytes, 0)
+    result[node.id] = {
+      weights,
+      totalCount: attribution.dominant === undefined ? 0 : 1,
+      totalBytes,
+      // A file is its own subtree of one. The gap between totalBytes and size is the
+      // unpainted remainder the renderer greys, exactly as for a part-painted directory.
+      subtreeCount: 1,
+      subtreeBytes: node.size,
+    }
+  }
+  return result
+}
+
+// The per-file half of `facetMap` (O2): every painted file's facet mix, as percentages.
+// Split out from the service and exported so the reduction can be tested against
+// `computeComposition` — the two MUST agree, since they are the Explorer pip and the
+// directory treemap describing the same file.
+//
+// `facets` is the id → index vocabulary the emitted `f` refers to. Pure: a function of the
+// repo's file set, the file-level store and the function-level mixes.
+export function computeFacetMapFiles(
+  files: ReadonlyArray<{ id: string; path: string; size: number }>,
+  store: ApertureSemanticStore.Store,
+  mixes: ApertureSubfacetStore.Mixes,
+  facets: ReadonlyArray<string>,
+): Record<string, ReadonlyArray<{ f: number; p: number }>> {
+  const indexByFacet = new Map(facets.map((id, i) => [id, i]))
+  const result: Record<string, ReadonlyArray<{ f: number; p: number }>> = {}
+  for (const file of files) {
+    const attribution = ApertureExtents.attributeFileBytes(file.size, mixes[file.path], store[file.id]?.facet)
+    const total = attribution.weights.reduce((sum, w) => sum + w.bytes, 0)
+    if (total <= 0) continue
+    // Percent of the file's *attributed* bytes, descending so a client reading only the head
+    // gets the dominant facet. A share that rounds to 0 is dropped rather than shipped as
+    // noise — the dominant weight can never round to 0, so a file is never emptied by this.
+    const weights = attribution.weights
+      .flatMap((w) => {
+        const f = indexByFacet.get(w.facet)
+        const p = Math.round((w.bytes / total) * 100)
+        return f === undefined || p === 0 ? [] : [{ f, p }]
+      })
+      .sort((a, b) => b.p - a.p)
+    if (weights.length) result[file.path] = weights
   }
   return result
 }

@@ -161,9 +161,11 @@ export const Payload = Schema.Struct({
   // output byte-stable. The version bump already prevents serving older caches.
   boundaries: Schema.optional(Schema.Array(Boundary)),
   semantics: Schema.Record(Schema.String, Semantic),
-  // Per-directory subtree composition, keyed by directory node id. Optional and
-  // derived (merged in alongside `semantics` at the read boundary), so adding it is
-  // backward compatible with older structure caches — no PAYLOAD_VERSION bump.
+  // Composition keyed by node id: a directory's is its recursive subtree's facet mix; an
+  // in-window file's is its own mix as a subtree of one, so a file tile can be painted as a
+  // band of its facets rather than a single dominant hue. Optional and derived (merged in
+  // alongside `semantics` at the read boundary), so widening it from directories-only to
+  // per-node stayed backward compatible with older structure caches — no PAYLOAD_VERSION bump.
   composition: Schema.optional(Schema.Record(Schema.String, Composition)),
   // The active Lens + its legend, merged in at the read boundary. Optional
   // so older/empty payloads still decode; the renderer falls back to no legend.
