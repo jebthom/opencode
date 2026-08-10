@@ -1,0 +1,255 @@
+// The facet composition chip — the multi-colour bar that replaces the single-colour
+// FileDecoration pip in the Aperture tree view.
+//
+// A FileDecoration gives one ThemeColor and a <=2-char badge, so O2 had to spend its whole
+// budget saying *which* facet (colour) and *how much* (shade glyph). A TreeItem's iconPath
+// is a URI, so we can hand VSCode a generated SVG instead and show the mix itself.
+//
+// Nothing here imports `vscode`: this is the pure reduction from "a file's facet weights"
+// to "an SVG string", so it is unit-testable (test/chip.test.ts) and the layout can be
+// swapped without touching the tree.
+
+export type ChipLayout = "bar6" | "bar-proportional" | "mosaic6"
+export type Theme = "light" | "dark"
+
+export type FacetWeight = { f: number; p: number }
+export type LegendEntry = { facet: string; label: string; color: string }
+
+// One block of colour in the chip. `frac` is its share of the bar and the fracs sum to 1,
+// so a quantized layout and a proportional one are the same shape and render through the
+// same code — only how the fracs were derived differs.
+export type Segment = { color: string; frac: number }
+
+// Cells in the quantized layouts. Six because MAX_FACETS is six (lenses.ts), so a file
+// spanning every facet of its Lens still gets one cell each.
+export const CHIP_CELLS = 6
+
+// SVG geometry. VSCode renders a tree item's icon in a 16x16 CSS-pixel box, and a wider
+// viewBox is only scaled back down into it — so 16px is a hard ceiling on the chip's width,
+// and six cells can never be more than ~2.7px each. (It is vector, so on a HiDPI display
+// that is 32 device pixels and stays crisp; the limit is perceptual width, not resolution.)
+//
+// Given the width is fixed, the bar takes the whole box rather than sitting inset in it.
+// Height is the only dimension with any slack, and a bar that fills it reads as a block in
+// the 22px row instead of as a sliver.
+const BOX = 16
+const BAR_X = 0
+const BAR_W = 16
+const BAR_H = 14
+const BAR_Y = (BOX - BAR_H) / 2
+const BAR_R = 2
+// A proportional segment narrower than this is invisible; floor it and take the width back
+// from the rest, so a 3% facet still registers as "there is a third colour here". Exported
+// as a fraction of the bar so callers and tests read it off the geometry rather than
+// restating it — the two drifted apart the first time the bar was resized.
+const MIN_SEGMENT_PX = 1.5
+export const MIN_SEGMENT_FRAC = MIN_SEGMENT_PX / BAR_W
+// Cells overlap their neighbour by this much rather than abutting exactly. At 16px the
+// renderer lands cell edges on fractional device pixels, and a sub-pixel gap shows up as a
+// pale hairline between two colours.
+const SEAM = 0.35
+
+// A facet's hue is either a hex (`#RRGGBB`, user + deterministic palettes) or an opencode
+// theme-role token (the built-in Architecture Lens, and the two greys). extension.ts maps
+// tokens to VSCode ThemeColor *ids* for FileDecoration, which is the right answer there
+// because the editor resolves them against its own theme — but an SVG needs a literal
+// colour, and there is no API to read a resolved ThemeColor's value. So tokens get a
+// concrete hex per theme kind here.
+//
+// These track THEME_ROLE_COLORS in extension.ts: same tokens, same intent, one resolved to
+// a colour id and one to a value. Changing a token in either place means changing both.
+export const THEME_ROLE_HEX: Record<string, { light: string; dark: string }> = {
+  // The Architecture Lens's layer hues (semantics.ts LAYER_HUE), matched to VSCode's own
+  // charts.* defaults for the corresponding role so the chip and the gutter agree.
+  info: { light: "#1A85FF", dark: "#3794FF" },
+  success: { light: "#388A34", dark: "#89D185" },
+  warning: { light: "#BF8803", dark: "#CCA700" },
+  accent: { light: "#652D90", dark: "#B180D7" },
+  error: { light: "#A1260D", dark: "#F14C4C" },
+  primary: { light: "#0066B8", dark: "#3794FF" },
+  // NONE_HUE — "painted, but not into this Lens's vocabulary". Must read as a deliberate
+  // grey rather than as absence, so it sits mid-way between the two theme backgrounds.
+  textMuted: { light: "#8C8C8C", dark: "#7A7A7A" },
+  // UNTAGGED_HUE — "non-code". Dimmer than textMuted, closer to the background, because it
+  // is the one grey that genuinely means "nothing to see".
+  border: { light: "#C4C4C4", dark: "#4A4A4A" },
+}
+
+// The grey a suppressed facet (PLAN O4) and an off-legend facet both fall back to.
+const MUTED = "textMuted"
+
+export function hexFor(hue: string | undefined, theme: Theme): string {
+  if (hue?.startsWith("#")) return hue
+  const role = THEME_ROLE_HEX[hue ?? MUTED] ?? THEME_ROLE_HEX[MUTED]!
+  return role[theme]
+}
+
+export interface SegmentOptions {
+  readonly layout: ChipLayout
+  readonly theme: Theme
+  // Facets toggled off in the legend. A suppressed facet greys **in place** rather than
+  // being dropped: keeping its area is what lets two rows stay comparable, which is the
+  // whole reason to filter rather than to search (PLAN O4).
+  readonly suppressed?: ReadonlySet<string>
+  readonly cells?: number
+}
+
+// Reduce a file's (or a rolled-up directory's) facet weights to the chip's segments.
+//
+// `weights` arrive descending by share, `f` indexing into `facets`. Returns [] for an
+// unpainted node, which the caller renders as no icon at all rather than as an empty bar.
+export function chipSegments(
+  weights: ReadonlyArray<FacetWeight>,
+  facets: ReadonlyArray<string>,
+  legend: ReadonlyArray<LegendEntry>,
+  opts: SegmentOptions,
+): Segment[] {
+  const colored: Array<{ color: string; p: number }> = []
+  for (const w of weights) {
+    if (w.p <= 0) continue
+    const id = facets[w.f]
+    const suppressed = id !== undefined && opts.suppressed?.has(id)
+    // An id outside the legend is "Other" (NONE_FACET is appended to `facets` but never
+    // appears in the legend), which greys for the same reason a suppressed facet does.
+    const hue = suppressed ? MUTED : legend.find((e) => e.facet === id)?.color
+    colored.push({ color: hexFor(hue, opts.theme), p: w.p })
+  }
+  if (colored.length === 0) return []
+
+  const total = colored.reduce((sum, c) => sum + c.p, 0)
+  if (total <= 0) return []
+
+  if (opts.layout === "bar-proportional") {
+    const floor = MIN_SEGMENT_FRAC
+    const fracs = colored.map((c) => Math.max(c.p / total, floor))
+    // Flooring the slivers overshoots 1; take the excess back from the segments that are
+    // above the floor, proportionally, so the bar still fills exactly.
+    const sum = fracs.reduce((a, b) => a + b, 0)
+    const slack = fracs.reduce((a, f) => a + Math.max(f - floor, 0), 0)
+    const excess = sum - 1
+    return colored.map((c, i) => ({
+      color: c.color,
+      frac: slack > 0 ? fracs[i]! - (Math.max(fracs[i]! - floor, 0) / slack) * excess : fracs[i]!,
+    }))
+  }
+
+  // mosaic6 is a fixed 3x2 grid, so its cell count is not negotiable — an override would
+  // leave the last row short or overflow it.
+  const cells = opts.layout === "mosaic6" ? CHIP_CELLS : (opts.cells ?? CHIP_CELLS)
+  return quantize(colored, cells).map((color) => ({ color, frac: 1 / cells }))
+}
+
+// Largest-remainder apportionment of `cells` cells across the weights.
+//
+// Largest remainder rather than plain rounding because the cells must sum to exactly
+// `cells` — a bar with five cells in a six-cell frame reads as a rendering bug. It also
+// guarantees the dominant facet can never round away: it has the largest share, so it has
+// either the largest floor or (at worst, when everything floors to zero) the first pick of
+// the remainders.
+function quantize(colored: ReadonlyArray<{ color: string; p: number }>, cells: number): string[] {
+  const total = colored.reduce((sum, c) => sum + c.p, 0)
+  const exact = colored.map((c) => (c.p / total) * cells)
+  const counts = exact.map(Math.floor)
+  let left = cells - counts.reduce((a, b) => a + b, 0)
+  // Ties go to the earlier entry, and `colored` is descending by share, so a tie resolves
+  // toward the bigger facet.
+  const order = exact.map((e, i) => ({ i, rem: e - Math.floor(e) })).sort((a, b) => b.rem - a.rem || a.i - b.i)
+  for (const { i } of order) {
+    if (left <= 0) break
+    counts[i]!++
+    left--
+  }
+  return counts.flatMap((n, i) => Array<string>(n).fill(colored[i]!.color))
+}
+
+// Render segments as a standalone 16x16 SVG document.
+//
+// Ids inside the document (the clip path) are scoped to it — VSCode loads each chip as its
+// own image, so identical ids across chips never collide.
+export function chipSvg(segments: ReadonlyArray<Segment>, layout: ChipLayout, theme: Theme): string {
+  const cells = layout === "mosaic6" ? mosaicRects(segments) : barRects(segments)
+  // The outline keeps the chip legible when a facet colour is close to the tree's own
+  // background — without it a pale pastel bar on a light theme has no edge at all.
+  const outline = theme === "light" ? "#00000026" : "#FFFFFF26"
+  // Both layouts fill and are clipped by the same rounded rect, so they read as the same
+  // object with the cells arranged differently — not as two different chips.
+  //
+  // Ids inside the document (the clip path) are scoped to it: VSCode loads each chip as its
+  // own image, so identical ids across chips never collide.
+  return (
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${BOX}" height="${BOX}" viewBox="0 0 ${BOX} ${BOX}">` +
+    `<clipPath id="c"><rect x="${BAR_X}" y="${BAR_Y}" width="${BAR_W}" height="${BAR_H}" rx="${BAR_R}"/></clipPath>` +
+    `<g clip-path="url(#c)">${cells.join("")}</g>` +
+    `<rect x="${BAR_X + 0.25}" y="${BAR_Y + 0.25}" width="${BAR_W - 0.5}" height="${BAR_H - 0.5}" rx="${BAR_R}" fill="none" stroke="${outline}" stroke-width="0.5"/>` +
+    `</svg>`
+  )
+}
+
+// One row of N. Widths come straight from the fracs, so this serves both the quantized and
+// the proportional layouts.
+function barRects(segments: ReadonlyArray<Segment>): string[] {
+  const rects: string[] = []
+  let x = BAR_X
+  segments.forEach((seg, i) => {
+    // Overshoot each segment's right edge by a hair so neighbouring rects overlap instead
+    // of leaving a seam: at 16px the renderer lands edges on fractional device pixels and
+    // a sub-pixel gap shows up as a light hairline between colours.
+    const w = seg.frac * BAR_W + (i === segments.length - 1 ? 0 : SEAM)
+    rects.push(`<rect x="${round(x)}" y="${BAR_Y}" width="${round(w)}" height="${BAR_H}" fill="${seg.color}"/>`)
+    x += seg.frac * BAR_W
+  })
+  return rects
+}
+
+// The same six cells folded into 3 columns x 2 rows. 16px is a hard ceiling on the chip's
+// width, so six cells in one row are 2.7px slivers; folding trades horizontal resolution for
+// cells of 5.3 x 7px, which is roughly six times the area and actually perceptible.
+//
+// Filled **column-major** — down, then across. That keeps the left-to-right ordering by
+// share that the single-row bar has, the dominant facet always starts top-left, and a facet
+// with an even cell count lands on whole columns: 4/1/1 is two solid columns plus a split
+// third, and 2/2/2 is three clean columns. Row-major would make the 4 an L wrapping the row
+// end, and would tear the middle facet of a 2/2/2 into two opposite corners.
+//
+// The cost, stated plainly: an *odd* cell count cannot align to a 2-row column, so 3/3
+// staircases (one facet takes a column and a half). Row-major would render that particular
+// case as two clean rows. There is no fill order that wins both; this one favours the
+// dominant-plus-remainder shape that real files actually have.
+//
+// No gaps between cells, deliberately: adjacent cells of one facet must merge into a single
+// block, so a pure file reads as one solid chip rather than as six tiles.
+function mosaicRects(segments: ReadonlyArray<Segment>): string[] {
+  const rows = 2
+  const cols = 3
+  const cw = BAR_W / cols
+  const ch = BAR_H / rows
+  return segments.slice(0, rows * cols).map((seg, i) => {
+    const col = Math.floor(i / rows)
+    const row = i % rows
+    const w = cw + (col === cols - 1 ? 0 : SEAM)
+    const h = ch + (row === rows - 1 ? 0 : SEAM)
+    const x = BAR_X + col * cw
+    const y = BAR_Y + row * ch
+    return `<rect x="${round(x)}" y="${round(y)}" width="${round(w)}" height="${round(h)}" fill="${seg.color}"/>`
+  })
+}
+
+function round(n: number): number {
+  return Math.round(n * 1000) / 1000
+}
+
+// Identity of a rendered chip, for the icon cache. Two nodes with the same segments get the
+// same URI and VSCode reuses the image.
+export function chipKey(segments: ReadonlyArray<Segment>, layout: ChipLayout, theme: Theme): string {
+  return `${layout}:${theme}:${segments.map((s) => `${s.color}@${round(s.frac)}`).join(",")}`
+}
+
+// The hover text: the full breakdown, which is the detail the chip necessarily rounds off.
+export function chipTooltip(
+  weights: ReadonlyArray<FacetWeight>,
+  facets: ReadonlyArray<string>,
+  legend: ReadonlyArray<LegendEntry>,
+): string {
+  const labelOf = (index: number) => legend.find((e) => e.facet === facets[index])?.label ?? facets[index] ?? "?"
+  return weights.map((w) => `${labelOf(w.f)} ${w.p}%`).join(" · ")
+}

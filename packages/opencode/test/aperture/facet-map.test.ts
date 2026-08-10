@@ -27,7 +27,7 @@ const file = { id: "n_a", path: "src/a.ts", size: 100 }
 describe("computeFacetMapFiles (Explorer pip weights)", () => {
   test("an un-mixed file is one weight at 100%", () => {
     const files = computeFacetMapFiles([file], { n_a: { facet: "likely", hash: "h" } }, {}, FACETS)
-    expect(files["src/a.ts"]).toEqual([{ f: 0, p: 100 }])
+    expect(files["src/a.ts"]).toEqual({ t: 100, w: [{ f: 0, p: 100 }] })
   })
 
   test("a function-painted file reports its mix, descending, summing to 100", () => {
@@ -41,12 +41,13 @@ describe("computeFacetMapFiles (Explorer pip weights)", () => {
         subtreeBytes: 100,
       },
     }
-    const weights = computeFacetMapFiles([file], { n_a: { facet: "likely", hash: "h" } }, mixes, FACETS)["src/a.ts"]!
-    expect(weights).toEqual([
+    const entry = computeFacetMapFiles([file], { n_a: { facet: "likely", hash: "h" } }, mixes, FACETS)["src/a.ts"]!
+    expect(entry.w).toEqual([
       { f: 1, p: 60 },
       { f: 0, p: 40 },
     ])
-    expect(weights.reduce((sum, w) => sum + w.p, 0)).toBe(100)
+    expect(entry.w.reduce((sum, w) => sum + w.p, 0)).toBe(100)
+    expect(entry.t).toBe(100)
   })
 
   test("the head weight is the facet the directory treemap counts the file toward", () => {
@@ -61,7 +62,7 @@ describe("computeFacetMapFiles (Explorer pip weights)", () => {
       },
     }
     const store = { n_a: { facet: "likely", hash: "h" } }
-    const head = computeFacetMapFiles([file], store, mixes, FACETS)["src/a.ts"]![0]!
+    const head = computeFacetMapFiles([file], store, mixes, FACETS)["src/a.ts"]!.w[0]!
     const counted = computeComposition([DIR], [file], store, mixes, LENS)[DIR.id]!.weights.find((w) => w.count === 1)!
     expect(FACETS[head.f]).toBe(counted.facet)
   })
@@ -72,7 +73,7 @@ describe("computeFacetMapFiles (Explorer pip weights)", () => {
 
   test('a file bucketed "Other" maps to the appended index', () => {
     const files = computeFacetMapFiles([file], { n_a: { facet: NONE_FACET, hash: "h" } }, {}, FACETS)
-    expect(files["src/a.ts"]).toEqual([{ f: FACETS.length - 1, p: 100 }])
+    expect(files["src/a.ts"]).toEqual({ t: 100, w: [{ f: FACETS.length - 1, p: 100 }] })
   })
 
   test("a sliver that rounds to 0% is dropped, never emptying the file", () => {
@@ -87,14 +88,37 @@ describe("computeFacetMapFiles (Explorer pip weights)", () => {
       },
     }
     const big = { id: "n_b", path: "src/big.ts", size: 1000 }
-    expect(computeFacetMapFiles([big], { n_b: { facet: "likely", hash: "h" } }, mixes, FACETS)["src/big.ts"]).toEqual([
-      { f: 0, p: 100 },
-    ])
+    expect(computeFacetMapFiles([big], { n_b: { facet: "likely", hash: "h" } }, mixes, FACETS)["src/big.ts"]).toEqual({
+      // `t` is the pre-rounding total, so the dropped sliver's bytes are still counted in
+      // the file's weight when a client rolls it into a directory.
+      t: 1000,
+      w: [{ f: 0, p: 100 }],
+    })
   })
 
   test("a zero-byte file contributes nothing", () => {
     const empty = { id: "n_c", path: "src/empty.ts", size: 0 }
     expect(computeFacetMapFiles([empty], { n_c: { facet: "likely", hash: "h" } }, {}, FACETS)).toEqual({})
+  })
+
+  // This is what `t` is for. The VSCode tree paints a folder chip by rolling its subtree's
+  // files up client-side; that rollup and the directory treemap over the same folder are
+  // one attribution, so they have to land on the same bytes per facet. Percentages alone
+  // can't do it — the two files below differ 9:1 in size, so an equal-weighted rollup
+  // would call the directory "hot" when the treemap calls it "likely".
+  test("t * p / 100 rolls a directory up to the same bytes the treemap counts", () => {
+    const big = { id: "n_b", path: "src/big.ts", size: 900 }
+    const small = { id: "n_s", path: "src/small.ts", size: 100 }
+    const store = { n_b: { facet: "likely", hash: "h" }, n_s: { facet: "hot", hash: "h" } }
+    const files = computeFacetMapFiles([big, small], store, {}, FACETS)
+
+    const rolled: Record<string, number> = {}
+    for (const entry of Object.values(files))
+      for (const w of entry.w) rolled[FACETS[w.f]!] = (rolled[FACETS[w.f]!] ?? 0) + (entry.t * w.p) / 100
+
+    const comp = computeComposition([DIR], [big, small], store, {}, LENS)[DIR.id]!
+    for (const w of comp.weights) expect(rolled[w.facet]).toBe(w.bytes)
+    expect(Object.keys(rolled).sort()).toEqual(comp.weights.map((w) => w.facet).sort())
   })
 })
 
@@ -128,7 +152,7 @@ describe("computeComposition (per-file entries)", () => {
   })
 
   test("the file's band and its Explorer pip name the same dominant facet", () => {
-    const head = computeFacetMapFiles([file], STORE, MIXES, FACETS)["src/a.ts"]![0]!
+    const head = computeFacetMapFiles([file], STORE, MIXES, FACETS)["src/a.ts"]!.w[0]!
     const comp = computeComposition([FILE_NODE], [file], STORE, MIXES, LENS)[FILE_NODE.id]!
     expect(FACETS[head.f]).toBe(comp.weights.find((w) => w.count === 1)!.facet)
   })

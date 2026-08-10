@@ -20,16 +20,186 @@
   ],
   "main": "./dist/extension.js",
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "aperture",
+          "title": "Aperture",
+          "icon": "media/aperture.svg"
+        }
+      ]
+    },
+    "views": {
+      "aperture": [
+        {
+          "id": "aperture.openEditors",
+          "name": "Open Editors",
+          "visibility": "collapsed"
+        },
+        {
+          "id": "aperture.fileTree",
+          "name": "Files"
+        }
+      ]
+    },
     "commands": [
       {
         "command": "aperture.repaint",
         "title": "Aperture: Repaint active editor"
       },
       {
-        "command": "aperture.focusFacet",
-        "title": "Aperture: Focus a facet in the Explorer"
+        "command": "aperture.filterFacets",
+        "title": "Aperture: Filter facets",
+        "icon": "$(filter)"
+      },
+      {
+        "command": "aperture.clearFacetFilter",
+        "title": "Aperture: Clear the facet filter",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "aperture.refreshTree",
+        "title": "Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "aperture.revealActiveFile",
+        "title": "Aperture: Reveal the active file in the Aperture tree"
+      },
+      {
+        "command": "aperture.newFile",
+        "title": "New File...",
+        "icon": "$(new-file)"
+      },
+      {
+        "command": "aperture.newFolder",
+        "title": "New Folder...",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "aperture.openToSide",
+        "title": "Open to the Side"
+      },
+      {
+        "command": "aperture.rename",
+        "title": "Rename..."
+      },
+      {
+        "command": "aperture.delete",
+        "title": "Delete"
+      },
+      {
+        "command": "aperture.findInFolder",
+        "title": "Find in Folder..."
+      },
+      {
+        "command": "aperture.copyPath",
+        "title": "Copy Path"
+      },
+      {
+        "command": "aperture.copyRelativePath",
+        "title": "Copy Relative Path"
+      },
+      {
+        "command": "aperture.revealInOS",
+        "title": "Reveal in File Explorer"
+      },
+      {
+        "command": "aperture.revealInExplorer",
+        "title": "Reveal in VS Code Explorer"
+      },
+      {
+        "command": "aperture.closeTab",
+        "title": "Close Editor",
+        "icon": "$(close)"
       }
     ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "aperture.newFile",
+          "when": "view == aperture.fileTree",
+          "group": "navigation@1"
+        },
+        {
+          "command": "aperture.newFolder",
+          "when": "view == aperture.fileTree",
+          "group": "navigation@2"
+        },
+        {
+          "command": "aperture.filterFacets",
+          "when": "view == aperture.fileTree",
+          "group": "navigation@3"
+        },
+        {
+          "command": "aperture.refreshTree",
+          "when": "view == aperture.fileTree",
+          "group": "navigation@4"
+        },
+        {
+          "command": "aperture.clearFacetFilter",
+          "when": "view == aperture.fileTree",
+          "group": "1_filter"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "aperture.openToSide",
+          "when": "view == aperture.fileTree && viewItem == apertureFile",
+          "group": "1_open@1"
+        },
+        {
+          "command": "aperture.revealInOS",
+          "when": "view == aperture.fileTree",
+          "group": "1_open@2"
+        },
+        {
+          "command": "aperture.revealInExplorer",
+          "when": "view == aperture.fileTree",
+          "group": "1_open@3"
+        },
+        {
+          "command": "aperture.newFile",
+          "when": "view == aperture.fileTree && viewItem == apertureFolder",
+          "group": "2_new@1"
+        },
+        {
+          "command": "aperture.newFolder",
+          "when": "view == aperture.fileTree && viewItem == apertureFolder",
+          "group": "2_new@2"
+        },
+        {
+          "command": "aperture.findInFolder",
+          "when": "view == aperture.fileTree && viewItem == apertureFolder",
+          "group": "3_find@1"
+        },
+        {
+          "command": "aperture.copyPath",
+          "when": "view == aperture.fileTree",
+          "group": "4_copy@1"
+        },
+        {
+          "command": "aperture.copyRelativePath",
+          "when": "view == aperture.fileTree",
+          "group": "4_copy@2"
+        },
+        {
+          "command": "aperture.rename",
+          "when": "view == aperture.fileTree",
+          "group": "5_modify@1"
+        },
+        {
+          "command": "aperture.delete",
+          "when": "view == aperture.fileTree",
+          "group": "5_modify@2"
+        },
+        {
+          "command": "aperture.closeTab",
+          "when": "view == aperture.openEditors && viewItem == apertureTab",
+          "group": "inline"
+        }
+      ]
+    },
     "configuration": {
       "title": "Aperture",
       "properties": {
@@ -45,8 +215,41 @@
         },
         "aperture.explorerPips": {
           "type": "boolean",
+          "default": false,
+          "description": "Show a facet pip on each source file in the Explorer, coloured by the active Lens. Off by default since the Aperture tree's chip carries the same information better — a pip can only name one facet, and it also tints the filename, which applies in every tree at once."
+        },
+        "aperture.tree.chipLayout": {
+          "type": "string",
+          "enum": [
+            "bar6",
+            "bar-proportional",
+            "mosaic6"
+          ],
+          "enumDescriptions": [
+            "Six equal cells in one row, apportioned to facets by byte share. Cells are ~2.7px wide.",
+            "One row, with segment widths as the true byte shares and a floor so a small facet stays visible.",
+            "The same six cells folded into three columns of two, filled top-to-bottom then left-to-right. Cells are ~5.3x7px, so individual facets are far easier to pick out."
+          ],
+          "default": "mosaic6",
+          "description": "How the Aperture tree's facet chip encodes a file's composition."
+        },
+        "aperture.tree.iconDelivery": {
+          "type": "string",
+          "enum": [
+            "data",
+            "file"
+          ],
+          "enumDescriptions": [
+            "Inline the chip SVG as a data: URI. Simpler, with no files on disk.",
+            "Write the chip SVG under the extension's storage and reference it as a file. Use this if chips render blank."
+          ],
+          "default": "data",
+          "description": "How generated chip SVGs are handed to VSCode."
+        },
+        "aperture.tree.autoReveal": {
+          "type": "boolean",
           "default": true,
-          "description": "Show a facet pip on each source file in the Explorer, coloured by the active Lens."
+          "description": "Reveal and select the active editor's file in the Aperture tree."
         }
       }
     },

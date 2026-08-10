@@ -1,13 +1,23 @@
 import * as vscode from "vscode"
+import type { ChipLayout } from "./chip"
+import * as ops from "./commands"
+import { ChipIcons, type IconDelivery } from "./icons"
+import { buildModel, type FacetFile, type FacetFiles, type TreeModel } from "./model"
+import { ApertureOpenEditors } from "./open-editors"
+import { ApertureTree, type Node } from "./tree"
 
 // Aperture — a slim client for the opencode server. It renders function-level Facet
-// painting in the editor gutter and reveals files the TUI drills into.
+// painting in the editor gutter, a facet-composition file tree, and reveals files the TUI
+// drills into.
 //
 //  - Gutter (extension → server): GET /aperture?drill=<relPath> returns the focused
 //    file's `extents` ({name,startLine,endLine,facet?,hue?}); we paint each as a colored
 //    left-border strip + overview-ruler mark.
 //  - Explorer pips (extension → server): GET /aperture/facets returns every painted file's
 //    facet mix in one shot; we decorate each file row with a coloured shade glyph.
+//  - Aperture tree (same fetch): our own TreeView in the activity bar, where each row's
+//    icon is a generated SVG of the file's whole facet mix — the thing a FileDecoration's
+//    one-colour budget cannot express — and folders roll their subtree up. See tree.ts.
 //  - Open-in-editor (TUI → server → extension): we listen on the /event SSE stream for
 //    `tui.file.open` (open a file) and `tui.directory.reveal` (show a directory in the
 //    Explorer). The latter is what connects the TUI's top bar — which since PLAN O1 shows
@@ -36,6 +46,13 @@ const FACET_MAP_DEBOUNCE_MS = 400
 // server a whole-repo attribution pass (~150KB response on a 2000-file repo), so paying
 // that every 5s to almost always find nothing changed is a bad trade.
 const FACET_MAP_POLL_MS = 20000
+// The tree's file set changes far less often than its colours, and a create/delete storm
+// (a branch switch, an install) should cost one re-enumeration rather than hundreds.
+const FILE_SET_DEBOUNCE_MS = 500
+// Hard ceiling on the enumerated file set. The excludes should keep a normal workspace two
+// orders of magnitude below this; the cap exists so a workspace that somehow isn't degrades
+// to a truncated tree instead of exhausting the extension host.
+const MAX_TREE_FILES = 50000
 
 // Since O3 every file is extent-painted, so a file routinely spans several facets. A
 // FileDecoration gives exactly one ThemeColor and a <=2-char badge rendered in that colour,
@@ -74,6 +91,7 @@ let pollTimer: ReturnType<typeof setInterval> | undefined
 // Module-scoped (like the two above) so deactivate can clear them.
 let facetMapTimer: ReturnType<typeof setTimeout> | undefined
 let facetMapPollTimer: ReturnType<typeof setInterval> | undefined
+let fileSetTimer: ReturnType<typeof setTimeout> | undefined
 // True while a repaint's fetch is outstanding, so the poll skips a tick rather than
 // stacking refetches behind a slow server walk.
 let repainting = false
@@ -246,14 +264,25 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Whole-repo file → facet mix, refetched in one request rather than per file: the Explorer
   // asks us to decorate every visible row, and a fetch per row would be thousands of calls.
-  let facetMap = new Map<string, FacetWeight[]>()
+  // Each entry is `{t, w}` — the file's attributed byte total and its mix as percentages of
+  // it. The pips only need `w`; `t` is what lets the tree roll a directory up by bytes
+  // rather than by file count, so its folder chips agree with the TUI's treemap.
+  let facetMap = new Map<string, FacetFile>()
   let facetLegend: LegendEntry[] = []
   let facetIds: string[] = []
-  // Which facet the pips report. Undefined = each file's own dominant facet. Set via the
-  // aperture.focusFacet command; PLAN O4/S4 will drive it from the TUI's legend filter
-  // instead, which is why nothing below assumes where the value came from.
-  let focusFacet: string | undefined
+  // The active Lens's id. Only the pips consult it (to stand down for git-changed); the
+  // tree paints every Lens.
+  let lensId: string | undefined
+  // Facets the user has toggled off (PLAN O4). One set drives both surfaces: the tree greys
+  // those cells in place, and the Explorer pips fall through to each file's largest
+  // surviving facet. Set via the aperture.filterFacets command; O4/S4 should eventually push
+  // it from the TUI's legend filter over SSE instead, which is why nothing below assumes
+  // where the value came from.
+  const suppressedFacets = new Set<string>()
   let fetchingFacetMap = false
+  // Guards the file-set enumeration the same way `fetchingFacetMap` guards the map fetch: a
+  // watcher burst must not stack whole-workspace searches on top of each other.
+  let fetchingFileSet = false
   // The last response body, verbatim. The server emits files in a stable order, so an
   // unchanged repo re-serializes byte-identically and this comparison is exact — which is
   // what lets the self-heal poll run without touching the UI. See the flicker note below.
@@ -262,21 +291,12 @@ export function activate(context: vscode.ExtensionContext) {
   // Firing `undefined` means "every decoration changed": VSCode drops its whole cache and
   // re-queries the provider for every visible row, and the rows paint bare for the round
   // trip — a visible full-tree flicker. So we fire a URI list whenever we can, and reserve
-  // `undefined` for the cases where every row really did change meaning (a new Lens, a new
-  // focus facet, pips switched off).
+  // `undefined` for the cases where every row really did change meaning (a new Lens, a
+  // filter change, pips switched off).
   const decorationsChanged = new vscode.EventEmitter<vscode.Uri[] | undefined>()
 
   async function fetchFacetMap() {
     const dir = directory()
-    // Turning the setting off has to actively clear what's already painted — returning early
-    // would leave the last fetch's pips on screen forever, since nothing else drops them.
-    if (!config().get<boolean>("explorerPips", true)) {
-      if (facetMap.size === 0) return
-      facetMap = new Map()
-      facetMapRaw = undefined
-      decorationsChanged.fire(undefined)
-      return
-    }
     if (!dir) return
     fetchingFacetMap = true
     try {
@@ -291,15 +311,9 @@ export function activate(context: vscode.ExtensionContext) {
       const data = JSON.parse(raw) as {
         lens?: { id: string; legend?: LegendEntry[] }
         facets?: string[]
-        files?: Record<string, FacetWeight[]>
+        files?: Record<string, FacetFile>
       }
-      // "Changed since last commit" is the one Lens we suppress here: VSCode already
-      // decorates modified files from its own SCM provider, and ours would compete with that
-      // badge for the same slot to say the same thing. The other deterministic built-ins
-      // (edit recency, bus factor) are file-level by nature and are exactly what a file tree
-      // wants to show, so — unlike the gutter — we do NOT skip all deterministic Lenses.
-      const suppressed = data.lens?.id === "git-changed"
-      const next = suppressed ? new Map<string, FacetWeight[]>() : new Map(Object.entries(data.files ?? {}))
+      const next = new Map(Object.entries(data.files ?? {}))
       // A different Lens (or vocabulary) re-colours every row at once, so a targeted list
       // would be wrong as well as pointless — that is a genuine full invalidation.
       const relit = JSON.stringify(facetIds) !== JSON.stringify(data.facets ?? [])
@@ -308,14 +322,16 @@ export function activate(context: vscode.ExtensionContext) {
       facetMap = next
       facetLegend = data.lens?.legend ?? []
       facetIds = data.facets ?? []
-      // A focus facet from a previous Lens means nothing under this one; dropping it avoids
-      // an Explorer that has silently blanked itself.
-      if (focusFacet !== undefined && !facetIds.includes(focusFacet)) focusFacet = undefined
+      lensId = data.lens?.id
+      // A filter from a previous Lens means nothing under this one; dropping the stale ids
+      // avoids a tree that has silently greyed itself out under a vocabulary that never had
+      // those facets.
+      for (const facet of [...suppressedFacets]) if (!facetIds.includes(facet)) suppressedFacets.delete(facet)
+      // The tree colours from the same fetch, and unlike the pips it has no reason to skip
+      // any Lens — so it is rebuilt before the early-out below.
+      rebuildModel()
       if (changed && changed.length === 0) return
-      log(
-        `facet map: ${next.size} files (was ${previous.size}), ` +
-          `${changed ? `${changed.length} rows` : "all rows"} repainted${suppressed ? " (suppressed)" : ""}`,
-      )
+      log(`facet map: ${next.size} files (was ${previous.size}), ${changed ? `${changed.length} rows` : "all rows"}`)
       decorationsChanged.fire(changed)
     } catch (e) {
       log(`facet map fetch FAILED: ${String(e)} (baseUrl=${baseUrl()} dir=${dir})`)
@@ -327,10 +343,10 @@ export function activate(context: vscode.ExtensionContext) {
   // The files whose pip actually differs between two maps — added, removed, or re-weighted.
   // Only these rows need re-querying, so a paint sweep touching a handful of files repaints
   // a handful of rows instead of blanking the tree.
-  function changedUris(before: Map<string, FacetWeight[]>, after: Map<string, FacetWeight[]>) {
+  function changedUris(before: Map<string, FacetFile>, after: Map<string, FacetFile>) {
     const folder = workspaceFolder()
     if (!folder) return undefined
-    const key = (w: FacetWeight[] | undefined) => (w ? JSON.stringify(w) : "")
+    const key = (entry: FacetFile | undefined) => (entry ? JSON.stringify(entry.w) : "")
     const paths = new Set([...before.keys(), ...after.keys()])
     return [...paths]
       .filter((p) => key(before.get(p)) !== key(after.get(p)))
@@ -346,30 +362,262 @@ export function activate(context: vscode.ExtensionContext) {
     onDidChangeFileDecorations: decorationsChanged.event,
     provideFileDecoration(uri) {
       if (uri.scheme !== "file") return undefined
+      // Off by default. A FileDecoration is not scopable to a view — it applies to every
+      // TreeItem carrying this resourceUri, ours included — and it tints the filename as
+      // well as adding the badge. Once the tree's chip is showing the whole mix, that is a
+      // second, coarser answer to the same question competing with it in the same row.
+      if (!config().get<boolean>("explorerPips", false)) return undefined
+      // "Changed since last commit" is the one Lens the pips suppress: VSCode already
+      // decorates modified files from its own SCM provider, and ours would compete with that
+      // badge for the same slot to say the same thing. The other deterministic built-ins
+      // (edit recency, bus factor) are file-level by nature and are exactly what a file tree
+      // wants to show, so — unlike the gutter — we do NOT skip all deterministic Lenses.
+      // Note this is a *pips* rule, not a data rule: the Aperture tree paints git-changed
+      // happily, because its rows have their own icon slot and contend with nothing.
+      if (lensId === "git-changed") return undefined
       // Files only. A folder decoration would need its own subtree rollup and would contend
-      // with git's folder badges; directory aggregation stays the top bar's job.
-      const weights = facetMap.get(vscode.workspace.asRelativePath(uri, false).replace(/\\/g, "/"))
+      // with git's folder badges; folder aggregation is the Aperture tree's job (and the
+      // TUI top bar's), where there is room to show a composition rather than one colour.
+      const entry = facetMap.get(vscode.workspace.asRelativePath(uri, false).replace(/\\/g, "/"))
       // No entry = unpainted, non-source, or the map hasn't loaded yet. Returning undefined
       // leaves the row plain; the refresh event makes VSCode ask again once it has.
-      if (!weights?.length) return undefined
-      const deco = decorationFrom(weights, facetLegend, facetIds, focusFacet)
+      if (!entry?.w.length) return undefined
+      const deco = decorationFrom(entry.w, facetLegend, facetIds, suppressedFacets)
       if (!deco) return undefined
       return new vscode.FileDecoration(deco.badge, deco.tooltip, deco.color)
     },
   }
 
-  // Pick which facet the pips report, or reset to each file's dominant one.
-  async function pickFocusFacet() {
+  // ---- Aperture tree -------------------------------------------------------
+
+  // The visible file set, and the trie + rollup built from it. Two independent inputs — the
+  // file set (from VSCode) and the facet map (from the server) — so the model is rebuilt
+  // whenever either lands rather than being owned by one of them.
+  let filePaths: string[] = []
+  let model: TreeModel = buildModel([], {}, 0)
+  // Directories the user created through the tree that have no files in them yet. The trie
+  // derives directories from file paths, so without this a new empty folder would vanish
+  // the moment it was made. Cleared when a re-enumeration finds them populated.
+  const newDirs = new Set<string>()
+
+  const icons = new ChipIcons(context.globalStorageUri, config().get<IconDelivery>("tree.iconDelivery", "data"))
+  // Everything the two views need to draw a chip. They ask through these functions rather
+  // than being handed values, so a Lens switch or a filter change is a refresh, not a
+  // re-wiring.
+  const chipContext = {
+    model: () => model,
+    facets: () => facetIds,
+    legend: () => facetLegend,
+    suppressed: (): ReadonlySet<string> => suppressedFacets,
+    layout: () => config().get<ChipLayout>("tree.chipLayout", "mosaic6"),
+    icons,
+  }
+
+  const fileOps: ops.FileOpsContext = {
+    root: () => workspaceFolder()?.uri,
+    rememberDir: (rel) => newDirs.add(rel),
+    refresh: () => fetchFileSet(),
+    // A file operation the user just performed from this view — show them the result even
+    // if they somehow triggered it with the view hidden.
+    reveal: (rel) => void revealInTree(rel, { show: true }),
+  }
+
+  const tree = new ApertureTree({
+    ...chipContext,
+    root: () => workspaceFolder()?.uri,
+    move: (sources, targetDir) => ops.move(fileOps, sources, targetDir),
+  })
+  const treeView = vscode.window.createTreeView("aperture.fileTree", {
+    treeDataProvider: tree,
+    dragAndDropController: tree,
+    showCollapseAll: true,
+    canSelectMany: true,
+  })
+  // Cleared by the first successful enumeration. Without it the view is silently blank
+  // while the search runs, which reads as "broken" rather than "not ready".
+  treeView.message = "Enumerating files…"
+
+  const openEditors = new ApertureOpenEditors({
+    ...chipContext,
+    relative: (uri) => vscode.workspace.asRelativePath(uri, false).replace(/\\/g, "/"),
+  })
+  const openEditorsView = vscode.window.createTreeView("aperture.openEditors", { treeDataProvider: openEditors })
+
+  function rebuildModel() {
+    const files: FacetFiles = {}
+    for (const [path, entry] of facetMap) files[path] = entry
+    model = buildModel(filePaths, files, facetIds.length, [...newDirs])
+    tree.refresh()
+    openEditors.refresh()
+  }
+
+  // Which rows a command should act on. VSCode passes the clicked item first and the full
+  // selection second, but only when the click was inside the selection — a right-click on
+  // an unselected row must act on that row alone, not on whatever was selected before.
+  function targets(node: Node | undefined, selected: Node[] | undefined): Node[] {
+    if (!node) return treeView.selection.slice()
+    return selected && selected.some((n) => n.rel === node.rel) ? selected : [node]
+  }
+
+  // What the tree must NOT enumerate.
+  //
+  // `findFiles(include, undefined)` applies `files.exclude` but explicitly **not**
+  // `search.exclude` (@types/vscode 1.125, index.d.ts:14093) — and the default
+  // `files.exclude` covers `.git`/`.DS_Store` and says nothing about `node_modules`. On this
+  // repo that is the difference between ~6k files and ~154k, of which ~147k are
+  // dependencies. That is not merely slow: every watcher event re-enumerated the lot into a
+  // fresh URI array and a fresh trie, and the churn was enough to OOM the remote extension
+  // host. So both settings are merged into one explicit exclude.
+  function excludePattern(): string | undefined {
+    const globs = new Set<string>()
+    for (const section of ["files", "search"]) {
+      const configured = vscode.workspace.getConfiguration(section).get<Record<string, unknown>>("exclude") ?? {}
+      // A value is `true`, `false`, or a `{ when: … }` sibling condition. Only unconditional
+      // `true` entries are taken: a conditional exclude is not worth evaluating here, and
+      // showing a file the search box would hide is a far smaller problem than the reverse.
+      for (const [glob, on] of Object.entries(configured)) if (on === true) globs.add(glob)
+    }
+    return globs.size === 0 ? undefined : `{${[...globs].join(",")}}`
+  }
+
+  // The same exclusions as literal directory names, for the watcher — which fires on paths
+  // rather than on a search, so it needs a cheap segment test rather than a glob match.
+  // A leading `**/` plus a literal name covers the entries that matter; anything with
+  // wildcards left in it is skipped rather than pulling in a glob dependency for what is
+  // only a scheduling hint.
+  function excludedSegments(): Set<string> {
+    const names = new Set<string>()
+    for (const glob of (excludePattern() ?? "").replace(/^\{|\}$/g, "").split(",")) {
+      const name = glob.replace(/^\*\*\//, "").replace(/\/\*\*$/, "")
+      if (name !== "" && !/[*?{}[\]]/.test(name)) names.add(name)
+    }
+    return names
+  }
+
+  // The tree's file set, enumerated in one search rather than by walking readDirectory —
+  // which would mean reimplementing `files.exclude` glob matching by hand.
+  //
+  // Two knock-on differences from the Explorer, both accepted: an empty directory only
+  // appears if something names it (directories are derived from file paths — hence
+  // `newDirs`, so a folder you just created is not invisible), and `search.exclude` applies
+  // on top of `files.exclude`.
+  async function fetchFileSet() {
+    const folder = workspaceFolder()
+    if (!folder) return
+    if (fetchingFileSet) return
+    fetchingFileSet = true
+    try {
+      const uris = await vscode.workspace.findFiles(
+        new vscode.RelativePattern(folder, "**/*"),
+        excludePattern(),
+        // A hard ceiling as well as the excludes: a misconfigured workspace should degrade
+        // to a truncated tree, never to an extension host that runs out of memory.
+        MAX_TREE_FILES,
+      )
+      filePaths = uris.map((uri) => vscode.workspace.asRelativePath(uri, false).replace(/\\/g, "/")).sort()
+      // A remembered empty directory that now holds a file is derivable again, so forget it
+      // rather than carrying a duplicate for the rest of the session.
+      for (const rel of [...newDirs]) if (filePaths.some((path) => path.startsWith(`${rel}/`))) newDirs.delete(rel)
+      log(`file set: ${filePaths.length} files`)
+      treeView.message =
+        filePaths.length >= MAX_TREE_FILES
+          ? `Showing the first ${MAX_TREE_FILES} files. Narrow files.exclude / search.exclude to see the rest.`
+          : undefined
+      rebuildModel()
+    } catch (e) {
+      log(`file set FAILED: ${String(e)}`)
+    } finally {
+      fetchingFileSet = false
+    }
+  }
+
+  function scheduleFileSet() {
+    if (fileSetTimer) clearTimeout(fileSetTimer)
+    fileSetTimer = setTimeout(() => void fetchFileSet(), FILE_SET_DEBOUNCE_MS)
+  }
+
+  // Whether a watcher event is worth a re-enumeration. `files.watcherExclude` already keeps
+  // most dependency churn out of the watcher, but it is a different setting from the two
+  // above and does not have to agree with them — so a create inside an excluded directory
+  // can still arrive, and re-enumerating for a file the tree will never show is pure cost.
+  function watchedPath(uri: vscode.Uri): boolean {
+    const rel = vscode.workspace.asRelativePath(uri, false).replace(/\\/g, "/")
+    const excluded = excludedSegments()
+    return !rel.split("/").some((segment) => excluded.has(segment))
+  }
+
+  // Reveal a path in the tree.
+  //
+  // Two callers with different standing, hence `show`. A TUI navigation is an explicit "go
+  // look at this", so it opens the view if it is closed; auto-reveal follows the active
+  // editor and must never yank the sidebar open behind you, so it stays put unless the view
+  // is already on screen.
+  //
+  // `expand` is the thing the built-in Explorer could not do at all: `TreeView.reveal` takes
+  // it directly, whereas ExplorerView.selectResource stops *at* the target and leaves it
+  // shut. That whole workaround is now gone (see revealDirectory).
+  async function revealInTree(rel: string, opts: { expand?: boolean; show?: boolean } = {}) {
+    if (!treeView.visible && !opts.show) return
+    const node = tree.find(rel)
+    if (!node) {
+      log(`tree reveal skipped: ${rel} is not in the tree`)
+      return
+    }
+    try {
+      // `focus` is deliberately left off. The Explorer version had no say — revealInExplorer
+      // always focuses — and the old comment accepted that it dragged the cursor out of the
+      // terminal running the TUI. Selecting without focusing shows you the directory and
+      // leaves you typing where you were.
+      await treeView.reveal(node, { select: true, expand: opts.expand || undefined })
+    } catch (e) {
+      log(`tree reveal FAILED for ${rel}: ${String(e)}`)
+    }
+  }
+
+  function revealActiveFile() {
+    if (!config().get<boolean>("tree.autoReveal", true)) return
+    const uri = vscode.window.activeTextEditor?.document.uri
+    if (!uri || uri.scheme !== "file") return
+    void revealInTree(vscode.workspace.asRelativePath(uri, false).replace(/\\/g, "/"))
+  }
+
+  // ---- facet filter (PLAN O4) ----------------------------------------------
+
+  // Toggle facets off. Checked = shown; unchecking is what greys a facet, and the picker
+  // opens with the current filter already applied so it reads as state rather than as a
+  // fresh question each time.
+  async function pickFacetFilter() {
     if (facetLegend.length === 0) {
       vscode.window.showInformationMessage("Aperture: no active Lens to filter by.")
       return
     }
-    const reset = "Show each file's dominant facet"
-    const picked = await vscode.window.showQuickPick([reset, ...facetLegend.map((e) => e.label)], {
-      title: "Aperture: focus a facet in the Explorer",
-    })
+    const picked = await vscode.window.showQuickPick(
+      facetLegend.map((entry) => ({
+        label: entry.label,
+        facet: entry.facet,
+        picked: !suppressedFacets.has(entry.facet),
+      })),
+      {
+        canPickMany: true,
+        title: "Aperture: filter facets",
+        placeHolder: "Unchecked facets grey out in the tree and drop out of the Explorer pips",
+      },
+    )
+    // Escape leaves the filter alone; deliberately unchecking everything does not.
     if (picked === undefined) return
-    focusFacet = picked === reset ? undefined : facetLegend.find((e) => e.label === picked)?.facet
+    const shown = new Set(picked.map((item) => item.facet))
+    suppressedFacets.clear()
+    for (const entry of facetLegend) if (!shown.has(entry.facet)) suppressedFacets.add(entry.facet)
+    applyFilter()
+  }
+
+  // One filter, three surfaces. Nothing is refetched — the server ships each file's whole
+  // mix precisely so this stays a client-side re-render.
+  function applyFilter() {
+    log(`filter: ${suppressedFacets.size} of ${facetLegend.length} facets suppressed`)
+    tree.refresh()
+    openEditors.refresh()
+    // A genuine full invalidation: every row's answer changed at once.
     decorationsChanged.fire(undefined)
   }
 
@@ -384,78 +632,32 @@ export function activate(context: vscode.ExtensionContext) {
     } catch {
       // file may have moved/been deleted — ignore.
     }
+    void revealInTree(relPath, { show: true })
   }
 
-  // Pick any entry inside `uri` that the Explorer is actually showing. Revealing a child is
-  // how we force a folder open (see revealDirectory), so the one thing that matters is that
-  // the entry exists in the tree's model — revealing something the tree filters out finds no
-  // item and silently does nothing. `files.exclude` is where the usual offenders live
-  // (`**/.git`, `**/node_modules`, `**/.DS_Store`), so we honour it; its values are globs,
-  // but the ones that matter here are a leading `**/` plus a literal name, and anything
-  // fancier is left unmatched rather than pulling in a glob dependency for a heuristic.
-  // Which entry we get is irrelevant — it exists only to be something whose *parent* is the
-  // folder we want expanded.
+  // Open a directory in the Aperture tree, so it shows what the TUI's top bar has navigated
+  // into. This is the bar's link into the editor now that it no longer lists files (PLAN
+  // O1): the bar aggregates, the tree enumerates.
   //
-  // Not covered: `explorer.excludeGitIgnore`, and glob patterns we decline to match. If we
-  // pick something the tree is hiding, the reveal no-ops and the folder is left collapsed —
-  // i.e. it degrades to the old behaviour rather than misbehaving.
-  async function firstVisibleChild(uri: vscode.Uri): Promise<vscode.Uri | undefined> {
-    let entries: [string, vscode.FileType][]
-    try {
-      entries = await vscode.workspace.fs.readDirectory(uri)
-    } catch {
-      return undefined // unreadable / vanished — caller falls back to a plain reveal
-    }
-    const exclude = vscode.workspace.getConfiguration("files", uri).get<Record<string, boolean>>("exclude") ?? {}
-    const hidden = new Set(
-      Object.entries(exclude)
-        .filter(([, on]) => on)
-        .map(([glob]) => glob.replace(/^\*\*\//, ""))
-        .filter((name) => !/[*?{}[\]]/.test(name)),
-    )
-    const pick = entries.find(([name]) => !hidden.has(name))
-    return pick ? vscode.Uri.joinPath(uri, pick[0]) : undefined
-  }
-
-  // Open a directory in the Explorer, so the file tree shows what the TUI's top bar has
-  // navigated into. This is the bar's link into the editor now that it no longer lists
-  // files (PLAN O1): the bar aggregates, the file tree enumerates.
-  //
-  // `revealInExplorer` alone is not enough, and the reason is in ExplorerView.selectResource:
-  // it walks *down* from the root with `while (item.resource !== resource) await
-  // tree.expand(item)`, so it expands every ancestor and stops the moment it reaches the
-  // target — the target itself is never expanded. Revealing `src` therefore selects it and
-  // leaves it shut, which is why the TUI could be rooted inside a folder the Explorer still
-  // showed collapsed. Revealing something *inside* `src` makes `src` an ancestor, so the
-  // same loop opens it. That is the mechanism, not a trick.
-  //
-  // (`list.expand` looks like the obvious fix and is not: it acts on the list service's
-  // last-focused list, and on an already-open folder it walks focus to the first child
-  // instead of doing nothing. It was tried and did not work.)
-  //
-  // Reveal also *focuses* the Explorer, which is deliberate: the user clicked a directory
-  // asking to go look at it, so handing them the tree is the useful outcome even though it
-  // moves the cursor out of the terminal running the TUI.
+  // This used to target the built-in Explorer and was three times this length, because
+  // `revealInExplorer` cannot open the folder you give it. ExplorerView.selectResource walks
+  // *down* from the root with `while (item.resource !== resource) await tree.expand(item)`,
+  // so it expands every ancestor and stops the moment it reaches the target — revealing
+  // `src` selected it and left it shut. The workaround was to reveal an arbitrary *child*
+  // (so `src` became an ancestor and the same loop opened it), which in turn needed a
+  // readDirectory and a hand-rolled `files.exclude` matcher to pick a child the Explorer was
+  // not hiding. `TreeView.reveal` takes `expand` as a parameter, so all of that is gone.
   async function revealDirectory(relPath: string) {
-    const folder = workspaceFolder()
-    if (!folder) return
-    // The TUI's root scope is the empty string, which joinPath would turn into a trailing
-    // slash the Explorer can't match — use the folder URI itself.
-    const uri = relPath === "" ? folder.uri : vscode.Uri.joinPath(folder.uri, relPath)
-    try {
-      // The workspace root is the tree's root and is always open, so it needs no child.
-      const child = relPath === "" ? undefined : await firstVisibleChild(uri)
-      if (child) await vscode.commands.executeCommand("revealInExplorer", child)
-      // Put the selection back on the folder that was actually clicked, so the Explorer
-      // highlight matches where the TUI is rooted. Revealing a folder never collapses it,
-      // so the expansion from the step above survives — and on an already-open folder the
-      // whole sequence is idempotent.
-      await vscode.commands.executeCommand("revealInExplorer", uri)
-      log(`reveal ${relPath === "" ? "<root>" : relPath}${child ? "" : " (no visible child — not expanded)"}`)
-    } catch (e) {
-      // directory may have moved/been deleted — ignore, as revealFile does.
-      log(`reveal FAILED for ${relPath}: ${String(e)}`)
+    if (!workspaceFolder()) return
+    // The TUI's root scope is the empty string. There is no node for the root — it *is* the
+    // tree — so the useful response is to bring the view forward and leave it at that.
+    if (relPath === "") {
+      await vscode.commands.executeCommand("workbench.view.extension.aperture")
+      log("reveal <root>")
+      return
     }
+    await revealInTree(relPath, { expand: true, show: true })
+    log(`reveal ${relPath}`)
   }
 
   function handleEvent(evt: { type?: string; properties?: any }) {
@@ -543,27 +745,118 @@ export function activate(context: vscode.ExtensionContext) {
 
   sse = connectEvents()
 
+  // Create/delete change the tree's file set; content changes don't, and are already
+  // covered by the facet map's own refresh.
+  const fileWatcher = vscode.workspace.createFileSystemWatcher("**/*")
+
   context.subscriptions.push(
     decorationsChanged,
+    tree,
+    treeView,
+    fileWatcher,
+    fileWatcher.onDidCreate((uri) => {
+      if (watchedPath(uri)) scheduleFileSet()
+    }),
+    fileWatcher.onDidDelete((uri) => {
+      if (watchedPath(uri)) scheduleFileSet()
+    }),
     vscode.window.registerFileDecorationProvider(decorationProvider),
     vscode.commands.registerCommand("aperture.repaint", () => scheduleRepaint()),
-    vscode.commands.registerCommand("aperture.focusFacet", () => void pickFocusFacet()),
-    vscode.window.onDidChangeActiveTextEditor(() => scheduleRepaint()),
+    vscode.commands.registerCommand("aperture.filterFacets", () => void pickFacetFilter()),
+    vscode.commands.registerCommand("aperture.clearFacetFilter", () => {
+      if (suppressedFacets.size === 0) return
+      suppressedFacets.clear()
+      applyFilter()
+    }),
+    vscode.commands.registerCommand("aperture.refreshTree", () => {
+      void fetchFileSet()
+      // Drop the response cache so the refetch is a real one rather than a no-op bail.
+      facetMapRaw = undefined
+      scheduleFacetMap()
+    }),
+    vscode.commands.registerCommand("aperture.revealActiveFile", () => revealActiveFile()),
+    vscode.commands.registerCommand("aperture.openToSide", (node: Node) =>
+      vscode.commands.executeCommand("vscode.open", node.uri, { viewColumn: vscode.ViewColumn.Beside }),
+    ),
+    // The built-in copyFilePath / revealFileInOS / revealInExplorer are wrapped rather than
+    // put in the menu directly: a `view/item/context` entry hands the command *our tree
+    // node*, not a URI, so a workbench command that expects a resource gets an object it
+    // can't read. Going through executeCommand with node.uri is the reliable form.
+    vscode.commands.registerCommand("aperture.copyPath", (node: Node) =>
+      vscode.env.clipboard.writeText(node.uri.fsPath),
+    ),
+    vscode.commands.registerCommand("aperture.copyRelativePath", (node: Node) =>
+      vscode.env.clipboard.writeText(node.rel),
+    ),
+    vscode.commands.registerCommand("aperture.revealInOS", (node: Node) =>
+      vscode.commands.executeCommand("revealFileInOS", node.uri),
+    ),
+    vscode.commands.registerCommand("aperture.revealInExplorer", (node: Node) =>
+      vscode.commands.executeCommand("revealInExplorer", node.uri),
+    ),
+    vscode.commands.registerCommand("aperture.findInFolder", (node: Node) =>
+      // The Explorer's own `filesExplorer.findInFolder` reads its selection rather than an
+      // argument, so this drives the search view directly instead.
+      vscode.commands.executeCommand("workbench.action.findInFiles", { filesToInclude: `./${node.rel}` }),
+    ),
+    vscode.commands.registerCommand("aperture.newFile", (node?: Node) =>
+      ops.newFile(fileOps, node ?? treeView.selection[0]),
+    ),
+    vscode.commands.registerCommand("aperture.newFolder", (node?: Node) =>
+      ops.newFolder(fileOps, node ?? treeView.selection[0]),
+    ),
+    vscode.commands.registerCommand("aperture.rename", (node: Node) => ops.rename(fileOps, node)),
+    vscode.commands.registerCommand("aperture.delete", (node: Node | undefined, selected: Node[] | undefined) =>
+      ops.remove(fileOps, targets(node, selected)),
+    ),
+    vscode.commands.registerCommand("aperture.closeTab", (node: { tab?: vscode.Tab }) =>
+      node.tab ? vscode.window.tabGroups.close(node.tab) : undefined,
+    ),
+    openEditors,
+    openEditorsView,
+    vscode.window.tabGroups.onDidChangeTabGroups(() => openEditors.refresh()),
+    // Reveal on visibility too: auto-reveal is skipped while the view is hidden (there is
+    // nothing to scroll), so opening the view has to catch up to the active editor.
+    treeView.onDidChangeVisibility((e) => {
+      if (e.visible) revealActiveFile()
+    }),
+    vscode.window.onDidChangeActiveTextEditor(() => {
+      scheduleRepaint()
+      revealActiveFile()
+    }),
     // A newly split/opened editor becomes visible without necessarily becoming active —
     // repaint so it drills + fills without needing a focus.
     vscode.window.onDidChangeVisibleTextEditors(() => scheduleRepaint()),
     // Warm open-but-hidden tabs so their function paint is ready before they're focused.
-    vscode.window.tabGroups.onDidChangeTabs(() => void warmOpenTabs()),
+    // The Open Editors view is a projection of this same state, so it refreshes here too —
+    // including on a dirty/clean flip, which is a tab change rather than a group change.
+    vscode.window.tabGroups.onDidChangeTabs(() => {
+      void warmOpenTabs()
+      openEditors.refresh()
+    }),
     vscode.workspace.onDidSaveTextDocument((doc) => {
       if (vscode.window.visibleTextEditors.some((e) => e.document === doc)) scheduleRepaint()
     }),
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (!e.affectsConfiguration("aperture")) return
+      // The tree's own settings never touch the server; they only change how what we
+      // already have is drawn, so they repaint in place.
+      if (e.affectsConfiguration("aperture.tree")) {
+        icons.setDelivery(config().get<IconDelivery>("tree.iconDelivery", "data"))
+        tree.refresh()
+        openEditors.refresh()
+      }
+      // The pips setting is read inside provideFileDecoration, so toggling it changes every
+      // row's answer at once — a genuine full invalidation, and the only way the already
+      // painted pips get dropped.
+      if (e.affectsConfiguration("aperture.explorerPips")) decorationsChanged.fire(undefined)
+      if (!e.affectsConfiguration("aperture.host") && !e.affectsConfiguration("aperture.port")) return
       // Reconnect against the new host/port and repaint. The fresh connection re-warms every
       // open tab on connect (see connectEvents), so no explicit re-warm is needed here.
       sse?.abort()
       sse = connectEvents()
       scheduleRepaint()
+      facetMapRaw = undefined
       scheduleFacetMap()
     }),
   )
@@ -582,6 +875,9 @@ export function activate(context: vscode.ExtensionContext) {
   // connectEvents), so switching to one is instant (no click-to-drill).
   scheduleRepaint()
   scheduleFacetMap()
+  // The tree needs both inputs; this is the one that doesn't depend on the server, so it
+  // renders a plain file tree immediately and gains its chips when the facet map lands.
+  void fetchFileSet()
 }
 
 export function deactivate() {
@@ -589,6 +885,7 @@ export function deactivate() {
   if (pollTimer) clearInterval(pollTimer)
   if (facetMapTimer) clearTimeout(facetMapTimer)
   if (facetMapPollTimer) clearInterval(facetMapPollTimer)
+  if (fileSetTimer) clearTimeout(fileSetTimer)
   sse?.abort()
   sse = undefined
   for (const deco of decorationByColor.values()) deco.dispose()
@@ -617,21 +914,28 @@ export function themeColorFor(hue: string): vscode.ThemeColor | undefined {
 
 // Reduce a file's facet mix to the one colour + one glyph a FileDecoration can carry.
 //
-// `focus` is a parameter rather than a baked-in "dominant" on purpose: filtering the view to
-// a single facet (PLAN O4/S4) is the same question asked with a different focus, so that
-// feature changes only what is passed here and never this encoding. With no focus we show
-// the file's plurality facet, which matches the server's `attributeFileBytes(...).dominant`
-// and therefore the TUI tile and the directory treemap. With a focus we show *that* facet's
-// share, and a file that doesn't carry it gets no decoration at all — so setting a focus
-// visually subtracts every unrelated file from the tree.
+// `suppressed` is a parameter rather than this picking a baked-in "dominant" on purpose:
+// legend filtering (PLAN O4/S4) is the same question asked over a smaller vocabulary, so
+// that feature changes only what is passed here and never this encoding.
+//
+// With nothing suppressed we show the file's plurality facet, which matches the server's
+// `attributeFileBytes(...).dominant` and therefore the TUI tile and the directory treemap.
+// With facets suppressed we show the file's largest *surviving* facet, and a file made
+// entirely of suppressed facets gets no decoration at all — so filtering visually subtracts
+// the unrelated files from the tree.
+//
+// Note the divergence from the Aperture tree, which greys a suppressed facet in place
+// rather than dropping it. That is not an inconsistency: the tree has a whole chip to spend
+// and can afford to preserve area, while a one-colour pip has to choose a facet, so the
+// only filtering it can express is subtraction.
 export function decorationFrom(
   weights: ReadonlyArray<FacetWeight>,
   legend: ReadonlyArray<LegendEntry>,
   facets: ReadonlyArray<string>,
-  focus: string | undefined,
+  suppressed: ReadonlySet<string>,
 ): { badge: string; color: vscode.ThemeColor | undefined; tooltip: string } | undefined {
-  // Weights arrive sorted descending, so the head is the plurality facet.
-  const chosen = focus === undefined ? weights[0] : weights.find((w) => facets[w.f] === focus)
+  // Weights arrive sorted descending, so the first survivor is the largest one.
+  const chosen = suppressed.size === 0 ? weights[0] : weights.find((w) => !suppressed.has(facets[w.f] ?? ""))
   if (!chosen) return undefined
   const labelOf = (index: number) => legend.find((e) => e.facet === facets[index])?.label ?? facets[index] ?? "?"
   const hue = legend.find((e) => e.facet === facets[chosen.f])?.color

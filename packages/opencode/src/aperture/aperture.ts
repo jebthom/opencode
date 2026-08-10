@@ -207,11 +207,22 @@ export type FacetFilesOutcome =
 // Weights are `{f, p}` — an index into `facets`, and an integer percent of the file's
 // attributed bytes — which keeps a ~2300-file repo's payload small enough to refetch on
 // every invalidation. Files with nothing painted are omitted entirely.
+//
+// `t` is the file's attributed byte total, the denominator those percentages came from.
+// It ships because percentages alone are not roll-up-able: a client aggregating a
+// directory from its files (the VSCode tree's folder chips) would have to weight every
+// file equally, and would then disagree with the byte-weighted directory treemap over the
+// same folder — the exact class of disagreement O3's single-classification model exists
+// to prevent. With `t` the client's rollup is `t * p / 100` summed per facet, which is
+// `attributeFileBytes` re-associated, so the two cannot drift.
 export interface FacetMap {
   readonly lens: AperturePayload.LensInfo
   // Facet ids in legend order, with NONE_FACET appended, so `f` indexes into this.
   readonly facets: ReadonlyArray<string>
-  readonly files: Record<string, ReadonlyArray<{ readonly f: number; readonly p: number }>>
+  readonly files: Record<
+    string,
+    { readonly t: number; readonly w: ReadonlyArray<{ readonly f: number; readonly p: number }> }
+  >
 }
 
 export interface Interface {
@@ -1988,9 +1999,9 @@ export function computeFacetMapFiles(
   store: ApertureSemanticStore.Store,
   mixes: ApertureSubfacetStore.Mixes,
   facets: ReadonlyArray<string>,
-): Record<string, ReadonlyArray<{ f: number; p: number }>> {
+): Record<string, { t: number; w: ReadonlyArray<{ f: number; p: number }> }> {
   const indexByFacet = new Map(facets.map((id, i) => [id, i]))
-  const result: Record<string, ReadonlyArray<{ f: number; p: number }>> = {}
+  const result: Record<string, { t: number; w: ReadonlyArray<{ f: number; p: number }> }> = {}
   for (const file of files) {
     const attribution = ApertureExtents.attributeFileBytes(file.size, mixes[file.path], store[file.id]?.facet)
     const total = attribution.weights.reduce((sum, w) => sum + w.bytes, 0)
@@ -2005,7 +2016,9 @@ export function computeFacetMapFiles(
         return f === undefined || p === 0 ? [] : [{ f, p }]
       })
       .sort((a, b) => b.p - a.p)
-    if (weights.length) result[file.path] = weights
+    // `t` is the pre-rounding denominator, so a client's `t * p / 100` rollup carries the
+    // file's real weight even where the percentages were rounded or a sliver dropped.
+    if (weights.length) result[file.path] = { t: total, w: weights }
   }
   return result
 }

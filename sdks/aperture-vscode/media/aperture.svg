@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+  <!-- The activity-bar icon: the composition chip itself, at three rows. VSCode masks this
+       with the theme's foreground, so `currentColor` is all the colour it can carry. -->
+  <path d="M3 4.5h18a1.5 1.5 0 0 1 1.5 1.5v2A1.5 1.5 0 0 1 21 9.5H3A1.5 1.5 0 0 1 1.5 8V6A1.5 1.5 0 0 1 3 4.5Zm0 1.5v2h4V6H3Zm5.5 0v2h4V6h-4Zm5.5 0v2h7V6h-7Z"/>
+  <path d="M3 11h11a1 1 0 0 1 0 2H3a1 1 0 1 1 0-2Z" opacity="0.7"/>
+  <path d="M3 15.5h15a1 1 0 0 1 0 2H3a1 1 0 0 1 0-2Z" opacity="0.45"/>
+</svg>

@@ -76,12 +76,20 @@ const LensSummary = Schema.Struct({
 // filtering to one facet needs that facet's share, not the file's plurality winner. `f`
 // indexes into `facets`; `p` is an integer percent of the file's attributed bytes,
 // descending. Files with nothing painted are omitted.
+//
+// `t` is the attributed byte total those percentages divide. Percentages alone cannot be
+// rolled up — a client aggregating a directory from its files would weight every file
+// equally and disagree with the byte-weighted directory treemap — so `t` is what lets the
+// VSCode tree's folder chips reproduce `attributeFileBytes` exactly.
 const FacetMapResult = Schema.Struct({
   lens: AperturePayload.LensInfo,
   // Facet ids in legend order, with the "Other" facet appended (it is a real stored value
   // but never a Lens facet, so it needs an index without polluting the legend).
   facets: Schema.Array(Schema.String),
-  files: Schema.Record(Schema.String, Schema.Array(Schema.Struct({ f: Schema.Int, p: Schema.Int }))),
+  files: Schema.Record(
+    Schema.String,
+    Schema.Struct({ t: Schema.Int, w: Schema.Array(Schema.Struct({ f: Schema.Int, p: Schema.Int })) }),
+  ),
 })
 
 // Activate a Lens by id or name (the searchable Lens picker / `/lens-switch`). The
@@ -102,7 +110,9 @@ const SelectLensResult = Schema.Struct({
 // prompts/tool-calls. `interaction` is the type id (e.g. "lens.cycle", "tile.drill").
 export const InteractionInput = Schema.Struct({
   sessionID: Schema.String.annotate({ description: "The viewed session the interaction belongs to" }),
-  interaction: Schema.String.annotate({ description: "Interaction type id, e.g. lens.cycle / tile.drill / breadcrumb.nav" }),
+  interaction: Schema.String.annotate({
+    description: "Interaction type id, e.g. lens.cycle / tile.drill / breadcrumb.nav",
+  }),
   scope: Schema.optional(Schema.String).annotate({ description: "Repo-relative scope the view was at" }),
   drill: Schema.optional(Schema.String).annotate({ description: "Drilled file path, if any" }),
   lens: Schema.optional(Schema.String).annotate({ description: "Active lens id at the time" }),
@@ -164,7 +174,10 @@ export const ApertureApi = HttpApi.make("aperture")
       .add(
         HttpApiEndpoint.get("listLenses", `${root}/lens/list`, {
           query: Schema.Struct({ ...WorkspaceRoutingQueryFields }),
-          success: described(Schema.Array(LensSummary), "All available Lenses (built-in + user), with the active one marked"),
+          success: described(
+            Schema.Array(LensSummary),
+            "All available Lenses (built-in + user), with the active one marked",
+          ),
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "aperture.listLenses",

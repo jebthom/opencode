@@ -5104,10 +5104,13 @@ export type ApertureFacetMapResponses = {
     }
     facets: Array<string>
     files: {
-      [key: string]: Array<{
-        f: number
-        p: number
-      }>
+      [key: string]: {
+        t: number
+        w: Array<{
+          f: number
+          p: number
+        }>
+      }
     }
   }
 }
