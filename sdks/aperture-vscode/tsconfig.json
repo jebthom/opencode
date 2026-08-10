@@ -8,5 +8,8 @@
     "typeRoots": ["./node_modules/@types"],
     "strict": true,
     "skipLibCheck": true
-  }
+  },
+  // Only the extension itself. `script/` is a bun-run build tool that imports across the
+  // monorepo into packages/opencode, which is outside rootDir and not part of the bundle.
+  "include": ["src"]
 }
