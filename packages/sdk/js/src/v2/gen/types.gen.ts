@@ -5204,8 +5204,9 @@ export type ApertureActivityResponses = {
       promptedAt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
       agent: string
       entries: Array<{
-        path: string
-        action: "read" | "create" | "edit"
+        path?: string
+        action: "read" | "search" | "create" | "edit" | "run" | "fetch"
+        target: "file" | "place" | "none"
         agent: string
         sessionID: string
         depth: number

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { deriveTurns, mergeChildEntries, toRepoRelative, type MessageLike } from "@/aperture/activity-model"
+import { deriveTurns, mergeChildEntries, toRepoRelative, toRepoScope, type MessageLike } from "@/aperture/activity-model"
 import { computeFacetMapFiles } from "@/aperture/aperture"
 import { NONE_FACET } from "@/aperture/lenses"
 
@@ -43,7 +43,7 @@ const derive = (messages: MessageLike[], sessionID = "ses_root", depth = 0) =>
   deriveTurns(messages, { directory: DIR, sessionID, depth })
 
 describe("deriveTurns", () => {
-  test("maps read/edit/write onto actions and drops tools that touch no one file", () => {
+  test("maps every tool onto an action and a target", () => {
     const turns = derive([
       user("go"),
       assistant([
@@ -51,15 +51,85 @@ describe("deriveTurns", () => {
         tool("edit", { filePath: "src/b.ts" }),
         tool("write", { filePath: "src/c.ts" }),
         tool("bash", { command: "ls" }),
-        tool("grep", { pattern: "x" }),
+        tool("grep", { pattern: "x", path: "src" }),
       ]),
     ])
     expect(turns).toHaveLength(1)
-    expect(turns[0]!.entries.map((e) => [e.path, e.action])).toEqual([
-      ["src/a.ts", "read"],
-      ["src/b.ts", "edit"],
+    expect(turns[0]!.entries.map((e) => [e.path, e.action, e.target])).toEqual([
+      ["src/a.ts", "read", "file"],
+      ["src/b.ts", "edit", "file"],
       // The write tool means "whole-file write", new file or overwrite alike.
-      ["src/c.ts", "create"],
+      ["src/c.ts", "create", "file"],
+      // A shell command names no path we could ever colour, but it is still a step.
+      [undefined, "run", "none"],
+      ["src", "search", "place"],
+    ])
+  })
+
+  test("a directory read is a place, not a file", () => {
+    // The read tool takes a directory as happily as a file and agents use it that way
+    // constantly. Its result metadata says which, authoritatively (tool/read.ts).
+    const turns = derive([
+      user("go"),
+      assistant([
+        tool("read", { filePath: "packages" }, { metadata: { display: { type: "directory" } } }),
+        tool("read", { filePath: "src/a.ts" }, { metadata: { display: { type: "file" } } }),
+      ]),
+    ])
+    expect(turns[0]!.entries.map((e) => [e.path, e.target])).toEqual([
+      ["packages", "place"],
+      ["src/a.ts", "file"],
+    ])
+  })
+
+  test("a search with no path scopes to the repo root", () => {
+    const turns = derive([user("go"), assistant([tool("glob", { pattern: "**/*.ts" })])])
+    expect(turns[0]!.entries.map((e) => [e.path, e.action, e.target])).toEqual([["", "search", "place"]])
+  })
+
+  test("apply_patch expands into one entry per changed file", () => {
+    // Its *input* is patch text with no path field at all, so without reading the result
+    // metadata every patch-based edit would be a blind spot — and each changed file has to
+    // become its own step, since mutations are never aggregated.
+    const turns = derive([
+      user("go"),
+      assistant([
+        tool(
+          "apply_patch",
+          { patchText: "..." },
+          {
+            metadata: {
+              files: [
+                { relativePath: "src/a.ts", type: "update" },
+                { relativePath: "src/new.ts", type: "add" },
+              ],
+            },
+          },
+        ),
+      ]),
+    ])
+    expect(turns[0]!.entries.map((e) => [e.path, e.action, e.target])).toEqual([
+      ["src/a.ts", "edit", "file"],
+      ["src/new.ts", "create", "file"],
+    ])
+  })
+
+  test("an unrecognised tool records as an external fetch, and bookkeeping tools record nothing", () => {
+    // MCP tools register as `client_tool` with no reserved prefix, so they cannot be
+    // identified by pattern — but "we don't know what it did and it wasn't a repo file" is
+    // exactly what external means, and staying visible beats being silently dropped.
+    const turns = derive([
+      user("go"),
+      assistant([
+        tool("linear_create_issue", { title: "x" }),
+        tool("webfetch", { url: "https://example.com" }),
+        tool("todowrite", { todos: [] }),
+        tool("skill", { name: "x" }),
+      ]),
+    ])
+    expect(turns[0]!.entries.map((e) => [e.action, e.target])).toEqual([
+      ["fetch", "none"],
+      ["fetch", "none"],
     ])
   })
 
@@ -178,6 +248,23 @@ describe("toRepoRelative", () => {
     expect(toRepoRelative(DIR, DIR)).toBeUndefined()
     expect(toRepoRelative(DIR, "")).toBeUndefined()
     expect(toRepoRelative(DIR, undefined)).toBeUndefined()
+  })
+})
+
+describe("toRepoScope", () => {
+  test("treats the repo root as a real scope rather than a degenerate one", () => {
+    // The difference from toRepoRelative: a search with no path, or a read of the project
+    // directory itself, is scoped to "" — which is how AperturePayload keys the root.
+    expect(toRepoScope(DIR, DIR)).toBe("")
+    expect(toRepoScope(DIR, "")).toBe("")
+    expect(toRepoScope(DIR, undefined)).toBe("")
+    expect(toRepoScope(DIR, "src")).toBe("src")
+    expect(toRepoScope(DIR, "/repo/src/nested")).toBe("src/nested")
+  })
+
+  test("still rejects anything outside the project", () => {
+    expect(toRepoScope(DIR, "/etc")).toBeUndefined()
+    expect(toRepoScope(DIR, "../outside")).toBeUndefined()
   })
 })
 

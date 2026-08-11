@@ -1,12 +1,12 @@
 import type { TuiPlugin, TuiPluginApi, TuiThemeCurrent } from "@opencode-ai/plugin/tui"
 import type { MouseEvent, ScrollBoxRenderable } from "@opentui/core"
-import { RGBA } from "@opentui/core"
 import { useTerminalDimensions } from "@opentui/solid"
 import type { InternalTuiPlugin } from "../../plugin/internal"
 import { createEffect, createMemo, createResource, createSignal, For, onCleanup, Show } from "solid-js"
 import { DIRECTORY_HUE } from "@/aperture/semantics"
 import { NONE_FACET, NONE_HUE, NONE_LABEL, UNTAGGED_HUE, UNTAGGED_LABEL, BUILTIN_LENS_IDS } from "@/aperture/lenses"
 import { allocateCells, buildGrid, coalesce } from "@/aperture/treemap"
+import { facetColors, resolveColor, themeColor, GREY_CELL } from "./aperture-colors"
 import { openLensPicker, fetchLenses, drillDownsOf } from "./aperture-lens-picker"
 
 const id = "internal:aperture"
@@ -171,11 +171,6 @@ const LEGEND_SAFETY_PAD = 2
 // it appears and disappears under the user, and a row that only overflows once something
 // is filtered would be a bug that shows up exactly when the feature is in use.
 const LEGEND_RESET = "↺"
-// The hue a facet takes while it is filtered out of the legend (O4). Must match
-// SUPPRESSED_HUE in extension.ts and MUTED_HEX in chip.ts — one facet greying to two
-// different colours across the two surfaces would read as a bug in one of them. Since C1
-// all three are the same literal hex rather than a token each surface resolves for itself.
-const SUPPRESSED_HUE = NONE_HUE
 // Cells moved per wheel notch when we redirect a vertical wheel into horizontal
 // scroll. Blocks are ~10 cols wide, so 1 cell/notch (the raw terminal delta) feels
 // sluggish; a small multiplier makes the bar pan at a comfortable speed.
@@ -185,12 +180,6 @@ const HSCROLL_STEP = 3
 // they'd otherwise only surface on navigation or a manual ⟳. Recompute is a cheap scoped
 // walk, so a low-frequency poll keeps the view honest without meaningful cost.
 const REFRESH_POLL_MS = 5000
-
-// Cell sentinel for an empty / fully-untagged directory: painted light grey so the
-// bordered box reads as a real-but-uninhabited directory rather than a black void. The
-// leading space is deliberate — it keeps this distinct from any real tag id (slugs are
-// trimmed kebab-case and can never start with a space), so don't "tidy" it to "grey".
-const GREY_CELL = " grey"
 
 // Directory blocks and file tiles share one corner set. Kind used to be encoded by corner
 // shape (files rounded), which is redundant now that the two are different shapes in
@@ -516,33 +505,12 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
       label: e.label.length > cap ? e.label.slice(0, cap - 1) + "…" : e.label,
     }))
   })
-  // The one place a facet id becomes a colour — and therefore the one place the legend
-  // filter is applied (O4). A suppressed facet is handed the untagged grey here, so every
-  // surface downstream (the treemap blocks, the file-tile bands, the legend swatch itself)
-  // greys without knowing the filter exists. Painting from the *unfiltered* weights is what
-  // keeps a suppressed facet's area: nothing re-flows, so two directories stay comparable
-  // across a click, which is the whole reason to filter rather than to search.
-  //
-  // SUPPRESSED_HUE is NONE_HUE, not the dimmer UNTAGGED_HUE: a facet you turned off is
-  // still *code*, so it should sit where "Other" sits rather than dropping to the grey that
-  // means "nothing to see here". It also has to be the grey the VSCode extension uses (see
-  // SUPPRESSED_HUE in extension.ts / MUTED_HEX in chip.ts) — the same facet greying to two
-  // different colours across the two surfaces would read as a bug in one of them.
-  const colorByFacet = createMemo(() => {
-    const off = suppressed()
-    return new Map(legendEntries().map((e) => [e.facet, off.has(e.facet) ? SUPPRESSED_HUE : e.color]))
-  })
-  // A facet id → colour: the NONE_FACET escape paints the "Other" grey; a real facet paints
-  // its legend colour (hex palette or theme role).
-  const facetColor = (key: string): TuiThemeCurrent["text"] =>
-    key === NONE_FACET ? resolveColor(theme(), NONE_HUE) : resolveColor(theme(), colorByFacet().get(key))
-  // Resolve a treemap cell key to a colour: the grey sentinel → the dimmer non-code
-  // grey; a facet id (incl. NONE_FACET) → its facet colour; null padding → the panel bg.
-  const colorFor = (key: string | null): TuiThemeCurrent["text"] => {
-    if (key === GREY_CELL) return resolveColor(theme(), UNTAGGED_HUE)
-    if (key) return facetColor(key)
-    return theme().backgroundPanel
-  }
+  // Facet → colour, including the O4 legend filter. Shared with the sidebar Activity View
+  // through aperture-colors.ts rather than resolved here: two copies of this mapping is
+  // precisely how one facet ends up greying to two different colours across two surfaces.
+  const colors = createMemo(() => facetColors(legendEntries(), suppressed(), theme()))
+  const facetColor = (key: string): TuiThemeCurrent["text"] => colors().facetColor(key)
+  const colorFor = (key: string | null): TuiThemeCurrent["text"] => colors().colorFor(key)
   const boundaries = () => (graph.error ? [] : (graph()?.boundaries ?? []))
   const edgeList = () => (graph.error ? [] : (graph()?.edges ?? []))
   const compositionOf = (nodeID: string) => (graph.error ? undefined : graph()?.composition?.[nodeID])
@@ -1285,24 +1253,6 @@ function hueColor(theme: TuiThemeCurrent, hue: string | undefined, kind: GraphNo
   return kind === "directory" ? themeColor(theme, DIRECTORY_HUE) : theme.textMuted
 }
 
-// Resolve a theme role key (e.g. "info") to a theme color — the architecture
-// collection's hues and the agent palette use these.
-function themeColor(theme: TuiThemeCurrent, key: string) {
-  return key in theme ? (theme[key as keyof TuiThemeCurrent] as TuiThemeCurrent["text"]) : theme.textMuted
-}
-
-// Resolve a collection colour: a literal "#RRGGBB" (user palettes) → RGBA, or a theme
-// role key (architecture collection) → the theme's colour. Unknown/absent → muted.
-function resolveColor(theme: TuiThemeCurrent, color: string | undefined): TuiThemeCurrent["text"] {
-  if (!color) return theme.textMuted
-  if (color.startsWith("#")) return hexToRgba(color)
-  return color in theme ? (theme[color as keyof TuiThemeCurrent] as TuiThemeCurrent["text"]) : theme.textMuted
-}
-
-function hexToRgba(hex: string): TuiThemeCurrent["text"] {
-  const h = hex.replace("#", "")
-  return RGBA.fromInts(parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16))
-}
 
 const tui: TuiPlugin = async (api) => {
   api.slots.register({

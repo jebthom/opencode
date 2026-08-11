@@ -402,7 +402,11 @@ export function normalizeScope(scope: string) {
 // True if any path segment is an always-ignored directory. The glob `ignore`
 // already prunes these during the walk; this is a cheap belt-and-suspenders
 // guard for entries that slip through (e.g. an ignored dir named at the scope).
-function isIgnoredPath(rel: string) {
+// Exported so Aperture.activity can ask the same question about a path it is admitting
+// outside the source glob (a mutation to a .md/.json the view has no node for). A second
+// copy of this list is exactly how two surfaces end up disagreeing about what is in the
+// repo.
+export function isIgnoredPath(rel: string) {
   return rel.split("/").some((seg) => IGNORED_DIR_SET.has(seg))
 }
 

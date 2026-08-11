@@ -46,7 +46,7 @@ Three findings reshape the design:
 | **Overview Lens** | The existing Lens: partitions the codebase, ~4–6 facets, whole-repo paint, aggregated in the top bar. |
 | **Search Lens** | A narrow binary/ternary Lens probing one concern. Painted at **line level**, populated opportunistically by Explore/Build agents rather than by a sweep. |
 | **Line tag** | A syntax-anchored line-or-range facet assignment, the Search Lens's unit of data. |
-| **Activity View** | A block/waffle rendering of an agent's read/edit/write actions, coloured by the active Lens. |
+| **Activity View** | The vertical Activity Path: an agent's actions as one row per *step*, coloured by the active Lens. |
 
 ---
 
@@ -66,7 +66,7 @@ O4 (legend filter) ────────────────────�
 
 S1 (line-tag store) ──► S2 (agent tool) ──► S3 (line painting) ──► S5 (open-all)
 
-G1 ✅ (activity data) ──► G2 (block render) ──► G3 (placement/timeline)
+G1 ✅ (activity data) ──► G2+G3 ✅ (the Activity Path) ──► ✅ track complete
 
                                          C1 (colour fidelity) ──► ✅ independent
 ```
@@ -667,9 +667,12 @@ verified live: cycling the Lens returns `turns` **byte-identical** while
   case** — Aperture aggregates them, which is what the whole top bar is made of —
   and they are dropped for a rendering reason that belongs to **G2**: a turn's
   reads collapse into one block, so admitting a directory would aggregate an
-  aggregate. See G2 for the argument and for what to try if that changes. A file
-  that survives but is *unpainted* is a third case and is kept — that's the
-  honest grey the treemap already draws.
+  aggregate. A file that survives but is *unpainted* is a third case and is kept —
+  that's the honest grey the treemap already draws.
+  **Superseded by G2+G3:** directories are no longer dropped. They are kept as
+  *places* — counted as navigation, contributing no band cells — which honours the
+  aggregate-into-an-aggregate argument without discarding most of a turn's
+  gathering. Non-source *mutations* are kept too. See G2+G3 for both.
 - **The facet half is shaped exactly like `FacetMap`**: same `facets` vocabulary,
   same `{t, w:[{f,p}]}` weights, same `suppressed`, the whole mix rather than a
   pre-reduced dominant (O2's decision, so O4's filter stays a pure client-side
@@ -697,54 +700,90 @@ system off.
 **Not verified live:** sub-agent folding — no session in this repo has ever
 called the `task` tool, so it rests on the unit test alone.
 
-### G2 — Block rendering
+### G2 + G3 — The Activity Path ✅
 
-A treemap/waffle of the turn's actions, coloured by active-Lens facet.
+Built together: both are rendering decisions over the same geometry, and the
+orientation question turned out to be settled by the step rule rather than
+independent of it. **Implemented.**
 
-**Reads are less important than edits and writes.** Reads aggregate into one
-block, optionally expandable to per-file; edits and writes are always expanded.
-This is the core information-density decision and should survive contact with
-the experiment.
+**A step is either (a) a maximal run of consecutive `survey` entries within one
+`(turn, lane)`, or (b) a *single* non-survey entry.** That sentence is the whole
+design; everything below follows from it.
 
-**Open — directory reads are excluded, and the reason belongs to this step.** The
-`read` tool takes a *directory* as happily as a file, and agents use it that way
-constantly (a live session showed 4 of 6 reads were directories). G1 filters
-those out at the service, and the justification given there — "no node, no size,
-no facet" — is **wrong on its face**: a directory is exactly the thing Aperture
-*does* have an aggregation for. Its treemap band is the composition of everything
-beneath it.
+- **Only gathering aggregates.** Aggregation asserts the individual acts need not
+  be distinguished. That is true of gathering — "the agent looked at this much of
+  this mix" is the useful reading, and which of twelve files it opened third is
+  not — and false of anything that leaves a lasting effect. A mutation the user
+  did not notice is the failure mode this view exists to prevent, so **every
+  mutation and every external call is its own step**. Reads → write → reads is
+  three steps; reads → *three* writes → reads is five; three edits to one file are
+  three steps and are never deduped. Reads inside a run *are* deduped, with a count.
+  This supersedes G2's original "reads aggregate, edits expand" with a sharper rule.
+- **Mode is three-valued**, not read-vs-mutate: `survey` (reads, directory
+  listings, searches), `mutate` (edits, writes, shell commands), `external` (web
+  fetches, and any unrecognised tool — MCP registers as `client_tool` with no
+  reserved prefix, so it cannot be identified by pattern, and "we don't know what
+  it did and it wasn't a repo file" is exactly what external means). `bash` is
+  `mutate` because an un-inspectable act is better treated as consequential; note
+  it does not need that classification to split a survey run, since under the rule
+  *any* non-survey entry already breaks one.
+- **Lanes are structural, not cosmetic.** `mergeChildEntries` sorts the whole turn
+  by timestamp, so parallel sub-agents arrive interleaved entry-by-entry —
+  segmenting that merged sequence would shatter every run into alternating
+  one-entry steps. Partitioning by `sessionID` *before* segmenting fixes it, and
+  `agent` cannot do that job because two `Explore` agents share a name. This is
+  also what delivers G3's "sub-agent activity builds orthogonally" as a
+  consequence rather than as separate machinery.
+- **One step is exactly one row**, which is what makes G0's budget legible:
+  `ACTIVITY_ROWS` (10) steps visible, in a nested `<scrollbox>` pinned to newest.
+  The vertical axis is time; horizontal carries magnitude and composition. A
+  survey step draws an aggregate band scaled by `sqrt(n / nMax)` — the same area
+  idiom as the treemap's `scaleCells`. A mutate step holds exactly one file, so it
+  can afford to *name* it: identity is the whole point of showing a mutation.
 
-The real reason is that G2 aggregates. A turn's reads collapse into one block, so
-admitting a directory would fold an aggregate *into* an aggregate: one `read` of
-`packages/` would outweigh nine reads of individual files, and the block would
-report the facet mix of code the agent never opened. Whatever the block is
-measuring — "what did the agent actually look at" — a directory listing is not an
-instance of it.
+**Resolved — directory reads are back, as places.** G1's justification for
+dropping them ("no node, no size, no facet") was wrong on its face, and the real
+reason was that G2 aggregates: admitting a directory would fold an aggregate into
+an aggregate, so one `read` of `packages/` would outweigh nine real files and
+report the mix of code the agent never opened. Both halves are now honoured — a
+directory read or a search scope is kept and **counted as navigation** but
+contributes **no band cells**, drawn as PLAN's own suggested alternative, a
+`⌕ looked around ×n` line. A live session showed 4 of 6 reads were directories, so
+the old filter was discarding most of a turn's gathering.
 
-So the exclusion stands, but it is a **G2 rendering decision that G1 happens to
-implement**, and it should be revisited if the answer to "reads aggregate into
-what?" changes. Two things worth trying if it does: give directory reads their
-own non-aggregating mark (a navigation trace rather than a facet block), or lift
-them out of the waffle entirely into a per-turn "looked around in" line. The data
-to do either is one filter away — `Aperture.activity` drops these against
-`subtreeFor`, so restoring them is deleting a `.filter`, not re-deriving anything.
+**Resolved — non-source mutations are visible.** `subtreeFor` globs source
+extensions only, so a write to `package.json`, a migration, a README or a YAML
+config had no node and was silently dropped. That is a class of unambiguously
+lasting change, so a *mutation* to any non-ignored repo path is now kept as an
+uncoloured file and painted the honest grey the treemap already draws for un-swept
+code. *Reads* of such files stay dropped: gathering is aggregated anyway, so an
+uncolourable read adds a number without adding a reading. Caught only by running
+the thing — every unit test used `.ts` fixtures.
 
-### G3 — Placement and timeline orientation
+**Orientation: vertical, and the model stays orientation-free.** G3 proposed
+building the renderer orientation-agnostic and trying both surfaces; that is
+reversed. A row-per-step path is intrinsically vertical, and the top bar's budget
+(13 rows, wide, already contending with the Overview Lens) wants a different
+shape, so a shared component would collapse to a config blob. Segmentation instead
+lives in `aperture/activity-steps.ts` — pure, tested, no Solid/theme/Effect, the
+same posture as `treemap.ts` — and a horizontal variant would reuse the model
+while writing its own drawing.
 
-Either the right sidebar (vertical timeline, turns building downward) or the top
-bar (horizontal). **Replacing the overview is possible but likely confusing** —
-the two answer different questions, and a user mid-task wants both.
+**Landed:** `aperture/activity-steps.ts` (lanes + segmentation + `stepWeight`),
+`feature-plugins/sidebar/activity.tsx` (order 150, per G0), and
+`feature-plugins/system/aperture-colors.ts` — the facet→colour path lifted out of
+the top bar so the two surfaces cannot disagree about what a facet looks like,
+which the codebase repeatedly warns is how one facet ends up greying to two
+different colours. `ActivityEntry` gained `target` and an optional `path`;
+`ACTIONS` gained `search`/`run`/`fetch`; `apply_patch` expands to one entry per
+patched file from its result metadata (its *input* is patch text with no path
+field, so patch edits were a blind spot). No new host slot was needed —
+`sidebar_content` already appends by `order`.
 
-Structure: each turn builds along the timeline axis; within a turn, read / edit /
-write (and sub-agent r/e/w) build orthogonally.
-
-The sidebar is the safer default — it doesn't contend with the Overview Lens for
-the top bar, and vertical suits an append-only log. But this is explicitly for
-experiment; build the block renderer (G2) so it is orientation-agnostic and try
-both.
-
-Slot template: `feature-plugins/sidebar/files.tsx`. A new host slot may be
-needed in `packages/plugin/src/tui.ts` (only `aperture_top` exists today).
+**Verified live**, including the two things G1 could not be: cycling the Lens
+recolours the bands (green→yellow) while the steps stay byte-identical, and a turn
+launching two parallel sub-agents renders as **two indented lanes**, not
+interleaved rows — the first time the `task` path has been exercised in this repo.
 
 ---
 
@@ -864,16 +903,14 @@ has a second consumer: it should drive O2's Explorer `focus` as well as the TUI.
 
 **Then:** S2 → S3 → S5 in sequence, all gated on S1.
 
-**Track G** is independent throughout and can run alongside from the start. It's
-the most speculative track, so it should not block the others. G0 and G1 are
-done; **G2** is next and is now unblocked by data — it consumes
-`GET /aperture/activity` and needs no further backend work.
+**Track G** is complete: G0 → G1 → G2+G3 all landed. It ran independently of the
+other tracks throughout, as intended for the most speculative one.
 
 **Track C** is done. C1 landed after O1–O4, once O2's tree glyphs made the
 cross-surface half of the problem visible.
 
 **Natural split by surface:**
-- *Terminal renderer* (`aperture.tsx`): O1, O4, G2, G3
+- *Terminal renderer* (`aperture.tsx`, `sidebar/activity.tsx`): O1, O4, G2+G3 ✅
 - *VSCode extension* (`sdks/aperture-vscode`): O2, S3, S5's reveal path
 - *Server/data* (`aperture/`, tools, payload): O3, S1, S2, G1, the bulk endpoint
 - *Cross-cutting*: C1 ✅
@@ -890,7 +927,7 @@ cross-surface half of the problem visible.
 | 3 | ~~Whether filtered-off facets keep their treemap area~~ — **decided:** keep it, greying in place; weights are never touched, so no surface re-flows on a filter click. The Explorer pip is the deliberate exception (one colour, so it must subtract) | O4 ✅ |
 | 4 | Line-tag anchoring mechanism (composite recommended) | S1 |
 | 5 | Search Lens as a distinct type on the model vs. a flag | S1 |
-| 6 | Activity View in the sidebar vs. the top bar — **not a space contest**: G0 establishes that the sidebar is one shared scrollbox, so a new section costs scroll depth rather than pushing anything off-screen, and `order` is ours to pick. Both surfaces are equally unavailable in subagent sessions. G1 has since *emptied* the top bar of activity, so this is now a placement choice with no incumbent | G3 (G0 ✅, G1 ✅) |
+| 6 | ~~Activity View in the sidebar vs. the top bar~~ — **decided: the sidebar, vertically, and the orientation experiment is off.** One step is one row, so the path is intrinsically vertical; the top bar's 13-row wide budget wants a different shape and a shared renderer would collapse to a config blob. Segmentation stays pure and orientation-free in `activity-steps.ts`, so a horizontal variant could still reuse the model | G2+G3 ✅ |
 | 8 | ~~Where activity data comes from and how it gains per-session durability~~ — **decided:** derived from the durable message store on every read, never recorded. The `session.next.*` tracker was dead by default and in-memory; deriving makes durability, retroactive history and Lens-switch recolouring free, and removes the second source of truth | G1 ✅ |
 | 7 | ~~Whether to fix truecolor detection upstream in OpenTUI or locally~~ — **decided:** neither. Putting every paintable colour on an exact xterm-256 entry makes quantisation a no-op, so truecolor stops mattering for colour *identity* | C1 ✅ |
 

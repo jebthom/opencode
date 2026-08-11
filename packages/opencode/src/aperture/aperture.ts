@@ -27,7 +27,7 @@ import { AperturePainter } from "./painter"
 import { ApertureLensStore } from "./lens-store"
 import { ApertureDeterministic } from "./deterministic"
 import { ApertureActivityModel, type DerivedTurn } from "./activity-model"
-import type { Turn as ActivityTurn } from "./activity"
+import { modeOf, type Turn as ActivityTurn, type ActivityEntry } from "./activity"
 import { Database } from "@opencode-ai/core/database/database"
 import { Git } from "@/git"
 import {
@@ -1956,38 +1956,77 @@ export const layer = Layer.effect(
       const derived = yield* readTurns(ctx.directory, sessionID, maxTurns)
       const subtree = yield* subtreeFor(ctx.directory)
 
-      // Keep only entries whose path is a file the view actually knows about. `subtreeFor`
-      // is the same authority every other Aperture surface uses to decide what counts as a
-      // file, which is what keeps this filter from being a second opinion.
+      // Settle what each path-bearing entry actually points at. `subtreeFor` is the same
+      // authority every other Aperture surface uses to decide what counts as a file, which
+      // is what keeps this from being a second opinion — and it is the only place that
+      // holds the repo's file set, so the derivation's guess is overruled here.
       //
-      // Two different cases sit behind the one filter:
+      // Three cases:
       //
-      //  - Gitignored, binary and since-deleted paths have no node, no size and no facet, so
-      //    a block for one could only ever be an uncolourable, unsizeable hole.
-      //  - *Directories* — which the `read` tool takes as happily as a file, and agents use
-      //    that way constantly — are dropped for a different reason, and it is a RENDERING
-      //    one (PLAN.md G2): Aperture aggregates directories perfectly well, but a turn's
-      //    reads collapse into one block, so admitting a directory would fold an aggregate
-      //    into an aggregate. One read of `packages/` would outweigh nine reads of real
-      //    files and report the mix of code the agent never opened.
+      //  - A path in the file set is a `file`. It joins the facet band. One that survives
+      //    but has nothing painted yet is kept deliberately: it is the honest grey the
+      //    treemap already draws for un-swept code.
+      //  - A path *above* a known file is a `place` — a directory read or a search scope.
+      //    The `read` tool takes a directory as happily as a file and agents use it that
+      //    way constantly, so dropping these lost most of a turn's gathering. They are
+      //    kept and counted, but they contribute NO cells to a block (see the renderer):
+      //    a turn's survey entries collapse into one aggregate, so admitting a directory
+      //    would fold an aggregate into an aggregate — one read of `packages/` would
+      //    outweigh nine reads of real files and report the mix of code the agent never
+      //    opened. Counted as navigation, not as composition.
+      //  - A *mutation* to anything else is kept anyway, as an uncoloured file. This is the
+      //    case that is not symmetric, and deliberately so. `subtreeFor` globs source
+      //    extensions only, so a write to package.json, a migration, a README or a YAML
+      //    config has no node — and dropping those would mean the view silently omits
+      //    changes that are unambiguously lasting effects on the committable codebase,
+      //    which is the exact failure the Activity Path exists to prevent. They carry no
+      //    facet mix, so the renderer paints them the same honest grey it already draws for
+      //    un-swept code. *Reads* of such files stay dropped: gathering is aggregated
+      //    anyway, so an uncolourable read would add a number without adding a reading.
+      //  - Anything else — a read outside the source set, or any path under an ignored
+      //    directory — is dropped, as before.
       //
-      // That second exclusion is therefore G2's to revisit, not this function's. Restoring
-      // directory reads is deleting this filter, not re-deriving anything.
-      //
-      // A file that survives here but has nothing painted yet is a third case and is
-      // deliberately kept: it is the honest grey the treemap already draws for un-swept code.
+      // On the scratchpad question: a mutation outside the project was already impossible
+      // here, since `toRepoRelative` resolved it away before this function ever saw it, and
+      // `isIgnoredPath` removes the node_modules/dist family. What is NOT distinguished is a
+      // repo-internal path the user's .gitignore covers — nothing in Aperture reads
+      // .gitignore today. If scratch files inside the repo start showing up as mutations,
+      // that is the gap to close, and it belongs in `isIgnoredPath` rather than here.
       const known = new Set(subtree.map((file) => file.path))
+      const places = new Set<string>([""])
+      for (const file of subtree) {
+        for (let i = file.path.indexOf("/"); i !== -1; i = file.path.indexOf("/", i + 1)) {
+          places.add(file.path.slice(0, i))
+        }
+      }
+      const classify = (entry: ActivityEntry): ActivityEntry | undefined => {
+        // Pathless acts (a shell command, a web fetch) pass through untouched.
+        if (entry.path === undefined) return entry
+        if (known.has(entry.path)) return entry.target === "file" ? entry : { ...entry, target: "file" }
+        if (places.has(entry.path)) return entry.target === "place" ? entry : { ...entry, target: "place" }
+        // A change to a file the source glob doesn't cover is still a change to the repo.
+        if (modeOf(entry.action) === "mutate" && !ApertureExtract.isIgnoredPath(entry.path)) {
+          return { ...entry, target: "file" }
+        }
+        return undefined
+      }
       const turns = derived.map((turn) => ({
         promptedAt: turn.promptedAt,
         agent: turn.agent,
-        entries: turn.entries.filter((entry) => known.has(entry.path)),
+        entries: turn.entries.flatMap((entry) => {
+          const settled = classify(entry)
+          return settled ? [settled] : []
+        }),
       }))
 
-      // Only the touched paths are attributed — a handful of files, not the repo. That is
-      // the whole reason this doesn't just call facetMap(): the sidebar refetches on every
-      // turn boundary and shouldn't pay a 2000-file reduction to colour twenty blocks.
+      // Only the touched *files* are attributed — a handful, not the repo. That is the
+      // whole reason this doesn't just call facetMap(): the sidebar refetches on every turn
+      // boundary and shouldn't pay a 2000-file reduction to colour twenty blocks. Places
+      // are excluded by construction, since they contribute no cells to colour.
       const touched = new Set<string>()
-      for (const turn of turns) for (const entry of turn.entries) touched.add(entry.path)
+      for (const turn of turns) {
+        for (const entry of turn.entries) if (entry.target === "file" && entry.path) touched.add(entry.path)
+      }
 
       const lens = yield* activeUsable(ctx.directory, ctx.project.id)
       const store = yield* facetStoreFor(lens, ctx.directory, ctx.project.id)

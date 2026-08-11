@@ -112,12 +112,18 @@ const ActivityQuery = Schema.Struct({
   turns: Schema.optional(Schema.NumberFromString),
 })
 
-// One file touch. `depth` is 0 for the viewed session and 1 for a sub-agent it spawned —
-// sub-agent work lives in its own session, and the sidebar is hidden outright inside those,
-// so the parent's view is the only place it can ever be seen.
+// One recorded act. `target` says what it points at and therefore what it can contribute:
+// a `file` joins the facet band, a `place` (directory read or search scope) is counted as
+// navigation but paints no cells, and `none` is a pathless act with no path field at all.
+//
+// `depth` is 0 for the viewed session and 1 for a sub-agent it spawned — sub-agent work
+// lives in its own session, and the sidebar is hidden outright inside those, so the
+// parent's view is the only place it can ever be seen. `sessionID` doubles as the lane key
+// the client segments by, which is what keeps parallel sub-agents from interleaving.
 const ActivityEntrySchema = Schema.Struct({
-  path: Schema.String,
-  action: Schema.Literals(["read", "create", "edit"]),
+  path: Schema.optional(Schema.String),
+  action: Schema.Literals(["read", "search", "create", "edit", "run", "fetch"]),
+  target: Schema.Literals(["file", "place", "none"]),
   agent: Schema.String,
   sessionID: Schema.String,
   depth: Schema.Int,

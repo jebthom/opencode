@@ -121,17 +121,29 @@ export function deriveTurns(messages: ReadonlyArray<MessageLike>, options: Deriv
 
       const action = ApertureActivity.actionFromTool(part.tool)
       if (!action) continue
-      const rel = toRepoRelative(options.directory, part.state?.input?.["filePath"])
-      if (!rel) continue
-      turn.entries.push({
-        path: rel,
-        action,
+      const base = {
         agent,
         sessionID: options.sessionID,
         depth,
         callID: part.callID ?? "",
         timestamp: part.state?.time?.start ?? created,
-      })
+      }
+
+      // One apply_patch call changes many files at once, and each of those is a mutation
+      // the user needs to see individually — so it expands into one entry per patched
+      // file rather than a single opaque act. The paths come from the tool's own result
+      // metadata (tool/apply_patch.ts), since its *input* is patch text with no path
+      // field at all; without this, patch-based edits would be a blind spot.
+      if (part.tool === "apply_patch") {
+        for (const file of patchedFiles(part)) {
+          turn.entries.push({ ...base, action: file.action, target: "file", path: file.path })
+        }
+        continue
+      }
+
+      const aim = targetOf(action, part, options.directory)
+      if (!aim) continue
+      turn.entries.push({ ...base, action, ...aim })
     }
   }
 
@@ -145,6 +157,72 @@ export function deriveTurns(messages: ReadonlyArray<MessageLike>, options: Deriv
 export function mergeChildEntries(turn: DerivedTurn, entries: ReadonlyArray<ActivityEntry>): void {
   turn.entries.push(...entries)
   turn.entries.sort((a, b) => a.timestamp - b.timestamp)
+}
+
+// What one tool call points at, or undefined to drop it (a path outside the project).
+//
+// This is a best guess that `Aperture.activity` is free to overrule: only the service
+// holds the repo's file set, so only it can finally say whether a path is a file it knows,
+// a directory above one, or neither. Deciding as much as possible here anyway is what
+// keeps this function testable from fixtures without a database behind it.
+function targetOf(
+  action: ApertureActivity.Action,
+  part: PartLike,
+  directory: string,
+): { target: ApertureActivity.Target; path?: string } | undefined {
+  // A shell command or a web fetch names no path we could colour.
+  if (action === "run" || action === "fetch") return { target: "none" }
+
+  // grep/glob/lsp take an *optional* directory to search in; omitting it means the repo
+  // root, which is a real scope rather than a missing one.
+  if (action === "search") return scopeTarget(part.state?.input?.["path"], directory)
+
+  const raw = part.state?.input?.["filePath"]
+  // The `read` tool takes a directory as happily as a file, and agents use it that way
+  // constantly. Its result metadata says which, authoritatively (tool/read.ts) — but a
+  // still-*running* read has no metadata yet, and that case falls through to the service's
+  // own file-or-ancestor test, which reaches the same answer from the file set.
+  if (action === "read" && displayType(part) === "directory") return scopeTarget(raw, directory)
+
+  const rel = toRepoRelative(directory, raw)
+  return rel === undefined ? undefined : { target: "file", path: rel }
+}
+
+function scopeTarget(raw: unknown, directory: string): { target: ApertureActivity.Target; path?: string } | undefined {
+  if (raw === undefined || raw === null || raw === "") return { target: "place", path: "" }
+  const rel = toRepoScope(directory, raw)
+  return rel === undefined ? undefined : { target: "place", path: rel }
+}
+
+// The `display.type` a tool reported on its result ("file" | "directory" for `read`).
+// Absent on pending/running calls, which is why callers must have a fallback.
+function displayType(part: PartLike): string | undefined {
+  const display = part.state?.metadata?.["display"]
+  if (typeof display !== "object" || display === null) return undefined
+  const type = (display as Record<string, unknown>)["type"]
+  return typeof type === "string" ? type : undefined
+}
+
+// The files one apply_patch call changed, from its result metadata (`files`, built at
+// tool/apply_patch.ts). `relativePath` there is already repo-relative POSIX, resolved
+// against the instance worktree; if that ever diverges from Aperture's directory the path
+// simply fails the service's known-file test and is dropped, which is the safe direction.
+//
+// A `delete` keeps its entry rather than being skipped here: the service drops
+// since-deleted paths through the same filter that handles every other vanished file, and
+// duplicating that judgement in the derivation would be a second opinion to keep in sync.
+function patchedFiles(part: PartLike): { path: string; action: ApertureActivity.Action }[] {
+  const files = part.state?.metadata?.["files"]
+  if (!Array.isArray(files)) return []
+  const out: { path: string; action: ApertureActivity.Action }[] = []
+  for (const file of files) {
+    if (typeof file !== "object" || file === null) continue
+    const rel = (file as Record<string, unknown>)["relativePath"]
+    if (typeof rel !== "string" || rel === "") continue
+    // "add" creates a whole file; "update"/"move"/"delete" change one that existed.
+    out.push({ path: rel, action: (file as Record<string, unknown>)["type"] === "add" ? "create" : "edit" })
+  }
+  return out
 }
 
 // A user message counts as a prompt when it carries text the user actually wrote.
@@ -180,6 +258,17 @@ export function toRepoRelative(directory: string, filePath: unknown): string | u
   const rel = path.relative(directory, abs)
   if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) return undefined
   return rel.split(path.sep).join("/")
+}
+
+// Same, for a *scope* rather than a thing inside one: a search path or a directory read,
+// where the repo root is a legitimate answer rather than a degenerate one. `""` means the
+// root, matching how AperturePayload keys the root scope.
+export function toRepoScope(directory: string, dirPath: unknown): string | undefined {
+  if (typeof dirPath !== "string" || dirPath === "") return ""
+  const abs = path.isAbsolute(dirPath) ? dirPath : path.resolve(directory, dirPath)
+  const rel = path.relative(directory, abs)
+  if (rel.startsWith("..") || path.isAbsolute(rel)) return undefined
+  return rel === "" ? "" : rel.split(path.sep).join("/")
 }
 
 export * as ApertureActivityModel from "./activity-model"
