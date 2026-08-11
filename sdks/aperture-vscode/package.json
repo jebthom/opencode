@@ -226,9 +226,9 @@
             "mosaic6"
           ],
           "enumDescriptions": [
-            "Six equal cells in one row, apportioned to facets by byte share. Cells are ~2.7px wide.",
+            "Equal cells in one row, apportioned to facets by byte share — six, or one per facet where the node carries more. Cells are ~2.7px wide.",
             "One row, with segment widths as the true byte shares and a floor so a small facet stays visible.",
-            "The same six cells folded into three columns of two, filled top-to-bottom then left-to-right. Cells are ~5.3x7px, so individual facets are far easier to pick out."
+            "Three columns of two, with the right-hand column split vertically into four narrow cells. Cells are ~5.3x7px (~2.7x7px in the split third), so individual facets are far easier to pick out and every facet present is guaranteed one."
           ],
           "default": "mosaic6",
           "description": "How the Aperture tree's facet chip encodes a file's composition."

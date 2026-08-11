@@ -142,8 +142,10 @@ export function buildModel(
       if (total > 0) {
         const weights: FacetWeight[] = []
         for (let f = 0; f < acc.length; f++) {
-          const p = Math.round((acc[f]! / total) * 100)
-          if (p > 0) weights.push({ f, p })
+          // Floored at 1% for any facet with bytes under the folder, matching the per-file
+          // reduction on the server: a folder chip must not drop a facet its own children's
+          // chips are showing. Rounding alone hid one small painted file in a large folder.
+          if (acc[f]! > 0) weights.push({ f, p: Math.max(1, Math.round((acc[f]! / total) * 100)) })
         }
         weights.sort((a, b) => b.p - a.p || a.f - b.f)
         if (weights.length) result = weights

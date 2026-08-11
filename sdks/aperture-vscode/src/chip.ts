@@ -20,9 +20,39 @@ export type LegendEntry = { facet: string; label: string; color: string }
 // same code — only how the fracs were derived differs.
 export type Segment = { color: string; frac: number }
 
-// Cells in the quantized layouts. Six because MAX_FACETS is six (lenses.ts), so a file
-// spanning every facet of its Lens still gets one cell each.
+// Cells in the single-row quantized layout (`bar6`). Six is the *floor*, not a cap: a Lens
+// can hold MAX_FACETS = 6 facets (lenses.ts) and NONE_FACET is appended after them, so a
+// node can carry seven bands and a fixed six cells could not give them one each. Six was
+// picked as "one cell per Lens facet" and then quietly failed the case it was picked for;
+// `chipSegments` now widens the row to the band count when there are more than six.
 export const CHIP_CELLS = 6
+
+// The mosaic's cells, in fill order (each column bottom→top, then left to right — see
+// `mosaicRects`). `cx`/`cw` are in units of one third of the bar's width, `row` in units of
+// half its height (0 = top).
+//
+// Columns 0 and 1 are whole cells; column 2 is cut vertically into two half-width columns,
+// so the chip is a 3x2 grid whose right third has four narrow cells instead of two wide
+// ones. That asymmetry is the point: the left two thirds stay big enough to read the
+// dominant facet at a glance, while the eight-slot budget is what makes "every facet present
+// gets a cell" affordable for a node carrying all seven bands. A minor facet costs a sliver
+// of the right third rather than a sixth of the whole chip.
+const MOSAIC_CELLS: ReadonlyArray<{ cx: number; cw: number; row: number }> = [
+  { cx: 0, cw: 1, row: 1 },
+  { cx: 0, cw: 1, row: 0 },
+  { cx: 1, cw: 1, row: 1 },
+  { cx: 1, cw: 1, row: 0 },
+  { cx: 2, cw: 0.5, row: 1 },
+  { cx: 2, cw: 0.5, row: 0 },
+  { cx: 2.5, cw: 0.5, row: 1 },
+  { cx: 2.5, cw: 0.5, row: 0 },
+]
+export const MOSAIC_CELL_COUNT = MOSAIC_CELLS.length
+const MOSAIC_COLS = 3
+const MOSAIC_ROWS = 2
+// Each cell's share of the bar: a whole cell is a third by a half, a narrow one half that.
+// They sum to 1, so a mosaic Segment's `frac` means the same thing a bar Segment's does.
+const mosaicFrac = (cell: (typeof MOSAIC_CELLS)[number]) => cell.cw / (MOSAIC_COLS * MOSAIC_ROWS)
 
 // SVG geometry. VSCode renders a tree item's icon in a 16x16 CSS-pixel box, and a wider
 // viewBox is only scaled back down into it — so 16px is a hard ceiling on the chip's width,
@@ -125,35 +155,80 @@ export function chipSegments(
     }))
   }
 
-  // mosaic6 is a fixed 3x2 grid, so its cell count is not negotiable — an override would
-  // leave the last row short or overflow it.
-  const cells = opts.layout === "mosaic6" ? CHIP_CELLS : (opts.cells ?? CHIP_CELLS)
-  return quantize(colored, cells).map((color) => ({ color, frac: 1 / cells }))
+  // mosaic6 is a fixed grid, so its cell count is not negotiable — an override would leave
+  // the last row short or overflow it.
+  if (opts.layout === "mosaic6") {
+    return apportion(
+      colored,
+      MOSAIC_CELLS.map((c) => c.cw),
+    ).map((owner, i) => ({ color: colored[owner]!.color, frac: mosaicFrac(MOSAIC_CELLS[i]!) }))
+  }
+  // One row of equal cells, never fewer than there are bands: `apportion` can only give
+  // every facet a cell when there are cells to give, and a seventh band (NONE_FACET after a
+  // full six-facet Lens) would otherwise be the one that falls off. Six stays the floor, so
+  // the row only ever grows in the case that used to lose information.
+  const cells = Math.max(opts.cells ?? CHIP_CELLS, colored.length)
+  return apportion(
+    colored,
+    Array.from({ length: cells }, () => 1),
+  ).map((owner) => ({ color: colored[owner]!.color, frac: 1 / cells }))
 }
 
-// Largest-remainder apportionment of `cells` cells across the weights.
+// Hand each slot to one of `colored`, returning the owning index per slot. `slots` are the
+// slot *areas* in any consistent unit, in fill order; every slot is assigned, so the cells
+// always fill the frame exactly (a bar with a hole in it reads as a rendering bug).
 //
-// Largest remainder rather than plain rounding because the cells must sum to exactly
-// `cells` — a bar with five cells in a six-cell frame reads as a rendering bug. It also
-// guarantees the dominant facet can never round away: it has the largest share, so it has
-// either the largest floor or (at worst, when everything floors to zero) the largest
-// remainder and so the first pick of them. That holds however `colored` is ordered — the
-// apportionment reads shares, not positions.
-function quantize(colored: ReadonlyArray<{ color: string; p: number }>, cells: number): string[] {
+// Two properties, in priority order:
+//
+//  1. **Every facet present gets at least one slot** — whenever there are slots to go round.
+//     For these chips existence beats proportion: at ~16px a cell is a coarse enough unit
+//     that no apportionment is truthful anyway, and "this directory contains some parsing
+//     code" is the reading the chip is for. A pure largest-remainder apportionment (what
+//     this replaced) failed that — a 4% facet lost its cell to the dominant's remainder and
+//     the file read as pure. The TUI's treemap has always had the guarantee (`allocateCells`
+//     in aperture/treemap.ts steals a cell for any band that floored to zero), so the two
+//     surfaces disagreed about the same file; this is that guarantee in slot form.
+//  2. Subject to (1), a facet's slots approximate its share *by area*. Area, not slot count,
+//     because the mosaic's slots are deliberately unequal — apportioning eight slots by
+//     count would give a 50/50 file four slots each and draw it as 67/33, since the first
+//     four slots are the two wide columns.
+//
+// The walk is sequential and monotone: facets are laid down in the order given (Lens facet
+// order, see the caller), each taking slots while the slot's *midpoint* still falls inside
+// its cumulative share — i.e. while it owns the majority of that slot — and always taking at
+// least one. `slot + later < slots.length` is the reservation that makes (1) hold: never
+// take a slot that a facet still to come would need. Rounding leftovers fall to the last
+// facet, whose boundary is the end of the bar.
+//
+// If there are somehow more facets than slots the tail goes unpainted, which is why the
+// caller sizes the bar to the band count; the mosaic's eight slots already cover the seven
+// bands a six-facet Lens plus NONE_FACET can produce.
+function apportion(colored: ReadonlyArray<{ p: number }>, slots: ReadonlyArray<number>): number[] {
   const total = colored.reduce((sum, c) => sum + c.p, 0)
-  const exact = colored.map((c) => (c.p / total) * cells)
-  const counts = exact.map(Math.floor)
-  let left = cells - counts.reduce((a, b) => a + b, 0)
-  // Ties go to the earlier entry, which is now the earlier facet in Lens order: two facets
-  // with an identical share resolve the same way on every node, rather than by whichever
-  // happened to sort first.
-  const order = exact.map((e, i) => ({ i, rem: e - Math.floor(e) })).sort((a, b) => b.rem - a.rem || a.i - b.i)
-  for (const { i } of order) {
-    if (left <= 0) break
-    counts[i]!++
-    left--
+  const units = slots.reduce((sum, s) => sum + s, 0)
+  const owners: number[] = []
+  let slot = 0
+  let used = 0
+  let boundary = 0
+  for (let f = 0; f < colored.length; f++) {
+    boundary += (colored[f]!.p / total) * units
+    const later = colored.length - 1 - f
+    let taken = 0
+    while (
+      slot < slots.length &&
+      (taken === 0 || (slot + later < slots.length && used + slots[slot]! / 2 <= boundary))
+    ) {
+      owners.push(f)
+      used += slots[slot]!
+      slot++
+      taken++
+    }
   }
-  return counts.flatMap((n, i) => Array<string>(n).fill(colored[i]!.color))
+  while (slot < slots.length) {
+    owners.push(colored.length - 1)
+    slot++
+  }
+  return owners
 }
 
 // Render segments as a standalone 16x16 SVG document.
@@ -195,43 +270,47 @@ function barRects(segments: ReadonlyArray<Segment>): string[] {
   return rects
 }
 
-// The same six cells folded into 3 columns x 2 rows. 16px is a hard ceiling on the chip's
-// width, so six cells in one row are 2.7px slivers; folding trades horizontal resolution for
-// cells of 5.3 x 7px, which is roughly six times the area and actually perceptible.
+// The bar folded into 3 columns x 2 rows, with the right-hand column cut vertically into two
+// half-width columns (see MOSAIC_CELLS). 16px is a hard ceiling on the chip's width, so six
+// cells in one row are 2.7px slivers; folding trades horizontal resolution for cells of
+// 5.3 x 7px, which is roughly six times the area and actually perceptible. The split third
+// buys back two extra slots at 2.7 x 7px — still twice the area of a `bar6` cell — which is
+// what lets every facet present get a slot without shrinking the two columns that carry the
+// reading.
 //
-// Filled **column-major from the bottom left** — up, then across. That keeps the
-// left-to-right ordering the single-row bar has, and a facet with an even cell count lands
-// on whole columns: 4/1/1 is two solid columns plus a split third, and 2/2/2 is three clean
-// columns. Row-major would make the 4 an L wrapping the row end, and would tear the middle
-// facet of a 2/2/2 into two opposite corners.
+// Filled **column-major from the bottom left** — up, then across, and within the split third
+// up the left half before the right. That keeps the left-to-right ordering the single-row
+// bar has, and a facet with an even cell count lands on whole columns: 4/2/2 is two solid
+// columns plus a split third, and 2/2/2/2 is four clean columns. Row-major would make the 4
+// an L wrapping the row end, and would tear a middle facet into two opposite corners.
 //
 // Bottom-up rather than top-down so this is the TUI treemap block's fill exactly (see
 // `buildGrid` in aperture/treemap.ts): the two are different sizes and can never draw the
 // same picture, but a directory's chip and its block in the Aperture bar grow the same way,
 // so one habit reads both. The TUI's reason for bottom-up is that its blocks are sized by
 // directory size and a partial column at the top reads as a smaller directory sitting on a
-// full footing; the mosaic always spends all six cells, so nothing here is ever partial and
+// full footing; the mosaic always spends all its cells, so nothing here is ever partial and
 // the direction costs it nothing.
 //
-// The cost, stated plainly: an *odd* cell count cannot align to a 2-row column, so 3/3
+// The cost, stated plainly: an *odd* cell count cannot align to a 2-row column, so 3/5
 // staircases (one facet takes a column and a half). Row-major would render that particular
 // case as two clean rows. There is no fill order that wins both; this one favours the
 // dominant-plus-remainder shape that real files actually have.
 //
 // No gaps between cells, deliberately: adjacent cells of one facet must merge into a single
-// block, so a pure file reads as one solid chip rather than as six tiles.
+// block, so a pure file reads as one solid chip rather than as eight tiles.
 function mosaicRects(segments: ReadonlyArray<Segment>): string[] {
-  const rows = 2
-  const cols = 3
-  const cw = BAR_W / cols
-  const ch = BAR_H / rows
-  return segments.slice(0, rows * cols).map((seg, i) => {
-    const col = Math.floor(i / rows)
-    const row = rows - 1 - (i % rows)
-    const w = cw + (col === cols - 1 ? 0 : SEAM)
-    const h = ch + (row === rows - 1 ? 0 : SEAM)
-    const x = BAR_X + col * cw
-    const y = BAR_Y + row * ch
+  const cw = BAR_W / MOSAIC_COLS
+  const ch = BAR_H / MOSAIC_ROWS
+  return segments.slice(0, MOSAIC_CELLS.length).map((seg, i) => {
+    const cell = MOSAIC_CELLS[i]!
+    const x = BAR_X + cell.cx * cw
+    const y = BAR_Y + cell.row * ch
+    // Overshoot into the neighbour below and to the right, where there is one, for the same
+    // sub-pixel-seam reason `barRects` does. A cell on the bar's right or bottom edge has no
+    // neighbour to overlap and is left exact so the clip has nothing to trim.
+    const w = cell.cw * cw + (cell.cx + cell.cw < MOSAIC_COLS ? SEAM : 0)
+    const h = ch + (cell.row < MOSAIC_ROWS - 1 ? SEAM : 0)
     return `<rect x="${round(x)}" y="${round(y)}" width="${round(w)}" height="${round(h)}" fill="${seg.color}"/>`
   })
 }

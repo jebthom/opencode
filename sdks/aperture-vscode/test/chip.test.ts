@@ -1,10 +1,18 @@
 import { describe, expect, test } from "bun:test"
-import { CHIP_CELLS, chipSegments, chipSvg, hexFor, MIN_SEGMENT_FRAC, type LegendEntry } from "../src/chip"
+import {
+  CHIP_CELLS,
+  chipSegments,
+  chipSvg,
+  hexFor,
+  MIN_SEGMENT_FRAC,
+  MOSAIC_CELL_COUNT,
+  type LegendEntry,
+} from "../src/chip"
 
 // The chip is the whole reason the tree exists: a FileDecoration could say *which* facet
-// and *how much*, but not the mix. These tests pin the two things the mix depends on —
-// that the cells always fill the frame, and that the biggest facet is never the one that
-// rounds away.
+// and *how much*, but not the mix. These tests pin the three things the mix depends on —
+// that the cells always fill the frame, that the biggest facet is never the one that rounds
+// away, and that no facet present is ever apportioned to nothing.
 
 const LEGEND: LegendEntry[] = [
   { facet: "parsing", label: "Parsing", color: "#4E79A7" },
@@ -15,6 +23,8 @@ const FACETS = ["parsing", "server", "tui", "none"]
 
 const bar = (weights: Array<{ f: number; p: number }>, extra = {}) =>
   chipSegments(weights, FACETS, LEGEND, { layout: "bar6", ...extra })
+const mosaic = (weights: Array<{ f: number; p: number }>, extra = {}) =>
+  chipSegments(weights, FACETS, LEGEND, { layout: "mosaic6", ...extra })
 
 describe("chipSegments — quantized", () => {
   test("an un-mixed file is six cells of one colour", () => {
@@ -65,14 +75,39 @@ describe("chipSegments — quantized", () => {
     expect(new Set(segments.map((s) => s.color)).size).toBe(6)
   })
 
-  test("a sliver quantizes away without emptying the file", () => {
+  test("a sliver keeps a cell rather than rounding away", () => {
     const segments = bar([
       { f: 0, p: 96 },
       { f: 1, p: 4 },
     ])
     expect(segments).toHaveLength(CHIP_CELLS)
-    // 4% of six cells is 0.24 — below the 0.76 remainder of the dominant, so it loses.
-    expect(new Set(segments.map((s) => s.color))).toEqual(new Set(["#4E79A7"]))
+    // 4% of six cells is 0.24, so largest-remainder gave this cell to the dominant and the
+    // file read as pure. Existence outranks proportion here: one cell overstates 4% as 17%,
+    // which is the trade the chip is for.
+    expect(segments.map((s) => s.color)).toEqual(["#4E79A7", "#4E79A7", "#4E79A7", "#4E79A7", "#4E79A7", "#F28E2B"])
+  })
+
+  test("no facet present is ever apportioned to nothing, however small", () => {
+    for (const p of [4, 1, 0.4, 0.01]) {
+      const segments = bar([
+        { f: 0, p: 100 - p },
+        { f: 1, p },
+      ])
+      expect(segments).toHaveLength(CHIP_CELLS)
+      expect(segments.filter((s) => s.color === "#F28E2B")).toHaveLength(1)
+    }
+  })
+
+  test("the row widens past six rather than dropping a seventh band", () => {
+    // A six-facet Lens plus NONE_FACET is seven bands — one more than the six cells the
+    // layout was named for, so a fixed six could not give them one each.
+    const facets = ["a", "b", "c", "d", "e", "f", "none"]
+    const legend = facets.map((facet, i) => ({ facet, label: facet, color: `#00000${i}` }))
+    const weights = facets.map((_, f) => ({ f, p: f === 0 ? 94 : 1 }))
+    const segments = chipSegments(weights, facets, legend, { layout: "bar6" })
+    expect(segments).toHaveLength(7)
+    expect(new Set(segments.map((s) => s.color)).size).toBe(7)
+    expect(segments.reduce((sum, s) => sum + s.frac, 0)).toBeCloseTo(1, 10)
   })
 
   test("an unpainted node gets no segments at all, not an empty bar", () => {
@@ -214,17 +249,18 @@ describe("chipSvg", () => {
   })
 
   test("mosaic renders one cell per cell, inside the same clipped frame as the bar", () => {
-    const svg = chipSvg(bar([{ f: 0, p: 100 }]), "mosaic6", "dark")
+    const svg = chipSvg(mosaic([{ f: 0, p: 100 }]), "mosaic6", "dark")
     const cells = svg.slice(svg.indexOf("<g "), svg.indexOf("</g>"))
-    expect(cells.match(/<rect /g)).toHaveLength(CHIP_CELLS)
+    expect(cells.match(/<rect /g)).toHaveLength(MOSAIC_CELL_COUNT)
     expect(svg).toContain('clip-path="url(#c)"')
   })
 
   test("mosaic fills column-major, so a facet stays contiguous instead of wrapping a row", () => {
-    // 4/1/1 over three columns of two: the dominant facet should be the two whole left
-    // columns. Row-major would give it the top row plus one bottom-left cell — an L.
+    // 4/2/2 over the eight slots: the dominant facet should be the two whole left columns,
+    // and the two minor facets a half-column each of the split third. Row-major would give
+    // the dominant the top row plus one bottom-left cell — an L.
     const svg = chipSvg(
-      bar([
+      mosaic([
         { f: 0, p: 67 },
         { f: 1, p: 17 },
         { f: 2, p: 16 },
@@ -233,16 +269,19 @@ describe("chipSvg", () => {
       "dark",
     )
     // Coordinates are emitted rounded to 3dp, so compare on that.
-    const column = Math.round((16 / 3) * 1000) / 1000
-    const xs = [...svg.matchAll(/<rect x="([\d.]+)"[^>]*fill="#4E79A7"/g)].map((m) => Number(m[1]))
-    expect(xs).toEqual([0, 0, column, column])
+    const at = (thirds: number) => Math.round((16 / 3) * thirds * 1000) / 1000
+    const xsFor = (hex: string) =>
+      [...svg.matchAll(new RegExp(`<rect x="([\\d.]+)"[^>]*fill="${hex}"`, "g"))].map((m) => Number(m[1]))
+    expect(xsFor("#4E79A7")).toEqual([at(0), at(0), at(1), at(1)])
+    expect(xsFor("#F28E2B")).toEqual([at(2), at(2)])
+    expect(xsFor("#59A14F")).toEqual([at(2.5), at(2.5)])
   })
 
   test("mosaic fills bottom-up, so the first facet starts in the bottom-left cell", () => {
-    // 1/5 over three columns of two: parsing's single cell is the first one placed, and
-    // the fill starts at the bottom of the left column — the TUI treemap's direction.
+    // 1/7 over the eight slots: parsing's single cell is the first one placed, and the fill
+    // starts at the bottom of the left column — the TUI treemap's direction.
     const svg = chipSvg(
-      bar([
+      mosaic([
         { f: 0, p: 17 },
         { f: 1, p: 83 },
       ]),
@@ -256,6 +295,49 @@ describe("chipSvg", () => {
 
   test("the grid ignores a cell-count override, which would leave its last row short", () => {
     const segments = chipSegments([{ f: 0, p: 100 }], FACETS, LEGEND, { layout: "mosaic6", cells: 4 })
-    expect(segments).toHaveLength(CHIP_CELLS)
+    expect(segments).toHaveLength(MOSAIC_CELL_COUNT)
+  })
+})
+
+describe("chipSegments — mosaic", () => {
+  test("the split third costs a minor facet a sliver, not a sixth of the chip", () => {
+    // Every cell is a Segment whose frac is its true share of the bar: four whole cells at a
+    // sixth and four narrow ones at a twelfth.
+    const segments = mosaic([{ f: 0, p: 100 }])
+    expect(segments).toHaveLength(MOSAIC_CELL_COUNT)
+    expect(segments.map((s) => s.frac)).toEqual([1 / 6, 1 / 6, 1 / 6, 1 / 6, 1 / 12, 1 / 12, 1 / 12, 1 / 12])
+    expect(segments.reduce((sum, s) => sum + s.frac, 0)).toBeCloseTo(1, 10)
+  })
+
+  test("slots are apportioned by area, so an even mix draws even", () => {
+    // The trap the split third sets: four slots each is 67/33 by area, not 50/50. Splitting
+    // by area instead of by slot count puts the boundary after the second whole column.
+    const segments = mosaic([
+      { f: 0, p: 50 },
+      { f: 1, p: 50 },
+    ])
+    const share = (hex: string) => segments.filter((s) => s.color === hex).reduce((sum, s) => sum + s.frac, 0)
+    expect(share("#4E79A7")).toBeCloseTo(0.5, 10)
+    expect(share("#F28E2B")).toBeCloseTo(0.5, 10)
+  })
+
+  test("all seven bands of a full Lens fit, which six cells could not do", () => {
+    const facets = ["a", "b", "c", "d", "e", "f", "none"]
+    const legend = facets.map((facet, i) => ({ facet, label: facet, color: `#00000${i}` }))
+    const weights = facets.map((_, f) => ({ f, p: f === 0 ? 94 : 1 }))
+    const segments = chipSegments(weights, facets, legend, { layout: "mosaic6" })
+    expect(segments).toHaveLength(MOSAIC_CELL_COUNT)
+    expect(new Set(segments.map((s) => s.color)).size).toBe(7)
+  })
+
+  test("a sliver survives in the mosaic too, not only in the proportional bar", () => {
+    const segments = mosaic([
+      { f: 0, p: 99.6 },
+      { f: 1, p: 0.4 },
+    ])
+    expect(segments.filter((s) => s.color === "#F28E2B")).toHaveLength(1)
+    // ...and it lands in the narrow third, so it costs the dominant a twelfth rather than a
+    // sixth of the chip.
+    expect(segments.at(-1)!.frac).toBeCloseTo(1 / 12, 10)
   })
 })
