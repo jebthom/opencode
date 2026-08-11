@@ -96,6 +96,58 @@ const FacetMapResult = Schema.Struct({
   suppressed: Schema.Array(Schema.String),
 })
 
+// Per-turn agent activity for a session, facet-resolved under the active Lens (G1). Feeds
+// the sidebar Activity View: a turn renders as blocks coloured by what the agent was
+// working on, so a user can see at a glance whether it visited the concerns they expected.
+//
+// Derived from the durable message store on every read, never recorded — which is what
+// makes a Lens switch recolour history for free: `turns` comes back byte-identical and only
+// `facets`/`files` move. The facet half is shaped exactly like FacetMapResult (same
+// vocabulary, same `{t, w:[{f,p}]}` weights, same `suppressed`) so the Activity View, the
+// Explorer pip and the directory treemap are three renderings of one attribution.
+const ActivityQuery = Schema.Struct({
+  ...WorkspaceRoutingQueryFields,
+  sessionID: Schema.String,
+  // How many of the most recent turns to report. Clamped server-side.
+  turns: Schema.optional(Schema.NumberFromString),
+})
+
+// One file touch. `depth` is 0 for the viewed session and 1 for a sub-agent it spawned —
+// sub-agent work lives in its own session, and the sidebar is hidden outright inside those,
+// so the parent's view is the only place it can ever be seen.
+const ActivityEntrySchema = Schema.Struct({
+  path: Schema.String,
+  action: Schema.Literals(["read", "create", "edit"]),
+  agent: Schema.String,
+  sessionID: Schema.String,
+  depth: Schema.Int,
+  callID: Schema.String,
+  timestamp: Schema.Number,
+})
+
+// One user turn. A turn is a non-synthetic user message: the synthetic ones (tool-result
+// and background sub-agent injections, compaction) are continuations of the prompt that
+// caused them, not new prompts. `agent` is the prompting agent; an entry carries its own
+// acting agent, which differs after a plan→build switch mid-turn.
+const ActivityTurnSchema = Schema.Struct({
+  promptedAt: Schema.Number,
+  agent: Schema.String,
+  entries: Schema.Array(ActivityEntrySchema),
+})
+
+const ActivityResult = Schema.Struct({
+  lens: AperturePayload.LensInfo,
+  facets: Schema.Array(Schema.String),
+  turns: Schema.Array(ActivityTurnSchema),
+  // Facet mix per *touched* path only, deduped across turns — the same shape as
+  // FacetMapResult.files, scoped to what the turns actually reference.
+  files: Schema.Record(
+    Schema.String,
+    Schema.Struct({ t: Schema.Int, w: Schema.Array(Schema.Struct({ f: Schema.Int, p: Schema.Int })) }),
+  ),
+  suppressed: Schema.Array(Schema.String),
+})
+
 // Replace the legend filter (O4): the set of facets to grey out, in the active Lens's
 // vocabulary. The whole set, not a delta — the TUI's legend and the extension's picker each
 // own a set, and sending it entire is what stops the two drifting apart. Ids outside the
@@ -168,6 +220,19 @@ export const ApertureApi = HttpApi.make("aperture")
             summary: "Get the whole-repo facet map",
             description:
               "Every painted source file in the repo with its facet mix under the active Lens, for bulk file-tree decoration.",
+          }),
+        ),
+      )
+      .add(
+        HttpApiEndpoint.get("activity", `${root}/activity`, {
+          query: ActivityQuery,
+          success: described(ActivityResult, "The session's recent turns with each touched file's facet mix"),
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "aperture.activity",
+            summary: "Get a session's Aperture activity",
+            description:
+              "Per-turn agent read/edit/write activity for a session, with the facet of each touched file under the active Lens. Derived from the message store on read, so switching Lens recolours history without re-recording it.",
           }),
         ),
       )

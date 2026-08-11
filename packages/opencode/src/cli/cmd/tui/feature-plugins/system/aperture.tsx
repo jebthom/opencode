@@ -7,16 +7,6 @@ import { createEffect, createMemo, createResource, createSignal, For, onCleanup,
 import { DIRECTORY_HUE } from "@/aperture/semantics"
 import { NONE_FACET, NONE_HUE, NONE_LABEL, UNTAGGED_HUE, UNTAGGED_LABEL, BUILTIN_LENS_IDS } from "@/aperture/lenses"
 import { allocateCells, buildGrid, coalesce } from "@/aperture/treemap"
-import {
-  ACTION_GLYPH,
-  ACTION_LABEL,
-  ACTIONS,
-  type Action,
-  type ActivityEntry,
-  type Fill,
-  type Style,
-} from "@/aperture/activity"
-import { createActivityTracker } from "./aperture-activity"
 import { openLensPicker, fetchLenses, drillDownsOf } from "./aperture-lens-picker"
 
 const id = "internal:aperture"
@@ -141,15 +131,16 @@ const BLOCK_H = 1 + 2 + COLUMN_ROWS
 const FILE_GRID_ROWS = Math.max(1, Math.floor(BLOCK_H / FILE_TILE_H))
 
 // The bar's base height, and the budget every other vertical constant is cut from: the
-// four header rows (title / nav / legend / actions), one block (a label row over a
-// COLUMN_ROWS-tall treemap wrapped in a 2-row border), and the bar's own bottom border.
+// three header rows (title / nav / legend), one block (a label row over a COLUMN_ROWS-tall
+// treemap wrapped in a 2-row border), and the bar's own bottom border.
 // One row is added on top *only while the horizontal scrollbar is actually showing* (see
 // scrollbarVisible) — the block fills the whole height, so the scrollbar would otherwise
 // paint over its bottom border, but when the strip fits, that row goes back to the
-// conversation. Dropping the file tier (O1) took this from 20 to 14; if you want to spend
-// the space back, spend it on COLUMN_ROWS. NB: `routes/session/index.tsx` hides the bar
-// outright on short terminals using its own literal — move that with this.
-const TOP_BAR_HEIGHT = 4 + BLOCK_H + 1
+// conversation. Dropping the file tier (O1) took this from 20 to 14, and dropping the
+// agent-action glyph row (G1) from 14 to 13; if you want to spend the space back, spend it
+// on COLUMN_ROWS. NB: `routes/session/index.tsx` hides the bar outright on short terminals
+// using its own literal — move that with this.
+const TOP_BAR_HEIGHT = 3 + BLOCK_H + 1
 // Inter-column gap in the scroll strip (the scrollbox's contentOptions gap) and the bar's
 // own horizontal padding — both feed the content-width vs viewport-width test that decides
 // whether the horizontal scrollbar shows. Keep in sync with the JSX that uses them.
@@ -218,14 +209,6 @@ const SQUARE_CORNERS = {
   cross: "┼",
 }
 
-// An ephemeral overlay glyph drawn on a node tile (Foundation A). Later steps
-// fill these in: agent tracking (step 7) emits read/edit/write/create with an
-// agent color; planning (step 8) emits the same with style "planned". `color` is
-// resolved by the producer; the renderer only dims when style is "planned".
-// `fill` is solid on the node actually touched, outline on an ancestor directory
-// that contains it (the glyph propagated up the tree).
-type Overlay = { action: Action; color: TuiThemeCurrent["text"]; style: Style; fill: Fill }
-
 function View(props: { api: TuiPluginApi; session_id: string }) {
   const theme = () => props.api.theme.current
   // Reactive terminal size: column mode reclaims the reserved scrollbar row when the strip
@@ -244,15 +227,6 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   // the same gesture. The POST is what tells the server, and its echoed event is what tells
   // any other surface — see the subscription below.
   const [suppressed, setSuppressed] = createSignal<ReadonlySet<string>>(new Set())
-
-  // Foundation B: per-turn agent activity, fed by session.next.* events. Empty
-  // unless the experimental event system is on (graceful no-op otherwise).
-  const activity = createActivityTracker(props.api, props.session_id)
-
-  // Map an agent name to a stable theme color so concurrent agents are
-  // distinguishable. Cycles the status palette by a hash of the name; step 8 may
-  // pin specific agents (e.g. plan → a fixed hue).
-  const agentColor = (agent: string) => themeColor(theme(), AGENT_PALETTE[hashString(agent) % AGENT_PALETTE.length])
 
   // Recompute on display (refresh=true): every scope we show — on navigation, on
   // the manual refresh button, and on a live invalidation event — is recomputed
@@ -690,30 +664,6 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     setHoveredId(undefined)
   }
 
-  // Overlay glyphs for a node tile: this turn's agent activity. One glyph per
-  // distinct action, colored by the agent that most recently performed it. A file
-  // shows *solid* glyphs for actions taken on it directly; a directory shows
-  // *outline* glyphs for actions on any file it contains, so activity propagates up
-  // to its parents and grandparents. A direct (solid) action always wins over a
-  // containment (outline) one for the same action. Reactive via the activity index;
-  // planned styling arrives with step 8.
-  const overlaysFor = (node: GraphNode): Overlay[] => {
-    const byAction = new Map<Action, Overlay>()
-    // Scan newest→oldest so the first entry seen for an action carries the most
-    // recent agent's color; a solid is never overwritten by a later outline.
-    const consider = (entries: ActivityEntry[], fill: Fill) => {
-      for (let i = entries.length - 1; i >= 0; i--) {
-        const e = entries[i]!
-        const prev = byAction.get(e.action)
-        if (prev && (prev.fill === "solid" || prev.fill === fill)) continue
-        byAction.set(e.action, { action: e.action, color: agentColor(e.agent), style: "actual", fill })
-      }
-    }
-    consider(activity.entriesFor(node.path), "solid")
-    if (node.kind === "directory") consider(activity.descendantsFor(node.path), "outline")
-    return ACTIONS.filter((a) => byAction.has(a)).map((a) => byAction.get(a)!)
-  }
-
   // A file's facet mix as text — the band spelled out, since a 14-column strip of colour
   // can show that a file is mixed without saying what it is mixed *of*. Same reading the
   // VSCode Explorer pip puts in its tooltip.
@@ -730,17 +680,14 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     return parts.join(" · ")
   }
 
-  // Hover text for a node: its path/size, plus the latest action on it this turn.
+  // Hover text for a node: its path/size and — for a file — its facet mix spelled out.
   const hoverNode = (node: GraphNode) => {
     const mix = node.kind === "file" ? describeMix(node.id) : undefined
     const base = mix ? `${describeNode(node)} · ${mix}` : describeNode(node)
     // List out-of-window import targets so a dependency that left the window is
     // still legible even though it can't be drawn as an in-window highlight.
     const outs = boundariesFor().get(node.id) ?? []
-    const withOut = outs.length ? `${base} · →${outs.map((b) => basename(b.path)).join(" ")}` : base
-    const entries = activity.entriesFor(node.path)
-    const latest = entries[entries.length - 1]
-    return latest ? `${withOut} · ${latest.agent} ${ACTION_LABEL[latest.action]} ${relTime(latest.timestamp)}` : withOut
+    return outs.length ? `${base} · →${outs.map((b) => basename(b.path)).join(" ")}` : base
   }
 
   // How many cells a directory's treemap paints. Everything about a block's size derives
@@ -1012,25 +959,6 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
         </Show>
       </box>
 
-      {/* Agent-action glyphs, on their own row beneath the layer legend: the solid
-          form (file touched) + the outline form (a directory containing it), per
-          action. Drawn neutral here — at render time they take the acting agent's
-          color. */}
-      <box flexDirection="row" gap={2} height={1} flexShrink={0}>
-        <For each={ACTIONS}>
-          {(action) => (
-            <box flexDirection="row" flexShrink={0}>
-              <text fg={theme().text} wrapMode="none">
-                {ACTION_GLYPH[action].solid + ACTION_GLYPH[action].outline}
-              </text>
-              <text fg={theme().textMuted} wrapMode="none">
-                {" " + action}
-              </text>
-            </box>
-          )}
-        </For>
-      </box>
-
       {/* Sideways-scrolling graph strip. The tiles lay out in a row that overflows
           the viewport and pans horizontally; a thin themed scrollbar marks the
           position and vertical-wheel panning is wired through onWheel above.
@@ -1070,7 +998,6 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
               borderColor={() => borderColorFor(node)}
               composition={() => compositionOf(node.id)}
               colorFor={colorFor}
-              overlays={() => overlaysFor(node)}
               theme={theme}
               onDrill={() => openDirectory(node.path)}
               onEnter={() => enterNode(node)}
@@ -1096,7 +1023,6 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                         width={FILE_TILE_W}
                         colors={(w) => bandColors(node.id, w)}
                         borderColor={() => borderColorFor(node)}
-                        overlays={() => overlaysFor(node)}
                         theme={theme}
                         onOpen={() => openFile(node.path)}
                         onEnter={() => enterNode(node)}
@@ -1111,34 +1037,6 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
         </Show>
       </scrollbox>
     </box>
-  )
-}
-
-// --- overlay layer (Foundation A) ------------------------------------------
-
-// Glyph strip drawn to the right of a node label. `overlays` and `theme` are
-// accessors so the strip stays reactive to live activity (step 7) and to theme
-// switches. Planned overlays are dimmed; actual ones use the producer's color
-// (e.g. the acting agent's) unless `color` overrides it — file tiles force the
-// glyphs to the tile's dark foreground so they read against the colored background.
-// Renders nothing until a feature fills `overlaysFor`.
-function OverlayRow(props: {
-  overlays: () => Overlay[]
-  theme: () => TuiThemeCurrent
-  color?: () => TuiThemeCurrent["text"]
-}) {
-  return (
-    <Show when={props.overlays().length > 0}>
-      <box flexDirection="row" flexShrink={0}>
-        <For each={props.overlays()}>
-          {(o) => (
-            <text fg={o.style === "planned" ? props.theme().textMuted : (props.color?.() ?? o.color)} wrapMode="none">
-              {ACTION_GLYPH[o.action][o.fill]}
-            </text>
-          )}
-        </For>
-      </box>
-    </Show>
   )
 }
 
@@ -1160,7 +1058,6 @@ function DirBlock(props: {
   borderColor: () => TuiThemeCurrent["text"]
   composition: () => Composition | undefined
   colorFor: (key: string | null) => TuiThemeCurrent["text"]
-  overlays: () => Overlay[]
   theme: () => TuiThemeCurrent
   onDrill: () => void
   onEnter: () => void
@@ -1174,12 +1071,9 @@ function DirBlock(props: {
       onMouseOver={() => props.onEnter()}
       onMouseOut={() => props.onLeave()}
     >
-      <box flexDirection="row" gap={1} flexShrink={0}>
-        <text fg={props.labelFg()} wrapMode="none">
-          {props.label}
-        </text>
-        <OverlayRow overlays={props.overlays} theme={props.theme} />
-      </box>
+      <text fg={props.labelFg()} wrapMode="none">
+        {props.label}
+      </text>
       <box
         border
         customBorderChars={SQUARE_CORNERS}
@@ -1254,15 +1148,14 @@ function FileTile(props: {
   width: number
   colors: (width: number) => (TuiThemeCurrent["text"] | undefined)[]
   borderColor: () => TuiThemeCurrent["text"]
-  overlays: () => Overlay[]
   theme: () => TuiThemeCurrent
   onOpen: () => void
   onEnter: () => void
   onLeave: () => void
 }) {
-  // Inner cols (width − border) shared between the name and the activity glyph strip, so
-  // the glyphs sit flush right and the band keeps its full width behind the name.
-  const nameWidth = () => Math.max(0, props.width - 2 - props.overlays().length)
+  // The tile's inner cols (width − border), all of them the name's: the band keeps its
+  // full width behind the name and nothing is held back to its right.
+  const nameWidth = () => Math.max(0, props.width - 2)
   return (
     <box
       border
@@ -1274,19 +1167,16 @@ function FileTile(props: {
       onMouseOver={() => props.onEnter()}
       onMouseOut={() => props.onLeave()}
     >
-      <box flexDirection="row" height={1} flexShrink={0}>
-        <NameRow
-          name={truncate(props.label, nameWidth())}
-          width={nameWidth()}
-          colors={() => props.colors(nameWidth())}
-          // Dark text over the band, the same treatment the directory bars used: every band
-          // colour (facet hues and the untagged grey alike) is a light fill, so the label
-          // reads against all of them without having to know which facet it landed on.
-          textColor={() => props.theme().background}
-          theme={props.theme}
-        />
-        <OverlayRow overlays={props.overlays} theme={props.theme} />
-      </box>
+      <NameRow
+        name={truncate(props.label, nameWidth())}
+        width={nameWidth()}
+        colors={() => props.colors(nameWidth())}
+        // Dark text over the band, the same treatment the directory bars used: every band
+        // colour (facet hues and the untagged grey alike) is a light fill, so the label
+        // reads against all of them without having to know which facet it landed on.
+        textColor={() => props.theme().background}
+        theme={props.theme}
+      />
     </box>
   )
 }
@@ -1325,24 +1215,6 @@ function NameRow(props: {
 function describeNode(node: GraphNode) {
   if (node.kind === "directory") return node.path + "/"
   return `${node.path} · ${formatBytes(node.size)}`
-}
-
-// Theme status keys cycled to give each agent a distinct, stable color.
-const AGENT_PALETTE = ["accent", "info", "success", "warning", "error"] as const
-
-function hashString(s: string) {
-  let h = 0
-  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0
-  return Math.abs(h)
-}
-
-// Compact "time since" for the hover line (e.g. "12s", "3m", "2h").
-function relTime(ts: number) {
-  const secs = Math.max(0, Math.round((Date.now() - ts) / 1000))
-  if (secs < 60) return `${secs}s ago`
-  const mins = Math.round(secs / 60)
-  if (mins < 60) return `${mins}m ago`
-  return `${Math.round(mins / 60)}h ago`
 }
 
 function formatBytes(n: number) {

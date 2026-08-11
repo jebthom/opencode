@@ -5163,6 +5163,71 @@ export type ApertureFacetMapResponses = {
 
 export type ApertureFacetMapResponse = ApertureFacetMapResponses[keyof ApertureFacetMapResponses]
 
+export type ApertureActivityData = {
+  body?: never
+  path?: never
+  query: {
+    directory?: string
+    workspace?: string
+    sessionID: string
+    turns?: string
+  }
+  url: "/aperture/activity"
+}
+
+export type ApertureActivityErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ApertureActivityError = ApertureActivityErrors[keyof ApertureActivityErrors]
+
+export type ApertureActivityResponses = {
+  /**
+   * The session's recent turns with each touched file's facet mix
+   */
+  200: {
+    lens: {
+      id: string
+      name: string
+      legend: Array<{
+        facet: string
+        label: string
+        color: string
+      }>
+      deterministic?: boolean
+    }
+    facets: Array<string>
+    turns: Array<{
+      promptedAt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      agent: string
+      entries: Array<{
+        path: string
+        action: "read" | "create" | "edit"
+        agent: string
+        sessionID: string
+        depth: number
+        callID: string
+        timestamp: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      }>
+    }>
+    files: {
+      [key: string]: {
+        t: number
+        w: Array<{
+          f: number
+          p: number
+        }>
+      }
+    }
+    suppressed: Array<string>
+  }
+}
+
+export type ApertureActivityResponse = ApertureActivityResponses[keyof ApertureActivityResponses]
+
 export type ApertureCycleLensData = {
   body?: never
   path?: never

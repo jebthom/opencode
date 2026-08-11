@@ -66,7 +66,7 @@ O4 (legend filter) ────────────────────�
 
 S1 (line-tag store) ──► S2 (agent tool) ──► S3 (line painting) ──► S5 (open-all)
 
-G1 (activity data) ──► G2 (block render) ──► G3 (placement/timeline)
+G1 ✅ (activity data) ──► G2 (block render) ──► G3 (placement/timeline)
 
                                          C1 (colour fidelity) ──► ✅ independent
 ```
@@ -510,12 +510,192 @@ expected**. Today's activity display is per-turn glyphs on the file tree
 (`activity.ts`, `aperture-activity.ts`) — informative but not readable as a
 shape.
 
-### G1 — Activity data model
+### G0 — Sidebar occupancy audit and space budget
+
+G3's placement question needs a written inventory of what already lives in the
+sidebar before an Activity View can be sized against it. This is that inventory,
+plus the budget the rest of the track builds to.
+
+**The container.** `routes/session/sidebar.tsx` — one `<box>`, `width={42}`,
+`height="100%"`, padding 1/2/1/2, holding a `<scrollbox flexGrow={1}>` (which
+contains `sidebar_title`, then `sidebar_content`, wrapped in a
+`flexShrink={0} gap={1} paddingRight={1}` box) above a fixed
+`<box flexShrink={0} paddingTop={1}>` holding `sidebar_footer`.
+
+- **Width: 36 columns of drawable text.** 42 − 4 padding = 38; the content
+  wrapper's `paddingRight={1}` leaves 37; the vertical scrollbar takes the last
+  column once content overflows. `files.tsx:35` already hard-codes `36` as its
+  truncation width, so 36 is the house number — use it rather than inventing
+  another.
+- **Height: `terminalHeight − 2 − 4`** — outer padding, then the footer (wrapper
+  `paddingTop` 1 + the footer's own gap + path/branch line + version line). The
+  getting-started card in `sidebar/footer.tsx` adds ~9 rows more, but only while
+  no paid provider is configured and `dismissed_getting_started` is unset.
+- `42` is duplicated in `sidebar.tsx:29` and `routes/session/index.tsx:257`
+  (`contentWidth`); the two must move together if the column is ever widened.
+
+**Visibility gates** (`routes/session/index.tsx:238–244`, `1320–1339`):
+
+- **Hidden outright for subagent sessions** (`session()?.parentID`). This is the
+  gate that bites Track G — a sidebar Activity View is unavailable inside exactly
+  the sessions where sub-agent attribution is most interesting. The top bar has
+  the identical gate (`index.tsx:253`), so it does not favour one placement over
+  the other, but it is a real limit on both.
+- `wide()` = width > 120. Auto-shows when wide; below that the *same* `<Sidebar>`
+  renders as an overlay over the chat behind an `RGBA.fromInts(0,0,0,70)` scrim —
+  same width, same content.
+- Toggle `session.sidebar.toggle` / `<leader>b` (`config/keybind.ts:80,279`), kv
+  `sidebar` = `"auto" | "hide"` plus a transient `sidebarOpen` signal.
+
+**Slot inventory.** All five internal sections come from
+`feature-plugins/sidebar/*.tsx`, registered in `plugin/internal.ts:30–35`.
+`sidebar_content` renders in the slot library's **append** mode: every registrant
+draws, sorted by ascending `order` (ties → registration order → plugin id),
+separated by `gap={1}`.
+
+| order | section | file | shown when | rows |
+| --- | --- | --- | --- | --- |
+| 100 | **Context** | `sidebar/context.tsx` | always | 4 — header, tokens, % used, $ spent |
+| 200 | **MCP** | `sidebar/mcp.tsx` | ≥1 server | 1 + N, word-wrapped; collapsible above 2 (collapsed header shows `(n active, m errors)`) |
+| 300 | **LSP** | `sidebar/lsp.tsx` | always — the box is unconditional | 1 + max(1, N); placeholder line when empty |
+| 400 | **Todo** | `sidebar/todo.tsx` | ≥1 todo, not all completed | 1 + N, wrapping |
+| 500 | **Modified Files** | `sidebar/files.tsx` | session diff non-empty | 1 + N |
+
+`sidebar_title` (`single_winner`, host default at `sidebar.tsx:55–82`): bold
+title, session id when `InstallationChannel !== "latest"`, `WorkspaceLabel` when
+the session has a workspace, share URL when shared — **1–4 rows**.
+`sidebar_footer` (`single_winner`): the host default is 2 lines;
+`sidebar/footer.tsx` (order 100) wins it.
+
+Nothing else registers a sidebar slot today — Aperture holds `aperture_top` only.
+The one other registrant is `.opencode/plugins/tui-smoke.tsx:833`, a dev smoke
+plugin that pushes several bordered blocks in; it interleaves by order, which is
+worth knowing when the sidebar mysteriously grows panels. Third-party plugins can
+register `sidebar_content` freely (`specs/tui-plugins.md:433–444`), so no order
+value is exclusively ours.
+
+**Steady state on this repo:** title 3 + Context 4 + LSP 4 + Todo 6 + Modified
+Files 9 + gaps ≈ **31 rows**, plus 4 footer and 2 chrome ≈ 37. On a 40-row
+terminal the column is already full; on a 30-row terminal ~24 rows are visible.
+
+**Scrolling — the finding that decides the budget.** The sidebar **already scrolls
+independently of the chat**: `ScrollBoxRenderable.onMouseEvent` handles wheel
+`scroll` itself, hit-tested to the hovered element, so scrolling over the sidebar
+moves only the sidebar (shared `getScrollAcceleration(tuiConfig)`, same as chat).
+There is no keyboard path — nothing focuses or key-binds it, so it is mouse-only.
+Two consequences:
+
+1. **A new section cannot push existing ones off-screen.** One scrollbox holds all
+   of `sidebar_content`, so added height costs scroll depth, not visibility. There
+   is no crowding-out collision of the kind the top bar has — only an
+   above/below-the-fold ordering question, and ordering is fully ours.
+2. **A shared scrollbox cannot give a sub-section its own viewport.** An
+   append-only log wants to stay pinned to its newest turn, and `stickyScroll` on
+   the shared box would pin the *whole sidebar* to its bottom. So an Activity View
+   that scrolls or sticks on its own needs a **nested `<scrollbox>` with an
+   explicit height** — which is also what caps its contribution at a constant.
+
+**Budget:**
+
+- **36 columns**, matching `files.tsx`.
+- **A fixed `ACTIVITY_ROWS` (default 10) inside a nested `<scrollbox>`, plus a
+  1-row header = 11 rows.** Constant contribution however many turns accumulate,
+  and the nested box can carry `stickyScroll` without dragging the sidebar along.
+- **`order: 150`** — directly below Context, above MCP/LSP/Todo/Files. The block
+  then begins around row 10 of the scroll region even with a 4-row title, so it is
+  above the fold on any terminal tall enough to show the sidebar at all, while
+  Context (the other always-present section) keeps the top slot.
+- Follow the section idiom so it reads as native: bold header row, `▼`/`▶` toggle
+  appearing only above 2 items and flipping on `onMouseDown`, `theme().textMuted`
+  body, `•` status dots, and `props.api.theme.current` rather than the host
+  `useTheme`.
+
+**Reuse — superseded by G1.** This section originally proposed lifting
+`createActivityTracker` (`feature-plugins/system/aperture-activity.ts`) out of the
+`aperture_top` slot's `View` so a sidebar slot could share one tracker instead of
+building a second with its own subscriptions. G1 found the tracker recorded
+*nothing* (its `session.next.*` events are gated behind
+`OPENCODE_EXPERIMENTAL_EVENT_SYSTEM`, default off) and deleted it: activity is now
+derived server-side from the message store and fetched over
+`GET /aperture/activity`, so there is no client-side tracker to share and the
+double-instantiation trap is moot. Facet colouring still comes from
+`colorByFacet` in `aperture.tsx`, which is also where O4's filter is applied —
+and the endpoint ships the same `{t, w:[{f,p}]}` weights that function reads.
+
+### G1 — Activity data model ✅
 
 Per-turn, per-agent read/edit/write actions with the facet of each touched file
 under the **currently active Lens** — so switching Lens recolours history
-without re-recording it. Activity is in-memory today; this needs at least
-per-session durability to be readable as a timeline.
+without re-recording it. **Implemented.**
+
+**The old display is gone.** The top bar's per-turn glyph strip (`●○` read, `■□`
+create, `◆◇` edit; solid on the touched file, outline on a containing directory)
+and its legend row are deleted, along with `OverlayRow`, `overlaysFor`, the
+`Overlay` type, the agent-colour palette and the hover line's trailing "agent
+edited X 3m ago" clause. `TOP_BAR_HEIGHT` 14 → 13 (the glyph row was one of the
+four header rows). `aperture-activity.ts` is deleted outright.
+
+**Resolved — activity is *derived*, not recorded.** The in-memory tracker
+subscribed to the `session.next.*` family, which
+`OPENCODE_EXPERIMENTAL_EVENT_SYSTEM` gates and which defaults to **false** — so
+it recorded nothing for anyone, and G0's "most of G1's substrate exists" was
+optimistic. Rather than fix and lift it, the read model is now a *view* of the
+durable message store: every tool call already persists as a `ToolPart` with its
+tool, its input and its timings; user messages are the turn boundary; assistant
+messages carry the acting agent.
+
+The consequences are the point. There is no write path, no ring to evict and no
+second source of truth that can drift. Per-session durability is free, history
+from before the feature landed is readable, and "switching Lens recolours history
+without re-recording it" is trivially true because nothing is recorded at all —
+verified live: cycling the Lens returns `turns` **byte-identical** while
+`facets`/`files` recolour.
+
+- **A turn is a non-*synthetic* user message.** Tool-result injections,
+  background sub-agent completions and compaction all arrive as synthetic user
+  messages; splitting on those would shatter one prompt into a dozen one-entry
+  turns, which is the single most damaging thing the derivation could get wrong.
+- **Sub-agent work folds into the parent turn** at `depth: 1`, found by walking a
+  `task` part's `state.metadata.sessionId` (`tool/task.ts`) into the child
+  session. This is the only place it can ever be seen — G0 established that the
+  sidebar is hidden outright *inside* subagent sessions. Capped at depth 1 and 16
+  children per turn so a fan-out turn can't make a sidebar refresh unbounded.
+- **Entries are filtered to files the view knows about** (`subtreeFor`). Two
+  different cases sit behind that one filter. Gitignored, binary and
+  since-deleted paths genuinely have no node, size or facet, so a block for one
+  could only be an uncolourable hole in the waffle. **Directories are not that
+  case** — Aperture aggregates them, which is what the whole top bar is made of —
+  and they are dropped for a rendering reason that belongs to **G2**: a turn's
+  reads collapse into one block, so admitting a directory would aggregate an
+  aggregate. See G2 for the argument and for what to try if that changes. A file
+  that survives but is *unpainted* is a third case and is kept — that's the
+  honest grey the treemap already draws.
+- **The facet half is shaped exactly like `FacetMap`**: same `facets` vocabulary,
+  same `{t, w:[{f,p}]}` weights, same `suppressed`, the whole mix rather than a
+  pre-reduced dominant (O2's decision, so O4's filter stays a pure client-side
+  function of (mix, focus)). Attribution runs through the same
+  `computeFacetMapFiles`, filtered *at its input* to the touched paths — so the
+  sidebar doesn't pay a 2265-file reduction to colour twenty blocks, and an
+  Activity View block, an Explorer pip and a treemap band for one file cannot
+  disagree. Verified against `/aperture/facets`: identical vocabulary, identical
+  weights.
+- **Reading is bounded**: `MessageV2.page` walks backwards until the requested
+  turn count is seen, so a months-old session costs what a fresh one does.
+  `Aperture.defaultLayer` gains `Database.defaultLayer` (the `Todo`/`Account`
+  idiom); `message-v2.ts` imports nothing under `aperture/`, so no cycle.
+
+**Landed:** `aperture/activity.ts` (vocabulary + wire shapes, still
+dependency-free), `aperture/activity-model.ts` (pure `deriveTurns` /
+`mergeChildEntries` / `toRepoRelative`, structurally typed so it tests from
+fixtures), `Aperture.activity()`, `GET /aperture/activity`, and
+`test/aperture/activity.test.ts` (12 cases, including the synthetic-message trap
+and facet agreement). No `PAYLOAD_VERSION` bump — derived at the read boundary.
+No new SSE event: G2 refetches off `session.status` idle, exactly as the top bar
+already does, which is a core event and so fires with the experimental event
+system off.
+
+**Not verified live:** sub-agent folding — no session in this repo has ever
+called the `task` tool, so it rests on the unit test alone.
 
 ### G2 — Block rendering
 
@@ -525,6 +705,29 @@ A treemap/waffle of the turn's actions, coloured by active-Lens facet.
 block, optionally expandable to per-file; edits and writes are always expanded.
 This is the core information-density decision and should survive contact with
 the experiment.
+
+**Open — directory reads are excluded, and the reason belongs to this step.** The
+`read` tool takes a *directory* as happily as a file, and agents use it that way
+constantly (a live session showed 4 of 6 reads were directories). G1 filters
+those out at the service, and the justification given there — "no node, no size,
+no facet" — is **wrong on its face**: a directory is exactly the thing Aperture
+*does* have an aggregation for. Its treemap band is the composition of everything
+beneath it.
+
+The real reason is that G2 aggregates. A turn's reads collapse into one block, so
+admitting a directory would fold an aggregate *into* an aggregate: one `read` of
+`packages/` would outweigh nine reads of individual files, and the block would
+report the facet mix of code the agent never opened. Whatever the block is
+measuring — "what did the agent actually look at" — a directory listing is not an
+instance of it.
+
+So the exclusion stands, but it is a **G2 rendering decision that G1 happens to
+implement**, and it should be revisited if the answer to "reads aggregate into
+what?" changes. Two things worth trying if it does: give directory reads their
+own non-aggregating mark (a navigation trace rather than a facet block), or lift
+them out of the waffle entirely into a per-turn "looked around in" line. The data
+to do either is one filter away — `Aperture.activity` drops these against
+`subtreeFor`, so restoring them is deleting a `.filter`, not re-deriving anything.
 
 ### G3 — Placement and timeline orientation
 
@@ -662,7 +865,9 @@ has a second consumer: it should drive O2's Explorer `focus` as well as the TUI.
 **Then:** S2 → S3 → S5 in sequence, all gated on S1.
 
 **Track G** is independent throughout and can run alongside from the start. It's
-the most speculative track, so it should not block the others.
+the most speculative track, so it should not block the others. G0 and G1 are
+done; **G2** is next and is now unblocked by data — it consumes
+`GET /aperture/activity` and needs no further backend work.
 
 **Track C** is done. C1 landed after O1–O4, once O2's tree glyphs made the
 cross-surface half of the problem visible.
@@ -685,7 +890,8 @@ cross-surface half of the problem visible.
 | 3 | ~~Whether filtered-off facets keep their treemap area~~ — **decided:** keep it, greying in place; weights are never touched, so no surface re-flows on a filter click. The Explorer pip is the deliberate exception (one colour, so it must subtract) | O4 ✅ |
 | 4 | Line-tag anchoring mechanism (composite recommended) | S1 |
 | 5 | Search Lens as a distinct type on the model vs. a flag | S1 |
-| 6 | Activity View in the sidebar vs. the top bar | G3 |
+| 6 | Activity View in the sidebar vs. the top bar — **not a space contest**: G0 establishes that the sidebar is one shared scrollbox, so a new section costs scroll depth rather than pushing anything off-screen, and `order` is ours to pick. Both surfaces are equally unavailable in subagent sessions. G1 has since *emptied* the top bar of activity, so this is now a placement choice with no incumbent | G3 (G0 ✅, G1 ✅) |
+| 8 | ~~Where activity data comes from and how it gains per-session durability~~ — **decided:** derived from the durable message store on every read, never recorded. The `session.next.*` tracker was dead by default and in-memory; deriving makes durability, retroactive history and Lens-switch recolouring free, and removes the second source of truth | G1 ✅ |
 | 7 | ~~Whether to fix truecolor detection upstream in OpenTUI or locally~~ — **decided:** neither. Putting every paintable colour on an exact xterm-256 entry makes quantisation a no-op, so truecolor stops mattering for colour *identity* | C1 ✅ |
 
 ---
@@ -748,26 +954,34 @@ Aperture files:
   function extents), `semantic-store.ts` (file-level facets),
   `subfacet-store.ts` (function-level facets), `semantics.ts`, `lenses.ts` +
   `lens-store.ts`, `deterministic.ts` (git/mtime/bus-factor built-ins),
-  `event.ts`, `dump.ts`, `study-log.ts`.
+  `event.ts`, `dump.ts`, `study-log.ts`, `activity.ts` (G1 vocabulary + wire
+  shapes, dependency-free) + `activity-model.ts` (the pure turn derivation over
+  stored messages).
 - Tools: `tool/lens-{create,list,select,edit,merge-facets,facet-files}.ts`,
   registered in `tool/registry.ts`.
 - HTTP: `server/routes/instance/httpapi/groups/aperture.ts` (+ `handlers/`),
   registered in `server.ts` and `api.ts`. Routes: `get`, `facets` (O2's bulk
-  whole-repo file→facet-mix map), `lens/cycle`, `lens/delete`, `lens/list`,
-  `lens/select`, `facet-filter`, `scope` (host → bar re-root), `interaction`.
-- TUI: `feature-plugins/system/aperture.tsx` (+ `aperture-activity.ts`,
-  `aperture-lens-picker.tsx`); registered in `cli/cmd/tui/plugin/internal.ts`;
-  slot placed in `routes/session/index.tsx`.
+  whole-repo file→facet-mix map), `activity` (G1's per-turn agent activity for a
+  session), `lens/cycle`, `lens/delete`, `lens/list`, `lens/select`,
+  `facet-filter`, `scope` (host → bar re-root), `interaction`.
+- TUI: `feature-plugins/system/aperture.tsx` (+ `aperture-lens-picker.tsx`);
+  registered in `cli/cmd/tui/plugin/internal.ts`; slot placed in
+  `routes/session/index.tsx`.
 - VSCode: `sdks/aperture-vscode/src/extension.ts` (gutter strips via
   `createTextEditorDecorationType`, SSE on `/event`, `tui.file.open` reveal,
   `tui.directory.reveal` → `TreeView.reveal`, and the reciprocal
   `onDidExpandElement` → `POST /aperture/scope`).
 - Tests: `packages/opencode/test/aperture/`.
 
-Slots: host slot map at `packages/plugin/src/tui.ts` (`TuiHostSlotMap` —
-currently only `aperture_top`); placement + height/visibility math in
-`routes/session/index.tsx`; sidebar template `feature-plugins/sidebar/files.tsx`;
-full-screen route template `feature-plugins/system/diff-viewer.tsx`.
+Slots: host slot map at `packages/plugin/src/tui.ts` (`TuiHostSlotMap`). Aperture's
+own slot is `aperture_top`; the sidebar exposes three more — `sidebar_title` and
+`sidebar_footer` (both `single_winner`, so a registrant *replaces* the host
+default) and `sidebar_content` (append mode, all registrants draw in ascending
+`order`). Slot modes are listed in `specs/tui-plugins.md`. Placement +
+height/visibility math in `routes/session/index.tsx`; sidebar container in
+`routes/session/sidebar.tsx`; section template `feature-plugins/sidebar/files.tsx`;
+full-screen route template `feature-plugins/system/diff-viewer.tsx`. **G0 has the
+full sidebar occupancy audit and space budget.**
 
 Events (server → TUI): `aperture.invalidated` (defined in `aperture/event.ts`,
 registered by importing that module from the route group before `api.ts`

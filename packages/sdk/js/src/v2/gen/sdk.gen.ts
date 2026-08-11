@@ -4,6 +4,8 @@ import { client } from "./client.gen.js"
 import { buildClientParams, type Client, type Options as Options2, type TDataShape } from "./client/index.js"
 import type {
   AgentPartInput,
+  ApertureActivityErrors,
+  ApertureActivityResponses,
   ApertureCycleLensErrors,
   ApertureCycleLensResponses,
   ApertureDeleteLensErrors,
@@ -737,6 +739,40 @@ export class Aperture extends HeyApiClient {
     )
     return (options?.client ?? this.client).get<ApertureFacetMapResponses, ApertureFacetMapErrors, ThrowOnError>({
       url: "/aperture/facets",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Get a session's Aperture activity
+   *
+   * Per-turn agent read/edit/write activity for a session, with the facet of each touched file under the active Lens. Derived from the message store on read, so switching Lens recolours history without re-recording it.
+   */
+  public activity<ThrowOnError extends boolean = false>(
+    parameters: {
+      directory?: string
+      workspace?: string
+      sessionID: string
+      turns?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "query", key: "sessionID" },
+            { in: "query", key: "turns" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<ApertureActivityResponses, ApertureActivityErrors, ThrowOnError>({
+      url: "/aperture/activity",
       ...options,
       ...params,
     })

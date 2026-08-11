@@ -27,6 +27,12 @@ export const apertureHandlers = HttpApiBuilder.group(InstanceHttpApi, "aperture"
       return yield* aperture.facetMap()
     })
 
+    const activity = Effect.fn("ApertureHttpApi.activity")(function* (ctx: {
+      query: { sessionID: string; turns?: number }
+    }) {
+      return yield* aperture.activity(ctx.query.sessionID, ctx.query.turns)
+    })
+
     const cycleLens = Effect.fn("ApertureHttpApi.cycleLens")(function* (ctx: {
       query: { direction: "next" | "prev" }
     }) {
@@ -107,6 +113,7 @@ export const apertureHandlers = HttpApiBuilder.group(InstanceHttpApi, "aperture"
     return handlers
       .handle("get", get)
       .handle("facetMap", facetMap)
+      .handle("activity", activity)
       .handle("cycleLens", cycleLens)
       .handle("deleteLens", deleteLens)
       .handle("listLenses", listLenses)

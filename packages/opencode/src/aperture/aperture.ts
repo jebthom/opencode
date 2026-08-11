@@ -9,6 +9,8 @@ import { EventV2 } from "@opencode-ai/core/event"
 import { Watcher } from "@opencode-ai/core/filesystem/watcher"
 import { FileSystem } from "@opencode-ai/core/filesystem"
 import { SessionStatus } from "@/session/status"
+import { MessageV2 } from "@/session/message-v2"
+import type { SessionID } from "@/session/schema"
 import { Storage } from "@/storage/storage"
 import { Provider } from "@/provider/provider"
 import { Config } from "@/config/config"
@@ -24,6 +26,9 @@ import { ApertureExtents } from "./extents"
 import { AperturePainter } from "./painter"
 import { ApertureLensStore } from "./lens-store"
 import { ApertureDeterministic } from "./deterministic"
+import { ApertureActivityModel, type DerivedTurn } from "./activity-model"
+import type { Turn as ActivityTurn } from "./activity"
+import { Database } from "@opencode-ai/core/database/database"
 import { Git } from "@/git"
 import {
   type Lens,
@@ -100,6 +105,26 @@ const WORKING_SET_PAINT_CAP = 200
 // releases the permit and pauses between slices. Must not exceed the painter's own
 // per-pass file cap (MAX_PER_PASS) or the tail of a slice would be silently dropped.
 const EXTENT_DRAIN_BATCH = 240
+
+// --- activity (G1) ---------------------------------------------------------
+// How many recent turns `activity` reports when the caller doesn't say, and the ceiling it
+// will honour. The sidebar's Activity View is a fixed-height box (G0 budgets ACTIVITY_ROWS
+// = 10), so a client asking for hundreds of turns is asking for scroll depth it can't use —
+// and every extra turn is another page of messages read.
+const ACTIVITY_TURNS_DEFAULT = 20
+const ACTIVITY_TURNS_MAX = 100
+// Messages read per page while walking backwards, and a hard stop on the walk. The cap is
+// the guard against a pathological session (one prompt, thousands of tool calls) making a
+// sidebar refresh unbounded; it truncates the *oldest* turns, which is the right end to lose.
+const ACTIVITY_PAGE_SIZE = 50
+const ACTIVITY_MESSAGE_CAP = 1000
+// Sub-agent recursion. Depth 1 means a turn folds in the sessions it spawned but not their
+// own sub-agents — the task tool is disabled inside subagents unless explicitly permitted,
+// so deeper nesting is rare enough not to pay for on every refresh. A subagent session is
+// one prompt, so one turn is all there is to read.
+const ACTIVITY_MAX_DEPTH = 1
+const ACTIVITY_MAX_CHILDREN = 16
+const ACTIVITY_CHILD_TURNS = 1
 
 // Storage key: ["aperture", <projectID>, "structure", <scopeKey>]. Per project
 // and per scope so each navigated directory keeps its own durable subgraph.
@@ -229,6 +254,35 @@ export interface FacetMap {
   readonly suppressed: ReadonlyArray<string>
 }
 
+// A session's agent activity, per turn, with the facet of every touched file under the
+// ACTIVE Lens (PLAN.md G1). Feeds the sidebar Activity View: a turn renders as blocks
+// coloured by what the agent was working on, so a user can see at a glance whether it
+// visited the concerns they expected.
+//
+// Nothing here is recorded. `turns` is derived from the durable message store at the read
+// boundary (see activity-model.ts) and the facets are resolved on the way out, so switching
+// Lens recolours history without re-recording it — `turns` comes back byte-identical and
+// only `facets`/`files` move.
+//
+// The facet half is deliberately shaped exactly like `FacetMap`: same `facets` vocabulary,
+// same `{t, w:[{f,p}]}` weights, same `suppressed`. The Activity View, the Explorer pip and
+// the directory treemap are then three renderings of one attribution and cannot disagree —
+// and, as in O2, the whole mix ships rather than a pre-reduced dominant, so O4's filter
+// stays a pure client-side function of (mix, focus) and a filter click costs no round trip.
+export interface Activity {
+  readonly lens: AperturePayload.LensInfo
+  // Facet ids in legend order, with NONE_FACET appended, so `f` indexes into this.
+  readonly facets: ReadonlyArray<string>
+  readonly turns: ReadonlyArray<ActivityTurn>
+  // Facet mix per *touched* path, deduped across turns (a turn re-touches the same files
+  // heavily). Paths the painter has nothing for are absent, exactly as in FacetMap.
+  readonly files: Record<
+    string,
+    { readonly t: number; readonly w: ReadonlyArray<{ readonly f: number; readonly p: number }> }
+  >
+  readonly suppressed: ReadonlyArray<string>
+}
+
 export interface Interface {
   // Cached payload for `scope` (default repo root); computes + persists on a miss
   // or when the scope has been marked dirty by a file change in its window.
@@ -267,6 +321,9 @@ export interface Interface {
   // Every painted file in the repo with its facet mix, under the active Lens (O2).
   // Bulk source for the VSCode Explorer's file decorations — see FacetMap.
   readonly facetMap: () => Effect.Effect<FacetMap>
+  // Per-turn agent activity for a session, facet-resolved under the active Lens (G1).
+  // `turns` is how many of the most recent turns to report.
+  readonly activity: (sessionID: string, turns?: number) => Effect.Effect<Activity>
   // The legend filter (O4): the facet ids the user has toggled off, which every surface
   // paints grey in place of their Lens colour. View-only and in-memory — see the note on
   // `suppressedFacets`. `setFacetFilter` replaces the whole set and returns what was kept
@@ -297,6 +354,9 @@ export const layer = Layer.effect(
     // Drives the deterministic "Changed since last commit" built-in (git status). Like
     // Provider/Config it's self-provided in defaultLayer so the layer stays R = never.
     const git = yield* Git.Service
+    // Captured here (rather than required per call) so `activity`'s message reads keep the
+    // service's R = never, the same shape processor.ts uses for its own MessageV2 calls.
+    const database = yield* Database.Service
 
     // Shared by the foreground and background painters (see PAINT_CONCURRENCY).
     const paintGate = yield* Semaphore.make(PAINT_CONCURRENCY)
@@ -1883,6 +1943,139 @@ export const layer = Layer.effect(
       }
     })
 
+    // Per-turn agent activity for a session, facet-resolved under the active Lens (G1).
+    //
+    // Derived, never recorded — see activity-model.ts for why. The two halves are
+    // independent on purpose: `turns` depends only on the message store, `facets`/`files`
+    // only on the Lens, so a Lens switch recolours the same history and a new turn
+    // repaints against the same legend.
+    const activity = Effect.fn("Aperture.activity")(function* (sessionID: string, turnCount?: number) {
+      const ctx = yield* InstanceState.context
+      const maxTurns = Math.max(1, Math.min(turnCount ?? ACTIVITY_TURNS_DEFAULT, ACTIVITY_TURNS_MAX))
+
+      const derived = yield* readTurns(ctx.directory, sessionID, maxTurns)
+      const subtree = yield* subtreeFor(ctx.directory)
+
+      // Keep only entries whose path is a file the view actually knows about. `subtreeFor`
+      // is the same authority every other Aperture surface uses to decide what counts as a
+      // file, which is what keeps this filter from being a second opinion.
+      //
+      // Two different cases sit behind the one filter:
+      //
+      //  - Gitignored, binary and since-deleted paths have no node, no size and no facet, so
+      //    a block for one could only ever be an uncolourable, unsizeable hole.
+      //  - *Directories* — which the `read` tool takes as happily as a file, and agents use
+      //    that way constantly — are dropped for a different reason, and it is a RENDERING
+      //    one (PLAN.md G2): Aperture aggregates directories perfectly well, but a turn's
+      //    reads collapse into one block, so admitting a directory would fold an aggregate
+      //    into an aggregate. One read of `packages/` would outweigh nine reads of real
+      //    files and report the mix of code the agent never opened.
+      //
+      // That second exclusion is therefore G2's to revisit, not this function's. Restoring
+      // directory reads is deleting this filter, not re-deriving anything.
+      //
+      // A file that survives here but has nothing painted yet is a third case and is
+      // deliberately kept: it is the honest grey the treemap already draws for un-swept code.
+      const known = new Set(subtree.map((file) => file.path))
+      const turns = derived.map((turn) => ({
+        promptedAt: turn.promptedAt,
+        agent: turn.agent,
+        entries: turn.entries.filter((entry) => known.has(entry.path)),
+      }))
+
+      // Only the touched paths are attributed — a handful of files, not the repo. That is
+      // the whole reason this doesn't just call facetMap(): the sidebar refetches on every
+      // turn boundary and shouldn't pay a 2000-file reduction to colour twenty blocks.
+      const touched = new Set<string>()
+      for (const turn of turns) for (const entry of turn.entries) touched.add(entry.path)
+
+      const lens = yield* activeUsable(ctx.directory, ctx.project.id)
+      const store = yield* facetStoreFor(lens, ctx.directory, ctx.project.id)
+      // Deterministic Lenses carry no function-level mix (see finalize), so every file
+      // attributes whole to its file-level facet.
+      const mixes = isDeterministic(lens)
+        ? {}
+        : yield* ApertureSubfacetStore.readMixes(storage, ctx.project.id, lens.id)
+      const facets = [...lens.facets.map((t) => t.id), NONE_FACET]
+
+      return {
+        facets,
+        turns,
+        // Filtering the subtree (rather than the reduction) keeps `computeFacetMapFiles`
+        // the single, tested attribution path it is for the Explorer pip.
+        files: computeFacetMapFiles(
+          subtree.filter((file) => touched.has(file.path)),
+          store,
+          mixes,
+          facets,
+        ),
+        suppressed: [...(suppressedFacets.get(ctx.directory) ?? [])],
+        lens: {
+          id: lens.id,
+          name: lens.name,
+          legend: lensLegend(lens),
+          ...(isDeterministic(lens) ? { deterministic: true } : {}),
+        },
+      }
+    })
+
+    // Walk a session's messages newest-first until `maxTurns` prompts have been seen, fold
+    // them into turns, then fold each turn's sub-agent sessions in beneath it.
+    //
+    // Paging backwards (rather than MessageV2.stream) is what keeps this bounded: a
+    // months-old session with thousands of messages costs the same as a fresh one, because
+    // the sidebar only ever shows the recent tail.
+    const readTurns = (
+      directory: string,
+      sessionID: string,
+      maxTurns: number,
+      depth = 0,
+    ): Effect.Effect<DerivedTurn[]> =>
+      Effect.gen(function* () {
+        const messages = yield* recentMessages(sessionID, maxTurns)
+        const turns = ApertureActivityModel.deriveTurns(messages, { directory, sessionID, depth, maxTurns })
+        // Sub-agent work lives in its own session, and the sidebar is hidden outright inside
+        // subagent sessions (G0) — so folding it into the parent's turn is the only way it is
+        // ever seen. Bounded in depth and fan-out so one heavily-parallel turn can't turn a
+        // sidebar refresh into an unbounded walk.
+        if (depth >= ACTIVITY_MAX_DEPTH) return turns
+        for (const turn of turns) {
+          for (const child of turn.children.slice(0, ACTIVITY_MAX_CHILDREN)) {
+            const childTurns = yield* readTurns(directory, child.sessionID, ACTIVITY_CHILD_TURNS, depth + 1)
+            for (const childTurn of childTurns) ApertureActivityModel.mergeChildEntries(turn, childTurn.entries)
+          }
+        }
+        return turns
+      })
+
+    // The tail of a session's messages, oldest-first, holding at least `maxTurns` prompts.
+    // `MessageV2.page` returns newest-first; we page until enough user messages have gone by
+    // (or the session runs out) and then put them back in conversation order.
+    const recentMessages = (sessionID: string, maxTurns: number) =>
+      Effect.gen(function* () {
+        const collected: ApertureActivityModel.MessageLike[] = []
+        let before: string | undefined
+        let prompts = 0
+        while (prompts <= maxTurns && collected.length < ACTIVITY_MESSAGE_CAP) {
+          const page = yield* MessageV2.page({
+            sessionID: sessionID as SessionID,
+            limit: ACTIVITY_PAGE_SIZE,
+            before,
+          }).pipe(
+            Effect.provideService(Database.Service, database),
+            Effect.catch(() => Effect.succeed(undefined)),
+          )
+          if (!page || page.items.length === 0) break
+          // `items` is oldest-first within the page; prepend so `collected` stays in
+          // conversation order as we walk further back.
+          collected.unshift(...page.items)
+          prompts += page.items.filter((m) => m.info.role === "user").length
+          if (!page.more || !page.cursor) break
+          before = page.cursor
+        }
+        return collected
+      })
+
     // Read/replace the legend filter (PLAN.md O4). Replace rather than toggle: the caller
     // owns a set (the TUI's legend, the extension's multi-select picker), so sending the
     // whole set keeps the two surfaces from drifting apart over a dropped message.
@@ -1913,6 +2106,7 @@ export const layer = Layer.effect(
       deleteLens: (idOrName) => deleteLens(idOrName),
       facetFiles: (lens, facets) => facetFiles(lens, facets),
       facetMap: () => facetMap(),
+      activity: (sessionID, turns) => activity(sessionID, turns),
       facetFilter: () => facetFilter(),
       setFacetFilter: (facets) => setFacetFilter(facets),
       drill: (file, scope) => drill(file, scope),
@@ -1923,6 +2117,10 @@ export const layer = Layer.effect(
 export const defaultLayer = layer.pipe(
   Layer.provide(Storage.defaultLayer),
   Layer.provide(EventV2.defaultLayer),
+  // Self-provided so the layer stays R = never (the idiom Todo/Account use). `activity`
+  // derives turns from the durable message store, which is a database read; message-v2
+  // imports nothing under aperture/, so this adds no cycle.
+  Layer.provide(Database.defaultLayer),
   // Self-provided (Provider's own stack is self-contained) so the layer stays
   // R = never, mirroring Agent.defaultLayer — the painter needs both to resolve a
   // small model and read the context flag.
