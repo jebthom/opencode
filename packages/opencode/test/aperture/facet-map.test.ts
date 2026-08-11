@@ -76,7 +76,7 @@ describe("computeFacetMapFiles (Explorer pip weights)", () => {
     expect(files["src/a.ts"]).toEqual({ t: 100, w: [{ f: FACETS.length - 1, p: 100 }] })
   })
 
-  test("a sliver that rounds to 0% is dropped, never emptying the file", () => {
+  test("a sliver that rounds to 0% is floored to 1%, never dropped", () => {
     // 1000 bytes: a 3-byte "hot" function (0.3%) and the rest on the file facet.
     const mixes = {
       "src/big.ts": {
@@ -88,11 +88,17 @@ describe("computeFacetMapFiles (Explorer pip weights)", () => {
       },
     }
     const big = { id: "n_b", path: "src/big.ts", size: 1000 }
+    // Both surfaces that consume this guarantee a facet present at least one cell (the TUI's
+    // `allocateCells`, the VSCode chip's `apportion`), and neither can honour that for a
+    // facet dropped here. Overstating 0.3% as 1% is the smaller lie than reading as pure.
     expect(computeFacetMapFiles([big], { n_b: { facet: "likely", hash: "h" } }, mixes, FACETS)["src/big.ts"]).toEqual({
-      // `t` is the pre-rounding total, so the dropped sliver's bytes are still counted in
-      // the file's weight when a client rolls it into a directory.
+      // `t` is the pre-rounding total, so the floored sliver's real bytes are still what a
+      // client's rollup carries — the 1% is a display floor, not a re-weighting.
       t: 1000,
-      w: [{ f: 0, p: 100 }],
+      w: [
+        { f: 0, p: 100 },
+        { f: 1, p: 1 },
+      ],
     })
   })
 

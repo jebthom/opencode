@@ -92,10 +92,22 @@ export class ApertureTree implements vscode.TreeDataProvider<Node>, vscode.TreeD
 
     const weights = this.ctx.model().weights(node.rel, node.dir)
     if (!weights?.length) {
-      // Unpainted — a non-source file, or a folder with nothing painted below it. Leaving
-      // `iconPath` unset is deliberate: with `resourceUri` set, VSCode falls back to the
-      // user's file icon theme, so these rows look exactly like the Explorer's and the
-      // chip stays a positive signal rather than every row carrying one.
+      // Unpainted — a non-source file, or a folder with nothing painted below it. For a
+      // file, leaving `iconPath` unset is deliberate: with `resourceUri` set, VSCode falls
+      // back to the user's file icon theme, so these rows look exactly like the Explorer's
+      // and the chip stays a positive signal rather than every row carrying one.
+      //
+      // A folder cannot afford the same, because of alignment. Every row gets a
+      // fixed-width twistie slot and the icon is drawn *after* it, so a row with no icon
+      // starts its label one icon-width left of a sibling that has one — and most file icon
+      // themes (Seti, the default, among them) draw nothing for a folder. An unpainted
+      // folder would then line its label up with its siblings' icons instead of their
+      // labels, which reads as the file being a level deeper than it is. The Explorer dodges
+      // this by collapsing the twistie on childless rows so a file's icon sits in the
+      // twistie column; a contributed TreeView has no say in twistie rendering, so the icon
+      // slot is the only lever, and the fix is to always spend it. The hollow chip is what
+      // goes there: same frame as a real chip, no cells, i.e. "nothing painted below here".
+      if (node.dir) item.iconPath = this.ctx.icons.empty()
       return item
     }
 

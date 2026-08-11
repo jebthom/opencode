@@ -2073,13 +2073,18 @@ export function computeFacetMapFiles(
     const total = attribution.weights.reduce((sum, w) => sum + w.bytes, 0)
     if (total <= 0) continue
     // Percent of the file's *attributed* bytes, descending so a client reading only the head
-    // gets the dominant facet. A share that rounds to 0 is dropped rather than shipped as
-    // noise — the dominant weight can never round to 0, so a file is never emptied by this.
+    // gets the dominant facet. A facet holding any bytes at all is floored at 1% rather than
+    // rounded away: existence outranks proportion on these surfaces (the TUI treemap and the
+    // VSCode chip both guarantee a present facet a cell, and neither can honour that for a
+    // facet the wire already dropped). Overstating a 0.3% function as 1% is the smaller lie.
+    // Floored shares can push the sum a point or two past 100; `t` is the pre-rounding
+    // denominator, so a client's `t * p / 100` rollup absorbs that as noise rather than as
+    // the whole sliver going missing.
     const weights = attribution.weights
       .flatMap((w) => {
         const f = indexByFacet.get(w.facet)
-        const p = Math.round((w.bytes / total) * 100)
-        return f === undefined || p === 0 ? [] : [{ f, p }]
+        if (f === undefined || w.bytes <= 0) return []
+        return [{ f, p: Math.max(1, Math.round((w.bytes / total) * 100)) }]
       })
       .sort((a, b) => b.p - a.p)
     // `t` is the pre-rounding denominator, so a client's `t * p / 100` rollup carries the

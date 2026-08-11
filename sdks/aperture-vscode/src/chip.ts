@@ -254,6 +254,19 @@ export function chipSvg(segments: ReadonlyArray<Segment>, layout: ChipLayout, th
   )
 }
 
+// The hollow chip: the chip's frame with nothing in it, worn by a folder that has nothing
+// painted below it. It exists for alignment rather than for information — see the note in
+// tree.ts — but it also says the true thing, so the empty slot reads as "no facets here"
+// rather than as a chip that failed to draw.
+//
+// `chipSvg` with no segments is already exactly this drawing (no cells, just the clip and
+// the outline), so this is that call rather than a second geometry to keep in step with it.
+// Layout is immaterial when there are no cells; `bar6` is passed as the arbitrary one.
+export const EMPTY_CHIP_KEY = "empty"
+export function emptyChipSvg(theme: Theme): string {
+  return chipSvg([], "bar6", theme)
+}
+
 // One row of N. Widths come straight from the fracs, so this serves both the quantized and
 // the proportional layouts.
 function barRects(segments: ReadonlyArray<Segment>): string[] {

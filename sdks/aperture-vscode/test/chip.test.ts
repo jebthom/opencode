@@ -3,6 +3,7 @@ import {
   CHIP_CELLS,
   chipSegments,
   chipSvg,
+  emptyChipSvg,
   hexFor,
   MIN_SEGMENT_FRAC,
   MOSAIC_CELL_COUNT,
@@ -291,6 +292,18 @@ describe("chipSvg", () => {
     // BAR_Y is 1 and a cell is BAR_H/2 = 7 tall, so the bottom row starts at y=8.
     expect(svg).toContain('<rect x="0" y="8"')
     expect(svg).toMatch(/<rect x="0" y="8"[^>]*fill="#4E79A7"/)
+  })
+
+  test("the hollow chip is the same frame with no cells in it", () => {
+    // An unpainted folder wears this so its row spends the icon slot and its label lines up
+    // with its siblings' (tree.ts). That only works if the frame is the same 16x16 box a
+    // real chip draws, and it only reads as "nothing painted" if no cell is filled.
+    const empty = emptyChipSvg("dark")
+    expect(empty).toStartWith('<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">')
+    expect(empty.slice(empty.indexOf("<g "), empty.indexOf("</g>"))).not.toContain("<rect ")
+    // The outline is the whole drawing, and it is the one part that follows the theme.
+    expect(empty).toContain('stroke="#FFFFFF26"')
+    expect(emptyChipSvg("light")).toContain('stroke="#00000026"')
   })
 
   test("the grid ignores a cell-count override, which would leave its last row short", () => {

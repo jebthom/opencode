@@ -46,8 +46,9 @@ export function allocateCells<T extends string>(
 //
 // Column-major so a band whose cell count is a multiple of `rows` lands on whole columns
 // instead of being smeared across the rows — the same shape rule the VSCode tree chip's
-// 3x2 mosaic follows (chip.ts `mosaicRects`, which fills bottom-up column-major to
-// match). The two are different sizes and can never draw the same picture, but a
+// mosaic follows (chip.ts `mosaicRects`: three columns of two, the rightmost cut vertically
+// so minor facets cost a sliver, filled bottom-up column-major to match). The two are
+// different sizes and can never draw the same picture, but a
 // directory whose block reads as "two green columns then a blue one" and its chip agree
 // about the shape, where a row-major block would have shown that as stripes.
 //

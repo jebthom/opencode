@@ -2,7 +2,7 @@ import * as crypto from "node:crypto"
 import * as fs from "node:fs"
 import * as path from "node:path"
 import * as vscode from "vscode"
-import { chipKey, chipSvg, type ChipLayout, type Segment } from "./chip"
+import { chipKey, chipSvg, EMPTY_CHIP_KEY, emptyChipSvg, type ChipLayout, type Segment } from "./chip"
 
 // Getting a generated SVG in front of VSCode as a tree icon.
 //
@@ -53,6 +53,21 @@ export class ChipIcons {
         dark: this.uri(chipSvg(segments, layout, "dark"), key, "dark"),
       }
       this.cache.set(key, icon)
+    }
+    return icon
+  }
+
+  // The hollow chip, for a folder with nothing painted below it. Shares the cache and both
+  // deliveries with the real chips — it is one more {light,dark} pair — under a key no
+  // `chipKey` can collide with (every one of those is prefixed with a layout name).
+  empty(): vscode.IconPath {
+    let icon = this.cache.get(EMPTY_CHIP_KEY)
+    if (!icon) {
+      icon = {
+        light: this.uri(emptyChipSvg("light"), EMPTY_CHIP_KEY, "light"),
+        dark: this.uri(emptyChipSvg("dark"), EMPTY_CHIP_KEY, "dark"),
+      }
+      this.cache.set(EMPTY_CHIP_KEY, icon)
     }
     return icon
   }
