@@ -40,17 +40,29 @@ export function allocateCells<T extends string>(
 }
 
 // Lay a flat, band-ordered cell list into a `rows`-tall grid that grows
-// horizontally, filled bottom row first, left→right (bottom-aligned: the footing
-// stays full and the partial cells land on the top row). Rows are padded with nulls
-// to a common width so the block is rectangular. Returns rows top→bottom.
+// horizontally, filled **column-major from the bottom left**: each column bottom→top,
+// then the next column to the right. Rows are padded with nulls to a common width so the
+// block is rectangular. Returns rows top→bottom.
+//
+// Column-major so a band whose cell count is a multiple of `rows` lands on whole columns
+// instead of being smeared across the rows — the same shape rule the VSCode tree chip's
+// 3x2 mosaic follows (chip.ts `mosaicRects`, which fills bottom-up column-major to
+// match). The two are different sizes and can never draw the same picture, but a
+// directory whose block reads as "two green columns then a blue one" and its chip agree
+// about the shape, where a row-major block would have shown that as stripes.
+//
+// Bottom-aligned within a column, which is what keeps the footing full: only the last
+// column can be partial, so the block's one ragged corner is top-right. A block resting
+// on a broken footing reads as a rendering bug rather than as a smaller directory.
 export function buildGrid<T>(flat: ReadonlyArray<T>, rows: number): (T | null)[][] {
   if (flat.length === 0 || rows <= 0) return []
   const cols = Math.ceil(flat.length / rows)
   const grid: (T | null)[][] = Array.from({ length: rows }, () => Array.from({ length: cols }, () => null as T | null))
   let i = 0
-  for (let fromBottom = 0; fromBottom < rows; fromBottom++) {
-    const row = rows - 1 - fromBottom
-    for (let col = 0; col < cols && i < flat.length; col++) grid[row]![col] = flat[i++]!
+  for (let col = 0; col < cols && i < flat.length; col++) {
+    for (let fromBottom = 0; fromBottom < rows && i < flat.length; fromBottom++) {
+      grid[rows - 1 - fromBottom]![col] = flat[i++]!
+    }
   }
   return grid
 }

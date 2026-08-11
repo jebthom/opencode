@@ -95,6 +95,28 @@ describe("chipSegments — quantized", () => {
   })
 })
 
+describe("chipSegments — ordering", () => {
+  test("segments run in Lens facet order, not in the descending-share order they arrive in", () => {
+    // The wire order is by share (tui 60 before parsing 40); the chip lays parsing first
+    // because it comes first in the Lens, so two files with these facets read alike.
+    const segments = bar([
+      { f: 2, p: 60 },
+      { f: 0, p: 40 },
+    ])
+    expect(segments.map((s) => s.color)).toEqual(["#4E79A7", "#4E79A7", "#59A14F", "#59A14F", "#59A14F", "#59A14F"])
+  })
+
+  test("the off-legend facet lands at the far end, where the TUI puts its untagged grey", () => {
+    // f 3 is NONE_FACET — appended after the Lens's own facets, so it sorts last.
+    const segments = bar([
+      { f: 3, p: 50 },
+      { f: 0, p: 50 },
+    ])
+    expect(segments.slice(0, 3).map((s) => s.color)).toEqual(["#4E79A7", "#4E79A7", "#4E79A7"])
+    expect(new Set(segments.slice(3).map((s) => s.color))).toEqual(new Set([THEME_ROLE_HEX["textMuted"]!.dark]))
+  })
+})
+
 describe("chipSegments — suppression (PLAN O4)", () => {
   test("a suppressed facet greys in place, keeping its area", () => {
     const mix = [
@@ -112,6 +134,32 @@ describe("chipSegments — suppression (PLAN O4)", () => {
   test("suppressing everything still renders a full grey bar", () => {
     const segments = bar([{ f: 0, p: 100 }], { suppressed: new Set(["parsing", "server", "tui"]) })
     expect(segments).toHaveLength(CHIP_CELLS)
+  })
+
+  // The extension no longer threads `suppressed` through each paint site: it derives one
+  // legend whose suppressed entries already carry the muted hue, and every surface — chip,
+  // pip, gutter — reads colour from that. These pin the two paths as interchangeable, so the
+  // derivation can't quietly diverge from what the chip's own suppression does.
+  test("a legend pre-greyed by the filter paints the same as the suppressed set", () => {
+    const mix = [
+      { f: 0, p: 50 },
+      { f: 1, p: 50 },
+    ]
+    const greyed: LegendEntry[] = LEGEND.map((e) => (e.facet === "parsing" ? { ...e, color: "textMuted" } : e))
+    const viaSet = bar(mix, { suppressed: new Set(["parsing"]) })
+    const viaLegend = chipSegments(mix, FACETS, greyed, { layout: "bar6", theme: "dark" })
+    expect(viaLegend).toEqual(viaSet)
+  })
+
+  test("the two paths agree when they overlap, so applying both is not double-greying", () => {
+    const mix = [
+      { f: 0, p: 34 },
+      { f: 1, p: 33 },
+      { f: 2, p: 33 },
+    ]
+    const greyed: LegendEntry[] = LEGEND.map((e) => (e.facet === "tui" ? { ...e, color: "textMuted" } : e))
+    const both = chipSegments(mix, FACETS, greyed, { layout: "bar6", theme: "dark", suppressed: new Set(["tui"]) })
+    expect(both).toEqual(bar(mix, { suppressed: new Set(["tui"]) }))
   })
 })
 
@@ -198,6 +246,22 @@ describe("chipSvg", () => {
     const column = Math.round((16 / 3) * 1000) / 1000
     const xs = [...svg.matchAll(/<rect x="([\d.]+)"[^>]*fill="#4E79A7"/g)].map((m) => Number(m[1]))
     expect(xs).toEqual([0, 0, column, column])
+  })
+
+  test("mosaic fills bottom-up, so the first facet starts in the bottom-left cell", () => {
+    // 1/5 over three columns of two: parsing's single cell is the first one placed, and
+    // the fill starts at the bottom of the left column — the TUI treemap's direction.
+    const svg = chipSvg(
+      bar([
+        { f: 0, p: 17 },
+        { f: 1, p: 83 },
+      ]),
+      "mosaic6",
+      "dark",
+    )
+    // BAR_Y is 1 and a cell is BAR_H/2 = 7 tall, so the bottom row starts at y=8.
+    expect(svg).toContain('<rect x="0" y="8"')
+    expect(svg).toMatch(/<rect x="0" y="8"[^>]*fill="#4E79A7"/)
   })
 
   test("the grid ignores a cell-count override, which would leave its last row short", () => {

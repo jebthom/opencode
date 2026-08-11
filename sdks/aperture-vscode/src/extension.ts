@@ -71,6 +71,11 @@ const SHADES: ReadonlyArray<{ min: number; glyph: string }> = [
 // The TUI resolves tokens against its loaded theme; we can't, so we map each known token to
 // the nearest VSCode ThemeColor so the colour still adapts to the editor's theme. Unknown
 // tokens resolve to undefined and are skipped (not painted).
+// The hue a facet takes while it is filtered out of the legend (PLAN O4). The same token
+// chip.ts falls back to, so the tree chip, the Explorer pip and the gutter stripe all grey
+// to one colour — and one the TUI also reads as "off" rather than as a facet of its own.
+const SUPPRESSED_HUE = "textMuted"
+
 const THEME_ROLE_COLORS: Record<string, string> = {
   info: "charts.blue",
   success: "charts.green",
@@ -143,6 +148,18 @@ export function activate(context: vscode.ExtensionContext) {
   type Extent = { name: string; startLine: number; endLine: number; facet?: string; hue?: string }
   type GraphNode = { id: string; path: string; kind: string }
 
+  // The colour a function's stripe paints, honouring the legend filter (PLAN O4).
+  //
+  // `ex.hue` is the server's own resolution of `ex.facet`, made before it knew about the
+  // filter, so a suppressed facet would still arrive in its Lens colour. Preferring the
+  // filtered legend — which is the same table with suppressed facets swapped to the muted
+  // role — is what greys the gutter alongside the chips. `ex.hue` remains the fallback for
+  // an extent whose facet isn't in the legend (notably "Other").
+  function hueForExtent(ex: Extent): string | undefined {
+    if (ex.facet === undefined) return ex.hue
+    return facetLegend.find((e) => e.facet === ex.facet)?.color ?? ex.hue
+  }
+
   async function fetchExtents(relPath: string): Promise<Extent[] | undefined> {
     const dir = directory()
     if (!dir) return undefined
@@ -184,7 +201,10 @@ export function activate(context: vscode.ExtensionContext) {
       log(`fetch FAILED for ${relPath}: ${String(e)} (baseUrl=${baseUrl()} dir=${directory()})`)
       return
     }
-    const painted = (extents ?? []).filter((e) => e.hue && resolveHue(e.hue) !== undefined).length
+    const painted = (extents ?? []).filter((e) => {
+      const hue = hueForExtent(e)
+      return hue !== undefined && resolveHue(hue) !== undefined
+    }).length
     log(`drill ${relPath}: ${extents?.length ?? 0} extents, ${painted} painted`)
 
     // Group line ranges by hue; a painted function carries a hue we can resolve (hex or
@@ -193,7 +213,7 @@ export function activate(context: vscode.ExtensionContext) {
     // range would leave every line but the first un-striped.
     const rangesByColor = new Map<string, vscode.Range[]>()
     for (const ex of extents ?? []) {
-      const hue = ex.hue
+      const hue = hueForExtent(ex)
       if (!hue || resolveHue(hue) === undefined) continue
       const list = rangesByColor.get(hue) ?? []
       for (let line = ex.startLine - 1; line <= ex.endLine - 1; line++) {
@@ -268,17 +288,31 @@ export function activate(context: vscode.ExtensionContext) {
   // it. The pips only need `w`; `t` is what lets the tree roll a directory up by bytes
   // rather than by file count, so its folder chips agree with the TUI's treemap.
   let facetMap = new Map<string, FacetFile>()
+  // The legend exactly as the server sent it, and the legend everything actually paints
+  // from. They differ only by the filter: `facetLegend` is `facetLegendRaw` with every
+  // suppressed facet's colour swapped for the muted role (see applyFilter).
+  //
+  // One derivation, rather than a `suppressed` set threaded through every paint site: a
+  // facet becomes a colour in exactly one place, so filtering is a property of the palette
+  // and each surface — chips, pips, gutter — greys without knowing the filter exists. Raw is
+  // kept because un-filtering has to restore the true hue without a refetch.
+  let facetLegendRaw: LegendEntry[] = []
   let facetLegend: LegendEntry[] = []
   let facetIds: string[] = []
   // The active Lens's id. Only the pips consult it (to stand down for git-changed); the
   // tree paints every Lens.
   let lensId: string | undefined
-  // Facets the user has toggled off (PLAN O4). One set drives both surfaces: the tree greys
-  // those cells in place, and the Explorer pips fall through to each file's largest
-  // surviving facet. Set via the aperture.filterFacets command; O4/S4 should eventually push
-  // it from the TUI's legend filter over SSE instead, which is why nothing below assumes
-  // where the value came from.
+  // Facets the user has toggled off (PLAN O4). One set drives every surface: the tree greys
+  // those cells in place, the Explorer pips fall through to each file's largest surviving
+  // facet, and the gutter greys their extents.
+  //
+  // The server owns it — the TUI's legend and the aperture.filterFacets command both POST to
+  // it, and it comes back to us over SSE and on the facet map. This is a local mirror of that
+  // value, never the authority, so nothing here cares which surface the user clicked.
   const suppressedFacets = new Set<string>()
+  // Outstanding filter POSTs of ours. While non-zero the facet map's `suppressed` is ignored
+  // (a response requested before our POST would carry the pre-click filter) — see fetchFacetMap.
+  let filterPosts = 0
   let fetchingFacetMap = false
   // Guards the file-set enumeration the same way `fetchingFacetMap` guards the map fetch: a
   // watcher burst must not stack whole-workspace searches on top of each other.
@@ -312,6 +346,7 @@ export function activate(context: vscode.ExtensionContext) {
         lens?: { id: string; legend?: LegendEntry[] }
         facets?: string[]
         files?: Record<string, FacetFile>
+        suppressed?: string[]
       }
       const next = new Map(Object.entries(data.files ?? {}))
       // A different Lens (or vocabulary) re-colours every row at once, so a targeted list
@@ -320,13 +355,22 @@ export function activate(context: vscode.ExtensionContext) {
       const changed = relit ? undefined : changedUris(facetMap, next)
       const previous = facetMap
       facetMap = next
-      facetLegend = data.lens?.legend ?? []
+      facetLegendRaw = data.lens?.legend ?? []
       facetIds = data.facets ?? []
       lensId = data.lens?.id
-      // A filter from a previous Lens means nothing under this one; dropping the stale ids
-      // avoids a tree that has silently greyed itself out under a vocabulary that never had
-      // those facets.
-      for (const facet of [...suppressedFacets]) if (!facetIds.includes(facet)) suppressedFacets.delete(facet)
+      // Adopt the server's filter. This is the self-heal path: the SSE event is what makes a
+      // click feel instant, but a reconnect (or an extension that started after the filter
+      // was set) missed it, and this fetch is where that gets put right. The server clears
+      // the set on a Lens switch, so a filter never leaks into a vocabulary that lacks it.
+      //
+      // Skipped while our own POST is in flight: this response may have been requested
+      // before it, in which case it carries the pre-click filter and would visibly un-grey
+      // what the user just clicked, only for the echo to re-grey it a moment later.
+      if (filterPosts === 0) {
+        suppressedFacets.clear()
+        for (const facet of data.suppressed ?? []) suppressedFacets.add(facet)
+        refreshLegend()
+      }
       // The tree colours from the same fetch, and unlike the pips it has no reason to skip
       // any Lens — so it is rebuilt before the early-out below.
       rebuildModel()
@@ -586,13 +630,17 @@ export function activate(context: vscode.ExtensionContext) {
   // Toggle facets off. Checked = shown; unchecking is what greys a facet, and the picker
   // opens with the current filter already applied so it reads as state rather than as a
   // fresh question each time.
+  //
+  // The picker is the sibling of the TUI's legend click, not a second filter: it posts the
+  // set the user chose and lets the server's echo apply it, so both surfaces agree even
+  // though only one of them was touched.
   async function pickFacetFilter() {
-    if (facetLegend.length === 0) {
+    if (facetLegendRaw.length === 0) {
       vscode.window.showInformationMessage("Aperture: no active Lens to filter by.")
       return
     }
     const picked = await vscode.window.showQuickPick(
-      facetLegend.map((entry) => ({
+      facetLegendRaw.map((entry) => ({
         label: entry.label,
         facet: entry.facet,
         picked: !suppressedFacets.has(entry.facet),
@@ -600,25 +648,61 @@ export function activate(context: vscode.ExtensionContext) {
       {
         canPickMany: true,
         title: "Aperture: filter facets",
-        placeHolder: "Unchecked facets grey out in the tree and drop out of the Explorer pips",
+        placeHolder: "Unchecked facets grey out here, in the editor gutter, and in the opencode top bar",
       },
     )
     // Escape leaves the filter alone; deliberately unchecking everything does not.
     if (picked === undefined) return
     const shown = new Set(picked.map((item) => item.facet))
-    suppressedFacets.clear()
-    for (const entry of facetLegend) if (!shown.has(entry.facet)) suppressedFacets.add(entry.facet)
-    applyFilter()
+    void setFacetFilter(facetLegendRaw.filter((e) => !shown.has(e.facet)).map((e) => e.facet))
   }
 
-  // One filter, three surfaces. Nothing is refetched — the server ships each file's whole
-  // mix precisely so this stays a client-side re-render.
+  // Hand a new filter to the server, which holds it for every surface and echoes it back as
+  // aperture.facets.filtered. Applied locally first: the round trip is short but not free,
+  // and a filter click should land on the next frame.
+  async function setFacetFilter(facets: string[]) {
+    const dir = directory()
+    suppressedFacets.clear()
+    for (const facet of facets) suppressedFacets.add(facet)
+    applyFilter()
+    if (!dir) return
+    filterPosts++
+    try {
+      await fetch(`${baseUrl()}/aperture/facet-filter`, {
+        method: "POST",
+        headers: { "x-opencode-directory": dir, "Content-Type": "application/json" },
+        body: JSON.stringify({ facets }),
+      })
+    } catch (e) {
+      // The local paint stands. The next facet-map fetch reconciles us with whatever the
+      // server actually holds, so a dropped POST self-corrects rather than sticking.
+      log(`facet filter POST FAILED: ${String(e)}`)
+    } finally {
+      filterPosts--
+    }
+  }
+
+  // Re-derive the painted legend from the raw one + the filter. The single place a facet's
+  // colour is decided, so every surface below greys by reading its colour as usual.
+  function refreshLegend() {
+    facetLegend = facetLegendRaw.map((entry) =>
+      suppressedFacets.has(entry.facet) ? { ...entry, color: SUPPRESSED_HUE } : entry,
+    )
+  }
+
+  // One filter, every surface. Nothing is refetched — the server ships each file's whole mix
+  // precisely so this stays a client-side re-render.
   function applyFilter() {
-    log(`filter: ${suppressedFacets.size} of ${facetLegend.length} facets suppressed`)
+    log(`filter: ${suppressedFacets.size} of ${facetLegendRaw.length} facets suppressed`)
+    refreshLegend()
     tree.refresh()
     openEditors.refresh()
     // A genuine full invalidation: every row's answer changed at once.
     decorationsChanged.fire(undefined)
+    // The gutter reads the legend too, and unlike the tree it isn't driven by an event —
+    // repaint the editors the user can actually see. Straight through, not debounced: this
+    // is a click, not a paint sweep.
+    void repaintVisible()
   }
 
   // ---- open-in-editor via SSE ----------------------------------------------
@@ -668,6 +752,18 @@ export function activate(context: vscode.ExtensionContext) {
     } else if (evt.type === "aperture.invalidated") {
       scheduleRepaint()
       scheduleFacetMap()
+    } else if (evt.type === "aperture.facets.filtered" && Array.isArray(evt.properties?.facets)) {
+      // Someone filtered the legend — the TUI's top bar, or the server clearing it on a Lens
+      // switch. The event carries the whole set, so adopt it wholesale rather than diffing.
+      // No refetch: the filter changes how the colours we already hold are painted, nothing
+      // about what was painted.
+      const next: string[] = evt.properties.facets.filter((f: unknown) => typeof f === "string")
+      // Our own filter clicks echo back through here. Bailing on an unchanged set spares the
+      // whole-tree invalidation and gutter repaint we already did optimistically.
+      if (next.length === suppressedFacets.size && next.every((f) => suppressedFacets.has(f))) return
+      suppressedFacets.clear()
+      for (const facet of next) suppressedFacets.add(facet)
+      applyFilter()
     }
   }
 
@@ -765,8 +861,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand("aperture.filterFacets", () => void pickFacetFilter()),
     vscode.commands.registerCommand("aperture.clearFacetFilter", () => {
       if (suppressedFacets.size === 0) return
-      suppressedFacets.clear()
-      applyFilter()
+      void setFacetFilter([])
     }),
     vscode.commands.registerCommand("aperture.refreshTree", () => {
       void fetchFileSet()

@@ -534,6 +534,20 @@ export function legend(lens: Lens): LegendEntry[] {
   return lens.facets.map((t) => ({ facet: t.id, label: t.label, color: t.color }))
 }
 
+// Narrow a set of facet ids to those this Lens actually paints with — its own facets plus
+// NONE_FACET, which is a real stored value ("Other") even though it is never in the legend.
+// Order and duplicates are dropped; the result is a set.
+//
+// This is the guard on the legend filter (O4). Facet ids are slugs, so two unrelated Lenses
+// can easily share one ("core", "ui"): a filter left over from a previous vocabulary would
+// sit inert until a Lens reusing that id came round, and then grey out something the user
+// never turned off. Filtering the ids in — rather than trusting the caller — is what keeps
+// a filter meaningful only in the Lens it was expressed against.
+export function facetsWithin(lens: Lens, facets: ReadonlyArray<string>): Set<string> {
+  const known = new Set([...lens.facets.map((t) => t.id), NONE_FACET])
+  return new Set(facets.filter((f) => known.has(f)))
+}
+
 // System prompt handed to the painter model: the Lens's role sentence, the
 // enumerated facet definitions, then the fixed echo/format instructions. Replaces the
 // previously hard-coded architectural-layer prose so any Lens can paint.

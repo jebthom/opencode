@@ -8,6 +8,8 @@ import type {
   ApertureCycleLensResponses,
   ApertureDeleteLensErrors,
   ApertureDeleteLensResponses,
+  ApertureFacetFilterErrors,
+  ApertureFacetFilterResponses,
   ApertureFacetMapErrors,
   ApertureFacetMapResponses,
   ApertureGetErrors,
@@ -862,6 +864,45 @@ export class Aperture extends HeyApiClient {
       ...options,
       ...params,
     })
+  }
+
+  /**
+   * Set the legend facet filter
+   *
+   * Grey out the given facets across every Aperture surface (top bar, tree chips, editor gutter). View-only and never persisted; an empty list clears the filter.
+   */
+  public facetFilter<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      facets?: Array<string>
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "facets" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<ApertureFacetFilterResponses, ApertureFacetFilterErrors, ThrowOnError>(
+      {
+        url: "/aperture/facet-filter",
+        ...options,
+        ...params,
+        headers: {
+          "Content-Type": "application/json",
+          ...options?.headers,
+          ...params.headers,
+        },
+      },
+    )
   }
 
   /**

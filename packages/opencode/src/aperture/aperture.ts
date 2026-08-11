@@ -30,6 +30,7 @@ import {
   type LensParent,
   type PaletteId,
   legend as lensLegend,
+  facetsWithin,
   orderForest,
   inDomain,
   NONE_FACET,
@@ -223,6 +224,9 @@ export interface FacetMap {
     string,
     { readonly t: number; readonly w: ReadonlyArray<{ readonly f: number; readonly p: number }> }
   >
+  // The facets currently toggled off in the legend (O4), so a client that arrives late or
+  // reconnects paints the same filter the others are painting. Empty when nothing is filtered.
+  readonly suppressed: ReadonlyArray<string>
 }
 
 export interface Interface {
@@ -263,6 +267,12 @@ export interface Interface {
   // Every painted file in the repo with its facet mix, under the active Lens (O2).
   // Bulk source for the VSCode Explorer's file decorations — see FacetMap.
   readonly facetMap: () => Effect.Effect<FacetMap>
+  // The legend filter (O4): the facet ids the user has toggled off, which every surface
+  // paints grey in place of their Lens colour. View-only and in-memory — see the note on
+  // `suppressedFacets`. `setFacetFilter` replaces the whole set and returns what was kept
+  // (ids outside the active Lens are dropped).
+  readonly facetFilter: () => Effect.Effect<string[]>
+  readonly setFacetFilter: (facets: ReadonlyArray<string>) => Effect.Effect<string[]>
   // Drill into a file (A5): like `get`, but the payload also carries `extents` —
   // the file's function-level tiles, coloured from the per-function store — and a
   // drill-in paint pass is scheduled at top priority to fill any not-yet-painted
@@ -681,6 +691,15 @@ export const layer = Layer.effect(
     // one re-runs the drill-in painter (onFileChanged) so its tiles stay fresh; the
     // per-extent hash scopes that repaint to the functions that actually changed.
     const drilledFiles = new Map<string, Set<string>>()
+    // Facets the user has toggled off in the legend, per directory (PLAN.md O4). The server
+    // holds this so the TUI's top bar and the VSCode extension filter as one — either can set
+    // it, both read it back from facetMap(), and the FacetsFiltered event carries a change to
+    // whichever surface didn't make it.
+    //
+    // In-memory and never persisted: it is a way of *looking* at a Lens, not part of one, so
+    // it dies with the server rather than being restored into a session that didn't ask for
+    // it. Nothing here touches lens-store's on-disk state.
+    const suppressedFacets = new Map<string, Set<string>>()
 
     const schedulePaint = (
       directory: string,
@@ -1178,7 +1197,19 @@ export const layer = Layer.effect(
             if (Object.keys(built).length) extents = built
           }
         }
-        return { ...structure, semantics, composition, lens: lensInfo, ...(extents ? { extents } : {}) }
+        // The legend filter rides out with the colours it modifies (O4). Read here rather
+        // than baked into the structure cache: finalize runs on every fetch, so a filter set
+        // from the VSCode picker is picked up by the next TUI poll even if the event was
+        // missed, and a TUI that starts mid-filter opens already greyed.
+        const filtered = suppressedFacets.get(ctx.directory)
+        return {
+          ...structure,
+          semantics,
+          composition,
+          lens: lensInfo,
+          ...(filtered?.size ? { suppressed: [...filtered] } : {}),
+          ...(extents ? { extents } : {}),
+        }
       })
 
     // Background whole-repo painter (vs. the per-scope window of get/refresh). One
@@ -1525,6 +1556,18 @@ export const layer = Layer.effect(
             }),
           )
         }
+        // A filter is expressed in the *outgoing* Lens's vocabulary, so it means nothing under
+        // the incoming one — carrying it over would silently grey out facets of a Lens the user
+        // has never filtered. Clearing here covers select/cycle/create/edit/merge/delete at once.
+        if (suppressedFacets.delete(directory)) {
+          yield* events
+            .publish(
+              ApertureEvent.Event.FacetsFiltered,
+              { facets: [] },
+              { location: { directory: AbsolutePath.make(directory) } },
+            )
+            .pipe(Effect.ignore)
+        }
         // Bump the epoch so an in-flight background sweep abandons the old Lens
         // and restarts for the new one (the wake below re-runs the parked loop).
         lensEpoch.set(directory, (lensEpoch.get(directory) ?? 0) + 1)
@@ -1827,6 +1870,10 @@ export const layer = Layer.effect(
       return {
         facets,
         files: computeFacetMapFiles(subtree, store, mixes, facets),
+        // The legend filter rides the same response the colours do, so a client that
+        // reconnects (or starts after the filter was set) picks it up from its ordinary
+        // refresh instead of waiting for the next FacetsFiltered event — which it missed.
+        suppressed: [...(suppressedFacets.get(ctx.directory) ?? [])],
         lens: {
           id: lens.id,
           name: lens.name,
@@ -1834,6 +1881,23 @@ export const layer = Layer.effect(
           ...(isDeterministic(lens) ? { deterministic: true } : {}),
         },
       }
+    })
+
+    // Read/replace the legend filter (PLAN.md O4). Replace rather than toggle: the caller
+    // owns a set (the TUI's legend, the extension's multi-select picker), so sending the
+    // whole set keeps the two surfaces from drifting apart over a dropped message.
+    const facetFilter = Effect.fn("Aperture.facetFilter")(function* () {
+      const ctx = yield* InstanceState.context
+      return [...(suppressedFacets.get(ctx.directory) ?? [])]
+    })
+
+    const setFacetFilter = Effect.fn("Aperture.setFacetFilter")(function* (facets: readonly string[]) {
+      const ctx = yield* InstanceState.context
+      const lens = yield* activeUsable(ctx.directory, ctx.project.id)
+      const next = facetsWithin(lens, facets)
+      if (next.size === 0) suppressedFacets.delete(ctx.directory)
+      else suppressedFacets.set(ctx.directory, next)
+      return [...next]
     })
 
     return Service.of({
@@ -1849,6 +1913,8 @@ export const layer = Layer.effect(
       deleteLens: (idOrName) => deleteLens(idOrName),
       facetFiles: (lens, facets) => facetFiles(lens, facets),
       facetMap: () => facetMap(),
+      facetFilter: () => facetFilter(),
+      setFacetFilter: (facets) => setFacetFilter(facets),
       drill: (file, scope) => drill(file, scope),
     })
   }),

@@ -22,6 +22,7 @@ import {
   facetEnumIds,
   NONE_FACET,
   legend,
+  facetsWithin,
   buildSystemPrompt,
   slugify,
 } from "@/aperture/lenses"
@@ -164,6 +165,19 @@ describe("aperture lenses", () => {
     expect(ids).toContain(NONE_FACET)
     for (const t of ARCHITECTURE.facets) expect(ids).toContain(t.id)
     expect(legend(ARCHITECTURE).some((e) => e.facet === NONE_FACET)).toBe(false)
+  })
+
+  // The guard on the legend filter (O4): a filter is only ever meaningful in the vocabulary
+  // it was expressed against, and facet ids are slugs that unrelated Lenses can share.
+  test("facetsWithin keeps only the active Lens's facets, plus Other", () => {
+    const own = ARCHITECTURE.facets.map((t) => t.id)
+    expect(facetsWithin(ARCHITECTURE, own)).toEqual(new Set(own))
+    // "Other" is filterable — it is a real stored facet, just never a legend entry.
+    expect(facetsWithin(ARCHITECTURE, [NONE_FACET])).toEqual(new Set([NONE_FACET]))
+    // An id from some other Lens is dropped rather than left to grey a facet later.
+    expect(facetsWithin(ARCHITECTURE, ["not-a-facet"])).toEqual(new Set())
+    expect(facetsWithin(ARCHITECTURE, [own[0]!, "not-a-facet", own[0]!])).toEqual(new Set([own[0]!]))
+    expect(facetsWithin(ARCHITECTURE, [])).toEqual(new Set())
   })
 
   test("slugify produces kebab ids", () => {

@@ -90,6 +90,20 @@ const FacetMapResult = Schema.Struct({
     Schema.String,
     Schema.Struct({ t: Schema.Int, w: Schema.Array(Schema.Struct({ f: Schema.Int, p: Schema.Int })) }),
   ),
+  // Facets currently toggled off in the legend (O4). Carried here as well as on the
+  // aperture.facets.filtered event so a client that reconnects — or connects after the
+  // filter was set — recovers it from an ordinary refresh instead of painting unfiltered.
+  suppressed: Schema.Array(Schema.String),
+})
+
+// Replace the legend filter (O4): the set of facets to grey out, in the active Lens's
+// vocabulary. The whole set, not a delta — the TUI's legend and the extension's picker each
+// own a set, and sending it entire is what stops the two drifting apart. Ids outside the
+// active Lens are dropped; the response is what was kept.
+export const FacetFilterInput = Schema.Struct({
+  facets: Schema.Array(Schema.String).annotate({
+    description: "Facet ids to grey out; empty clears the filter",
+  }),
 })
 
 // Activate a Lens by id or name (the searchable Lens picker / `/lens-switch`). The
@@ -195,6 +209,20 @@ export const ApertureApi = HttpApi.make("aperture")
             identifier: "aperture.selectLens",
             summary: "Select a Lens",
             description: "Activate an Aperture Lens by id or name; the view re-paints from its cached facets.",
+          }),
+        ),
+      )
+      .add(
+        HttpApiEndpoint.post("facetFilter", `${root}/facet-filter`, {
+          query: Schema.Struct({ ...WorkspaceRoutingQueryFields }),
+          payload: FacetFilterInput,
+          success: described(Schema.Array(Schema.String), "The facets now greyed out"),
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "aperture.facetFilter",
+            summary: "Set the legend facet filter",
+            description:
+              "Grey out the given facets across every Aperture surface (top bar, tree chips, editor gutter). View-only and never persisted; an empty list clears the filter.",
           }),
         ),
       )

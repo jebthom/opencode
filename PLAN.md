@@ -360,23 +360,38 @@ neutral grey/dark-brown rather than disappearing, so structure is preserved and
 the remaining facets pop. Supports visual search ("show me only the parsing
 code").
 
-Client-side only: a set of suppressed facet ids in the renderer, applied at the
-hue-resolution boundary (`hueOf` and the composition/treemap weights). No
-server, no repaint. Multi-select, with a clear "reset" affordance.
+Built as **one suppressed set on the server, applied once per client at its
+facet→colour map**. The set lives in memory per directory (never on disk — it is a
+way of looking at a Lens, not part of one) and is cleared on a Lens switch, since a
+filter is only meaningful in the vocabulary it was expressed against. The TUI's
+legend click and the extension's picker both `POST /aperture/facet-filter`; the
+server echoes `aperture.facets.filtered` over SSE, and the set also rides the graph
+payload and the facet map so a client that reconnects or starts late recovers it
+from an ordinary fetch instead of painting unfiltered.
+
+Each client applies it in exactly one place — `colorByFacet` in the TUI, the derived
+`facetLegend` in the extension — so the treemap blocks, file bands, tree chips,
+Explorer pips and editor gutter all grey without knowing the filter exists. Colours
+stay *true* on the wire, so a click repaints on the next frame with no round trip and
+untoggling needs no refetch. Weights are never touched, which is what preserves area.
+Multi-select, with a `↺` reset affordance that appears only while a filter is on
+(and is charged for in the legend row's trim budget).
 
 Shared with Search Lenses (**S4** is the same code path, less useful there) —
 build once, in `aperture.tsx`.
 
-**Also feeds the Explorer.** O2's pips already take a `focus` facet and already
-render "not this facet" as no decoration; the suppressed-facet set built here
-should be pushed to the extension (over SSE, alongside `aperture.invalidated`)
-rather than left to O2's stopgap QuickPick, so filtering the top bar filters the
-file tree in the same gesture.
+**Also feeds the Explorer**, and the gutter: O2's stopgap QuickPick now posts to the
+same authority rather than owning its own set, so filtering from either surface
+filters both in one gesture. The editor gutter — the one surface that had no
+suppression at all — greys a suppressed function's stripe by resolving its
+`extent.facet` through the filtered legend rather than trusting the `hue` the server
+resolved before it knew about the filter.
 
-**Open:** whether off-facets keep their area in the treemap (preserves layout
-stability, which is a core Aperture value) or collapse (maximises contrast for
-what remains). Default to preserving area; layout stability is the thing we've
-consistently protected.
+**Decided:** off-facets *keep* their area and grey in place. Layout stability is the
+thing we've consistently protected, and keeping the area is what lets two directories
+stay comparable across a click — which is the whole reason to filter rather than to
+search. The one exception is the Explorer pip, which subtracts instead: a one-colour
+pip has to choose a facet, so subtraction is the only filtering it can express.
 
 ---
 
@@ -645,7 +660,7 @@ shouldn't slide past the point where there's no slack left.
 | 1 | ~~Extent painting always-on vs. widened heuristic, given ~5.8× cost~~ — **decided:** always-on, with granularity (not coverage) as the cost dial; one painter, one classification per file, semantic store demoted to a derived projection | O3 ✅ |
 | 1b | ~~How the Explorer pip carries colour + a multi-facet mix under VSCode's one-colour/one-glyph budget~~ — **decided:** one contributed colour id per exact palette hex (exact legend hue, no facet-count limit); colour = focused facet, shade glyph = its byte share; `focus` a parameter, defaulting to dominant | O2 ✅ |
 | 2 | ~~What dimension replaces the file tier in the top bar~~ — **decided:** the child list goes, leaving one row of directory blocks; the scope's own files return as a packed alphabetical grid of one-line tiles, each banded by its *own* facet mix (the only surface that shows a file's minority facets — the Explorer pip is dominant-only) | O1 ✅ |
-| 3 | Whether filtered-off facets keep their treemap area | O4 |
+| 3 | ~~Whether filtered-off facets keep their treemap area~~ — **decided:** keep it, greying in place; weights are never touched, so no surface re-flows on a filter click. The Explorer pip is the deliberate exception (one colour, so it must subtract) | O4 ✅ |
 | 4 | Line-tag anchoring mechanism (composite recommended) | S1 |
 | 5 | Search Lens as a distinct type on the model vs. a flag | S1 |
 | 6 | Activity View in the sidebar vs. the top bar | G3 |

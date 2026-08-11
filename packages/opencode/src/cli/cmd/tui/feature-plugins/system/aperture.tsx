@@ -81,13 +81,17 @@ type Graph = {
   composition?: Record<string, Composition>
   // The active Lens + legend (facet → label + colour), merged in server-side.
   lens?: { id: string; name: string; legend: readonly { facet: string; label: string; color: string }[] }
+  // Facets already toggled off server-side when this payload was built (O4) — the filter
+  // the VSCode picker set before the bar opened. Colours above stay true regardless; this
+  // only says which of them to paint grey.
+  suppressed?: readonly string[]
 }
 
 // --- block dimensions ------------------------------------------------------
 // A block is a grid of CELL_W-wide cells, `COLUMN_ROWS` tall, whose *area* is the
 // directory's size against its biggest sibling. Width is not a separate quantity: it is
-// however many columns those cells occupy (`buildGrid` fills the bottom row first and grows
-// upward, so a block is a bottom-aligned rectangle). That identity is the point — a block
+// however many columns those cells occupy (`buildGrid` fills column by column, each one
+// bottom-up, so a block is a bottom-aligned rectangle). That identity is the point — a block
 // is never wider than the colour inside it, so there is no blank right-hand margin.
 const COLUMN_COLS_MIN = 2 // → 6 terminal cols outer
 const COLUMN_COLS_MAX = 6 // → 14 terminal cols outer
@@ -168,6 +172,15 @@ const LEGEND_LABEL_MIN = 6
 // A couple of columns held back from the fit test so ambiguous-width legend glyphs
 // (■ ◀ ▶ ⌄) a terminal may render two cells wide can't nudge the row past the edge.
 const LEGEND_SAFETY_PAD = 2
+// The "clear the legend filter" control (O4), rendered at the tail of the legend row only
+// while at least one facet is greyed. Named because the fit test has to charge for it —
+// it appears and disappears under the user, and a row that only overflows once something
+// is filtered would be a bug that shows up exactly when the feature is in use.
+const LEGEND_RESET = "↺"
+// The hue a facet takes while it is filtered out of the legend (O4). Must match
+// SUPPRESSED_HUE in the VSCode extension (and MUTED in its chip.ts) — one facet greying to
+// two different colours across the two surfaces would read as a bug in one of them.
+const SUPPRESSED_HUE = NONE_HUE
 // Cells moved per wheel notch when we redirect a vertical wheel into horizontal
 // scroll. Blocks are ~10 cols wide, so 1 cell/notch (the raw terminal delta) feels
 // sluggish; a small multiplier makes the bar pan at a comfortable speed.
@@ -219,6 +232,14 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   // Cleared on mouse-out so the header falls back to the summary. Set as a plain
   // string so any feature (node detail, edge target, …) can drive it uniformly.
   const [hovered, setHovered] = createSignal<string | undefined>()
+  // Facets toggled off in the legend (O4): clicking a swatch greys that facet everywhere
+  // instead of hiding it, so the remaining facets pop while the layout holds still.
+  //
+  // Held here *and* on the server. Locally so a click repaints on the next frame rather
+  // than after a round trip; on the server so the VSCode extension greys the same facets in
+  // the same gesture. The POST is what tells the server, and its echoed event is what tells
+  // any other surface — see the subscription below.
+  const [suppressed, setSuppressed] = createSignal<ReadonlySet<string>>(new Set())
 
   // Foundation B: per-turn agent activity, fed by session.next.* events. Empty
   // unless the experimental event system is on (graceful no-op otherwise).
@@ -265,6 +286,21 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     if (event.properties.scope === scope()) refetch()
   })
   onCleanup(() => off())
+
+  // The legend filter changed somewhere else (O4) — the VSCode picker, or the server
+  // clearing it on a Lens switch. Adopt it wholesale: the event carries the entire set, and
+  // the server is the authority for it. No refetch — the filter only changes how the
+  // colours we already hold are painted.
+  //
+  // Our own clicks come back through here too, already applied optimistically — bail on an
+  // unchanged set so the echo costs nothing rather than repainting the strip a second time.
+  const offFilter = props.api.event.on("aperture.facets.filtered", (event) => {
+    const next = event.properties.facets
+    const current = suppressed()
+    if (next.length === current.size && next.every((f) => current.has(f))) return
+    setSuppressed(new Set(next))
+  })
+  onCleanup(() => offFilter())
 
   // Shell commands (rm, mv, git, scaffolding, …) mutate the tree without firing
   // file.edited, so nothing else invalidates the view. Recompute is cheap, so we
@@ -360,6 +396,44 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     void props.api.client.tui.openFile({ path })
   }
 
+  // Adopt a filter that was already set when this view mounted — the extension's picker set
+  // one before the TUI opened, or this panel was remounted. Once only: past the first
+  // payload the event subscription is the live channel, and re-reading every poll would let
+  // a fetch that raced ahead of our own POST un-grey a facet the user just clicked.
+  let seededFilter = false
+  createEffect(() => {
+    if (seededFilter || graph.error || graph.loading) return
+    const g = graph()
+    if (!g) return
+    seededFilter = true
+    if (g.suppressed?.length) setSuppressed(new Set(g.suppressed))
+  })
+
+  // Push the filter to the server, which holds it for every surface and echoes it back as
+  // aperture.facets.filtered so the VSCode extension greys in the same gesture (O4).
+  // Fire-and-forget, like the other click actions: a failed publish must leave the local
+  // paint alone rather than un-grey what the user just clicked.
+  const publishFilter = (next: ReadonlySet<string>) => {
+    void props.api.client.aperture.facetFilter({ facets: [...next] })
+  }
+  // Click a legend swatch (glyph or label) to grey its facet; click again to restore.
+  // Multi-select — each click is independent, so "show me only the parsing code" is a
+  // matter of turning the others off.
+  const toggleFacet = (facet: string) => {
+    const next = new Set(suppressed())
+    if (!next.delete(facet)) next.add(facet)
+    logInteraction("legend.toggle", facet)
+    setSuppressed(next)
+    publishFilter(next)
+  }
+  // The way back from any filter, however many clicks built it. Only rendered while
+  // something is actually suppressed, so it costs no room in the common case.
+  const clearFilter = () => {
+    logInteraction("legend.reset")
+    setSuppressed(new Set<string>())
+    publishFilter(new Set<string>())
+  }
+
   // Delete the active Lens via the ✕ control. Two-step: the first click arms a
   // "confirm?" state, the second performs the delete. Fire-and-forget — the repaint
   // (and the fall-back to Architecture) rides aperture.invalidated like a cycle.
@@ -409,14 +483,18 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   // entries with (possibly) shortened labels.
   const trimmedLegend = createMemo(() => {
     const entries = legendEntries()
+    // The reset control is only in the row while a filter is on, so it's only charged for
+    // then — otherwise every unfiltered legend would pay for a control it isn't showing.
+    const reset = suppressed().size > 0 ? 1 : 0
     // Top-level children of the legend row: optional lens cluster + one per entry + the two
-    // fixed swatches. Gaps sit between them.
-    const children = (activeName() ? 1 : 0) + entries.length + 2
+    // fixed swatches + the optional reset control. Gaps sit between them.
+    const children = (activeName() ? 1 : 0) + entries.length + 2 + reset
     const fixed =
       lensClusterWidth() +
       entries.length * 2 + // ■ + leading space on each entry (the label is the trimmable rest)
       (2 + NONE_LABEL.length) + // "Other" swatch + label
       (2 + UNTAGGED_LABEL.length) + // "Non-code" swatch + label
+      reset * LEGEND_RESET.length +
       Math.max(0, children - 1) * LEGEND_GAP +
       LEGEND_SAFETY_PAD
     const budget = dimensions().width - BAR_PADDING_X * 2 - fixed
@@ -439,7 +517,22 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
       label: e.label.length > cap ? e.label.slice(0, cap - 1) + "…" : e.label,
     }))
   })
-  const colorByFacet = createMemo(() => new Map(legendEntries().map((e) => [e.facet, e.color])))
+  // The one place a facet id becomes a colour — and therefore the one place the legend
+  // filter is applied (O4). A suppressed facet is handed the untagged grey here, so every
+  // surface downstream (the treemap blocks, the file-tile bands, the legend swatch itself)
+  // greys without knowing the filter exists. Painting from the *unfiltered* weights is what
+  // keeps a suppressed facet's area: nothing re-flows, so two directories stay comparable
+  // across a click, which is the whole reason to filter rather than to search.
+  //
+  // SUPPRESSED_HUE is NONE_HUE, not the dimmer UNTAGGED_HUE: a facet you turned off is
+  // still *code*, so it should sit where "Other" sits rather than dropping to the grey that
+  // means "nothing to see here". It also has to be the grey the VSCode extension uses (see
+  // SUPPRESSED_HUE in extension.ts / MUTED in chip.ts) — the same facet greying to two
+  // different colours across the two surfaces would read as a bug in one of them.
+  const colorByFacet = createMemo(() => {
+    const off = suppressed()
+    return new Map(legendEntries().map((e) => [e.facet, off.has(e.facet) ? SUPPRESSED_HUE : e.color]))
+  })
   // A facet id → colour: the NONE_FACET escape paints the "Other" grey; a real facet paints
   // its legend colour (hex palette or theme role).
   const facetColor = (key: string): TuiThemeCurrent["text"] =>
@@ -840,16 +933,25 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
           {(entry) => (
             // Hovering a swatch surfaces the untrimmed facet name in the hover line, so an
             // ellipsised label still tells you what it stands for.
+            //
+            // Clicking anywhere in this box — glyph or label — toggles the facet off and on
+            // (O4). The handler sits on the wrapper rather than on the ■ so the whole entry
+            // is the hit area: the label is the wider half and the easier thing to aim at.
+            // onMouseDown, not up: the mouse-up convention above is only for controls that
+            // open a dialog whose backdrop would eat the release.
             <box
               flexDirection="row"
               flexShrink={0}
+              onMouseDown={() => toggleFacet(entry.facet)}
               onMouseOver={() => setHovered(entry.full)}
               onMouseOut={() => setHovered(undefined)}
             >
-              <text fg={resolveColor(theme(), entry.color)} wrapMode="none">
+              {/* Painted through facetColor, not entry.color, so the swatch greys with
+                  everything else it stands for — the legend shows its own off-state. */}
+              <text fg={facetColor(entry.facet)} wrapMode="none">
                 ■
               </text>
-              <text fg={theme().textMuted} wrapMode="none">
+              <text fg={suppressed().has(entry.facet) ? theme().border : theme().textMuted} wrapMode="none">
                 {" " + entry.label}
               </text>
             </box>
@@ -874,6 +976,15 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
             {" " + UNTAGGED_LABEL}
           </text>
         </box>
+        {/* Un-grey everything in one click. Shown only while a filter is on — it is the
+            exit from a state, not a permanent control, and the legend row has no columns to
+            spare for one. Its width is in the trim budget (see trimmedLegend) so the labels
+            give up the space it takes rather than the row overflowing when it appears. */}
+        <Show when={suppressed().size > 0}>
+          <text fg={theme().accent} onMouseDown={() => clearFilter()} wrapMode="none">
+            {LEGEND_RESET}
+          </text>
+        </Show>
       </box>
 
       {/* Agent-action glyphs, on their own row beneath the layer legend: the solid
@@ -1066,10 +1177,13 @@ function DirBlock(props: {
 // The colored grid itself, painted *inside* the directory's border. `cells` — the block's
 // area, decided by the caller so the surrounding box can be sized to match — is split
 // across the tag bands plus a trailing grey band for the not-yet-tagged / non-code
-// remainder, by largest-remainder rounding, laid out in fixed-order bands bottom-aligned
-// (the footing stays full, growth appears on top). So a directory reads at its true size,
-// starts all grey, and each tag only occupies its real byte-proportion as the sweep fills
-// in — rather than a handful of tagged files painting the whole block.
+// remainder, by largest-remainder rounding, laid out in fixed-order bands column-major and
+// bottom-aligned (each column fills bottom-up before the next one starts, so the footing
+// stays full and a band reads as columns rather than as stripes) — the same order the VSCode
+// tree chip's mosaic uses, so the two renderings of one directory can be read the same way.
+// So a directory reads at its true size, starts all grey, and each tag only occupies its
+// real byte-proportion as the sweep fills in — rather than a handful of tagged files
+// painting the whole block.
 function TreemapBlock(props: {
   composition: () => Composition | undefined
   colorFor: (key: string | null) => TuiThemeCurrent["text"]

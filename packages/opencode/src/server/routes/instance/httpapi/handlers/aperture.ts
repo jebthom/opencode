@@ -1,14 +1,17 @@
 import { Aperture } from "@/aperture/aperture"
+import { ApertureEvent } from "@/aperture/event"
 import { legend, orderForest } from "@/aperture/lenses"
 import * as StudyLog from "@/aperture/study-log"
+import { EventV2Bridge } from "@/event-v2-bridge"
 import { Effect } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
-import type { InteractionInput } from "../groups/aperture"
+import type { FacetFilterInput, InteractionInput } from "../groups/aperture"
 
 export const apertureHandlers = HttpApiBuilder.group(InstanceHttpApi, "aperture", (handlers) =>
   Effect.gen(function* () {
     const aperture = yield* Aperture.Service
+    const events = yield* EventV2Bridge.Service
 
     const get = Effect.fn("ApertureHttpApi.get")(function* (ctx: {
       query: { scope?: string; refresh?: "true" | "false"; drill?: string }
@@ -61,6 +64,19 @@ export const apertureHandlers = HttpApiBuilder.group(InstanceHttpApi, "aperture"
       return { status: "ok" as const, active: { id: found.id, name: found.name, legend: legend(found) } }
     })
 
+    // Replace the legend filter and tell the other surfaces (O4). The publish happens
+    // *inside the request* on purpose: that's what has EventV2Bridge stamp the event's
+    // `location` from the ambient instance, and without it the /event SSE filter drops the
+    // event and the VSCode extension silently never greys (the same trap as
+    // aperture.invalidated — see painter.ts publishInvalidated).
+    const facetFilter = Effect.fn("ApertureHttpApi.facetFilter")(function* (ctx: {
+      payload: typeof FacetFilterInput.Type
+    }) {
+      const facets = yield* aperture.setFacetFilter(ctx.payload.facets)
+      yield* events.publish(ApertureEvent.Event.FacetsFiltered, { facets })
+      return facets
+    })
+
     const interaction = Effect.fn("ApertureHttpApi.interaction")(function* (ctx: {
       payload: typeof InteractionInput.Type
     }) {
@@ -83,6 +99,7 @@ export const apertureHandlers = HttpApiBuilder.group(InstanceHttpApi, "aperture"
       .handle("deleteLens", deleteLens)
       .handle("listLenses", listLenses)
       .handle("selectLens", selectLens)
+      .handle("facetFilter", facetFilter)
       .handle("interaction", interaction)
   }),
 )

@@ -66,14 +66,33 @@ describe("ApertureTreemap.allocateCells", () => {
 })
 
 describe("ApertureTreemap.buildGrid", () => {
-  it("bottom-aligns: the footing row is full, partial cells land on top", () => {
-    // 5 cells, 3 rows → 2 cols. Bottom row fills first (2), middle next (2), top
-    // gets the remainder (1) on the left with a null pad on the right.
+  it("bottom-aligns: the footing row is full, the partial cells land on top", () => {
+    // 5 cells, 3 rows → 2 cols. The left column fills bottom-up (3), the right one takes
+    // the remainder (2) from the bottom, so the single null is the top-right.
     const grid = buildGrid(["a", "a", "a", "a", "a"], 3)
     expect(grid).toEqual([
       ["a", null],
       ["a", "a"],
       ["a", "a"],
+    ])
+  })
+
+  it("fills column-major, so a band of `rows` cells is one whole column", () => {
+    // 6 cells, 3 rows → 2 cols: "a" takes the left column entire, "b" the right one.
+    // Row-major would have striped both bands across all three rows.
+    const grid = buildGrid(["a", "a", "a", "b", "b", "b"], 3)
+    expect(grid).toEqual([
+      ["a", "b"],
+      ["a", "b"],
+      ["a", "b"],
+    ])
+  })
+
+  it("starts the first band at the bottom left, as the tree chip's mosaic does", () => {
+    const grid = buildGrid(["a", "b", "c", "d"], 2)
+    expect(grid).toEqual([
+      ["b", "d"],
+      ["a", "c"],
     ])
   })
 

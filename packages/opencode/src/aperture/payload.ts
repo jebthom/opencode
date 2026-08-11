@@ -174,6 +174,11 @@ export const Payload = Schema.Struct({
   // file (at most one key in practice); derived at the read boundary like
   // `composition`, so it's backward compatible with structure caches.
   extents: Schema.optional(Schema.Record(Schema.String, Schema.Array(Extent))),
+  // Facets the user has toggled off in the legend (O4), merged in at the read boundary like
+  // `lens`. The renderer greys these instead of painting their Lens colour — the *colours*
+  // still ship true, so a client can toggle one off and back on without a refetch, and the
+  // weights are untouched so a suppressed facet keeps its area. Optional; absent = unfiltered.
+  suppressed: Schema.optional(Schema.Array(Schema.String)),
 })
 export type Payload = typeof Payload.Type
 

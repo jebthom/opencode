@@ -98,6 +98,16 @@ export interface SegmentOptions {
 //
 // `weights` arrive descending by share, `f` indexing into `facets`. Returns [] for an
 // unpainted node, which the caller renders as no icon at all rather than as an empty bar.
+//
+// Segments come out in **Lens facet order** (ascending `f`), not in the descending-share
+// order the weights arrive in. Share order would put the dominant facet first and make
+// every chip a different reading — the same two facets swap ends between two files, so
+// the eye has to re-read the colours on every row instead of learning one layout. Facet
+// order is the order the legend prints in and the order the TUI's treemap bands lay down
+// (aperture.ts builds its Composition weights from `[...lens.facets, NONE_FACET]`), so a
+// directory's chip, its block in the TUI bar, and the legend all sequence alike. It also
+// lands NONE_FACET — the highest index, appended after the Lens's own facets — at the far
+// end, which is where the TUI puts its untagged grey.
 export function chipSegments(
   weights: ReadonlyArray<FacetWeight>,
   facets: ReadonlyArray<string>,
@@ -105,7 +115,7 @@ export function chipSegments(
   opts: SegmentOptions,
 ): Segment[] {
   const colored: Array<{ color: string; p: number }> = []
-  for (const w of weights) {
+  for (const w of [...weights].sort((a, b) => a.f - b.f)) {
     if (w.p <= 0) continue
     const id = facets[w.f]
     const suppressed = id !== undefined && opts.suppressed?.has(id)
@@ -144,15 +154,17 @@ export function chipSegments(
 // Largest remainder rather than plain rounding because the cells must sum to exactly
 // `cells` — a bar with five cells in a six-cell frame reads as a rendering bug. It also
 // guarantees the dominant facet can never round away: it has the largest share, so it has
-// either the largest floor or (at worst, when everything floors to zero) the first pick of
-// the remainders.
+// either the largest floor or (at worst, when everything floors to zero) the largest
+// remainder and so the first pick of them. That holds however `colored` is ordered — the
+// apportionment reads shares, not positions.
 function quantize(colored: ReadonlyArray<{ color: string; p: number }>, cells: number): string[] {
   const total = colored.reduce((sum, c) => sum + c.p, 0)
   const exact = colored.map((c) => (c.p / total) * cells)
   const counts = exact.map(Math.floor)
   let left = cells - counts.reduce((a, b) => a + b, 0)
-  // Ties go to the earlier entry, and `colored` is descending by share, so a tie resolves
-  // toward the bigger facet.
+  // Ties go to the earlier entry, which is now the earlier facet in Lens order: two facets
+  // with an identical share resolve the same way on every node, rather than by whichever
+  // happened to sort first.
   const order = exact.map((e, i) => ({ i, rem: e - Math.floor(e) })).sort((a, b) => b.rem - a.rem || a.i - b.i)
   for (const { i } of order) {
     if (left <= 0) break
@@ -205,11 +217,19 @@ function barRects(segments: ReadonlyArray<Segment>): string[] {
 // width, so six cells in one row are 2.7px slivers; folding trades horizontal resolution for
 // cells of 5.3 x 7px, which is roughly six times the area and actually perceptible.
 //
-// Filled **column-major** — down, then across. That keeps the left-to-right ordering by
-// share that the single-row bar has, the dominant facet always starts top-left, and a facet
-// with an even cell count lands on whole columns: 4/1/1 is two solid columns plus a split
-// third, and 2/2/2 is three clean columns. Row-major would make the 4 an L wrapping the row
-// end, and would tear the middle facet of a 2/2/2 into two opposite corners.
+// Filled **column-major from the bottom left** — up, then across. That keeps the
+// left-to-right ordering the single-row bar has, and a facet with an even cell count lands
+// on whole columns: 4/1/1 is two solid columns plus a split third, and 2/2/2 is three clean
+// columns. Row-major would make the 4 an L wrapping the row end, and would tear the middle
+// facet of a 2/2/2 into two opposite corners.
+//
+// Bottom-up rather than top-down so this is the TUI treemap block's fill exactly (see
+// `buildGrid` in aperture/treemap.ts): the two are different sizes and can never draw the
+// same picture, but a directory's chip and its block in the Aperture bar grow the same way,
+// so one habit reads both. The TUI's reason for bottom-up is that its blocks are sized by
+// directory size and a partial column at the top reads as a smaller directory sitting on a
+// full footing; the mosaic always spends all six cells, so nothing here is ever partial and
+// the direction costs it nothing.
 //
 // The cost, stated plainly: an *odd* cell count cannot align to a 2-row column, so 3/3
 // staircases (one facet takes a column and a half). Row-major would render that particular
@@ -225,7 +245,7 @@ function mosaicRects(segments: ReadonlyArray<Segment>): string[] {
   const ch = BAR_H / rows
   return segments.slice(0, rows * cols).map((seg, i) => {
     const col = Math.floor(i / rows)
-    const row = i % rows
+    const row = rows - 1 - (i % rows)
     const w = cw + (col === cols - 1 ? 0 : SEAM)
     const h = ch + (row === rows - 1 ? 0 : SEAM)
     const x = BAR_X + col * cw

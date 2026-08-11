@@ -17,6 +17,20 @@ export const Event = {
       scope: Schema.String,
     },
   }),
+  // Emitted when the legend filter changes (PLAN.md O4): the set of facets the user has
+  // toggled off, which every surface paints grey instead of their Lens colour. Carries the
+  // whole set rather than a delta so a listener can apply it without tracking history.
+  //
+  // A view-only signal — nothing is repainted and nothing is stored, so this deliberately
+  // does *not* ride Invalidated: a filter click must not cost a recompute.
+  FacetsFiltered: EventV2.define({
+    type: "aperture.facets.filtered",
+    schema: {
+      facets: Schema.Array(Schema.String).annotate({
+        description: "Facet ids toggled off in the legend; empty means nothing is filtered",
+      }),
+    },
+  }),
 }
 
 export * as ApertureEvent from "./event"

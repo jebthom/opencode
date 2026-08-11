@@ -71,6 +71,7 @@ export type Event =
   | EventSessionStatus
   | EventSessionIdle
   | EventApertureInvalidated
+  | EventApertureFacetsFiltered
   | EventCommandExecuted
   | EventProjectDirectoriesUpdated
   | EventProjectUpdated
@@ -1363,6 +1364,16 @@ export type GlobalEvent = {
         type: "aperture.invalidated"
         properties: {
           scope: string
+        }
+      }
+    | {
+        id: string
+        type: "aperture.facets.filtered"
+        properties: {
+          /**
+           * Facet ids toggled off in the legend; empty means nothing is filtered
+           */
+          facets: Array<string>
         }
       }
     | {
@@ -4526,6 +4537,17 @@ export type EventApertureInvalidated = {
   }
 }
 
+export type EventApertureFacetsFiltered = {
+  id: string
+  type: "aperture.facets.filtered"
+  properties: {
+    /**
+     * Facet ids toggled off in the legend; empty means nothing is filtered
+     */
+    facets: Array<string>
+  }
+}
+
 export type EventCommandExecuted = {
   id: string
   type: "command.executed"
@@ -5112,6 +5134,7 @@ export type ApertureFacetMapResponses = {
         }>
       }
     }
+    suppressed: Array<string>
   }
 }
 
@@ -5274,6 +5297,39 @@ export type ApertureSelectLensResponses = {
 }
 
 export type ApertureSelectLensResponse = ApertureSelectLensResponses[keyof ApertureSelectLensResponses]
+
+export type ApertureFacetFilterData = {
+  body?: {
+    /**
+     * Facet ids to grey out; empty clears the filter
+     */
+    facets: Array<string>
+  }
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/aperture/facet-filter"
+}
+
+export type ApertureFacetFilterErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ApertureFacetFilterError = ApertureFacetFilterErrors[keyof ApertureFacetFilterErrors]
+
+export type ApertureFacetFilterResponses = {
+  /**
+   * The facets now greyed out
+   */
+  200: Array<string>
+}
+
+export type ApertureFacetFilterResponse = ApertureFacetFilterResponses[keyof ApertureFacetFilterResponses]
 
 export type ApertureInteractionData = {
   body?: {
