@@ -22,6 +22,10 @@ import { ApertureTree, type Node } from "./tree"
 //    `tui.file.open` (open a file) and `tui.directory.reveal` (show a directory in the
 //    Explorer). The latter is what connects the TUI's top bar — which since PLAN O1 shows
 //    only aggregated directory blocks, no files — to the files themselves.
+//  - Re-root the top bar (extension → server → TUI): the reciprocal of the above. Expanding
+//    a folder in our tree POSTs /aperture/scope, which the server publishes as
+//    `aperture.scope.focused` for the top bar to adopt — so a directory opened in either
+//    surface is the directory both of them show.
 //
 // Connection is manual: the user runs `opencode --port <N>` and points us at it via the
 // `aperture.port` / `aperture.host` settings. Everything is an inert no-op when there's
@@ -49,6 +53,15 @@ const FACET_MAP_POLL_MS = 20000
 // The tree's file set changes far less often than its colours, and a create/delete storm
 // (a branch switch, an install) should cost one re-enumeration rather than hundreds.
 const FILE_SET_DEBOUNCE_MS = 500
+// How long to wait before telling the TUI's top bar that a folder was opened here. One
+// gesture can expand several levels (a reveal, or a click on a folder inside a collapsed
+// chain) and only the deepest is worth sending, so this is long enough to collect a burst
+// and short enough that the bar still moves in the same beat as the click.
+const SCOPE_FOCUS_DEBOUNCE_MS = 120
+// How long the echo guard outlives a TUI-driven reveal. `TreeView.reveal` resolves once the
+// expansions are done, but the events for them can land a tick later — holding the guard a
+// moment longer is cheaper than racing that.
+const SCOPE_ECHO_GUARD_MS = 300
 // Hard ceiling on the enumerated file set. The excludes should keep a normal workspace two
 // orders of magnitude below this; the cap exists so a workspace that somehow isn't degrades
 // to a truncated tree instead of exhausting the extension host.
@@ -96,6 +109,7 @@ let pollTimer: ReturnType<typeof setInterval> | undefined
 let facetMapTimer: ReturnType<typeof setTimeout> | undefined
 let facetMapPollTimer: ReturnType<typeof setInterval> | undefined
 let fileSetTimer: ReturnType<typeof setTimeout> | undefined
+let scopeTimer: ReturnType<typeof setTimeout> | undefined
 // True while a repaint's fetch is outstanding, so the poll skips a tick rather than
 // stacking refetches behind a slow server walk.
 let repainting = false
@@ -622,6 +636,55 @@ export function activate(context: vscode.ExtensionContext) {
     void revealInTree(vscode.workspace.asRelativePath(uri, false).replace(/\\/g, "/"))
   }
 
+  // ---- tree → top bar ------------------------------------------------------
+
+  // The reciprocal of the `tui.directory.reveal` handling below: opening a folder here
+  // re-roots the TUI's top bar at it, so the bar shows that directory's composition while
+  // the tree shows its files. Between the two, a directory the user navigates to in either
+  // surface is the directory both of them are looking at.
+  //
+  // Set while a TUI-driven reveal is expanding the tree. Every ancestor of the revealed
+  // folder fires an expand event, and posting those would walk the bar *back up* the chain
+  // it just asked us to open. This is the only echo guard here on purpose: tracking "where
+  // the bar is" would go stale the moment the user walked it out with the breadcrumb (which
+  // deliberately publishes nothing), and a redundant POST is free — the bar ignores a scope
+  // it is already showing.
+  let adoptingBarScope = false
+  let pendingScope: string | undefined
+
+  // Only the last expansion in the window is posted: expanding a collapsed chain (from a
+  // reveal, or from a click on a folder whose parents were shut) fires an event per level,
+  // and the deepest one is the directory the user is actually looking at.
+  function focusScope(rel: string) {
+    if (!config().get<boolean>("tree.focusTopBar", true)) return
+    pendingScope = rel
+    if (scopeTimer) clearTimeout(scopeTimer)
+    scopeTimer = setTimeout(() => {
+      scopeTimer = undefined
+      const scope = pendingScope
+      pendingScope = undefined
+      if (scope === undefined || adoptingBarScope) return
+      void postScope(scope)
+    }, SCOPE_FOCUS_DEBOUNCE_MS)
+  }
+
+  async function postScope(scope: string) {
+    const dir = directory()
+    if (!dir) return
+    try {
+      await fetch(`${baseUrl()}/aperture/scope`, {
+        method: "POST",
+        headers: { "x-opencode-directory": dir, "Content-Type": "application/json" },
+        body: JSON.stringify({ scope }),
+      })
+      log(`focus scope ${scope === "" ? "<root>" : scope}`)
+    } catch (e) {
+      // No TUI attached, or the server is down. The tree is unaffected — the bar simply
+      // stays where it was, exactly as it does when nothing is listening.
+      log(`focus scope POST FAILED: ${String(e)}`)
+    }
+  }
+
   // ---- facet filter (PLAN O4) ----------------------------------------------
 
   // Toggle facets off. Checked = shown; unchecking is what greys a facet, and the picker
@@ -730,15 +793,25 @@ export function activate(context: vscode.ExtensionContext) {
   // not hiding. `TreeView.reveal` takes `expand` as a parameter, so all of that is gone.
   async function revealDirectory(relPath: string) {
     if (!workspaceFolder()) return
-    // The TUI's root scope is the empty string. There is no node for the root — it *is* the
-    // tree — so the useful response is to bring the view forward and leave it at that.
-    if (relPath === "") {
-      await vscode.commands.executeCommand("workbench.view.extension.aperture")
-      log("reveal <root>")
-      return
+    // The bar has moved itself, and the expansions we are about to perform are its doing —
+    // ignore what they fire, or we would post its own navigation back to it one ancestor at
+    // a time (see focusScope).
+    adoptingBarScope = true
+    try {
+      // The TUI's root scope is the empty string. There is no node for the root — it *is* the
+      // tree — so the useful response is to bring the view forward and leave it at that.
+      if (relPath === "") {
+        await vscode.commands.executeCommand("workbench.view.extension.aperture")
+        log("reveal <root>")
+        return
+      }
+      await revealInTree(relPath, { expand: true, show: true })
+      log(`reveal ${relPath}`)
+    } finally {
+      setTimeout(() => {
+        adoptingBarScope = false
+      }, SCOPE_ECHO_GUARD_MS)
     }
-    await revealInTree(relPath, { expand: true, show: true })
-    log(`reveal ${relPath}`)
   }
 
   function handleEvent(evt: { type?: string; properties?: any }) {
@@ -912,6 +985,11 @@ export function activate(context: vscode.ExtensionContext) {
     treeView.onDidChangeVisibility((e) => {
       if (e.visible) revealActiveFile()
     }),
+    // Opening a folder here re-roots the TUI's top bar at it. Only folders can be expanded,
+    // so the `dir` test is belt-and-braces against a future non-file row.
+    treeView.onDidExpandElement((e) => {
+      if (e.element.dir) focusScope(e.element.rel)
+    }),
     vscode.window.onDidChangeActiveTextEditor(() => {
       scheduleRepaint()
       revealActiveFile()
@@ -978,6 +1056,7 @@ export function deactivate() {
   if (facetMapTimer) clearTimeout(facetMapTimer)
   if (facetMapPollTimer) clearInterval(facetMapPollTimer)
   if (fileSetTimer) clearTimeout(fileSetTimer)
+  if (scopeTimer) clearTimeout(scopeTimer)
   sse?.abort()
   sse = undefined
   for (const deco of decorationByColor.values()) deco.dispose()

@@ -23,6 +23,21 @@ export const Event = {
   //
   // A view-only signal — nothing is repainted and nothing is stored, so this deliberately
   // does *not* ride Invalidated: a filter click must not cost a recompute.
+  // The reciprocal of `tui.directory.reveal`: a host surface (the Aperture VSCode
+  // extension's file tree) says "the user opened this directory — re-root the view there".
+  // The TUI's top bar adopts it as its scope, so expanding `packages/` in the tree and
+  // clicking the `packages/` block in the bar land both surfaces in the same place.
+  //
+  // A navigation intent, not an invalidation: nothing is recomputed by publishing it, and
+  // the bar's own refetch happens because its scope changed, exactly as it does for a click.
+  ScopeFocused: EventV2.define({
+    type: "aperture.scope.focused",
+    schema: {
+      scope: Schema.String.annotate({
+        description: "Repo-relative directory to re-root the Aperture view at; empty string = the repo root",
+      }),
+    },
+  }),
   FacetsFiltered: EventV2.define({
     type: "aperture.facets.filtered",
     schema: {

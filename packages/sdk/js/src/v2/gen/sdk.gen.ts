@@ -12,6 +12,8 @@ import type {
   ApertureFacetFilterResponses,
   ApertureFacetMapErrors,
   ApertureFacetMapResponses,
+  ApertureFocusScopeErrors,
+  ApertureFocusScopeResponses,
   ApertureGetErrors,
   ApertureGetResponses,
   ApertureInteractionErrors,
@@ -903,6 +905,43 @@ export class Aperture extends HeyApiClient {
         },
       },
     )
+  }
+
+  /**
+   * Re-root the Aperture view
+   *
+   * Publish an intent for the Aperture view (the TUI top bar) to re-root at a directory — the reciprocal of the top bar revealing a directory in the host editor's file tree.
+   */
+  public focusScope<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      scope?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "scope" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<ApertureFocusScopeResponses, ApertureFocusScopeErrors, ThrowOnError>({
+      url: "/aperture/scope",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
   }
 
   /**

@@ -106,6 +106,16 @@ export const FacetFilterInput = Schema.Struct({
   }),
 })
 
+// Re-root the Aperture view at a directory (the reciprocal of tui.directory.reveal). Posted
+// by a host surface — the VSCode extension's file tree, when the user expands a folder — and
+// published as aperture.scope.focused for the TUI's top bar to adopt. Purely a navigation
+// intent: nothing is computed or stored, so an unknown path costs a repaint at most.
+export const ScopeFocusInput = Schema.Struct({
+  scope: Schema.String.annotate({
+    description: "Repo-relative directory to re-root the view at; empty clears to the repo root",
+  }),
+})
+
 // Activate a Lens by id or name (the searchable Lens picker / `/lens-switch`). The
 // repaint rides the aperture.invalidated event the switch publishes; this returns the
 // resolved Lens, or "not-found" when the id/name doesn't match an available Lens.
@@ -223,6 +233,20 @@ export const ApertureApi = HttpApi.make("aperture")
             summary: "Set the legend facet filter",
             description:
               "Grey out the given facets across every Aperture surface (top bar, tree chips, editor gutter). View-only and never persisted; an empty list clears the filter.",
+          }),
+        ),
+      )
+      .add(
+        HttpApiEndpoint.post("focusScope", `${root}/scope`, {
+          query: Schema.Struct({ ...WorkspaceRoutingQueryFields }),
+          payload: ScopeFocusInput,
+          success: described(Schema.Boolean, "Scope focus intent published"),
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "aperture.focusScope",
+            summary: "Re-root the Aperture view",
+            description:
+              "Publish an intent for the Aperture view (the TUI top bar) to re-root at a directory — the reciprocal of the top bar revealing a directory in the host editor's file tree.",
           }),
         ),
       )

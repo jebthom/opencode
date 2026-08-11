@@ -754,13 +754,14 @@ Aperture files:
 - HTTP: `server/routes/instance/httpapi/groups/aperture.ts` (+ `handlers/`),
   registered in `server.ts` and `api.ts`. Routes: `get`, `facets` (O2's bulk
   whole-repo file→facet-mix map), `lens/cycle`, `lens/delete`, `lens/list`,
-  `lens/select`, `interaction`.
+  `lens/select`, `facet-filter`, `scope` (host → bar re-root), `interaction`.
 - TUI: `feature-plugins/system/aperture.tsx` (+ `aperture-activity.ts`,
   `aperture-lens-picker.tsx`); registered in `cli/cmd/tui/plugin/internal.ts`;
   slot placed in `routes/session/index.tsx`.
 - VSCode: `sdks/aperture-vscode/src/extension.ts` (gutter strips via
   `createTextEditorDecorationType`, SSE on `/event`, `tui.file.open` reveal,
-  `tui.directory.reveal` → `revealInExplorer`).
+  `tui.directory.reveal` → `TreeView.reveal`, and the reciprocal
+  `onDidExpandElement` → `POST /aperture/scope`).
 - Tests: `packages/opencode/test/aperture/`.
 
 Slots: host slot map at `packages/plugin/src/tui.ts` (`TuiHostSlotMap` —
@@ -784,6 +785,16 @@ plugin has no emit API: `TuiEventBus` is subscribe-only, so publishing means
 calling `props.api.client.tui.*`. Adding an event needs
 `bun run --cwd packages/sdk/js build` to regenerate the client method and the
 `Event` union; the VSCode extension parses raw SSE JSON and needs no SDK change.
+
+Events (host editor → TUI): `aperture.scope.focused` (defined in
+`aperture/event.ts`, routed `groups/aperture.ts` → `handlers/aperture.ts` as
+`POST /aperture/scope`) — the reciprocal of `tui.directory.reveal`. The extension
+posts it when the user expands a folder in the Aperture tree; the top bar adopts
+the path as its scope, so a directory opened in either surface is the directory
+both of them show. Two guards keep the round trip from echoing: the extension
+holds a "the bar asked for this" flag across a TUI-driven reveal (which expands
+the whole ancestor chain, one event per level) and debounces expansions to the
+deepest one, and the bar ignores a scope it is already at.
 
 Persistence:
 - Project directory (`.opencode/aperture/`): Lens defs (`lenses.json`) + active

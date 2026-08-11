@@ -6,7 +6,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { Effect } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
-import type { FacetFilterInput, InteractionInput } from "../groups/aperture"
+import type { FacetFilterInput, InteractionInput, ScopeFocusInput } from "../groups/aperture"
 
 export const apertureHandlers = HttpApiBuilder.group(InstanceHttpApi, "aperture", (handlers) =>
   Effect.gen(function* () {
@@ -77,6 +77,18 @@ export const apertureHandlers = HttpApiBuilder.group(InstanceHttpApi, "aperture"
       return facets
     })
 
+    // Re-root the view somewhere else, on behalf of a host surface. Publishes and nothing
+    // more: the bar refetches because its scope changed, which is the same path a click on a
+    // directory block takes. Published inside the request for the same reason facetFilter is
+    // — that is what stamps the event's `location`, without which the /event SSE filter drops
+    // it before any other surface sees it.
+    const focusScope = Effect.fn("ApertureHttpApi.focusScope")(function* (ctx: {
+      payload: typeof ScopeFocusInput.Type
+    }) {
+      yield* events.publish(ApertureEvent.Event.ScopeFocused, { scope: ctx.payload.scope })
+      return true
+    })
+
     const interaction = Effect.fn("ApertureHttpApi.interaction")(function* (ctx: {
       payload: typeof InteractionInput.Type
     }) {
@@ -100,6 +112,7 @@ export const apertureHandlers = HttpApiBuilder.group(InstanceHttpApi, "aperture"
       .handle("listLenses", listLenses)
       .handle("selectLens", selectLens)
       .handle("facetFilter", facetFilter)
+      .handle("focusScope", focusScope)
       .handle("interaction", interaction)
   }),
 )

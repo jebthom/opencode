@@ -28,7 +28,10 @@ const id = "internal:aperture"
 // the scope's direct child directories as bordered treemap blocks. Clicking a block
 // re-roots the view at it *and* reveals that directory in the editor's file tree
 // (`tui.directory.reveal`); a root button, an up button, and a clickable breadcrumb
-// walk back out without touching the editor. Data is fetched per scope from
+// walk back out without touching the editor. The link runs both ways — opening a directory
+// in the editor's tree re-roots the bar at it (`aperture.scope.focused`), so the two
+// surfaces stay on the same directory whichever one the user navigated in. Data is
+// fetched per scope from
 // api.client.aperture.get({ scope }); when the server reports a file change inside the
 // viewed scope (aperture.invalidated) we refetch just that scope, so the visible view
 // stays live without recomputing graphs nobody is looking at.
@@ -302,6 +305,27 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     setSuppressed(new Set(next))
   })
   onCleanup(() => offFilter())
+
+  // The other half of the link to the editor (the reciprocal of revealDirectory below): a
+  // host surface — the VSCode extension's file tree — says the user opened a directory
+  // there, and the bar re-roots at it. So expanding `packages/` in the tree and clicking the
+  // `packages/` block in the bar leave both surfaces showing the same place, whichever one
+  // the user touched.
+  //
+  // Bail on an unchanged scope: the reveal *we* asked for makes the tree expand, which comes
+  // straight back through here, and re-setting the signal would refetch the scope we are
+  // already showing. (The extension drops the echo too — this is the belt to its braces, and
+  // covers a host that doesn't.)
+  const offScope = props.api.event.on("aperture.scope.focused", (event) => {
+    const next = event.properties.scope
+    if (next === scope()) return
+    // Logged like a click, because it is one — just performed in the editor rather than in
+    // the bar. Keeping it in the study log is what makes a navigation traceable to the
+    // surface it came from instead of appearing as an unexplained scope change.
+    logInteraction("tree.navigate", next)
+    setScope(next)
+  })
+  onCleanup(() => offScope())
 
   // Shell commands (rm, mv, git, scaffolding, …) mutate the tree without firing
   // file.edited, so nothing else invalidates the view. Recompute is cheap, so we

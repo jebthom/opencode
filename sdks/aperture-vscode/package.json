@@ -250,6 +250,11 @@
           "type": "boolean",
           "default": true,
           "description": "Reveal and select the active editor's file in the Aperture tree."
+        },
+        "aperture.tree.focusTopBar": {
+          "type": "boolean",
+          "default": true,
+          "description": "Expanding a folder in the Aperture tree re-roots the opencode top bar at it."
         }
       }
     },

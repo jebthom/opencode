@@ -71,6 +71,7 @@ export type Event =
   | EventSessionStatus
   | EventSessionIdle
   | EventApertureInvalidated
+  | EventApertureScopeFocused
   | EventApertureFacetsFiltered
   | EventCommandExecuted
   | EventProjectDirectoriesUpdated
@@ -1363,6 +1364,16 @@ export type GlobalEvent = {
         id: string
         type: "aperture.invalidated"
         properties: {
+          scope: string
+        }
+      }
+    | {
+        id: string
+        type: "aperture.scope.focused"
+        properties: {
+          /**
+           * Repo-relative directory to re-root the Aperture view at; empty string = the repo root
+           */
           scope: string
         }
       }
@@ -4537,6 +4548,17 @@ export type EventApertureInvalidated = {
   }
 }
 
+export type EventApertureScopeFocused = {
+  id: string
+  type: "aperture.scope.focused"
+  properties: {
+    /**
+     * Repo-relative directory to re-root the Aperture view at; empty string = the repo root
+     */
+    scope: string
+  }
+}
+
 export type EventApertureFacetsFiltered = {
   id: string
   type: "aperture.facets.filtered"
@@ -5085,6 +5107,7 @@ export type ApertureGetResponses = {
         hue?: string
       }>
     }
+    suppressed?: Array<string>
   }
 }
 
@@ -5330,6 +5353,39 @@ export type ApertureFacetFilterResponses = {
 }
 
 export type ApertureFacetFilterResponse = ApertureFacetFilterResponses[keyof ApertureFacetFilterResponses]
+
+export type ApertureFocusScopeData = {
+  body?: {
+    /**
+     * Repo-relative directory to re-root the view at; empty clears to the repo root
+     */
+    scope: string
+  }
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/aperture/scope"
+}
+
+export type ApertureFocusScopeErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ApertureFocusScopeError = ApertureFocusScopeErrors[keyof ApertureFocusScopeErrors]
+
+export type ApertureFocusScopeResponses = {
+  /**
+   * Scope focus intent published
+   */
+  200: boolean
+}
+
+export type ApertureFocusScopeResponse = ApertureFocusScopeResponses[keyof ApertureFocusScopeResponses]
 
 export type ApertureInteractionData = {
   body?: {
