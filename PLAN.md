@@ -785,6 +785,61 @@ recolours the bands (green→yellow) while the steps stay byte-identical, and a 
 launching two parallel sub-agents renders as **two indented lanes**, not
 interleaved rows — the first time the `task` path has been exercised in this repo.
 
+### G4 — Activity Path affordances
+
+The path works end-to-end, so the next round is information density: it currently
+spends a row per step to say very little, and nothing in it is clickable. Five
+changes, ordered cheapest-first so the track degrades gracefully if it is cut short.
+
+- [ ] **1. Double the height.** `ACTIVITY_ROWS` 10 → 20. G0 sized the budget at 10
+  rows on the assumption that a turn's activity was one block; one row per *step*
+  spends rows much faster, and the section is the one the user is actually watching.
+  Supersedes G0's "fixed `ACTIVITY_ROWS` (default 10), plus a 1-row header = 11
+  rows" — the new contribution is 1 header + 20 body + 2 hover = **23 rows**, still
+  constant however long the session runs, which is the property that mattered.
+
+- [ ] **2. Words, not glyphs.** Retire `●⌕◆■⚙↗` for `Read` / `Search` / `Edit` /
+  `Write` / `Run` / `Fetch`. The glyph vocabulary was inherited from the top bar's
+  deleted overlay row, where horizontal space was scarce; here it costs a legend the
+  user has to hold in their head. Pad the verb to a fixed 6 columns so the bands
+  still align into a column — the alignment is what makes two steps comparable at a
+  glance, and it is worth more than the 5 columns it costs the band.
+
+- [ ] **3. Click a file to open it.** `api.client.tui.openFile({ path })`, exactly
+  what a top-bar file tile does (`aperture.tsx` `openFile`), logged through
+  `aperture.interaction` as `file.open` so the study log stays complete. Mouse-down
+  is already spoken for on aggregated survey rows (see 4), which splits cleanly:
+  **a row standing for one file opens it; a row standing for many expands.**
+
+- [ ] **4. Expand an aggregated survey row.** Clicking a survey step that stands for
+  more than one target expands it in place, indented one level exactly as a
+  sub-agent lane is, into one child row per file — name over its own facet band —
+  followed by any places it visited. A `▸`/`▾` in the spine marks the affordance,
+  the same idiom the sidebar sections already use for their own headers. This is the
+  escape hatch the aggregation rule needs: reads collapse because *usually* nobody
+  cares which twelve files, but when they do, the answer should be one click away
+  rather than a different surface.
+
+- [ ] **5. Hover detail, from the titles we already store.** Two muted lines under
+  the scrollbox, reserved always so the layout cannot jump, showing detail for the
+  hovered row: the files a survey step read, the command a `Run` step actually ran,
+  the target of a fetch.
+
+  The natural-language half of this is **free**. Every tool result already persists
+  a `title` on its completed part (`session/processor.ts`), and for `bash` that
+  title *is* the model-written description the chat renders — `tool/shell.ts` sets
+  `title: input.description`, so "Echoes the string smoke-three" is sitting in the
+  message store already. Nothing is regenerated and no model is called; `title` just
+  has to be carried through the derivation, the wire and the step accumulator, capped
+  server-side so a pathological title cannot inflate the response.
+
+**Not in scope.** Expanding a *mutation* row (it already stands for exactly one file,
+so there is nothing to expand), and a keyboard path to any of this — the sidebar is
+mouse-only today (G0), and giving one section focus semantics nothing else has would
+be a bigger change than the rest of this track combined.
+
+---
+
 ---
 
 ## Track C — Colour fidelity ✅
@@ -903,8 +958,9 @@ has a second consumer: it should drive O2's Explorer `focus` as well as the TUI.
 
 **Then:** S2 → S3 → S5 in sequence, all gated on S1.
 
-**Track G** is complete: G0 → G1 → G2+G3 all landed. It ran independently of the
-other tracks throughout, as intended for the most speculative one.
+**Track G**: G0 → G1 → G2+G3 landed and the path is working end-to-end. **G4**
+(affordances — height, words, click-to-open, expandable survey rows, hover detail) is
+next and is ordered cheapest-first so it degrades gracefully if cut short.
 
 **Track C** is done. C1 landed after O1–O4, once O2's tree glyphs made the
 cross-surface half of the problem visible.
