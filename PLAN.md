@@ -32,10 +32,12 @@ Three findings reshape the design:
    work. These want different painting granularity, different interactions, and
    arguably different cost models. We now name them separately.
 3. **Colour identity is not surviving the terminal.** Participants on Mac and
-   Linux saw hues collapse toward each other. Real, and it needs fixing before
+   Linux saw hues collapse toward each other. Real, and it needed fixing before
    the final experiment — but it's a rendering-fidelity bug, not a design
-   question, and it blocks nothing else. Deferred to the end of the sprint
-   (Track C) so the design work gets the thinking time.
+   question, and it blocked nothing else. Fixed in Track C, where it turned out
+   to be a straightforward palette bug (two of `pastel`'s six colours were
+   literally identical in a 256-colour terminal) rather than the terminal-palette
+   reprojection it looked like.
 
 ## Vocabulary added this sprint
 
@@ -66,7 +68,7 @@ S1 (line-tag store) ──► S2 (agent tool) ──► S3 (line painting) ─�
 
 G1 (activity data) ──► G2 (block render) ──► G3 (placement/timeline)
 
-                                         C1 (colour fidelity) ──► deferred, independent
+                                         C1 (colour fidelity) ──► ✅ independent
 ```
 
 ---
@@ -310,11 +312,13 @@ the built-ins' hardcoded ramps, so we contribute **one colour id per exact hex**
 (`#4E79A7` → `aperture.c4E79A7`), generated from `lenses.ts` by
 `sdks/aperture-vscode/script/gen-colors.ts`. The pip is therefore the Lens's
 *actual* legend hue for every Lens and every palette, not an approximation.
-Theme-role tokens (the architecture Lens, `NONE_HUE`/`UNTAGGED_HUE`) still fall
-through `THEME_ROLE_COLORS`. **C1 accordingly inherits the TUI's palettes verbatim
-— there is no second, differently-limited Explorer palette to account for.** The
-one cost: a contributed colour is a fixed hex, not theme-adaptive, so a `dark`
-Lens reads low-contrast on a light editor theme (the tradeoff the TUI already has).
+Theme-role tokens (the architecture Lens, `NONE_HUE`/`UNTAGGED_HUE`) still fell
+through `THEME_ROLE_COLORS` at this point, which is where C1 later found the
+cross-surface mismatch: the token table here and the one in `chip.ts` disagreed
+with each other and with the TUI. C1 deleted both and made the server ship hex.
+The one cost, unchanged: a contributed colour is a fixed hex, not theme-adaptive,
+so the palette does not soften on a light editor theme (the tradeoff the TUI
+already has, now taken deliberately across both surfaces).
 
 **Multi-facet encoding — colour says *which*, glyph says *how much*.** Since O3
 every file is extent-painted, so files routinely span several facets. Colour = the
@@ -541,84 +545,103 @@ needed in `packages/plugin/src/tui.ts` (only `aperture_top` exists today).
 
 ---
 
-## Track C — Colour fidelity (deferred)
+## Track C — Colour fidelity ✅
 
-Parked until the design tracks are through — it blocks nothing and is repair
-work, not a design question. It does need to land **before the final
-experiment**, since the hue encoding is the whole visual contract. Good work for
-a day when the open decisions above need thinking time rather than typing.
+### C1 — Hue collapse in 256-colour terminals ✅
 
-Most of the diagnosis is already done (below), so picking it up cold is cheap.
+**Symptom.** On some Mac and Linux terminals, distinct Lens hues rendered as
+near-identical colours; participants could not tell facets apart. Separately,
+once O2 put facet glyphs in the VSCode tree, its colours did not match the TUI
+legend either.
 
-### C1 — Diagnose and fix hue collapse in 256-colour terminals
+**The original hypothesis was wrong**, and usefully so — the truth is much
+smaller. It assumed OpenTUI reprojects our colours onto the terminal's *own*
+themed palette (Solarized/Nord/Dracula), which would have meant resolving hues
+against the detected palette at render time. In fact:
 
-**Symptom.** On some Mac and Linux terminals, distinct Lens hues render as near-
-identical colours; participants could not tell facets apart and were confused
-about what the View was showing.
+- `NATIVE_PALETTE_QUERY_SIZE = 16` (`@opentui/core/index-jx0p1c2f.js:22091`).
+  OpenTUI queries only indices **0–15** over OSC 4;
+  `normalizeTerminalPalette` fills **16–255 from the standard xterm cube and
+  grey ramp** unconditionally. A terminal colour scheme only ever perturbs 16
+  slots.
+- Measured across 8 terminal themes, the theme barely moves the minimum
+  pairwise CIEDE2000 of a palette at all.
 
-**Leading hypothesis, established by reading the renderer** (OpenTUI core 0.3.1,
-`index-jx0p1c2f.js`):
+**The actual bug was palette-internal, against the *standard* cube.** The guard
+test only ever checked each colour against grey, never against the other five.
+Quantised to xterm-256:
 
-- `CliRenderer.shouldSyncNativePaletteState()` returns true iff the terminal
-  advertises `ansi256` **and not** `rgb`.
-- When true, OpenTUI queries the terminal's *actual* palette over **OSC 4** and
-  pushes those 256 RGBA entries into the native renderer
-  (`rendererSetPaletteState`). All output RGB is then quantised onto **the
-  terminal theme's own colours** — Solarized, Nord, Dracula, Terminal.app
-  defaults — not the standard xterm-256 colour cube.
-- Our palettes in `aperture/lenses.ts` are hand-tuned to be safe against the
-  **standard cube** (see the comment at `lenses.ts:133` and the "no … collapses
-  to grey" test). That guarantee simply does not hold against an arbitrary
-  themed palette, which typically offers far fewer distinct hues. Hence
-  "projected into a different space, which flattened differences."
-- Fallback only kicks in when OSC 4 detection *fails*
-  (`normalizeTerminalPalette` → `getFallbackAnsi256Palette`), so a terminal that
-  answers honestly is the *worse* case.
+| palette | min ΔE2000 | |
+|---|---|---|
+| **pastel** (the default) | **0.0** | `#F7C8A0` and `#F5E1A4` both → idx 223 — *the same colour* |
+| pastel-ordinal | 9.0 | `#79C7C1` → 115, `#9BCF8F` → 114 |
+| earthy | 11.9 | |
+| bright | 16.4 | |
 
-**Why it hit Mac/Linux and not us:** whether `rgb` is set comes from the native
-`getTerminalCapabilities`. `COLORTERM=truecolor` is commonly lost over ssh, is
-not set by several Linux terminal defaults, and Terminal.app genuinely has no
-truecolor. tmux is explicitly special-cased in OpenTUI and is a strong suspect
-for a second, independent path to the same failure.
+And the TUI/VSCode mismatch was a third thing again: the server shipped
+theme-role *tokens* (`info`, `textMuted`, `border`) rather than colour, and each
+surface resolved them for itself. `info` was `#56b6c2` in the TUI and `#3794FF`
+in the chip; `textMuted` and `border` both collapsed onto `descriptionForeground`
+in the gutter, so "Other" and "Non-code" were one colour there and two in the
+chips; `primary` was missing from the extension's table entirely and went
+unpainted.
 
-**Work:**
+**Resolution: one closed universe of eight hexes, every one an exact xterm-256
+entry.** A colour that *is* a palette entry quantises to itself, so a 256-colour
+terminal shows bit-identical RGB to a truecolor one, which is bit-identical to
+what VSCode paints. No capability detection, no render-time palette search,
+nothing to reconcile.
 
-1. **Diagnostic first.** Add `opencode debug aperture-colors` (extend
-   `cli/cmd/debug/index.ts`, which already reports `TERM`/`TERM_PROGRAM`): print
-   detected capabilities (`rgb`, `ansi256`, multiplexer), whether native palette
-   sync is active, the detected OSC-4 palette, and — for each facet of the active
-   Lens — the requested hex next to the colour it will actually resolve to, plus
-   pairwise perceptual distance (CIEDE2000) between resolved facet colours.
-   Everything else in this task is guesswork without this.
-2. **Survey.** Run the diagnostic across the terminals a participant might
-   plausibly use: macOS Terminal.app, iTerm2, Ghostty, WezTerm, Alacritty,
-   GNOME Terminal, Konsole, xterm, VSCode integrated terminal, each bare and
-   under tmux, each local and over ssh. Record capabilities + minimum pairwise
-   distance in a table checked into `docs/`.
-3. **Fix, in priority order:**
-   - *Prefer truecolor where it's actually available.* Determine whether `rgb`
-     is being under-detected (env not propagated, tmux passthrough, missing
-     `COLORTERM`) and correct detection or set it ourselves where safe.
-     Recovering truecolor makes the whole problem vanish for most terminals.
-   - *When genuinely 256-only, choose facet colours against the detected
-     palette instead of assuming the cube.* Resolve facet hues at render time by
-     maximising minimum perceptual distance among the terminal's real entries,
-     rather than shipping fixed hex and hoping. This is the substantive change
-     and belongs next to the palette definitions in `lenses.ts`.
-   - *Guarantee a floor.* If the detected palette cannot separate N facets
-     acceptably, fall back to a redundant encoding rather than lying: reduce to
-     fewer facets visually, or add a texture/glyph channel. Silently flattening
-     is the worst outcome.
-4. **Regression test.** Replace/extend the current cube-only test with one that
-   takes a palette as input and asserts a minimum pairwise distance, then run it
-   over the palettes captured in the survey.
+- Six categorical colours, chosen by max-min dispersion search over the 216 cube
+  cells under L\* 45–75 / C\* 30–75: `#D7005F` `#AF5F00` `#AFAF00` `#00875F`
+  `#00AFD7` `#5F5FD7`. Min pairwise ΔE2000 **32.3** (was 16.4 for `bright`).
+- The ordinal palette is those six **reversed** — Lab hue rotates monotonically
+  299°→8°, a cool→warm rank ramp — so the whole product holds six hues, not 42.
+  `CHANGE_COLORS` and `BUS_FACTOR_COLORS` are slices of it.
+- Greys: "Other" `#8A8A8A` (ramp idx 245), "Non-code" `#444444` (idx 238).
+- `LAYER_HUE` (Architecture Lens) pinned to five of the six. `DIRECTORY_HUE`
+  deliberately stays a theme role — it is TUI-only chrome, and painting it a
+  facet colour would make directories read as a facet.
 
-**Open decisions:** whether to fix detection upstream in OpenTUI or work around
-it locally; whether the fallback encoding is fewer-facets or texture.
+**One trap worth remembering:** exactness is necessary but not sufficient.
+`#808080` is in the table *twice* — grey-ramp 244 and system 8 — and a quantiser
+taking the lower index lands it in the re-themable range, where Solarized paints
+a slate blue. The obvious mid-grey was the wrong grey. `collidesWithSystemColor`
+in `aperture/color-256.ts` guards this; it was caught by the diagnostic, not by
+reasoning.
 
-**Done when:** every terminal in the survey table shows all facets of a 6-facet
-Lens as mutually distinguishable, verified by the diagnostic and by eye on at
-least one real Mac and one real Linux machine.
+**Landed:**
+
+1. `aperture/lenses.ts` — two palettes replacing seven, greys and ramps pinned to
+   hex, and the rule written down: every paintable colour is an exact xterm-256
+   entry outside 0–15.
+2. `aperture/color-256.ts` (new) — quantisation + CIEDE2000, shared by the guard
+   test and the diagnostic so they can't disagree.
+3. `aperture/lens-store.ts` — legacy palette ids map forward on read, and facet
+   colour is re-derived from `(palette, index)` on every read instead of being
+   stored. Stored colour was a second source of truth that went stale whenever
+   the palettes changed.
+4. Extension — `THEME_ROLE_HEX` and `THEME_ROLE_COLORS` both deleted; contributed
+   colour ids go 39 → 8; chip segments are now theme-independent, so the tree
+   computes one set instead of two.
+5. `opencode debug aperture-colors` — prints each facet's requested hex beside
+   the swatch it quantises to, so the fix can be *seen* on a participant's
+   machine rather than argued about.
+6. Guard tests: exact-entry, no-system-collision, and min pairwise ΔE ≥ 20 over
+   palettes + built-in ramps + both greys.
+
+**Dropped from the original plan:** the terminal survey table (the theme turns
+out not to matter), and choosing facet colours against the detected palette at
+render time (exact cube cells make it moot). Open decision #7 — fix truecolor
+detection upstream in OpenTUI or locally — is resolved as **neither**.
+
+**Accepted tradeoff:** no facet colour adapts to light vs dark any more. That is
+deliberate — consistency across surfaces is the whole point — but `#444444`
+"Non-code" reads as a dark bar rather than receding on a light background. Any
+`aperture.cXXXXXX` id can be retuned via `workbench.colorCustomizations`.
+
+**Still to do:** verify by eye on a real Mac and a real Linux machine, which is
+the one claim the tests cannot make.
 
 ---
 
@@ -641,15 +664,14 @@ has a second consumer: it should drive O2's Explorer `focus` as well as the TUI.
 **Track G** is independent throughout and can run alongside from the start. It's
 the most speculative track, so it should not block the others.
 
-**Track C** is deferred: pick up C1 on a low-momentum day, or when the design
-tracks are blocked on a decision. It must land before the final experiment, so it
-shouldn't slide past the point where there's no slack left.
+**Track C** is done. C1 landed after O1–O4, once O2's tree glyphs made the
+cross-surface half of the problem visible.
 
 **Natural split by surface:**
 - *Terminal renderer* (`aperture.tsx`): O1, O4, G2, G3
 - *VSCode extension* (`sdks/aperture-vscode`): O2, S3, S5's reveal path
 - *Server/data* (`aperture/`, tools, payload): O3, S1, S2, G1, the bulk endpoint
-- *Cross-cutting, deferred*: C1
+- *Cross-cutting*: C1 ✅
 
 ---
 
@@ -664,7 +686,7 @@ shouldn't slide past the point where there's no slack left.
 | 4 | Line-tag anchoring mechanism (composite recommended) | S1 |
 | 5 | Search Lens as a distinct type on the model vs. a flag | S1 |
 | 6 | Activity View in the sidebar vs. the top bar | G3 |
-| 7 | Whether to fix truecolor detection upstream in OpenTUI or locally | C1 *(deferred)* |
+| 7 | ~~Whether to fix truecolor detection upstream in OpenTUI or locally~~ — **decided:** neither. Putting every paintable colour on an exact xterm-256 entry makes quantisation a no-op, so truecolor stops mattering for colour *identity* | C1 ✅ |
 
 ---
 

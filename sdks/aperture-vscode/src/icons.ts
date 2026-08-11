@@ -22,8 +22,9 @@ import { chipKey, chipSvg, type ChipLayout, type Segment } from "./chip"
 export type IconDelivery = "data" | "file"
 
 export class ChipIcons {
-  // Keyed by the two themes' chip identity together: one cache entry is one {light,dark}
-  // pair, which is what a TreeItem consumes.
+  // One cache entry is one {light,dark} pair, which is what a TreeItem consumes. Since C1
+  // the two differ only in the outline stroke — facet colour is a fixed hex on both — so
+  // one chip identity keys the pair.
   private readonly cache = new Map<string, vscode.IconPath>()
   private directory: string | undefined
 
@@ -39,14 +40,17 @@ export class ChipIcons {
     this.cache.clear()
   }
 
-  for(light: ReadonlyArray<Segment>, dark: ReadonlyArray<Segment>, layout: ChipLayout): vscode.IconPath | undefined {
-    if (light.length === 0) return undefined
-    const key = `${chipKey(light, layout, "light")}|${chipKey(dark, layout, "dark")}`
+  for(segments: ReadonlyArray<Segment>, layout: ChipLayout): vscode.IconPath | undefined {
+    if (segments.length === 0) return undefined
+    const key = chipKey(segments, layout)
     let icon = this.cache.get(key)
     if (!icon) {
+      // Both themes still get their own SVG: the chip's outline is the one thing that has
+      // to follow the editor theme, since it exists to give the chip an edge against the
+      // sidebar background.
       icon = {
-        light: this.uri(chipSvg(light, layout, "light"), key, "light"),
-        dark: this.uri(chipSvg(dark, layout, "dark"), key, "dark"),
+        light: this.uri(chipSvg(segments, layout, "light"), key, "light"),
+        dark: this.uri(chipSvg(segments, layout, "dark"), key, "dark"),
       }
       this.cache.set(key, icon)
     }

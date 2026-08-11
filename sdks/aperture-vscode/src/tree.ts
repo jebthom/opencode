@@ -103,11 +103,9 @@ export class ApertureTree implements vscode.TreeDataProvider<Node>, vscode.TreeD
     const legend = this.ctx.legend()
     const layout = this.ctx.layout()
     const suppressed = this.ctx.suppressed()
-    // Both themes are rendered so VSCode can pick without us re-resolving on theme change:
-    // a facet's hue may be a theme-role token, which has no single correct hex.
-    const light = chipSegments(weights, facets, legend, { layout, theme: "light", suppressed })
-    const dark = chipSegments(weights, facets, legend, { layout, theme: "dark", suppressed })
-    item.iconPath = this.ctx.icons.for(light, dark, layout)
+    // One set of segments for both themes: every facet colour is a fixed hex (PLAN C1), so
+    // there is nothing left to re-resolve when the editor theme changes.
+    item.iconPath = this.ctx.icons.for(chipSegments(weights, facets, legend, { layout, suppressed }), layout)
 
     const breakdown = chipTooltip(weights, facets, legend)
     const tooltip = new vscode.MarkdownString()

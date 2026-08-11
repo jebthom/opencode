@@ -21,87 +21,126 @@ import {
   isAssignableFacet,
   facetEnumIds,
   NONE_FACET,
+  NONE_HUE,
+  UNTAGGED_HUE,
   legend,
   facetsWithin,
   buildSystemPrompt,
   slugify,
 } from "@/aperture/lenses"
-import { LAYERS } from "@/aperture/semantics"
+import { LAYERS, LAYER_HUE } from "@/aperture/semantics"
+import { XTERM_256, collidesWithSystemColor, deltaE, hexFromRgb, isExact, nearestIndex } from "@/aperture/color-256"
 import { AperturePayload } from "@/aperture/payload"
 
 describe("aperture lenses", () => {
-  test("categorical + ordinal palettes, each at least MAX_FACETS colours", () => {
-    expect(PALETTE_IDS.sort()).toEqual([
-      "bright",
-      "bright-ordinal",
-      "dark",
-      "dark-ordinal",
-      "earthy",
-      "pastel",
-      "pastel-ordinal",
-    ])
-    const categorical = PALETTE_IDS.filter((id) => PALETTES[id].kind === "categorical")
-    const ordinal = PALETTE_IDS.filter((id) => PALETTES[id].kind === "ordinal")
-    expect(categorical.sort()).toEqual(["bright", "dark", "earthy", "pastel"])
-    expect(ordinal.sort()).toEqual(["bright-ordinal", "dark-ordinal", "pastel-ordinal"])
-    expect(ORDINAL_PALETTE_IDS.sort()).toEqual(["bright-ordinal", "dark-ordinal", "pastel-ordinal"])
+  test("exactly two palettes, each MAX_FACETS colours", () => {
+    expect(PALETTE_IDS.sort()).toEqual(["categorical", "ordinal"])
+    expect(PALETTES.categorical.kind).toBe("categorical")
+    expect(PALETTES.ordinal.kind).toBe("ordinal")
+    expect(ORDINAL_PALETTE_IDS).toEqual(["ordinal"])
     for (const id of PALETTE_IDS) {
       expect(PALETTES[id].colors.length).toBeGreaterThanOrEqual(MAX_FACETS)
       for (const c of PALETTES[id].colors) expect(c).toMatch(/^#[0-9A-Fa-f]{6}$/)
     }
   })
 
-  test("bright-ordinal palette is the source for the Edit recency heat-map colours", () => {
-    expect(MTIME_RECENCY.facets.map((f) => f.color)).toEqual([...PALETTES["bright-ordinal"].colors])
+  // The ordinal palette is the categorical six reversed, not a second set of hexes. Keeping
+  // one closed colour universe is what lets the VSCode extension contribute a colour id per
+  // hue instead of approximating (see gen-colors.ts).
+  test("the ordinal palette is the categorical palette reversed", () => {
+    expect([...PALETTES.ordinal.colors]).toEqual([...PALETTES.categorical.colors].reverse())
   })
 
-  // A palette colour that is dark *and* desaturated quantises onto the xterm-256 grey ramp
-  // in a non-truecolor terminal, where it reads as — and collides with — the "Other"/Non-code
-  // greys. Guard every categorical palette against that so a muted palette can't silently
-  // regress to grey. See the note on PALETTES in lenses.ts.
-  test("no categorical palette colour collapses to grey in 256-colour space", () => {
-    // The xterm-256 palette: 16 system colours, a 6×6×6 colour cube, then a 24-step grey ramp.
-    const cubeLevel = (i: number) => (i === 0 ? 0 : 55 + 40 * i)
-    const xterm256: [number, number, number][] = [
-      [0, 0, 0],
-      [128, 0, 0],
-      [0, 128, 0],
-      [128, 128, 0],
-      [0, 0, 128],
-      [128, 0, 128],
-      [0, 128, 128],
-      [192, 192, 192],
-      [128, 128, 128],
-      [255, 0, 0],
-      [0, 255, 0],
-      [255, 255, 0],
-      [0, 0, 255],
-      [255, 0, 255],
-      [0, 255, 255],
-      [255, 255, 255],
-    ]
-    for (let r = 0; r < 6; r++)
-      for (let g = 0; g < 6; g++) for (let b = 0; b < 6; b++) xterm256.push([cubeLevel(r), cubeLevel(g), cubeLevel(b)])
-    for (let i = 0; i < 24; i++) xterm256.push([8 + 10 * i, 8 + 10 * i, 8 + 10 * i])
+  test("the ordinal palette is the source for the Edit recency heat-map colours", () => {
+    expect(MTIME_RECENCY.facets.map((f) => f.color)).toEqual([...PALETTES.ordinal.colors])
+  })
 
-    const nearest = (hex: string): [number, number, number] => {
-      const c = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16)) as [number, number, number]
-      let best = Infinity
-      let winner = xterm256[0]!
-      for (const p of xterm256) {
-        const d = (c[0] - p[0]) ** 2 + (c[1] - p[1]) ** 2 + (c[2] - p[2]) ** 2
-        if (d < best) [best, winner] = [d, p]
-      }
-      return winner
+  // --- the C1 colour-fidelity contract ---------------------------------------
+  //
+  // Every colour Aperture can paint must be an *exact* xterm-256 entry, and no two may sit
+  // perceptually close. Together those two properties are what make a facet's hue mean the
+  // same thing in the TUI and in VSCode, on a truecolor terminal and a 256-colour one, under
+  // any terminal colour theme. See the note on PALETTES in lenses.ts for the full argument.
+  //
+  // The predecessor of these tests only checked each colour against *grey*, never against
+  // the other five — which is why `pastel` shipped with #F7C8A0 and #F5E1A4 both quantising
+  // to xterm idx 223, i.e. literally the same colour on any 256-colour terminal.
+
+  // The quantisation maths lives in aperture/color-256.ts because `opencode debug
+  // aperture-colors` needs the same answers on a participant's machine. Spot-check the table
+  // against the published xterm-256 formulae first, so a bug in the shared module can't make
+  // the guards below vacuously pass.
+  test("the xterm-256 table matches the standard formulae", () => {
+    expect(XTERM_256).toHaveLength(256)
+    expect(XTERM_256[0]).toEqual([0, 0, 0])
+    expect(XTERM_256[15]).toEqual([255, 255, 255])
+    expect(XTERM_256[16]).toEqual([0, 0, 0]) // cube origin
+    expect(XTERM_256[231]).toEqual([255, 255, 255]) // cube corner
+    expect(XTERM_256[232]).toEqual([8, 8, 8]) // grey ramp start
+    expect(XTERM_256[255]).toEqual([238, 238, 238]) // grey ramp end
+    // The two cells the greys are meant to land on, and one the palette uses.
+    expect(hexFromRgb(XTERM_256[244]!)).toBe("#808080")
+    expect(hexFromRgb(XTERM_256[238]!)).toBe("#444444")
+    expect(hexFromRgb(XTERM_256[161]!)).toBe("#D7005F")
+  })
+
+  // Every hex the product can emit, tagged with where it came from so a failure names it.
+  const everyColor = (): Array<{ where: string; hex: string }> => [
+    ...PALETTE_IDS.flatMap((id) => PALETTES[id].colors.map((hex) => ({ where: `palette "${id}"`, hex }))),
+    ...BUILTIN_LENSES.flatMap((lens) =>
+      lens.facets
+        .filter((f) => f.color.startsWith("#"))
+        .map((f) => ({ where: `lens "${lens.id}" facet "${f.id}"`, hex: f.color })),
+    ),
+    { where: "NONE_HUE", hex: NONE_HUE },
+    { where: "UNTAGGED_HUE", hex: UNTAGGED_HUE },
+  ]
+
+  test("every paintable colour is an exact xterm-256 entry", () => {
+    for (const { where, hex } of everyColor()) {
+      if (!isExact(hex))
+        throw new Error(
+          `${where} colour ${hex} is not an exact xterm-256 entry — a 256-colour terminal would show ${hexFromRgb(XTERM_256[nearestIndex(hex)]!)} instead, so the TUI and VSCode would disagree. Pick a cube cell (channels from 0/95/135/175/215/255) or a grey-ramp cell (8+10k).`,
+        )
     }
+  })
 
-    for (const id of PALETTE_IDS)
-      for (const hex of PALETTES[id].colors) {
-        const [r, g, b] = nearest(hex)
-        const isGrey = r === g && g === b
-        if (isGrey) throw new Error(`palette "${id}" colour ${hex} quantises to grey rgb(${r},${g},${b}) in 256-colour`)
-        expect(isGrey).toBe(false)
+  // Being an exact entry is necessary but not sufficient: entries 0-15 are the ones a
+  // terminal theme repaints, so a colour that coincides with one is themed away even though
+  // it quantises "exactly". #808080 is the trap — it is both grey-ramp 244 and system 8.
+  test("no paintable colour coincides with a re-themable system colour (0-15)", () => {
+    for (const { where, hex } of everyColor())
+      if (collidesWithSystemColor(hex))
+        throw new Error(
+          `${where} colour ${hex} is also an xterm system colour (index 0-15), the range a terminal colour theme overrides — Solarized/Nord/Dracula would repaint it and it would stop matching VSCode. Move it one step along the grey ramp or into the colour cube.`,
+        )
+  })
+
+  test("no two paintable colours are perceptually close", () => {
+    // The closest legitimate pairs are the greys against the palette (ΔE ~23) and the two
+    // greys against each other (26.4) — "Other" and "Non-code" are meant to read as
+    // neighbouring greys, just separable ones. The palette's own minimum is 32.3.
+    const MIN_DELTA_E = 20
+    const all = everyColor()
+    // Dedupe: the ramps are slices of the ordinal palette, so the same hex appears more than
+    // once by design and comparing it with itself would trivially fail.
+    const unique = [...new Map(all.map((c) => [c.hex, c])).values()]
+    for (let i = 0; i < unique.length; i++)
+      for (let j = i + 1; j < unique.length; j++) {
+        const a = unique[i]!
+        const b = unique[j]!
+        const d = deltaE(a.hex, b.hex)
+        if (d < MIN_DELTA_E)
+          throw new Error(
+            `${a.where} ${a.hex} and ${b.where} ${b.hex} are only ΔE2000 ${d.toFixed(1)} apart (need ${MIN_DELTA_E}) — they would read as the same facet colour.`,
+          )
       }
+  })
+
+  test("architecture layer hues are drawn from the categorical palette", () => {
+    // semantics.ts can't import PALETTES (lenses.ts imports semantics.ts), so its literals
+    // are kept honest here instead.
+    for (const layer of LAYERS) expect(PALETTES.categorical.colors).toContain(LAYER_HUE[layer])
   })
 
   test("assignColors pairs facets with palette colours in order", () => {
@@ -109,16 +148,17 @@ describe("aperture lenses", () => {
       { id: "a", label: "A", description: "first" },
       { id: "b", label: "B", description: "second" },
     ]
-    const out = assignColors("bright", facets)
-    expect(out.map((t) => t.color)).toEqual([PALETTES.bright.colors[0], PALETTES.bright.colors[1]])
+    const out = assignColors("categorical", facets)
+    expect(out.map((t) => t.color)).toEqual([PALETTES.categorical.colors[0], PALETTES.categorical.colors[1]])
   })
 
-  test("architecture is the global built-in mirroring LAYERS with theme-role colours", () => {
+  test("architecture is the global built-in mirroring LAYERS with literal hex colours", () => {
     expect(ARCHITECTURE.id).toBe(ARCHITECTURE_ID)
     expect(ARCHITECTURE.scope).toBe("global")
     expect(ARCHITECTURE.facets.map((t) => t.id)).toEqual([...LAYERS])
-    // Architecture keeps theme-role keys (not hex) so it stays theme-adaptive.
-    for (const t of ARCHITECTURE.facets) expect(t.color.startsWith("#")).toBe(false)
+    // Hex, not theme roles: the roles resolved differently in the TUI and in VSCode, which
+    // made this Lens the worst cross-surface colour mismatch in the product (PLAN C1).
+    for (const t of ARCHITECTURE.facets) expect(t.color).toMatch(/^#[0-9A-Fa-f]{6}$/)
   })
 
   test("isValidFacet only accepts ids in the Lens", () => {
@@ -204,12 +244,10 @@ describe("aperture deterministic built-ins", () => {
     expect(CHANGE_FACET_IDS.length).toBe(5)
     // Five buckets + unchanged fills MAX_FACETS exactly.
     expect(GIT_CHANGED.facets.length).toBe(MAX_FACETS)
-    // The five buckets carry a warm hex heat ramp; "unchanged" is a muted theme role.
-    for (const id of CHANGE_FACET_IDS) {
-      const facet = GIT_CHANGED.facets.find((t) => t.id === id)!
-      expect(facet.color).toMatch(/^#[0-9A-Fa-f]{6}$/)
-    }
-    expect(GIT_CHANGED.facets.find((t) => t.id === "unchanged")!.color).toBe("textMuted")
+    // The five buckets carry a cold→hot slice of the ordinal ramp; "unchanged" recedes to
+    // the same grey as "Other", so a file with no changes reads as "not what you're looking at".
+    expect(GIT_CHANGED.facets.slice(0, 5).map((t) => t.color)).toEqual([...PALETTES.ordinal.colors].slice(1))
+    expect(GIT_CHANGED.facets.find((t) => t.id === "unchanged")!.color).toBe(NONE_HUE)
     expect(MTIME_RECENCY.facets.map((t) => t.id)).toEqual([...RECENCY_FACET_IDS])
     expect(RECENCY_FACET_IDS.length).toBe(6)
     // Recency colours are concrete hex (an ordinal ramp), not theme roles.

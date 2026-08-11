@@ -255,383 +255,83 @@
     },
     "colors": [
       {
-        "id": "aperture.c008787",
-        "description": "Aperture facet colour #008787",
+        "id": "aperture.c00875F",
+        "description": "Aperture facet colour #00875F",
         "defaults": {
-          "dark": "#008787",
-          "light": "#008787",
-          "highContrast": "#008787",
-          "highContrastLight": "#008787"
+          "dark": "#00875F",
+          "light": "#00875F",
+          "highContrast": "#00875F",
+          "highContrastLight": "#00875F"
         }
       },
       {
-        "id": "aperture.c3AAFA9",
-        "description": "Aperture facet colour #3AAFA9",
+        "id": "aperture.c00AFD7",
+        "description": "Aperture facet colour #00AFD7",
         "defaults": {
-          "dark": "#3AAFA9",
-          "light": "#3AAFA9",
-          "highContrast": "#3AAFA9",
-          "highContrastLight": "#3AAFA9"
+          "dark": "#00AFD7",
+          "light": "#00AFD7",
+          "highContrast": "#00AFD7",
+          "highContrastLight": "#00AFD7"
         }
       },
       {
-        "id": "aperture.c4E5BA6",
-        "description": "Aperture facet colour #4E5BA6",
+        "id": "aperture.c444444",
+        "description": "Aperture facet colour #444444",
         "defaults": {
-          "dark": "#4E5BA6",
-          "light": "#4E5BA6",
-          "highContrast": "#4E5BA6",
-          "highContrastLight": "#4E5BA6"
+          "dark": "#444444",
+          "light": "#444444",
+          "highContrast": "#444444",
+          "highContrastLight": "#444444"
         }
       },
       {
-        "id": "aperture.c4E79A7",
-        "description": "Aperture facet colour #4E79A7",
+        "id": "aperture.c5F5FD7",
+        "description": "Aperture facet colour #5F5FD7",
         "defaults": {
-          "dark": "#4E79A7",
-          "light": "#4E79A7",
-          "highContrast": "#4E79A7",
-          "highContrastLight": "#4E79A7"
+          "dark": "#5F5FD7",
+          "light": "#5F5FD7",
+          "highContrast": "#5F5FD7",
+          "highContrastLight": "#5F5FD7"
         }
       },
       {
-        "id": "aperture.c59A14F",
-        "description": "Aperture facet colour #59A14F",
+        "id": "aperture.c8A8A8A",
+        "description": "Aperture facet colour #8A8A8A",
         "defaults": {
-          "dark": "#59A14F",
-          "light": "#59A14F",
-          "highContrast": "#59A14F",
-          "highContrastLight": "#59A14F"
+          "dark": "#8A8A8A",
+          "light": "#8A8A8A",
+          "highContrast": "#8A8A8A",
+          "highContrastLight": "#8A8A8A"
         }
       },
       {
-        "id": "aperture.c5F5F87",
-        "description": "Aperture facet colour #5F5F87",
+        "id": "aperture.cAF5F00",
+        "description": "Aperture facet colour #AF5F00",
         "defaults": {
-          "dark": "#5F5F87",
-          "light": "#5F5F87",
-          "highContrast": "#5F5F87",
-          "highContrastLight": "#5F5F87"
+          "dark": "#AF5F00",
+          "light": "#AF5F00",
+          "highContrast": "#AF5F00",
+          "highContrastLight": "#AF5F00"
         }
       },
       {
-        "id": "aperture.c5F5FAF",
-        "description": "Aperture facet colour #5F5FAF",
+        "id": "aperture.cAFAF00",
+        "description": "Aperture facet colour #AFAF00",
         "defaults": {
-          "dark": "#5F5FAF",
-          "light": "#5F5FAF",
-          "highContrast": "#5F5FAF",
-          "highContrastLight": "#5F5FAF"
+          "dark": "#AFAF00",
+          "light": "#AFAF00",
+          "highContrast": "#AFAF00",
+          "highContrastLight": "#AFAF00"
         }
       },
       {
-        "id": "aperture.c5F875F",
-        "description": "Aperture facet colour #5F875F",
+        "id": "aperture.cD7005F",
+        "description": "Aperture facet colour #D7005F",
         "defaults": {
-          "dark": "#5F875F",
-          "light": "#5F875F",
-          "highContrast": "#5F875F",
-          "highContrastLight": "#5F875F"
-        }
-      },
-      {
-        "id": "aperture.c6B8E5A",
-        "description": "Aperture facet colour #6B8E5A",
-        "defaults": {
-          "dark": "#6B8E5A",
-          "light": "#6B8E5A",
-          "highContrast": "#6B8E5A",
-          "highContrastLight": "#6B8E5A"
-        }
-      },
-      {
-        "id": "aperture.c79C7C1",
-        "description": "Aperture facet colour #79C7C1",
-        "defaults": {
-          "dark": "#79C7C1",
-          "light": "#79C7C1",
-          "highContrast": "#79C7C1",
-          "highContrastLight": "#79C7C1"
-        }
-      },
-      {
-        "id": "aperture.c875F00",
-        "description": "Aperture facet colour #875F00",
-        "defaults": {
-          "dark": "#875F00",
-          "light": "#875F00",
-          "highContrast": "#875F00",
-          "highContrastLight": "#875F00"
-        }
-      },
-      {
-        "id": "aperture.c875F87",
-        "description": "Aperture facet colour #875F87",
-        "defaults": {
-          "dark": "#875F87",
-          "light": "#875F87",
-          "highContrast": "#875F87",
-          "highContrastLight": "#875F87"
-        }
-      },
-      {
-        "id": "aperture.c87875F",
-        "description": "Aperture facet colour #87875F",
-        "defaults": {
-          "dark": "#87875F",
-          "light": "#87875F",
-          "highContrast": "#87875F",
-          "highContrastLight": "#87875F"
-        }
-      },
-      {
-        "id": "aperture.c8C7A5B",
-        "description": "Aperture facet colour #8C7A5B",
-        "defaults": {
-          "dark": "#8C7A5B",
-          "light": "#8C7A5B",
-          "highContrast": "#8C7A5B",
-          "highContrastLight": "#8C7A5B"
-        }
-      },
-      {
-        "id": "aperture.c8E9BD9",
-        "description": "Aperture facet colour #8E9BD9",
-        "defaults": {
-          "dark": "#8E9BD9",
-          "light": "#8E9BD9",
-          "highContrast": "#8E9BD9",
-          "highContrastLight": "#8E9BD9"
-        }
-      },
-      {
-        "id": "aperture.c9BCF8F",
-        "description": "Aperture facet colour #9BCF8F",
-        "defaults": {
-          "dark": "#9BCF8F",
-          "light": "#9BCF8F",
-          "highContrast": "#9BCF8F",
-          "highContrastLight": "#9BCF8F"
-        }
-      },
-      {
-        "id": "aperture.c9C6B4F",
-        "description": "Aperture facet colour #9C6B4F",
-        "defaults": {
-          "dark": "#9C6B4F",
-          "light": "#9C6B4F",
-          "highContrast": "#9C6B4F",
-          "highContrastLight": "#9C6B4F"
-        }
-      },
-      {
-        "id": "aperture.cA65E2E",
-        "description": "Aperture facet colour #A65E2E",
-        "defaults": {
-          "dark": "#A65E2E",
-          "light": "#A65E2E",
-          "highContrast": "#A65E2E",
-          "highContrastLight": "#A65E2E"
-        }
-      },
-      {
-        "id": "aperture.cA8D5BA",
-        "description": "Aperture facet colour #A8D5BA",
-        "defaults": {
-          "dark": "#A8D5BA",
-          "light": "#A8D5BA",
-          "highContrast": "#A8D5BA",
-          "highContrastLight": "#A8D5BA"
-        }
-      },
-      {
-        "id": "aperture.cAF5F5F",
-        "description": "Aperture facet colour #AF5F5F",
-        "defaults": {
-          "dark": "#AF5F5F",
-          "light": "#AF5F5F",
-          "highContrast": "#AF5F5F",
-          "highContrastLight": "#AF5F5F"
-        }
-      },
-      {
-        "id": "aperture.cB07AA1",
-        "description": "Aperture facet colour #B07AA1",
-        "defaults": {
-          "dark": "#B07AA1",
-          "light": "#B07AA1",
-          "highContrast": "#B07AA1",
-          "highContrastLight": "#B07AA1"
-        }
-      },
-      {
-        "id": "aperture.cB5C7EB",
-        "description": "Aperture facet colour #B5C7EB",
-        "defaults": {
-          "dark": "#B5C7EB",
-          "light": "#B5C7EB",
-          "highContrast": "#B5C7EB",
-          "highContrastLight": "#B5C7EB"
-        }
-      },
-      {
-        "id": "aperture.cC2A878",
-        "description": "Aperture facet colour #C2A878",
-        "defaults": {
-          "dark": "#C2A878",
-          "light": "#C2A878",
-          "highContrast": "#C2A878",
-          "highContrastLight": "#C2A878"
-        }
-      },
-      {
-        "id": "aperture.cD70000",
-        "description": "Aperture facet colour #D70000",
-        "defaults": {
-          "dark": "#D70000",
-          "light": "#D70000",
-          "highContrast": "#D70000",
-          "highContrastLight": "#D70000"
-        }
-      },
-      {
-        "id": "aperture.cE15759",
-        "description": "Aperture facet colour #E15759",
-        "defaults": {
-          "dark": "#E15759",
-          "light": "#E15759",
-          "highContrast": "#E15759",
-          "highContrastLight": "#E15759"
-        }
-      },
-      {
-        "id": "aperture.cE2C2E9",
-        "description": "Aperture facet colour #E2C2E9",
-        "defaults": {
-          "dark": "#E2C2E9",
-          "light": "#E2C2E9",
-          "highContrast": "#E2C2E9",
-          "highContrastLight": "#E2C2E9"
-        }
-      },
-      {
-        "id": "aperture.cEB9A9A",
-        "description": "Aperture facet colour #EB9A9A",
-        "defaults": {
-          "dark": "#EB9A9A",
-          "light": "#EB9A9A",
-          "highContrast": "#EB9A9A",
-          "highContrastLight": "#EB9A9A"
-        }
-      },
-      {
-        "id": "aperture.cEDC948",
-        "description": "Aperture facet colour #EDC948",
-        "defaults": {
-          "dark": "#EDC948",
-          "light": "#EDC948",
-          "highContrast": "#EDC948",
-          "highContrastLight": "#EDC948"
-        }
-      },
-      {
-        "id": "aperture.cEFE08F",
-        "description": "Aperture facet colour #EFE08F",
-        "defaults": {
-          "dark": "#EFE08F",
-          "light": "#EFE08F",
-          "highContrast": "#EFE08F",
-          "highContrastLight": "#EFE08F"
-        }
-      },
-      {
-        "id": "aperture.cF28E2B",
-        "description": "Aperture facet colour #F28E2B",
-        "defaults": {
-          "dark": "#F28E2B",
-          "light": "#F28E2B",
-          "highContrast": "#F28E2B",
-          "highContrastLight": "#F28E2B"
-        }
-      },
-      {
-        "id": "aperture.cF3C08A",
-        "description": "Aperture facet colour #F3C08A",
-        "defaults": {
-          "dark": "#F3C08A",
-          "light": "#F3C08A",
-          "highContrast": "#F3C08A",
-          "highContrastLight": "#F3C08A"
-        }
-      },
-      {
-        "id": "aperture.cF4B8C4",
-        "description": "Aperture facet colour #F4B8C4",
-        "defaults": {
-          "dark": "#F4B8C4",
-          "light": "#F4B8C4",
-          "highContrast": "#F4B8C4",
-          "highContrastLight": "#F4B8C4"
-        }
-      },
-      {
-        "id": "aperture.cF5E1A4",
-        "description": "Aperture facet colour #F5E1A4",
-        "defaults": {
-          "dark": "#F5E1A4",
-          "light": "#F5E1A4",
-          "highContrast": "#F5E1A4",
-          "highContrastLight": "#F5E1A4"
-        }
-      },
-      {
-        "id": "aperture.cF7C8A0",
-        "description": "Aperture facet colour #F7C8A0",
-        "defaults": {
-          "dark": "#F7C8A0",
-          "light": "#F7C8A0",
-          "highContrast": "#F7C8A0",
-          "highContrastLight": "#F7C8A0"
-        }
-      },
-      {
-        "id": "aperture.cFF5F00",
-        "description": "Aperture facet colour #FF5F00",
-        "defaults": {
-          "dark": "#FF5F00",
-          "light": "#FF5F00",
-          "highContrast": "#FF5F00",
-          "highContrastLight": "#FF5F00"
-        }
-      },
-      {
-        "id": "aperture.cFF8700",
-        "description": "Aperture facet colour #FF8700",
-        "defaults": {
-          "dark": "#FF8700",
-          "light": "#FF8700",
-          "highContrast": "#FF8700",
-          "highContrastLight": "#FF8700"
-        }
-      },
-      {
-        "id": "aperture.cFFAF5F",
-        "description": "Aperture facet colour #FFAF5F",
-        "defaults": {
-          "dark": "#FFAF5F",
-          "light": "#FFAF5F",
-          "highContrast": "#FFAF5F",
-          "highContrastLight": "#FFAF5F"
-        }
-      },
-      {
-        "id": "aperture.cFFD787",
-        "description": "Aperture facet colour #FFD787",
-        "defaults": {
-          "dark": "#FFD787",
-          "light": "#FFD787",
-          "highContrast": "#FFD787",
-          "highContrastLight": "#FFD787"
+          "dark": "#D7005F",
+          "light": "#D7005F",
+          "highContrast": "#D7005F",
+          "highContrastLight": "#D7005F"
         }
       }
     ]

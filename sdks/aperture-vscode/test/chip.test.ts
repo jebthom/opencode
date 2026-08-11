@@ -1,13 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import {
-  CHIP_CELLS,
-  chipSegments,
-  chipSvg,
-  hexFor,
-  MIN_SEGMENT_FRAC,
-  THEME_ROLE_HEX,
-  type LegendEntry,
-} from "../src/chip"
+import { CHIP_CELLS, chipSegments, chipSvg, hexFor, MIN_SEGMENT_FRAC, type LegendEntry } from "../src/chip"
 
 // The chip is the whole reason the tree exists: a FileDecoration could say *which* facet
 // and *how much*, but not the mix. These tests pin the two things the mix depends on —
@@ -22,7 +14,7 @@ const LEGEND: LegendEntry[] = [
 const FACETS = ["parsing", "server", "tui", "none"]
 
 const bar = (weights: Array<{ f: number; p: number }>, extra = {}) =>
-  chipSegments(weights, FACETS, LEGEND, { layout: "bar6", theme: "dark", ...extra })
+  chipSegments(weights, FACETS, LEGEND, { layout: "bar6", ...extra })
 
 describe("chipSegments — quantized", () => {
   test("an un-mixed file is six cells of one colour", () => {
@@ -68,7 +60,7 @@ describe("chipSegments — quantized", () => {
     const even = [16, 17, 17, 17, 17, 16].map((p, f) => ({ f, p }))
     const facets = ["a", "b", "c", "d", "e", "f"]
     const legend = facets.map((facet, i) => ({ facet, label: facet, color: `#00000${i}` }))
-    const segments = chipSegments(even, facets, legend, { layout: "bar6", theme: "dark" })
+    const segments = chipSegments(even, facets, legend, { layout: "bar6" })
     expect(segments).toHaveLength(CHIP_CELLS)
     expect(new Set(segments.map((s) => s.color)).size).toBe(6)
   })
@@ -91,7 +83,7 @@ describe("chipSegments — quantized", () => {
   test("a facet outside the legend greys rather than vanishing", () => {
     // index 3 is NONE_FACET, which is a real stored value but never a legend entry.
     const segments = bar([{ f: 3, p: 100 }])
-    expect(segments[0]!.color).toBe(THEME_ROLE_HEX["textMuted"]!.dark)
+    expect(segments[0]!.color).toBe("#8A8A8A")
   })
 })
 
@@ -113,7 +105,7 @@ describe("chipSegments — ordering", () => {
       { f: 0, p: 50 },
     ])
     expect(segments.slice(0, 3).map((s) => s.color)).toEqual(["#4E79A7", "#4E79A7", "#4E79A7"])
-    expect(new Set(segments.slice(3).map((s) => s.color))).toEqual(new Set([THEME_ROLE_HEX["textMuted"]!.dark]))
+    expect(new Set(segments.slice(3).map((s) => s.color))).toEqual(new Set(["#8A8A8A"]))
   })
 })
 
@@ -127,7 +119,7 @@ describe("chipSegments — suppression (PLAN O4)", () => {
     const after = bar(mix, { suppressed: new Set(["parsing"]) })
     expect(after).toHaveLength(before.length)
     // Same three cells as before, now grey; the other three are untouched.
-    expect(after.filter((s) => s.color === THEME_ROLE_HEX["textMuted"]!.dark)).toHaveLength(3)
+    expect(after.filter((s) => s.color === "#8A8A8A")).toHaveLength(3)
     expect(after.filter((s) => s.color === "#F28E2B")).toHaveLength(3)
   })
 
@@ -145,9 +137,9 @@ describe("chipSegments — suppression (PLAN O4)", () => {
       { f: 0, p: 50 },
       { f: 1, p: 50 },
     ]
-    const greyed: LegendEntry[] = LEGEND.map((e) => (e.facet === "parsing" ? { ...e, color: "textMuted" } : e))
+    const greyed: LegendEntry[] = LEGEND.map((e) => (e.facet === "parsing" ? { ...e, color: "#8A8A8A" } : e))
     const viaSet = bar(mix, { suppressed: new Set(["parsing"]) })
-    const viaLegend = chipSegments(mix, FACETS, greyed, { layout: "bar6", theme: "dark" })
+    const viaLegend = chipSegments(mix, FACETS, greyed, { layout: "bar6" })
     expect(viaLegend).toEqual(viaSet)
   })
 
@@ -157,15 +149,15 @@ describe("chipSegments — suppression (PLAN O4)", () => {
       { f: 1, p: 33 },
       { f: 2, p: 33 },
     ]
-    const greyed: LegendEntry[] = LEGEND.map((e) => (e.facet === "tui" ? { ...e, color: "textMuted" } : e))
-    const both = chipSegments(mix, FACETS, greyed, { layout: "bar6", theme: "dark", suppressed: new Set(["tui"]) })
+    const greyed: LegendEntry[] = LEGEND.map((e) => (e.facet === "tui" ? { ...e, color: "#8A8A8A" } : e))
+    const both = chipSegments(mix, FACETS, greyed, { layout: "bar6", suppressed: new Set(["tui"]) })
     expect(both).toEqual(bar(mix, { suppressed: new Set(["tui"]) }))
   })
 })
 
 describe("chipSegments — proportional", () => {
   const prop = (weights: Array<{ f: number; p: number }>) =>
-    chipSegments(weights, FACETS, LEGEND, { layout: "bar-proportional", theme: "dark" })
+    chipSegments(weights, FACETS, LEGEND, { layout: "bar-proportional" })
 
   test("segment widths are the real shares and still fill the bar", () => {
     const segments = prop([
@@ -189,17 +181,15 @@ describe("chipSegments — proportional", () => {
 
 describe("hexFor", () => {
   test("a palette hex passes through untouched — it IS the identity matched to the TUI", () => {
-    expect(hexFor("#4E79A7", "dark")).toBe("#4E79A7")
+    expect(hexFor("#D7005F")).toBe("#D7005F")
   })
 
-  test("a theme-role token resolves per theme", () => {
-    expect(hexFor("info", "light")).toBe("#1A85FF")
-    expect(hexFor("info", "dark")).toBe("#3794FF")
-  })
-
-  test("an unknown token falls back to the muted grey rather than to nothing", () => {
-    expect(hexFor("no-such-role", "dark")).toBe(THEME_ROLE_HEX["textMuted"]!.dark)
-    expect(hexFor(undefined, "dark")).toBe(THEME_ROLE_HEX["textMuted"]!.dark)
+  // Since PLAN C1 the server sends a literal hex for every facet colour, including the two
+  // greys and the Architecture Lens's layers. A token arriving here means version skew with
+  // an older server, and the muted grey is a better answer than an invented colour.
+  test("a non-hex hue falls back to the muted grey rather than to nothing", () => {
+    expect(hexFor("info")).toBe("#8A8A8A")
+    expect(hexFor(undefined)).toBe("#8A8A8A")
   })
 })
 
@@ -265,11 +255,7 @@ describe("chipSvg", () => {
   })
 
   test("the grid ignores a cell-count override, which would leave its last row short", () => {
-    const segments = chipSegments([{ f: 0, p: 100 }], FACETS, LEGEND, {
-      layout: "mosaic6",
-      theme: "dark",
-      cells: 4,
-    })
+    const segments = chipSegments([{ f: 0, p: 100 }], FACETS, LEGEND, { layout: "mosaic6", cells: 4 })
     expect(segments).toHaveLength(CHIP_CELLS)
   })
 })

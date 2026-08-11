@@ -12,7 +12,7 @@ import { ARCHITECTURE_ID, BUILTIN_LENSES } from "@/aperture/lenses"
 const CREATE = {
   name: "Auth Flow",
   description: "Where auth happens",
-  palette: "pastel" as const,
+  palette: "categorical" as const,
   prompt: "Tag files by their role in authentication.",
   facets: [
     { label: "Login", description: "login + session start" },

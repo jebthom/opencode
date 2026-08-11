@@ -12,17 +12,9 @@ import * as Tool from "./tool"
 export const Parameters = Schema.Struct({
   name: Schema.String.annotate({ description: 'Short human name for the Lens, e.g. "Auth flow".' }),
   description: Schema.String.annotate({ description: "One-line summary of what this Lens captures." }),
-  palette: Schema.Literals([
-    "pastel",
-    "dark",
-    "bright",
-    "earthy",
-    "pastel-ordinal",
-    "bright-ordinal",
-    "dark-ordinal",
-  ]).annotate({
+  palette: Schema.Literals(["categorical", "ordinal"]).annotate({
     description:
-      "Colour palette. Use a CATEGORICAL palette (pastel, dark, bright, earthy) for unordered facets — each facet gets a distinct hue. Use an ORDINAL palette (pastel-ordinal, bright-ordinal, dark-ordinal) ONLY when the facets have a natural order (e.g. low→high, few→many, small→large): these run a cool→warm ramp so a facet's colour encodes its rank, and the facets MUST be listed in that order.",
+      'Colour palette. Both hold the same six colours, so this only chooses how they are ordered. Use "categorical" (the default choice) for unordered facets — each facet gets a distinct hue with no implied ranking. Use "ordinal" ONLY when the facets have a natural order (e.g. low→high, few→many, small→large): it runs the same six as a cool→warm ramp so a facet\'s colour encodes its rank, and the facets MUST then be listed lowest-first.',
   }),
   prompt: Schema.String.annotate({
     description:

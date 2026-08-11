@@ -51,8 +51,9 @@ export const ACTION_LABEL: Record<Action, string> = {
 // Whether an overlay reflects something that has happened or something a plan
 // only proposes. Drives styling at render time: `actual` uses the agent's color,
 // `planned` is dimmed (and proposed-file *blocks* get dashed borders in step 8).
-// Color is never baked in here — the renderer interprets this, mirroring how
-// LAYER_HUE is resolved against the active theme.
+// Color is never baked in here — the renderer interprets this. (Unlike LAYER_HUE, which
+// is now literal hex; overlay styling is still theme-relative because it dims the *agent's*
+// colour rather than naming one.)
 export const STYLES = ["actual", "planned"] as const
 export type Style = (typeof STYLES)[number]
 

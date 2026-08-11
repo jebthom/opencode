@@ -49,44 +49,26 @@ export const MIN_SEGMENT_FRAC = MIN_SEGMENT_PX / BAR_W
 // pale hairline between two colours.
 const SEAM = 0.35
 
-// A facet's hue is either a hex (`#RRGGBB`, user + deterministic palettes) or an opencode
-// theme-role token (the built-in Architecture Lens, and the two greys). extension.ts maps
-// tokens to VSCode ThemeColor *ids* for FileDecoration, which is the right answer there
-// because the editor resolves them against its own theme — but an SVG needs a literal
-// colour, and there is no API to read a resolved ThemeColor's value. So tokens get a
-// concrete hex per theme kind here.
+// Every hue the server sends is a literal `#RRGGBB` — user palettes, the deterministic
+// ramps, the Architecture Lens's layer hues, and both greys (PLAN C1). There used to be a
+// THEME_ROLE_HEX table here translating opencode theme-role tokens ("info", "textMuted") to
+// per-theme hexes, mirrored by a THEME_ROLE_COLORS table in extension.ts that translated the
+// same tokens to VSCode ThemeColor ids. The two disagreed with each other *and* with the TUI
+// — "interface" was #3794FF here and #56b6c2 in the TUI — which is exactly the mismatch C1
+// removed by making the server ship colour rather than a name for a colour.
 //
-// These track THEME_ROLE_COLORS in extension.ts: same tokens, same intent, one resolved to
-// a colour id and one to a value. Changing a token in either place means changing both.
-export const THEME_ROLE_HEX: Record<string, { light: string; dark: string }> = {
-  // The Architecture Lens's layer hues (semantics.ts LAYER_HUE), matched to VSCode's own
-  // charts.* defaults for the corresponding role so the chip and the gutter agree.
-  info: { light: "#1A85FF", dark: "#3794FF" },
-  success: { light: "#388A34", dark: "#89D185" },
-  warning: { light: "#BF8803", dark: "#CCA700" },
-  accent: { light: "#652D90", dark: "#B180D7" },
-  error: { light: "#A1260D", dark: "#F14C4C" },
-  primary: { light: "#0066B8", dark: "#3794FF" },
-  // NONE_HUE — "painted, but not into this Lens's vocabulary". Must read as a deliberate
-  // grey rather than as absence, so it sits mid-way between the two theme backgrounds.
-  textMuted: { light: "#8C8C8C", dark: "#7A7A7A" },
-  // UNTAGGED_HUE — "non-code". Dimmer than textMuted, closer to the background, because it
-  // is the one grey that genuinely means "nothing to see".
-  border: { light: "#C4C4C4", dark: "#4A4A4A" },
-}
+// NONE_HUE from lenses.ts. Duplicated as a literal rather than imported because this file is
+// bundled into the extension and deliberately has no dependency on the server package; it is
+// only ever a fallback for a hue the server didn't send, since "Other" arrives over the wire
+// with this exact value on it.
+const MUTED_HEX = "#8A8A8A"
 
-// The grey a suppressed facet (PLAN O4) and an off-legend facet both fall back to.
-const MUTED = "textMuted"
-
-export function hexFor(hue: string | undefined, theme: Theme): string {
-  if (hue?.startsWith("#")) return hue
-  const role = THEME_ROLE_HEX[hue ?? MUTED] ?? THEME_ROLE_HEX[MUTED]!
-  return role[theme]
+export function hexFor(hue: string | undefined): string {
+  return hue?.startsWith("#") ? hue : MUTED_HEX
 }
 
 export interface SegmentOptions {
   readonly layout: ChipLayout
-  readonly theme: Theme
   // Facets toggled off in the legend. A suppressed facet greys **in place** rather than
   // being dropped: keeping its area is what lets two rows stay comparable, which is the
   // whole reason to filter rather than to search (PLAN O4).
@@ -121,8 +103,8 @@ export function chipSegments(
     const suppressed = id !== undefined && opts.suppressed?.has(id)
     // An id outside the legend is "Other" (NONE_FACET is appended to `facets` but never
     // appears in the legend), which greys for the same reason a suppressed facet does.
-    const hue = suppressed ? MUTED : legend.find((e) => e.facet === id)?.color
-    colored.push({ color: hexFor(hue, opts.theme), p: w.p })
+    const hue = suppressed ? MUTED_HEX : legend.find((e) => e.facet === id)?.color
+    colored.push({ color: hexFor(hue), p: w.p })
   }
   if (colored.length === 0) return []
 
@@ -259,9 +241,10 @@ function round(n: number): number {
 }
 
 // Identity of a rendered chip, for the icon cache. Two nodes with the same segments get the
-// same URI and VSCode reuses the image.
-export function chipKey(segments: ReadonlyArray<Segment>, layout: ChipLayout, theme: Theme): string {
-  return `${layout}:${theme}:${segments.map((s) => `${s.color}@${round(s.frac)}`).join(",")}`
+// same URI and VSCode reuses the image. Theme isn't part of the identity: it selects the
+// outline inside chipSvg, and one cache entry holds the {light,dark} pair.
+export function chipKey(segments: ReadonlyArray<Segment>, layout: ChipLayout): string {
+  return `${layout}:${segments.map((s) => `${s.color}@${round(s.frac)}`).join(",")}`
 }
 
 // The hover text: the full breakdown, which is the detail the chip necessarily rounds off.

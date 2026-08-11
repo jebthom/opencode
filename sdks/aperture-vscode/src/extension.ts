@@ -66,25 +66,24 @@ const SHADES: ReadonlyArray<{ min: number; glyph: string }> = [
   { min: 0, glyph: "░" },
 ]
 
-// A facet's `hue` is either a hex string (`#RRGGBB`, user/deterministic palettes) or an
-// opencode theme-role token (the built-in Architecture Lens and the `none`/grey facets).
-// The TUI resolves tokens against its loaded theme; we can't, so we map each known token to
-// the nearest VSCode ThemeColor so the colour still adapts to the editor's theme. Unknown
-// tokens resolve to undefined and are skipped (not painted).
-// The hue a facet takes while it is filtered out of the legend (PLAN O4). The same token
+// The hue a facet takes while it is filtered out of the legend (PLAN O4). The same value
 // chip.ts falls back to, so the tree chip, the Explorer pip and the gutter stripe all grey
-// to one colour — and one the TUI also reads as "off" rather than as a facet of its own.
-const SUPPRESSED_HUE = "textMuted"
+// to one colour — and the one the TUI also reads as "off" rather than as a facet of its own.
+// This is NONE_HUE from the server's lenses.ts, duplicated as a literal because the
+// extension bundle deliberately has no dependency on the server package.
+const SUPPRESSED_HUE = "#8A8A8A"
 
-const THEME_ROLE_COLORS: Record<string, string> = {
-  info: "charts.blue",
-  success: "charts.green",
-  warning: "charts.yellow",
-  accent: "charts.purple",
-  error: "charts.red",
-  textMuted: "descriptionForeground",
-  border: "descriptionForeground",
-}
+// A THEME_ROLE_COLORS table used to live here, mapping opencode theme-role tokens
+// ("info", "textMuted") onto VSCode ThemeColor ids, with a parallel THEME_ROLE_HEX in
+// chip.ts mapping the same tokens onto literal hexes. They disagreed with each other and
+// with the TUI: `textMuted` and `border` both landed on `descriptionForeground` here, so
+// "Other" and "Non-code" were one colour in the gutter and two in the chips, while
+// `primary` was missing entirely and simply went unpainted.
+//
+// PLAN C1 removed the whole class of bug by having the server ship a literal hex for every
+// facet colour — see the note on PALETTES in packages/opencode/src/aperture/lenses.ts. A
+// non-hex hue is now a bug or a version skew, and `resolveHue` leaves it unpainted rather
+// than guessing at a colour the TUI isn't showing.
 
 // One decoration type per hex color, created lazily and reused. Cleared (set to an empty
 // range list) on every repaint for colors not present this pass, so stale strips vanish.
@@ -114,10 +113,8 @@ export function activate(context: vscode.ExtensionContext) {
 
   // ---- gutter painting -----------------------------------------------------
 
-  function resolveHue(hue: string): string | vscode.ThemeColor | undefined {
-    if (hue.startsWith("#")) return hue
-    const role = THEME_ROLE_COLORS[hue]
-    return role ? new vscode.ThemeColor(role) : undefined
+  function resolveHue(hue: string): string | undefined {
+    return hue.startsWith("#") ? hue : undefined
   }
 
   // Keyed by the raw hue string (hex or token), so a token and a hex never collide and
@@ -997,14 +994,14 @@ export type FacetWeight = { f: number; p: number }
 export type LegendEntry = { facet: string; label: string; color: string }
 
 // A facet's colour as a ThemeColor. FileDecoration.color accepts only a colour *id* — there
-// is no runtime API to hand VSCode a hex — so the palette hexes are contributed as ids in
-// package.json (`#4E79A7` → `aperture.c4E79A7`, see script/gen-colors.ts). That's what keeps
-// the Explorer pip the Lens's *actual* legend hue rather than an approximation of it.
-// Theme-role tokens have no hex to match and fall through to the editor's own colours.
+// is no runtime API to hand VSCode a hex — so every hex Aperture can emit is contributed as
+// an id in package.json (`#D7005F` → `aperture.cD7005F`, see script/gen-colors.ts). That's
+// what keeps the Explorer pip the Lens's *actual* legend hue rather than an approximation.
+// Since C1 that covers the whole colour universe, greys included; a non-hex hue is version
+// skew with an older server and goes unpainted rather than being guessed at.
 export function themeColorFor(hue: string): vscode.ThemeColor | undefined {
-  if (hue.startsWith("#")) return new vscode.ThemeColor(`aperture.c${hue.slice(1).toUpperCase()}`)
-  const role = THEME_ROLE_COLORS[hue]
-  return role ? new vscode.ThemeColor(role) : undefined
+  if (!hue.startsWith("#")) return undefined
+  return new vscode.ThemeColor(`aperture.c${hue.slice(1).toUpperCase()}`)
 }
 
 // Reduce a file's facet mix to the one colour + one glyph a FileDecoration can carry.
@@ -1037,9 +1034,9 @@ export function decorationFrom(
   return {
     badge: SHADES.find((s) => chosen.p >= s.min)!.glyph,
     // "Other" (and anything else outside the legend) has no legend colour; fall back to the
-    // muted role the TUI greys it with rather than leaving it uncoloured and indistinguishable
+    // grey the TUI paints it with rather than leaving it uncoloured and indistinguishable
     // from an unpainted file.
-    color: themeColorFor(hue ?? "textMuted"),
+    color: themeColorFor(hue ?? SUPPRESSED_HUE),
     tooltip: weights.map((w) => `${labelOf(w.f)} ${w.p}%`).join(" · "),
   }
 }

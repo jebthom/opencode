@@ -178,8 +178,9 @@ const LEGEND_SAFETY_PAD = 2
 // is filtered would be a bug that shows up exactly when the feature is in use.
 const LEGEND_RESET = "↺"
 // The hue a facet takes while it is filtered out of the legend (O4). Must match
-// SUPPRESSED_HUE in the VSCode extension (and MUTED in its chip.ts) — one facet greying to
-// two different colours across the two surfaces would read as a bug in one of them.
+// SUPPRESSED_HUE in extension.ts and MUTED_HEX in chip.ts — one facet greying to two
+// different colours across the two surfaces would read as a bug in one of them. Since C1
+// all three are the same literal hex rather than a token each surface resolves for itself.
 const SUPPRESSED_HUE = NONE_HUE
 // Cells moved per wheel notch when we redirect a vertical wheel into horizontal
 // scroll. Blocks are ~10 cols wide, so 1 cell/notch (the raw terminal delta) feels
@@ -527,7 +528,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   // SUPPRESSED_HUE is NONE_HUE, not the dimmer UNTAGGED_HUE: a facet you turned off is
   // still *code*, so it should sit where "Other" sits rather than dropping to the grey that
   // means "nothing to see here". It also has to be the grey the VSCode extension uses (see
-  // SUPPRESSED_HUE in extension.ts / MUTED in chip.ts) — the same facet greying to two
+  // SUPPRESSED_HUE in extension.ts / MUTED_HEX in chip.ts) — the same facet greying to two
   // different colours across the two surfaces would read as a bug in one of them.
   const colorByFacet = createMemo(() => {
     const off = suppressed()

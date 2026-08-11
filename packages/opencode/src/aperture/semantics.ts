@@ -5,32 +5,38 @@
 //
 // The structure of the graph is deterministic; this is the *paint*. Each file
 // node is painted with one fixed layer, and `LAYER_HUE` maps that layer to a
-// named theme color. The renderer already resolves a node's `hue` against the
-// active theme (aperture.tsx `hueColor`), so painting a node is just a matter
-// of storing the layer's theme-key here — no renderer-side color logic.
+// literal hex. The renderer resolves a node's `hue` (aperture.tsx `hueColor`)
+// and passes hex straight through, so painting a node is just a matter of
+// storing the colour here — no renderer-side color logic.
 
 // Fixed enum → predictable, stable hues and a legend that never reflows. Ordered
 // roughly outside-in (what the program presents → what it runs on).
 export const LAYERS = ["interface", "application", "domain", "data", "infrastructure"] as const
 export type Layer = (typeof LAYERS)[number]
 
-// Each layer maps to a distinct key on TuiThemeCurrent (packages/plugin/src/tui.ts).
-// We deliberately use the theme's *qualitative* status roles (info/success/warning/
-// accent/error ≈ blue/green/yellow/purple/red) rather than primary/secondary: those
-// two are tuned as low-contrast siblings in most themes and were perceptually
-// colliding (interface↔infra, application↔data). The status rainbow is kept
-// mutually distinct by virtually every theme. These strings MUST stay valid theme
-// keys — `hueColor` falls back to a structural color otherwise.
+// Five of the six categorical palette hues, in palette order minus amber. Written as
+// literals rather than imported because lenses.ts imports *this* file — the test
+// "architecture layer hues are drawn from the categorical palette" is what keeps the two
+// honest, so change these only by copying from PALETTES.categorical in lenses.ts.
+//
+// These were theme-role keys (info/success/warning/accent/error) until C1. The roles
+// resolved against whatever theme each surface happened to have, so "interface" was cyan
+// #56b6c2 in the TUI and blue #3794FF in the VSCode chip — the Architecture Lens was the
+// worst cross-surface mismatch in the product. Literal hex ends that: see the note on
+// PALETTES in lenses.ts for why every facet colour is now a fixed xterm-256 cell.
 export const LAYER_HUE: Record<Layer, string> = {
-  interface: "info", // blue
-  application: "success", // green
-  domain: "warning", // yellow/orange
-  data: "accent", // purple
-  infrastructure: "error", // red
+  interface: "#00AFD7", // cyan
+  application: "#00875F", // emerald
+  domain: "#AFAF00", // chartreuse
+  data: "#5F5FD7", // indigo
+  infrastructure: "#D7005F", // crimson
 }
 
-// Directories aren't a semantic layer — they're structural drill-in targets — but
-// they share the legend, so they get the 6th distinct hue: the theme's brand color.
+// Directories aren't a semantic layer — they're structural drill-in targets — but they
+// share the legend, so they get a 6th hue. Deliberately still a *theme role*, not a
+// palette colour: this one never leaves the TUI (it is a directory-label fallback at
+// aperture.tsx `hueColor`, and the VSCode extension has no directory hue at all), and
+// painting it a facet colour would make directories read as a facet.
 export const DIRECTORY_HUE = "primary"
 export const DIRECTORY_LABEL = "Directory"
 

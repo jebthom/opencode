@@ -63,8 +63,44 @@ function writeDoc(file: string, content: unknown): Effect.Effect<void> {
   }).pipe(Effect.provide(FSUtil.defaultLayer), Effect.ignore)
 }
 
+// Palettes that existed before C1 collapsed the set to two. A stored Lens still names one,
+// so map it forward on read rather than migrating the files: the mapping is total, the
+// colours are re-derived below anyway, and a read-time fix also covers a hand-edited
+// lenses.json. Anything unrecognised falls to "categorical".
+const LEGACY_PALETTES: Record<string, PaletteId> = {
+  pastel: "categorical",
+  dark: "categorical",
+  bright: "categorical",
+  earthy: "categorical",
+  "pastel-ordinal": "ordinal",
+  "bright-ordinal": "ordinal",
+  "dark-ordinal": "ordinal",
+}
+
+function resolvePalette(stored: string | undefined): PaletteId {
+  if (!stored) return "categorical"
+  if (stored in PALETTES) return stored as PaletteId
+  return LEGACY_PALETTES[stored] ?? "categorical"
+}
+
+// Normalise a stored Lens: resolve its palette id, then re-derive every facet colour from
+// (palette, index).
+//
+// Facet colour is *stored* — it was materialised when the Lens was created — which made it
+// a second source of truth that silently went stale whenever the palettes changed. Deriving
+// it on every read makes PALETTES the only place a colour is decided, so a palette edit can
+// never leave an old Lens painting hexes that no longer exist (which is what a straight
+// swap of the palette table would otherwise have done to every Lens on disk).
+function migrate(lens: Lens): Lens {
+  const palette = resolvePalette(lens.palette)
+  return { ...lens, palette, facets: assignColors(palette, lens.facets) }
+}
+
 // All user-defined Lenses for a project (empty when none defined yet).
-const readProject = (directory: string): Effect.Effect<StoredLenses> => readDoc<StoredLenses>(lensesFile(directory), {})
+const readProject = (directory: string): Effect.Effect<StoredLenses> =>
+  readDoc<StoredLenses>(lensesFile(directory), {}).pipe(
+    Effect.map((project) => Object.fromEntries(Object.entries(project).map(([id, lens]) => [id, migrate(lens)]))),
+  )
 
 // Built-in (global) Lenses first, then the project's user-defined ones — but arranged as a
 // DFS forest (orderForest), so a drill-down always sits immediately after the Lens it is
@@ -133,8 +169,7 @@ export const getActive = (directory: string): Effect.Effect<Lens> =>
 
 // Set the active Lens. No validation here (callers resolve the id first);
 // kept minimal so the tools can flip it cheaply.
-export const setActive = (directory: string, id: string): Effect.Effect<void> =>
-  writeDoc(activeFile(directory), { id })
+export const setActive = (directory: string, id: string): Effect.Effect<void> => writeDoc(activeFile(directory), { id })
 
 export interface CreateInput {
   readonly name: string
@@ -269,17 +304,14 @@ export interface UpdateResult {
 // in the project doc, so they're untouched). Returns the updated Lens plus a
 // flag telling the caller whether the previously-inferred facets are now invalid.
 // Returns undefined when the id isn't a project Lens.
-export const update = (
-  directory: string,
-  id: string,
-  input: UpdateInput,
-): Effect.Effect<UpdateResult | undefined> =>
+export const update = (directory: string, id: string, input: UpdateInput): Effect.Effect<UpdateResult | undefined> =>
   Effect.gen(function* () {
     const project = yield* readProject(directory)
     const prev = project[id]
     if (!prev) return undefined
 
-    const palette = input.palette ?? prev.palette ?? "pastel"
+    // `prev` came through readProject, so its palette is already normalised.
+    const palette = input.palette ?? prev.palette ?? "categorical"
     const facets = input.facets ? resolveFacets(palette, input.facets, prev.facets) : prev.facets
     if (facets.length === 0) return yield* Effect.die(new Error("a Lens needs at least one facet"))
     if (facets.length > MAX_FACETS)
@@ -291,9 +323,10 @@ export const update = (
     const prompt = input.prompt ?? prev.prompt
     const context = input.context ?? prev.context
     const prevById = new Map(prev.facets.map((t) => [t.id, t]))
-    const facetsAddedOrRemoved =
-      coloured.length !== prev.facets.length || coloured.some((t) => !prevById.has(t.id))
-    const definitionChanged = coloured.some((t) => prevById.get(t.id) && prevById.get(t.id)!.description !== t.description)
+    const facetsAddedOrRemoved = coloured.length !== prev.facets.length || coloured.some((t) => !prevById.has(t.id))
+    const definitionChanged = coloured.some(
+      (t) => prevById.get(t.id) && prevById.get(t.id)!.description !== t.description,
+    )
     const structural = facetsAddedOrRemoved || definitionChanged || prompt !== prev.prompt || context !== prev.context
 
     const directories = input.directories ? normalizeDirectories(input.directories) : prev.directories
@@ -362,9 +395,10 @@ export const remove = (directory: string, id: string): Effect.Effect<string[]> =
     return removed
   })
 
-// Convenience for the tools: a tiny summary of every palette for the agent to pick
-// from when proposing a schema.
+// Convenience for the tools: a tiny summary of both palettes for the agent to pick from
+// when proposing a schema. `kind` is the whole decision — the two hold the same six
+// colours, so the only question is whether the facets have a rank worth encoding.
 export const paletteSummary = () =>
-  Object.values(PALETTES).map((p) => ({ id: p.id, label: p.label, swatches: p.colors.length }))
+  Object.values(PALETTES).map((p) => ({ id: p.id, label: p.label, kind: p.kind, swatches: p.colors.length }))
 
 export * as ApertureLensStore from "./lens-store"

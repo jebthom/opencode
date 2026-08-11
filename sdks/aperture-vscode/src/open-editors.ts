@@ -83,11 +83,7 @@ export class ApertureOpenEditors implements vscode.TreeDataProvider<EditorNode> 
       const legend = this.ctx.legend()
       const layout = this.ctx.layout()
       const suppressed = this.ctx.suppressed()
-      item.iconPath = this.ctx.icons.for(
-        chipSegments(weights, facets, legend, { layout, theme: "light", suppressed }),
-        chipSegments(weights, facets, legend, { layout, theme: "dark", suppressed }),
-        layout,
-      )
+      item.iconPath = this.ctx.icons.for(chipSegments(weights, facets, legend, { layout, suppressed }), layout)
       item.tooltip = new vscode.MarkdownString(`**${rel}**\n\n${chipTooltip(weights, facets, legend)}`)
     }
     return item

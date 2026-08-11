@@ -16,11 +16,9 @@ export const Parameters = Schema.Struct({
   }),
   name: Schema.optional(Schema.String).annotate({ description: "New Lens name (optional)." }),
   description: Schema.optional(Schema.String).annotate({ description: "New one-line description (optional)." }),
-  palette: Schema.optional(
-    Schema.Literals(["pastel", "dark", "bright", "earthy", "pastel-ordinal", "bright-ordinal", "dark-ordinal"]),
-  ).annotate({
+  palette: Schema.optional(Schema.Literals(["categorical", "ordinal"])).annotate({
     description:
-      "New colour palette (optional). Cosmetic — re-colours without re-painting. Categorical (pastel/dark/bright/earthy) for unordered facets; ordinal (*-ordinal) only when facets have a natural order.",
+      'New colour palette (optional). Cosmetic — re-colours without re-painting. Both hold the same six colours: "categorical" for unordered facets, "ordinal" only when the facets have a natural order, in which case they must be listed lowest-first.',
   }),
   prompt: Schema.optional(Schema.String).annotate({
     description: "New painter prompt (optional). Changing it re-paints the whole repo from scratch.",

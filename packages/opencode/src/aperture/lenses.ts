@@ -11,10 +11,10 @@
 
 import { LAYERS, LAYER_LABEL, LAYER_DESCRIPTION, LAYER_HUE } from "./semantics"
 
-// A single semantic facet within a Lens. `color` is resolved at definition
-// time: a hex string (`#RRGGBB`) for user Lenses drawn from a palette, or a
-// theme-role key (e.g. "info") for the built-in architecture Lens. The
-// renderer's `resolveColor` accepts both, so the painting path is uniform.
+// A single semantic facet within a Lens. `color` is always a literal hex string
+// (`#RRGGBB`), including for the built-in architecture Lens and the two greys —
+// see the note on PALETTES for why no facet colour is a theme-role key any more.
+// The renderer's `resolveColor` still accepts both, so the painting path is uniform.
 export interface Facet {
   readonly id: string
   readonly label: string
@@ -51,8 +51,8 @@ export interface Lens {
   readonly id: string
   readonly name: string
   readonly description: string
-  // The categorical palette user Lenses draw from. Absent for the built-in
-  // architecture Lens, whose colours are theme roles rather than a palette.
+  // The palette user Lenses draw from. Absent for the built-in architecture
+  // Lens, which carries its own fixed slice of the same colours.
   readonly palette?: PaletteId
   // The role/instruction sentence(s) prepended to the generated painter system
   // prompt (the facet list + echo instructions are appended by `buildSystemPrompt`).
@@ -84,22 +84,17 @@ export interface Lens {
 
 // --- palettes --------------------------------------------------------------
 
-// Predefined palettes, split by `kind`. CATEGORICAL palettes (qualitative — pastel, dark,
-// bright, earthy) give each facet a maximally *distinct* hue for unordered categories; each
-// is a different tone so Lenses are partially distinguishable at a glance. ORDINAL palettes
-// (pastel/bright/dark-ordinal) instead run a *cool→warm spectral ramp* so a facet's colour
-// encodes its rank — for facet sets that have a natural order (few→many, old→new, low→high).
-// Six colours each caps a Lens at MAX_FACETS facets. Fixed hex (theme-independent) — the
-// distinctiveness across palettes is the point and can't survive being remapped onto a
-// theme's handful of roles.
-export type PaletteId =
-  | "pastel"
-  | "dark"
-  | "bright"
-  | "earthy"
-  | "pastel-ordinal"
-  | "bright-ordinal"
-  | "dark-ordinal"
+// There are exactly two palettes, and they are the *same six colours* in two orders.
+// CATEGORICAL gives each facet a maximally distinct hue for unordered categories;
+// ORDINAL runs the identical set as a cool→warm ramp so a facet's colour encodes its
+// rank (few→many, old→new, low→high). Six colours caps a Lens at MAX_FACETS facets.
+//
+// One set, not seven, because hue *is* the encoding and it has to mean the same thing on
+// every surface — the TUI legend, the VSCode gutter, the Explorer pips, the tree chips.
+// Every extra palette was another chance for two colours to collide (the old `pastel` had
+// two that were literally identical in a 256-colour terminal) and another 6 hexes for the
+// extension to mirror. See the note below PALETTES for the rule that keeps this honest.
+export type PaletteId = "categorical" | "ordinal"
 
 export const MAX_FACETS = 6
 
@@ -110,14 +105,24 @@ export const MAX_FACETS = 6
 // content hash) so those files aren't re-painted every sweep. The two greys below let
 // the renderer tell it apart from genuinely unpainted/non-code files.
 export const NONE_FACET = "none"
-// "Other — not this Lens" (code the painter judged unrelated). Theme role key,
-// resolved client-side; deliberately the more *visible* grey since it's meaningful
-// context you may still want to read.
-export const NONE_HUE = "textMuted"
+// "Other — not this Lens" (code the painter judged unrelated). Deliberately the more
+// *visible* grey since it's meaningful context you may still want to read. Literal hex
+// (xterm-256 grey-ramp idx 245), not a theme role: these two were the worst offenders for
+// cross-surface drift — the TUI resolved them against the opencode theme while VSCode
+// collapsed *both* onto `descriptionForeground`, so "Other" and "Non-code" were the same
+// colour in the gutter and different in the TUI.
+//
+// Note this is #8A8A8A and not the obvious mid-grey #808080. #808080 appears *twice* in the
+// xterm-256 table — grey-ramp idx 244 and system idx 8 — and a quantiser picking the lower
+// index lands it in the system range, which is precisely the range a terminal colour theme
+// overrides (Solarized paints idx 8 a slate blue). "Other" would then not be grey at all,
+// and would not match VSCode. One ramp step up is unambiguous, and happens to sit further
+// from UNTAGGED_HUE as well (ΔE 26.4 rather than 22.1).
+export const NONE_HUE = "#8A8A8A"
 export const NONE_LABEL = "Other"
 // Genuinely unpainted / non-code (no store entry — specs, assets, not-yet-swept). The
-// dimmer grey so it recedes furthest behind the feature you're exploring.
-export const UNTAGGED_HUE = "border"
+// dimmer grey so it recedes furthest behind the feature you're exploring (ramp idx 238).
+export const UNTAGGED_HUE = "#444444"
 export const UNTAGGED_LABEL = "Non-code"
 
 export interface Palette {
@@ -130,64 +135,57 @@ export interface Palette {
   readonly colors: ReadonlyArray<string>
 }
 
-// Palette colours must stay legible in a 256-colour terminal (COLORTERM unset), not just
-// truecolor: the renderer's RGB is quantised to the xterm-256 palette, and a colour that
-// is both dark *and* low-saturation snaps onto the grey ramp — where it reads as (and
-// collides with) the "Other"/Non-code greys (NONE_HUE/UNTAGGED_HUE). The safe move for a
-// muted look is to sit each colour on an exact colour-*cube* entry (channels drawn from
-// {0,95,135,175,215,255}) with at least two distinct levels, so it can never round to grey.
-// The "no ... collapses to grey" test in lenses.test.ts guards this.
+// THE RULE: every colour Aperture can ever paint — these six, both greys, and every
+// built-in ramp entry below — must be an *exact* xterm-256 palette entry. Cube cells have
+// all three channels drawn from {0,95,135,175,215,255}; grey-ramp cells are 8+10k.
+//
+// Why exactness and not merely "distinct enough": a non-truecolor terminal quantises our
+// RGB to its nearest palette entry, and a colour that already *is* an entry quantises to
+// itself — distance zero. So the colour a 256-colour terminal shows is bit-identical to
+// the colour a truecolor terminal shows, which is bit-identical to the hex VSCode paints
+// in the gutter, the Explorer pip and the tree chip. Hue means one thing everywhere, with
+// no capability detection and nothing to reconcile at render time.
+//
+// It also makes the terminal's own colour theme irrelevant. OpenTUI queries only indices
+// 0-15 over OSC 4 (NATIVE_PALETTE_QUERY_SIZE = 16) and fills 16-255 from the standard cube
+// regardless, so a Solarized/Nord/Dracula user only ever perturbs the 16 system slots —
+// and an exact cube cell is at distance 0 from itself, which no perturbed slot can beat.
+//
+// The old rule ("don't land on the grey ramp") was too weak: it checked each colour against
+// grey but never against the *other five*, and `pastel`'s #F7C8A0 and #F5E1A4 both
+// quantised to idx 223 — the same colour, on any 256-colour terminal. That was the hue
+// collapse participants reported. lenses.test.ts now guards exactness *and* a minimum
+// pairwise CIEDE2000 across the palette plus both greys.
+//
+// Changing a colour here means re-running `bun sdks/aperture-vscode/script/gen-colors.ts`.
+const CATEGORICAL = [
+  "#D7005F", // 161 crimson
+  "#AF5F00", // 130 amber
+  "#AFAF00", // 142 chartreuse
+  "#00875F", //  29 emerald
+  "#00AFD7", //  38 cyan
+  "#5F5FD7", //  62 indigo
+] as const
+
 export const PALETTES: Record<PaletteId, Palette> = {
-  pastel: {
-    id: "pastel",
-    label: "Pastel",
+  // Min pairwise CIEDE2000 among the six = 32.3, and ≥24.5 from either grey. Chosen by
+  // max-min dispersion search over the 216 cube cells, constrained to L* 45-75 and C* 30-75
+  // so no colour is so dark it reads as background or so pale it reads as the "Other" grey.
+  categorical: {
+    id: "categorical",
+    label: "Categorical",
     kind: "categorical",
-    colors: ["#A8D5BA", "#F7C8A0", "#B5C7EB", "#F4B8C4", "#E2C2E9", "#F5E1A4"],
+    colors: [...CATEGORICAL],
   },
-  // Muted-but-not-grey in 256-colour: every entry lands on an exact dark colour-cube cell
-  // (idx 131/94/65/30/61/96), spanning a full hue wheel while staying low-luminance.
-  dark: {
-    id: "dark",
-    label: "Dark",
-    kind: "categorical",
-    colors: ["#AF5F5F", "#875F00", "#5F875F", "#008787", "#5F5FAF", "#875F87"],
-  },
-  bright: {
-    id: "bright",
-    label: "Bright",
-    kind: "categorical",
-    colors: ["#4E79A7", "#F28E2B", "#59A14F", "#E15759", "#B07AA1", "#EDC948"],
-  },
-  // #5B6C5D (slot 5) previously quantised to grey rgb(98,98,98); replaced with a muted
-  // slate that lands on an exact cube cell and stays clear of the other five earth tones.
-  earthy: {
-    id: "earthy",
-    label: "Earthy",
-    kind: "categorical",
-    colors: ["#8C7A5B", "#A65E2E", "#6B8E5A", "#C2A878", "#5F5F87", "#9C6B4F"],
-  },
-  // Ordinal ramps — cool (indigo) → warm (red) so colour position reads as rank. Three tonal
-  // registers mirroring the categorical trio. All 256-safe (no colour hits the grey ramp).
-  "pastel-ordinal": {
-    id: "pastel-ordinal",
-    label: "Pastel (ordinal)",
+  // The same six reversed: Lab hue rotates monotonically 299° → 233° → 163° → 103° → 64° → 8°,
+  // a clean cool→warm ramp, so a facet's *position* in the ramp reads as its rank. Sharing
+  // the categorical set keeps the whole product down to eight hexes, which is what lets the
+  // VSCode extension contribute one colour id per hue instead of approximating.
+  ordinal: {
+    id: "ordinal",
+    label: "Ordinal (ranked)",
     kind: "ordinal",
-    colors: ["#8E9BD9", "#79C7C1", "#9BCF8F", "#EFE08F", "#F3C08A", "#EB9A9A"],
-  },
-  // Vivid cool→warm spectrum; the same ramp the built-in "Edit recency" heat-map Lens paints
-  // (RECENCY_COLORS below is derived from this, so the two never drift).
-  "bright-ordinal": {
-    id: "bright-ordinal",
-    label: "Bright (ordinal)",
-    kind: "ordinal",
-    colors: ["#4E5BA6", "#3AAFA9", "#59A14F", "#EDC948", "#F28E2B", "#E15759"],
-  },
-  // Dark cool→warm ramp on exact colour-cube cells (256-safe by construction).
-  "dark-ordinal": {
-    id: "dark-ordinal",
-    label: "Dark (ordinal)",
-    kind: "ordinal",
-    colors: ["#5F5FAF", "#008787", "#5F875F", "#87875F", "#875F00", "#AF5F5F"],
+    colors: [...CATEGORICAL].reverse(),
   },
 }
 
@@ -205,10 +203,7 @@ export function isPaletteId(value: unknown): value is PaletteId {
 
 // Pair each facet with the palette colour at its index. Facets beyond the palette
 // length wrap (callers should enforce MAX_FACETS, but wrapping keeps it total).
-export function assignColors(
-  palette: PaletteId,
-  facets: ReadonlyArray<Omit<Facet, "color">>,
-): Facet[] {
+export function assignColors(palette: PaletteId, facets: ReadonlyArray<Omit<Facet, "color">>): Facet[] {
   const colors = PALETTES[palette].colors
   return facets.map((facet, i) => ({ ...facet, color: colors[i % colors.length]! }))
 }
@@ -217,14 +212,15 @@ export function assignColors(
 
 export const ARCHITECTURE_ID = "architecture"
 
-// The original architectural-layer vocabulary, expressed as a Lens. Its facet
-// ids are the layer names and its colours are the theme-role keys (LAYER_HUE), so
-// it keeps its existing theme-adaptive look. Global scope: shared across projects
-// and the base we extend default schemas from later.
+// The original architectural-layer vocabulary, expressed as a Lens. Its facet ids are the
+// layer names and its colours are five of the six categorical palette hues (LAYER_HUE) —
+// literal hex like every other Lens, so it renders the same in the TUI and in VSCode.
+// Global scope: shared across projects and the base we extend default schemas from later.
 export const ARCHITECTURE: Lens = {
   id: ARCHITECTURE_ID,
   name: "Architectural layer",
-  description: "Classifies each file by its architectural layer (interface, application, domain, data, infrastructure).",
+  description:
+    "Classifies each file by its architectural layer (interface, application, domain, data, infrastructure).",
   prompt: "You classify each source file by its architectural layer in a codebase.",
   scope: "global",
   facets: LAYERS.map((layer) => ({
@@ -252,11 +248,11 @@ export const CHANGE_FACET_IDS = ["change-1", "change-10", "change-25", "change-5
 // Upper edges of the first four buckets; a churn below edge `i` lands in bucket `i`, and
 // anything at/above the last edge lands in the final (100+) bucket.
 const CHANGE_EDGES = [10, 25, 50, 100] as const
-// Warm heat ramp (NOT the cool→warm ordinal ramps): different warm shades of the original
-// "Changed" amber, running pale gold → red as the change grows, so magnitude reads as heat.
-// Every colour sits on an exact 256-colour cube cell (channels from {0,95,135,175,215,255})
-// with ≥2 distinct levels, so none can quantise onto the grey ramp (see the PALETTES note).
-const CHANGE_COLORS = ["#FFD787", "#FFAF5F", "#FF8700", "#FF5F00", "#D70000"] as const
+// Heat ramp, cold→hot as the change grows, so magnitude reads as temperature. Taken as the
+// warm five sixths of the ordinal palette rather than invented: keeping every ramp inside
+// the one eight-colour universe is what lets the VSCode extension contribute a colour id
+// per hue (see the PALETTES note), and it can't drift from the palette it's sliced from.
+const CHANGE_COLORS = PALETTES.ordinal.colors.slice(1) as ReadonlyArray<string>
 const CHANGE_LABELS = ["< 10 lines", "10–24 lines", "25–49 lines", "50–99 lines", "100+ lines"] as const
 
 // Bucket a changed file's line churn (additions + deletions vs HEAD) into a CHANGE_FACET_IDS
@@ -269,7 +265,8 @@ export function changeBucketIndex(lines: number): number {
 export const GIT_CHANGED: Lens = {
   id: GIT_CHANGED_ID,
   name: "Changed since last commit",
-  description: "Buckets files with uncommitted changes by how many lines changed (few = pale, many = hot); the rest recede.",
+  description:
+    "Buckets files with uncommitted changes by how many lines changed (few = pale, many = hot); the rest recede.",
   prompt: "",
   scope: "global",
   deterministic: "git-changed",
@@ -280,7 +277,7 @@ export const GIT_CHANGED: Lens = {
       description: `File has ${CHANGE_LABELS[i]!.toLowerCase()} of uncommitted working-tree changes.`,
       color: CHANGE_COLORS[i]!,
     })),
-    { id: "unchanged", label: "Unchanged", description: "File matches the last commit.", color: "textMuted" },
+    { id: "unchanged", label: "Unchanged", description: "File matches the last commit.", color: NONE_HUE },
   ],
 }
 
@@ -294,9 +291,9 @@ export const MTIME_RECENCY_ID = "edit-recency"
 
 // Facet ids in oldest→newest order; the single source of truth for index↔id mapping shared
 // with the deterministic compute. Colours run cool→warm so newest = red — this heat-map ramp
-// IS the shared "bright-ordinal" palette (kept in one place so the two can't drift).
+// IS the shared ordinal palette (kept in one place so the two can't drift).
 export const RECENCY_FACET_IDS = ["recency-0", "recency-1", "recency-2", "recency-3", "recency-4", "recency-5"] as const
-const RECENCY_COLORS = PALETTES["bright-ordinal"].colors
+const RECENCY_COLORS = PALETTES.ordinal.colors
 const RECENCY_LABELS = ["Oldest", "Older", "Mid-age", "Recent", "Newer", "Newest"] as const
 
 export const MTIME_RECENCY: Lens = {
@@ -337,7 +334,10 @@ export const BUS_FACTOR_ID = "bus-factor"
 // mapping shared with the deterministic compute). Note the ids are not contiguous: they
 // name the *lower bound* of each bucket (bus-3 covers 3–4, bus-5 covers 5+).
 export const BUS_FACTOR_FACET_IDS = ["bus-1", "bus-2", "bus-3", "bus-5"] as const
-const BUS_FACTOR_COLORS = ["#E15759", "#F28E2B", "#59A14F", "#4E5BA6"] as const
+// Warm→cool, so a single-author file glows and a well-shared one recedes. Four picks out of
+// the six-step ordinal ramp (crimson, amber, emerald, cyan) rather than four fresh hexes —
+// same reason as CHANGE_COLORS: one closed colour universe across every Lens.
+const BUS_FACTOR_COLORS = [5, 4, 2, 1].map((i) => PALETTES.ordinal.colors[i]!)
 const BUS_FACTOR_LABELS = ["1 author", "2 authors", "3–4 authors", "5+ authors"] as const
 const BUS_FACTOR_DESCRIPTIONS = [
   "Only one author has ever touched this file — highest bus-factor risk.",
@@ -497,9 +497,7 @@ export function inDomain(
 // The human labels of the parent facets a drill-down is scoped to (NONE_FACET reads as
 // "Other"). Used in the painter's domain note and in the Lens listing.
 export function scopeLabels(parent: Lens, facets: ReadonlyArray<string>): string[] {
-  return facets.map((id) =>
-    id === NONE_FACET ? NONE_LABEL : (parent.facets.find((f) => f.id === id)?.label ?? id),
-  )
+  return facets.map((id) => (id === NONE_FACET ? NONE_LABEL : (parent.facets.find((f) => f.id === id)?.label ?? id)))
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -562,7 +560,9 @@ export function buildSystemPrompt(lens: Lens, parent?: Lens): string {
       ? [
           `Every file below already falls under ${scopeLabels(parent, lens.parent.facets)
             .map((l) => `"${l}"`)
-            .join(", ")} of the "${parent.name}" Lens. That judgement is already made and files outside it are never shown to you, so do not re-apply or second-guess it — classify each file by which facet below it belongs to *within* that set.`,
+            .join(
+              ", ",
+            )} of the "${parent.name}" Lens. That judgement is already made and files outside it are never shown to you, so do not re-apply or second-guess it — classify each file by which facet below it belongs to *within* that set.`,
         ]
       : []
   return [
