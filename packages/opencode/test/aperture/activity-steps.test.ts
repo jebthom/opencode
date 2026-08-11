@@ -244,4 +244,22 @@ describe("step contents", () => {
   test("an empty turn yields no lanes", () => {
     expect(stepsForTurn(turn([])).lanes).toEqual([])
   })
+
+  test("titles accumulate deduped, in first-seen order", () => {
+    // The hover line reads these. For `bash` the title is the model-written description the
+    // chat already renders, so nothing is generated to produce it.
+    const step = stepsForTurn(
+      turn([
+        { ...entry("read", { path: "a.ts" }), title: "Read a.ts" },
+        { ...entry("read", { path: "b.ts" }), title: "Read b.ts" },
+        { ...entry("read", { path: "a.ts" }), title: "Read a.ts" },
+      ]),
+    ).lanes[0]!.steps[0]!
+    expect(step.titles).toEqual(["Read a.ts", "Read b.ts"])
+  })
+
+  test("a step whose entries carry no title has none, rather than empty strings", () => {
+    const step = stepsForTurn(turn([entry("run")])).lanes[0]!.steps[0]!
+    expect(step.titles).toEqual([])
+  })
 })

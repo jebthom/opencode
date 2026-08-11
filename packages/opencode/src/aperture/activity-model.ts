@@ -40,6 +40,9 @@ export interface PartLike {
     readonly input?: Record<string, unknown>
     readonly metadata?: Record<string, unknown>
     readonly time?: { readonly start?: number }
+    // The tool's own one-line description of what it did. For `bash` this is the
+    // model-written summary (tool/shell.ts sets `title: input.description`).
+    readonly title?: string
   }
   readonly metadata?: Record<string, unknown>
   // Text parts only: set on prompts the *system* injected rather than the user.
@@ -127,6 +130,7 @@ export function deriveTurns(messages: ReadonlyArray<MessageLike>, options: Deriv
         depth,
         callID: part.callID ?? "",
         timestamp: part.state?.time?.start ?? created,
+        ...titleOf(part),
       }
 
       // One apply_patch call changes many files at once, and each of those is a mutation
@@ -192,6 +196,17 @@ function scopeTarget(raw: unknown, directory: string): { target: ApertureActivit
   if (raw === undefined || raw === null || raw === "") return { target: "place", path: "" }
   const rel = toRepoScope(directory, raw)
   return rel === undefined ? undefined : { target: "place", path: rel }
+}
+
+// The tool's own one-line description of what it did, trimmed and capped. Absent on a call
+// that hasn't reported one yet, and omitted entirely rather than sent empty so the wire
+// carries nothing for the tools that have nothing to say.
+function titleOf(part: PartLike): { title?: string } {
+  const title = part.state?.title
+  if (typeof title !== "string") return {}
+  const trimmed = title.trim()
+  if (trimmed === "") return {}
+  return { title: trimmed.slice(0, ApertureActivity.TITLE_MAX) }
 }
 
 // The `display.type` a tool reported on its result ("file" | "directory" for `read`).

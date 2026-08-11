@@ -70,6 +70,11 @@ export type Target = (typeof TARGETS)[number]
 // do that job, since two `Explore` agents share a name. `agent` is the acting agent's
 // name, taken from the assistant message the tool call sits on, so a plan→build switch
 // mid-turn attributes correctly.
+// `title` is the one-line description the tool itself recorded on its completed part —
+// for `bash` that is the model-written summary the chat shows ("Echoes the string foo"),
+// for a read or an edit it is usually the path. It costs nothing to carry: every tool
+// result already persists it (session/processor.ts), so the Activity View's hover line is
+// reading text that exists rather than generating any.
 export interface ActivityEntry {
   readonly path?: string
   readonly action: Action
@@ -79,7 +84,13 @@ export interface ActivityEntry {
   readonly depth: number
   readonly callID: string
   readonly timestamp: number
+  readonly title?: string
 }
+
+// How much of a tool's title to carry. Long enough for a real bash description, short
+// enough that a pathological title can't inflate a response the sidebar refetches every
+// turn.
+export const TITLE_MAX = 120
 
 // All activity recorded under one user prompt. A turn is one *non-synthetic* user
 // message: synthetic ones (tool-result injections, background sub-agent result

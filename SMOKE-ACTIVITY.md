@@ -12,7 +12,12 @@ cd /home/jebthom/projects/opencode && bun dev .
 
 Each block below is a **separate prompt** — paste them one at a time and let each turn
 finish before reading the sidebar. The turn boundary is part of what's under test, so
-don't merge them. Marks: `●` read · `⌕` search · `◆` edit · `■` create · `⚙` run · `↗` fetch.
+don't merge them.
+
+Each row names its action in words (`Read` / `Search` / `Edit` / `Write` / `Run` / `Fetch`).
+A row marked `▸` stands for several targets and **expands** when clicked; a row naming one
+file **opens** it in the editor. Hovering any row fills the two lines under the path with
+detail — for a `Run` step, the description of the command it actually ran.
 
 ---
 
@@ -124,7 +129,7 @@ Do exactly this, in order, nothing else:
 ### 11
 
 ```
-Launch THREE subagents IN PARALLEL, in a single message, using the task tool. Do not read
+Launch THREE explore subagents IN PARALLEL, in a single message, using the task tool. Do not read
 anything yourself.
 - Subagent one: read packages/opencode/src/aperture/treemap.ts and report its exported function names.
 - Subagent two: read packages/opencode/src/aperture/lenses.ts and report its exported constant names.

@@ -820,7 +820,7 @@ changes, ordered cheapest-first so the track degrades gracefully if it is cut sh
   cares which twelve files, but when they do, the answer should be one click away
   rather than a different surface.
 
-- [ ] **5. Hover detail, from the titles we already store.** Two muted lines under
+- [x] **5. Hover detail, from the titles we already store.** Two muted lines under
   the scrollbox, reserved always so the layout cannot jump, showing detail for the
   hovered row: the files a survey step read, the command a `Run` step actually ran,
   the target of a fetch.
@@ -832,6 +832,13 @@ changes, ordered cheapest-first so the track degrades gracefully if it is cut sh
   message store already. Nothing is regenerated and no model is called; `title` just
   has to be carried through the derivation, the wire and the step accumulator, capped
   server-side so a pathological title cannot inflate the response.
+
+**Found by running it.** A `Run` or `Fetch` step drew a full-width bar of untagged grey —
+it has no file, so the band had nothing to paint, and a blank grey bar reads as an
+*unpainted file* rather than as an act that touched none. Fixed by giving a step with no
+files a zero-width band, which frees the row for its title: a shell command now reads
+`Run  Echo smoke-three` inline, and the hover line carries the same text in full. This is
+the case the G2+G3 live pass missed entirely, because it never exercised bash or fetch.
 
 **Not in scope.** Expanding a *mutation* row (it already stands for exactly one file,
 so there is nothing to expand), and a keyboard path to any of this — the sidebar is

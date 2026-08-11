@@ -70,7 +70,16 @@ export interface Step {
   readonly files: ReadonlyArray<StepFile>
   readonly places: ReadonlyArray<StepPlace>
   readonly beats: ReadonlyArray<StepBeat>
+  // The one-line descriptions the tools recorded, deduped in first-seen order and capped.
+  // A single-entry step has one (a `Run` step's is the command's model-written summary);
+  // an aggregated survey step has one per distinct call, which is what its hover line
+  // enumerates. Capped because a survey run is unbounded and the hover shows two lines.
+  readonly titles: ReadonlyArray<string>
 }
+
+// Enough to fill two 36-column hover lines several times over; beyond that the row's `×n`
+// is the honest summary and a longer list would only be truncated.
+const TITLES_MAX = 12
 
 export interface TurnSteps {
   readonly promptedAt: number
@@ -91,6 +100,7 @@ interface Draft {
   readonly files: Map<string, StepFile>
   readonly places: Map<string, StepPlace>
   readonly beats: Map<Action, StepBeat>
+  readonly titles: Set<string>
 }
 
 export function stepsForTurn(turn: Turn): TurnSteps {
@@ -149,6 +159,7 @@ function openDraft(lane: Draft[], entry: ActivityEntry, mode: Mode): Draft {
     files: new Map(),
     places: new Map(),
     beats: new Map(),
+    titles: new Set(),
   }
   lane.push(draft)
   return draft
@@ -156,6 +167,8 @@ function openDraft(lane: Draft[], entry: ActivityEntry, mode: Mode): Draft {
 
 function absorb(step: Draft, entry: ActivityEntry): void {
   step.endedAt = Math.max(step.endedAt, entry.timestamp)
+  // A Set, so a run that read the same file twice doesn't say so twice.
+  if (entry.title !== undefined && step.titles.size < TITLES_MAX) step.titles.add(entry.title)
 
   if (entry.path !== undefined && entry.target === "file") {
     const prev = step.files.get(entry.path)
@@ -184,6 +197,7 @@ function freeze(draft: Draft): Step {
     files: [...draft.files.values()],
     places: [...draft.places.values()],
     beats: [...draft.beats.values()],
+    titles: [...draft.titles],
   }
 }
 

@@ -5212,6 +5212,7 @@ export type ApertureActivityResponses = {
         depth: number
         callID: string
         timestamp: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+        title?: string
       }>
     }>
     files: {

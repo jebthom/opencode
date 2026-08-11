@@ -129,6 +129,9 @@ const ActivityEntrySchema = Schema.Struct({
   depth: Schema.Int,
   callID: Schema.String,
   timestamp: Schema.Number,
+  // The tool's own one-line description, already persisted on its completed part — for
+  // `bash` the model-written summary the chat renders. Nothing is generated to produce it.
+  title: Schema.optional(Schema.String),
 })
 
 // One user turn. A turn is a non-synthetic user message: the synthetic ones (tool-result

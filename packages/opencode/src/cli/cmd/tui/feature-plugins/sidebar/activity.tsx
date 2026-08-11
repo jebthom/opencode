@@ -33,8 +33,10 @@ const id = "internal:sidebar-activity"
 //
 // G0 sized this at 10 on the assumption that a turn's activity was one block; one row per
 // *step* spends rows far faster, and this is the section the user is actually watching.
-// Total contribution is 1 header + ACTIVITY_ROWS (+ the hover lines, once G4.5 lands).
+// Total contribution is 1 header + ACTIVITY_ROWS + HOVER_ROWS.
 const ACTIVITY_ROWS = 20
+// Reserved always, so the layout cannot jump as the pointer crosses rows.
+const HOVER_ROWS = 2
 // The sidebar's drawable width; `files.tsx` already hard-codes 36, so this is the house
 // number rather than a second opinion.
 const SIDEBAR_COLS = 36
@@ -266,6 +268,28 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     void props.api.client.tui.openFile({ path })
   }
 
+  // What the pointer is over, as the lines to print beneath the path (G4.5).
+  //
+  // The text is the tools' own recorded titles wherever they have one — for a `Run` step
+  // that is the model-written description of the command, which is the single most useful
+  // thing this section can say and which the row itself has no room for. Falls back to the
+  // paths when a step predates titles or the tool recorded none.
+  const [hovered, setHovered] = createSignal<string>()
+  const describe = (step: Step): string => {
+    if (step.titles.length > 0) return step.titles.join(" · ")
+    const names = [...step.files.map((f) => f.path), ...step.places.map((p) => p.path || "(repo root)")]
+    return names.length > 0 ? names.join(" · ") : step.agent
+  }
+
+  // The idle line, so the reserved rows are never simply blank: what the section is showing.
+  const summary = () => {
+    if (activity.error) return "activity unavailable"
+    const steps = rows().filter((r) => r.kind === "step").length
+    const turns = rows().filter((r) => r.kind === "turn").length
+    if (steps === 0) return ""
+    return `${steps} step${steps === 1 ? "" : "s"} over ${turns} turn${turns === 1 ? "" : "s"} · click a row to expand or open`
+  }
+
   const empty = () => rows().length === 0
 
   return (
@@ -313,6 +337,8 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                         maxSurvey={maxSurvey}
                         onToggle={() => toggle(it().key)}
                         onOpen={openFile}
+                        onHover={() => setHovered(describe(it().step))}
+                        onLeave={() => setHovered(undefined)}
                       />
                     )}
                   </Match>
@@ -327,6 +353,8 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                         theme={theme}
                         colorsFor={bandColors}
                         onOpen={openFile}
+                        onHover={() => setHovered(it().path || "(repo root)")}
+                        onLeave={() => setHovered(undefined)}
                       />
                     )}
                   </Match>
@@ -334,6 +362,13 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
               )}
             </For>
           </scrollbox>
+          {/* Reserved unconditionally: a hover area that appears and disappears would shift
+              every section below it as the pointer moved. Wrapped to HOVER_ROWS lines and
+              clipped, so a long bash description degrades to its first ~72 characters
+              rather than pushing the sidebar around. */}
+          <box height={HOVER_ROWS} flexShrink={0} overflow="hidden">
+            <text fg={theme().textMuted}>{hovered() ?? summary()}</text>
+          </box>
         </Show>
       </Show>
     </box>
@@ -373,6 +408,8 @@ function StepRow(props: {
   maxSurvey: () => number
   onToggle: () => void
   onOpen: (path: string) => void
+  onHover: () => void
+  onLeave: () => void
 }) {
   const depth = () => props.step.depth
   const verb = () => VERBS[dominantAction(props.step)].padEnd(VERB_COLS)
@@ -390,10 +427,15 @@ function StepRow(props: {
 
   const width = () => {
     const max = bandMax(depth())
+    // No file means no mix to paint, so there is no band — a shell command or a fetch
+    // would otherwise draw a full-width bar of untagged grey, which reads as an unpainted
+    // *file* rather than as an act that touched none. The row spends those columns on its
+    // description instead.
+    if (props.step.files.length === 0) return 0
     if (props.step.mode !== "survey") return max
     const n = props.step.files.length
     const peak = props.maxSurvey()
-    if (n === 0 || peak === 0) return 0
+    if (peak === 0) return 0
     // sqrt so area (not length) carries the comparison — the same idiom the treemap's
     // `scaleCells` uses, so a block and a step read at the same scale.
     return Math.max(BAND_MIN, Math.min(max, Math.round(max * Math.sqrt(n / peak))))
@@ -412,8 +454,12 @@ function StepRow(props: {
   })
 
   // A step with no file to paint (a shell command, a fetch, a run of directory listings)
-  // says what it was in words instead of leaving the row blank.
-  const beatLabel = () => (props.step.places.length > 0 ? "looked around" : props.step.agent)
+  // says what it was in words instead of leaving the row blank. The tool's own recorded
+  // title is the best of those words by far — for a shell command it is the model-written
+  // description the chat renders, so a `Run` row reads "Output the text smoke-three"
+  // rather than naming the agent that happened to run it.
+  const beatLabel = () =>
+    props.step.titles[0] ?? (props.step.places.length > 0 ? "looked around" : props.step.agent)
 
   const click = () => {
     if (expandable()) return props.onToggle()
@@ -422,7 +468,14 @@ function StepRow(props: {
   }
 
   return (
-    <box flexDirection="row" height={1} flexShrink={0} onMouseDown={click}>
+    <box
+      flexDirection="row"
+      height={1}
+      flexShrink={0}
+      onMouseDown={click}
+      onMouseOver={() => props.onHover()}
+      onMouseOut={() => props.onLeave()}
+    >
       <text fg={props.theme().textMuted} wrapMode="none">
         {`${" ".repeat(depth() * INDENT_COLS)}${expandable() ? (props.expanded ? "▾ " : "▸ ") : " ".repeat(SPINE_COLS)}${verb()} `}
       </text>
@@ -458,6 +511,8 @@ function EntryRow(props: {
   theme: () => TuiThemeCurrent
   colorsFor: (paths: ReadonlyArray<string>, width: number) => TuiThemeCurrent["text"][]
   onOpen: (path: string) => void
+  onHover: () => void
+  onLeave: () => void
 }) {
   const width = () => bandMax(props.depth)
   const label = () => (props.place ? (props.path === "" ? "(repo root)" : props.path) : basename(props.path))
@@ -476,6 +531,8 @@ function EntryRow(props: {
       flexShrink={0}
       // A place is a directory or a search scope, not a file the editor can open.
       onMouseDown={() => !props.place && props.onOpen(props.path)}
+      onMouseOver={() => props.onHover()}
+      onMouseOut={() => props.onLeave()}
     >
       <text fg={props.theme().textMuted} wrapMode="none">
         {`${" ".repeat(SPINE_COLS + props.depth * INDENT_COLS)}${VERBS[props.action].padEnd(VERB_COLS)} `}
