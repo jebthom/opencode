@@ -1,6 +1,6 @@
 import type { TuiPlugin, TuiPluginApi, TuiThemeCurrent } from "@opencode-ai/plugin/tui"
 import type { InternalTuiPlugin } from "../../plugin/internal"
-import { createMemo, createResource, createSignal, For, onCleanup, Show } from "solid-js"
+import { createMemo, createResource, createSignal, For, Match, onCleanup, Show, Switch } from "solid-js"
 import { allocateCells, buildGrid, coalesce } from "@/aperture/treemap"
 import { stepsForTurns, stepWeight, type Step, type TurnSteps } from "@/aperture/activity-steps"
 import type { Action, Turn } from "@/aperture/activity"
@@ -25,12 +25,16 @@ const id = "internal:sidebar-activity"
 // (derived server-side from the message store, never recorded), which also ships the legend
 // and the suppressed set, so the sidebar needs no graph fetch of its own.
 
-// G0's budget. The nested scrollbox is not a nicety: the sidebar's own scrollbox is shared
-// by every section, so `stickyScroll` on it would pin the WHOLE sidebar to its bottom.
-// A nested box with an explicit height is the only way this section can stay pinned to its
-// newest step, and it is also what caps its contribution at a constant however long the
-// session runs.
-const ACTIVITY_ROWS = 10
+// G0's budget, doubled in G4. The nested scrollbox is not a nicety: the sidebar's own
+// scrollbox is shared by every section, so `stickyScroll` on it would pin the WHOLE
+// sidebar to its bottom. A nested box with an explicit height is the only way this section
+// can stay pinned to its newest step, and it is also what caps its contribution at a
+// constant however long the session runs.
+//
+// G0 sized this at 10 on the assumption that a turn's activity was one block; one row per
+// *step* spends rows far faster, and this is the section the user is actually watching.
+// Total contribution is 1 header + ACTIVITY_ROWS (+ the hover lines, once G4.5 lands).
+const ACTIVITY_ROWS = 20
 // The sidebar's drawable width; `files.tsx` already hard-codes 36, so this is the house
 // number rather than a second opinion.
 const SIDEBAR_COLS = 36
@@ -38,23 +42,28 @@ const SIDEBAR_COLS = 36
 // point, and the endpoint pages backwards so a long session costs what a fresh one does.
 const ACTIVITY_TURNS = 12
 
-// Row anatomy: spine/indent, the action mark, a space, then the band or label, then `×n`.
+// Row anatomy: spine/indent, the action verb, a space, then the band or label, then `×n`.
 const SPINE_COLS = 2
-const MARK_COLS = 2
 const COUNT_COLS = 5
 const INDENT_COLS = 2
 const BAND_MIN = 2
-const bandMax = (depth: number) => SIDEBAR_COLS - SPINE_COLS - MARK_COLS - COUNT_COLS - depth * INDENT_COLS
+// The verb is padded to a fixed width so the bands line up into a column across rows of
+// different actions. That alignment is what makes two steps comparable at a glance, and it
+// is worth the columns it costs the band.
+const VERB_COLS = 6
+const bandMax = (depth: number) =>
+  SIDEBAR_COLS - SPINE_COLS - VERB_COLS - 1 - COUNT_COLS - depth * INDENT_COLS
 
-// One glyph per action, restoring the vocabulary G1 deleted from the top bar's overlay row.
-// Solid marks for things that changed the repo, outline/领 marks for things that only looked.
-const MARKS: Record<Action, string> = {
-  read: "●",
-  search: "⌕",
-  edit: "◆",
-  create: "■",
-  run: "⚙",
-  fetch: "↗",
+// One word per action (G4). This replaced a glyph set (●⌕◆■⚙↗) inherited from the top bar's
+// deleted overlay row, where horizontal space was scarce enough to justify a legend the
+// reader had to memorise. With the taller budget the words fit, and they need no legend.
+const VERBS: Record<Action, string> = {
+  read: "Read",
+  search: "Search",
+  edit: "Edit",
+  create: "Write",
+  run: "Run",
+  fetch: "Fetch",
 }
 
 // The wire shape of GET /aperture/activity. Declared locally for the same reason the top
@@ -75,6 +84,10 @@ type Row =
   | { kind: "turn"; key: string; promptedAt: number; agent: string }
   | { kind: "lane"; key: string; agent: string; depth: number }
   | { kind: "step"; key: string; step: Step }
+  // One target of an expanded survey step (G4.4), indented a level exactly as a sub-agent
+  // lane is. `path` is undefined for nothing; a place carries no facet mix, so it draws its
+  // name without a band.
+  | { kind: "entry"; key: string; depth: number; path: string; action: Action; count: number; place: boolean }
 
 function View(props: { api: TuiPluginApi; session_id: string }) {
   const [open, setOpen] = createSignal(true)
@@ -126,11 +139,25 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   const suppressed = () => filtered() ?? new Set(data()?.suppressed ?? [])
   const colors = createMemo(() => facetColors(data()?.lens?.legend ?? [], suppressed(), theme()))
 
+  // Which aggregated survey steps the user has opened (G4.4), by row key. Keyed by position
+  // rather than by identity because a refetch rebuilds the steps: position is stable across
+  // a refetch that only appended, which is the common case, and an expansion silently
+  // following a *different* step after history shifted is a smaller surprise than every
+  // expansion snapping shut on each turn boundary.
+  const [expanded, setExpanded] = createSignal<ReadonlySet<string>>(new Set())
+  const toggle = (key: string) =>
+    setExpanded((prev) => {
+      const next = new Set(prev)
+      if (!next.delete(key)) next.add(key)
+      return next
+    })
+
   // Segment every turn, then flatten to drawable rows in reading order: oldest turn first,
   // so the newest work sits at the bottom where stickyScroll pins it.
   const rows = createMemo<Row[]>(() => {
     const turns = data()?.turns ?? []
     const segmented: TurnSteps[] = stepsForTurns(turns)
+    const open = expanded()
     const out: Row[] = []
     segmented.forEach((turn, t) => {
       if (turn.lanes.length === 0) return
@@ -141,7 +168,35 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
         if (lane.depth > 0) {
           out.push({ kind: "lane", key: `t${t}l${l}`, agent: lane.agent, depth: lane.depth })
         }
-        lane.steps.forEach((step, s) => out.push({ kind: "step", key: `t${t}l${l}s${s}`, step }))
+        lane.steps.forEach((step, s) => {
+          const key = `t${t}l${l}s${s}`
+          out.push({ kind: "step", key, step })
+          if (!open.has(key)) return
+          // Files first, then the directories and search scopes — the files are what the
+          // aggregate was hiding, and a place has no band to compare against them anyway.
+          step.files.forEach((file, i) =>
+            out.push({
+              kind: "entry",
+              key: `${key}f${i}`,
+              depth: step.depth + 1,
+              path: file.path,
+              action: file.action,
+              count: file.count,
+              place: false,
+            }),
+          )
+          step.places.forEach((place, i) =>
+            out.push({
+              kind: "entry",
+              key: `${key}p${i}`,
+              depth: step.depth + 1,
+              path: place.path,
+              action: "search",
+              count: place.count,
+              place: true,
+            }),
+          )
+        })
       })
     })
     return out
@@ -165,12 +220,15 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   // floored to 1%. Places contribute nothing by design — a survey step is already an
   // aggregate, and folding a directory's subtree into it would report the mix of code the
   // agent never opened.
-  const stepBands = (step: Step) => {
+  // Takes a path list rather than a step so an expanded child row (one file) and the
+  // aggregate it came from (all of them) reduce through exactly the same arithmetic — the
+  // expansion has to agree with the row it opened, or the affordance undermines the reading.
+  const bandsFor = (paths: ReadonlyArray<string>) => {
     const files = data()?.files
     if (!files) return []
     const totals = new Map<string, number>()
-    for (const file of step.files) {
-      const mix = files[file.path]
+    for (const path of paths) {
+      const mix = files[path]
       if (!mix) continue
       for (const w of mix.w) {
         const facet = facets()[w.f]
@@ -181,17 +239,31 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     return [...totals].map(([key, value]) => ({ key, value }))
   }
 
-  // The colours of one step's band, left to right. Falls back to the untagged grey when the
-  // step touched nothing painted — the honest grey the treemap already draws for un-swept
-  // code, rather than an empty row that reads as a rendering bug.
-  const bandColors = (step: Step, width: number): TuiThemeCurrent["text"][] => {
-    const bands = stepBands(step)
+  // The colours of one band, left to right. Falls back to the untagged grey when nothing
+  // here is painted — the honest grey the treemap already draws for un-swept code, rather
+  // than an empty row that reads as a rendering bug.
+  const bandColors = (paths: ReadonlyArray<string>, width: number): TuiThemeCurrent["text"][] => {
+    const bands = bandsFor(paths)
     if (bands.length === 0) return Array.from({ length: width }, () => resolveColor(theme(), UNTAGGED_HUE))
     const flat: string[] = []
     for (const a of allocateCells(bands, width)) for (let i = 0; i < a.n; i++) flat.push(a.key)
     if (flat.length === 0) return Array.from({ length: width }, () => colors().colorFor(GREY_CELL))
     while (flat.length < width) flat.push(GREY_CELL)
     return flat.map((key) => colors().colorFor(key))
+  }
+
+  // Open a file in the editor — the same call a top-bar file tile makes, so a path opens
+  // the same way whichever Aperture surface the user clicked it in. Logged like a top-bar
+  // click so the study log records the surface a navigation came from. Fire-and-forget:
+  // a failed open must never break a click.
+  const openFile = (path: string) => {
+    void props.api.client.aperture.interaction({
+      sessionID: props.session_id,
+      interaction: "file.open",
+      lens: data()?.lens?.id ?? "",
+      detail: path,
+    })
+    void props.api.client.tui.openFile({ path })
   }
 
   const empty = () => rows().length === 0
@@ -230,14 +302,35 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
           >
             <For each={rows()}>
               {(row) => (
-                <Show when={row.kind === "step"} fallback={<LabelRow row={row} theme={theme} />}>
-                  <StepRow
-                    step={(row as Extract<Row, { kind: "step" }>).step}
-                    theme={theme}
-                    colorsFor={bandColors}
-                    maxSurvey={maxSurvey}
-                  />
-                </Show>
+                <Switch fallback={<LabelRow row={row} theme={theme} />}>
+                  <Match when={row.kind === "step" ? row : undefined}>
+                    {(it) => (
+                      <StepRow
+                        step={it().step}
+                        expanded={expanded().has(it().key)}
+                        theme={theme}
+                        colorsFor={bandColors}
+                        maxSurvey={maxSurvey}
+                        onToggle={() => toggle(it().key)}
+                        onOpen={openFile}
+                      />
+                    )}
+                  </Match>
+                  <Match when={row.kind === "entry" ? row : undefined}>
+                    {(it) => (
+                      <EntryRow
+                        path={it().path}
+                        action={it().action}
+                        count={it().count}
+                        place={it().place}
+                        depth={it().depth}
+                        theme={theme}
+                        colorsFor={bandColors}
+                        onOpen={openFile}
+                      />
+                    )}
+                  </Match>
+                </Switch>
               )}
             </For>
           </scrollbox>
@@ -265,17 +358,31 @@ function LabelRow(props: { row: Row; theme: () => TuiThemeCurrent }) {
   )
 }
 
-// One step, one row: the spine, the action mark, then either a facet band (gathering) or a
+// One step, one row: the spine, the action verb, then either a facet band (gathering) or a
 // named band (a changed file) or a plain label (a command, a fetch).
+//
+// Mouse-down means two different things, and the split is decided by what the row *stands
+// for* rather than by its mode: a row standing for many targets expands (G4.4), a row
+// standing for exactly one file opens it (G4.3). So there is never an ambiguity about what
+// a click will do — a row either has a `▸` or it names a file, never both.
 function StepRow(props: {
   step: Step
+  expanded: boolean
   theme: () => TuiThemeCurrent
-  colorsFor: (step: Step, width: number) => TuiThemeCurrent["text"][]
+  colorsFor: (paths: ReadonlyArray<string>, width: number) => TuiThemeCurrent["text"][]
   maxSurvey: () => number
+  onToggle: () => void
+  onOpen: (path: string) => void
 }) {
   const depth = () => props.step.depth
-  const mark = () => MARKS[dominantAction(props.step)]
+  const verb = () => VERBS[dominantAction(props.step)].padEnd(VERB_COLS)
   const count = () => stepWeight(props.step)
+  const targets = () => props.step.files.length + props.step.places.length
+
+  const expandable = () => props.step.mode === "survey" && targets() > 1
+  // The one file this row stands for, if it stands for exactly one — which covers every
+  // mutation and a single-file gathering step alike.
+  const only = () => (expandable() ? undefined : props.step.files[0]?.path)
 
   // A mutate step holds exactly one file, so it can afford to name it — identity is the
   // whole point of showing a mutation. A survey step names nothing and scales instead.
@@ -297,48 +404,118 @@ function StepRow(props: {
     if (w <= 0) return []
     const label = named()
     const name = label === undefined ? "" : truncate(basename(label), w)
-    const colors = props.colorsFor(props.step, w)
+    const colors = props.colorsFor(
+      props.step.files.map((f) => f.path),
+      w,
+    )
     return Array.from({ length: w }, (_, i) => ({ bg: colors[i]!, ch: name[i] ?? " " }))
   })
 
-  // A pathless step (a shell command, a web fetch) has no band to draw, so it says what it
-  // was in words instead of leaving the row blank.
-  const beatLabel = () => (props.step.files.length === 0 && props.step.places.length > 0 ? "looked around" : undefined)
+  // A step with no file to paint (a shell command, a fetch, a run of directory listings)
+  // says what it was in words instead of leaving the row blank.
+  const beatLabel = () => (props.step.places.length > 0 ? "looked around" : props.step.agent)
+
+  const click = () => {
+    if (expandable()) return props.onToggle()
+    const path = only()
+    if (path !== undefined) props.onOpen(path)
+  }
 
   return (
-    <box flexDirection="row" height={1} flexShrink={0}>
+    <box flexDirection="row" height={1} flexShrink={0} onMouseDown={click}>
       <text fg={props.theme().textMuted} wrapMode="none">
-        {`${" ".repeat(SPINE_COLS + depth() * INDENT_COLS)}${mark()} `}
+        {`${" ".repeat(depth() * INDENT_COLS)}${expandable() ? (props.expanded ? "▾ " : "▸ ") : " ".repeat(SPINE_COLS)}${verb()} `}
       </text>
       <Show
         when={cells().length > 0}
         fallback={
           <text fg={props.theme().textMuted} wrapMode="none">
-            {beatLabel() ?? props.step.agent}
+            {beatLabel()}
           </text>
         }
       >
-        <box flexDirection="row" height={1} flexShrink={0}>
-          <For each={coalesceCells(cells())}>
-            {(run) => (
-              <Show
-                when={run.text.trim().length > 0}
-                fallback={<box width={run.len} height={1} flexShrink={0} backgroundColor={run.bg} />}
-              >
-                {/* Dark text over the band, the treatment the top bar's file tiles use: every
-                    band colour is a light fill, so a name reads against all of them without
-                    having to know which facet it landed on. */}
-                <text bg={run.bg} fg={props.theme().background} wrapMode="none">
-                  {run.text}
-                </text>
-              </Show>
-            )}
-          </For>
-        </box>
+        <Band cells={cells()} theme={props.theme} />
       </Show>
       <text fg={props.theme().textMuted} wrapMode="none">
         {count() > 1 ? ` ×${count()}` : ""}
       </text>
+    </box>
+  )
+}
+
+// One target of an expanded survey step (G4.4): the file's own name over its own facet
+// band, indented past the aggregate it came from. Clicking opens it.
+//
+// This is deliberately the same shape a mutation row draws, so an expanded read and a
+// recorded edit of the same file look alike — the difference between them is the verb, not
+// the rendering.
+function EntryRow(props: {
+  path: string
+  action: Action
+  count: number
+  place: boolean
+  depth: number
+  theme: () => TuiThemeCurrent
+  colorsFor: (paths: ReadonlyArray<string>, width: number) => TuiThemeCurrent["text"][]
+  onOpen: (path: string) => void
+}) {
+  const width = () => bandMax(props.depth)
+  const label = () => (props.place ? (props.path === "" ? "(repo root)" : props.path) : basename(props.path))
+
+  const cells = createMemo(() => {
+    const w = width()
+    const name = truncate(label(), w)
+    const colors = props.colorsFor([props.path], w)
+    return Array.from({ length: w }, (_, i) => ({ bg: colors[i]!, ch: name[i] ?? " " }))
+  })
+
+  return (
+    <box
+      flexDirection="row"
+      height={1}
+      flexShrink={0}
+      // A place is a directory or a search scope, not a file the editor can open.
+      onMouseDown={() => !props.place && props.onOpen(props.path)}
+    >
+      <text fg={props.theme().textMuted} wrapMode="none">
+        {`${" ".repeat(SPINE_COLS + props.depth * INDENT_COLS)}${VERBS[props.action].padEnd(VERB_COLS)} `}
+      </text>
+      <Show
+        when={!props.place}
+        fallback={
+          <text fg={props.theme().textMuted} wrapMode="none">
+            {truncate(label(), width())}
+          </text>
+        }
+      >
+        <Band cells={cells()} theme={props.theme} />
+      </Show>
+      <text fg={props.theme().textMuted} wrapMode="none">
+        {props.count > 1 ? ` ×${props.count}` : ""}
+      </text>
+    </box>
+  )
+}
+
+// A run of coloured character cells, drawn as few elements as their colours allow.
+function Band(props: { cells: { bg: TuiThemeCurrent["text"]; ch: string }[]; theme: () => TuiThemeCurrent }) {
+  return (
+    <box flexDirection="row" height={1} flexShrink={0}>
+      <For each={coalesceCells(props.cells)}>
+        {(run) => (
+          <Show
+            when={run.text.trim().length > 0}
+            fallback={<box width={run.len} height={1} flexShrink={0} backgroundColor={run.bg} />}
+          >
+            {/* Dark text over the band, the treatment the top bar's file tiles use: every
+                band colour is a light fill, so a name reads against all of them without
+                having to know which facet it landed on. */}
+            <text bg={run.bg} fg={props.theme().background} wrapMode="none">
+              {run.text}
+            </text>
+          </Show>
+        )}
+      </For>
     </box>
   )
 }

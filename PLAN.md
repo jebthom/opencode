@@ -791,27 +791,27 @@ The path works end-to-end, so the next round is information density: it currentl
 spends a row per step to say very little, and nothing in it is clickable. Five
 changes, ordered cheapest-first so the track degrades gracefully if it is cut short.
 
-- [ ] **1. Double the height.** `ACTIVITY_ROWS` 10 → 20. G0 sized the budget at 10
+- [x] **1. Double the height.** `ACTIVITY_ROWS` 10 → 20. G0 sized the budget at 10
   rows on the assumption that a turn's activity was one block; one row per *step*
   spends rows much faster, and the section is the one the user is actually watching.
   Supersedes G0's "fixed `ACTIVITY_ROWS` (default 10), plus a 1-row header = 11
   rows" — the new contribution is 1 header + 20 body + 2 hover = **23 rows**, still
   constant however long the session runs, which is the property that mattered.
 
-- [ ] **2. Words, not glyphs.** Retire `●⌕◆■⚙↗` for `Read` / `Search` / `Edit` /
+- [x] **2. Words, not glyphs.** Retire `●⌕◆■⚙↗` for `Read` / `Search` / `Edit` /
   `Write` / `Run` / `Fetch`. The glyph vocabulary was inherited from the top bar's
   deleted overlay row, where horizontal space was scarce; here it costs a legend the
   user has to hold in their head. Pad the verb to a fixed 6 columns so the bands
   still align into a column — the alignment is what makes two steps comparable at a
   glance, and it is worth more than the 5 columns it costs the band.
 
-- [ ] **3. Click a file to open it.** `api.client.tui.openFile({ path })`, exactly
+- [x] **3. Click a file to open it.** `api.client.tui.openFile({ path })`, exactly
   what a top-bar file tile does (`aperture.tsx` `openFile`), logged through
   `aperture.interaction` as `file.open` so the study log stays complete. Mouse-down
   is already spoken for on aggregated survey rows (see 4), which splits cleanly:
   **a row standing for one file opens it; a row standing for many expands.**
 
-- [ ] **4. Expand an aggregated survey row.** Clicking a survey step that stands for
+- [x] **4. Expand an aggregated survey row.** Clicking a survey step that stands for
   more than one target expands it in place, indented one level exactly as a
   sub-agent lane is, into one child row per file — name over its own facet band —
   followed by any places it visited. A `▸`/`▾` in the spine marks the affordance,
