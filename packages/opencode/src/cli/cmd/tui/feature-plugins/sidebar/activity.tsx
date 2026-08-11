@@ -18,7 +18,7 @@ const id = "internal:sidebar-activity"
 // the step rule rather than being imposed on it: a gathering step aggregates a whole run of
 // reads into one row, while every mutation is its own step and therefore its own row. The
 // asymmetry IS the encoding of "a mutation the user did not notice is the failure this view
-// exists to prevent". Horizontal carries magnitude and composition.
+// exists to prevent". Horizontal carries composition; magnitude is the trailing `×n`.
 //
 // Segmentation lives in `aperture/activity-steps.ts` — pure, tested, and free of any
 // orientation — so this file holds only the drawing. Data comes from GET /aperture/activity
@@ -33,7 +33,7 @@ const id = "internal:sidebar-activity"
 //
 // G0 sized this at 10 on the assumption that a turn's activity was one block; one row per
 // *step* spends rows far faster, and this is the section the user is actually watching.
-// Total contribution is 1 header + ACTIVITY_ROWS + HOVER_ROWS.
+// Total contribution is 1 header + ACTIVITY_ROWS + 1 spacer + HOVER_ROWS.
 const ACTIVITY_ROWS = 20
 // Reserved always, so the layout cannot jump as the pointer crosses rows.
 const HOVER_ROWS = 2
@@ -48,11 +48,10 @@ const ACTIVITY_TURNS = 12
 const SPINE_COLS = 2
 const COUNT_COLS = 5
 const INDENT_COLS = 2
-const BAND_MIN = 2
 // The verb is padded to a fixed width so the bands line up into a column across rows of
 // different actions. That alignment is what makes two steps comparable at a glance, and it
-// is worth the columns it costs the band.
-const VERB_COLS = 6
+// is worth the columns it costs the band. Wide enough for "Search" plus a clear gap.
+const VERB_COLS = 8
 const bandMax = (depth: number) =>
   SIDEBAR_COLS - SPINE_COLS - VERB_COLS - 1 - COUNT_COLS - depth * INDENT_COLS
 
@@ -204,17 +203,6 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     return out
   })
 
-  // The largest gathering step on screen, as the denominator a survey band scales against.
-  // Only survey steps compete: a mutate step holds one file and draws its name at full
-  // width, so it is not measuring the same thing.
-  const maxSurvey = createMemo(() => {
-    let max = 0
-    for (const row of rows()) {
-      if (row.kind === "step" && row.step.mode === "survey") max = Math.max(max, row.step.files.length)
-    }
-    return max
-  })
-
   // Per-facet totals for a step, rolled up across the files it touched.
   //
   // `t * p / 100` is the documented client rollup: `p` is a rounded percentage and `t` the
@@ -334,7 +322,6 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                         expanded={expanded().has(it().key)}
                         theme={theme}
                         colorsFor={bandColors}
-                        maxSurvey={maxSurvey}
                         onToggle={() => toggle(it().key)}
                         onOpen={openFile}
                         onHover={() => setHovered(describe(it().step))}
@@ -362,6 +349,9 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
               )}
             </For>
           </scrollbox>
+          {/* A blank row, so the hover line reads as a caption on the path rather than as
+              one more entry in it. */}
+          <box height={1} flexShrink={0} />
           {/* Reserved unconditionally: a hover area that appears and disappears would shift
               every section below it as the pointer moved. Wrapped to HOVER_ROWS lines and
               clipped, so a long bash description degrades to its first ~72 characters
@@ -405,7 +395,6 @@ function StepRow(props: {
   expanded: boolean
   theme: () => TuiThemeCurrent
   colorsFor: (paths: ReadonlyArray<string>, width: number) => TuiThemeCurrent["text"][]
-  maxSurvey: () => number
   onToggle: () => void
   onOpen: (path: string) => void
   onHover: () => void
@@ -425,20 +414,19 @@ function StepRow(props: {
   // whole point of showing a mutation. A survey step names nothing and scales instead.
   const named = () => (props.step.mode === "survey" ? undefined : props.step.files[0]?.path)
 
+  // Every band is the same length, so they all begin and end in the same columns.
+  //
+  // This replaced an area-scaled width (sqrt of the file count against the largest step on
+  // screen). Scaling made the bar carry magnitude, but at the cost of the one reading the
+  // band is actually for: with ragged widths two steps' *proportions* cannot be compared by
+  // eye, which is the whole point of painting a mix. Magnitude is carried by the trailing
+  // `×n`, which states it exactly rather than implying it.
   const width = () => {
-    const max = bandMax(depth())
-    // No file means no mix to paint, so there is no band — a shell command or a fetch
-    // would otherwise draw a full-width bar of untagged grey, which reads as an unpainted
-    // *file* rather than as an act that touched none. The row spends those columns on its
-    // description instead.
+    // No file means no mix to paint — a shell command or a fetch would otherwise draw a
+    // full-width bar of untagged grey, which reads as an unpainted *file* rather than as an
+    // act that touched none. The row spends those columns on its description instead.
     if (props.step.files.length === 0) return 0
-    if (props.step.mode !== "survey") return max
-    const n = props.step.files.length
-    const peak = props.maxSurvey()
-    if (peak === 0) return 0
-    // sqrt so area (not length) carries the comparison — the same idiom the treemap's
-    // `scaleCells` uses, so a block and a step read at the same scale.
-    return Math.max(BAND_MIN, Math.min(max, Math.round(max * Math.sqrt(n / peak))))
+    return bandMax(depth())
   }
 
   const cells = createMemo(() => {
@@ -476,7 +464,9 @@ function StepRow(props: {
       onMouseOver={() => props.onHover()}
       onMouseOut={() => props.onLeave()}
     >
-      <text fg={props.theme().textMuted} wrapMode="none">
+      {/* flexShrink=0: without it a long path in the sibling label shrinks this element and
+          clips the verb, which "Search" (the longest) hits first. */}
+      <text fg={props.theme().textMuted} wrapMode="none" flexShrink={0}>
         {`${" ".repeat(depth() * INDENT_COLS)}${expandable() ? (props.expanded ? "▾ " : "▸ ") : " ".repeat(SPINE_COLS)}${verb()} `}
       </text>
       <Show
@@ -534,7 +524,7 @@ function EntryRow(props: {
       onMouseOver={() => props.onHover()}
       onMouseOut={() => props.onLeave()}
     >
-      <text fg={props.theme().textMuted} wrapMode="none">
+      <text fg={props.theme().textMuted} wrapMode="none" flexShrink={0}>
         {`${" ".repeat(SPINE_COLS + props.depth * INDENT_COLS)}${VERBS[props.action].padEnd(VERB_COLS)} `}
       </text>
       <Show

@@ -735,11 +735,11 @@ design; everything below follows from it.
   also what delivers G3's "sub-agent activity builds orthogonally" as a
   consequence rather than as separate machinery.
 - **One step is exactly one row**, which is what makes G0's budget legible:
-  `ACTIVITY_ROWS` (10) steps visible, in a nested `<scrollbox>` pinned to newest.
-  The vertical axis is time; horizontal carries magnitude and composition. A
-  survey step draws an aggregate band scaled by `sqrt(n / nMax)` — the same area
-  idiom as the treemap's `scaleCells`. A mutate step holds exactly one file, so it
-  can afford to *name* it: identity is the whole point of showing a mutation.
+  `ACTIVITY_ROWS` steps visible, in a nested `<scrollbox>` pinned to newest.
+  The vertical axis is time; horizontal carries composition. A mutate step holds
+  exactly one file, so it can afford to *name* it: identity is the whole point of
+  showing a mutation. (Bands were originally area-scaled by `sqrt(n / nMax)`, the
+  treemap's `scaleCells` idiom; G4.6 made them uniform — see there for why.)
 
 **Resolved — directory reads are back, as places.** G1's justification for
 dropping them ("no node, no size, no facet") was wrong on its face, and the real
@@ -839,6 +839,23 @@ it has no file, so the band had nothing to paint, and a blank grey bar reads as 
 files a zero-width band, which frees the row for its title: a shell command now reads
 `Run  Echo smoke-three` inline, and the hover line carries the same text in full. This is
 the case the G2+G3 live pass missed entirely, because it never exercised bash or fetch.
+
+- [x] **6. Uniform band length.** Every band is now the same width, beginning and
+  ending in the same columns on every row. Area-scaling the bar by file count made it
+  carry magnitude, but destroyed the reading the band actually exists for: with ragged
+  widths two steps' *proportions* cannot be compared by eye, which is the whole point of
+  painting a mix rather than a dominant. Magnitude moves entirely to the trailing `×n`,
+  which states it exactly instead of implying it. Indented lanes keep the shared right
+  edge — the indent eats into the band, not past it.
+
+- [x] **7. A wider verb column, and one that cannot be clipped.** `VERB_COLS` 6 → 8 for a
+  clear gap after the longest verb. The actual bug was flexbox: the verb `<text>` had no
+  `flexShrink={0}`, so a long path in the sibling label shrank it and clipped the verb —
+  "Search" first, being the longest.
+
+- [x] **8. A blank row above the hover line**, so it reads as a caption on the path rather
+  than as one more entry in it. Contribution is now 1 header + 20 body + 1 spacer + 2
+  hover = 24 rows.
 
 **Not in scope.** Expanding a *mutation* row (it already stands for exactly one file,
 so there is nothing to expand), and a keyboard path to any of this — the sidebar is

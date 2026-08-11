@@ -167,3 +167,5 @@
 {"ts":"2026-08-11T20:06:57.704Z","pid":116865,"where":"tui.submit","event":"send","sessionID":"ses_00d90a5afffe0A8lv6XA4npz0M","wasNewSession":false,"mode":"normal","agent":"build","model":{"providerID":"anthropic","modelID":"claude-haiku-4-5","variant":"high"},"messageID":"msg_ff26f71a7001borKLQ7P6hKK89"}
 {"ts":"2026-08-11T20:06:57.718Z","pid":116865,"where":"server.prompt","event":"received","sessionID":"ses_00d90a5afffe0A8lv6XA4npz0M","messageID":"msg_ff26f71a7001borKLQ7P6hKK89","model":{"providerID":"anthropic","modelID":"claude-haiku-4-5"},"agent":"build","isDefaultTitle":true}
 {"ts":"2026-08-11T20:06:57.764Z","pid":116865,"where":"server.ensureTitle","event":"generating","sessionID":"ses_00d90a5afffe0A8lv6XA4npz0M","titleProviderID":"anthropic","titleModelID":"claude-haiku-4-5","promptProviderID":"anthropic"}
+{"ts":"2026-08-11T20:09:18.085Z","pid":118853,"where":"tui.autocreate","event":"creating","agent":"build","model":{"providerID":"anthropic","modelID":"claude-haiku-4-5","variant":"high"}}
+{"ts":"2026-08-11T20:09:18.166Z","pid":118853,"where":"tui.autocreate","event":"created","sessionID":"ses_00d8e69f2ffeiEA3NhZhtrs1n2"}
