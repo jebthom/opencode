@@ -64,7 +64,8 @@ O3 ✅ (always-extent) ┬──► O1 ✅ (top bar simplify)
 O4 (legend filter) ──────────────────────────────► shared with S4
                      └──► also drives O2's `focus` (Explorer pips)
 
-S1 (line-tag store) ──► S2 (agent tool) ──► S3 (line painting) ──► S5 (open-all)
+S0 ✅ (tag = query) ──► S1 (rule model) ──► S2 (lens_mark) ──► S3 (line painting, sparse
+                    └──► S3's sparse layer ✅ (line-level git-changed)      layer ✅) ──► S5
 
 G1 ✅ (activity data) ──► G2+G3 ✅ (the Activity Path) ──► ✅ track complete
 
@@ -405,81 +406,365 @@ The largest new build. A Search Lens is a narrow binary/ternary probe used to
 scope a piece of work — participants created these spontaneously and wanted them
 at **line level**, which the VSCode gutter appears to promise.
 
-**The key insight that makes this affordable:** we do not sweep. Line-level
-painting across a whole codebase would be slow and expensive, but we already run
-Explore and Build agents that read the code as part of their normal work. Give
-them a **deterministic tool** to tag specific lines in specific files as they go,
-and the Search Lens fills in as a by-product of work that was happening anyway.
-
 Note the difference in kind from an Overview Lens: participants are often hunting
 **specific usages**, which may not sit inside a named extent at all. Line tags
 are therefore not a finer grade of extents — they're a separate, sparser layer,
 with the compensating benefit of binding directly to syntax.
 
-### S1 — Line-tag data model with syntax anchoring *(the hard part)*
+### S0 — What a line tag *is* ✅
 
-A line tag must **survive edits elsewhere in the file**. A raw line number is
-worthless the moment anything above it changes.
+The track originally proposed that an agent tag specific lines and that the tags
+be persisted behind a **composite anchor** (enclosing symbol + line-content hash
++ line number tiebreak) so they could survive edits elsewhere in the file, with
+"lost" as a first-class state. S1 was named "the hard part" and the anchoring
+mechanism was open decision #4.
 
-Anchor candidates, to be evaluated:
-- **Enclosing symbol + offset within it** — reuses `extents.ts` (already
-  computes named, line-delimited extents and stable `subNodeID(relPath, name)`
-  hashes) and degrades gracefully: if the symbol survives, the tag survives.
-  Weak for top-level/config code with no enclosing symbol.
-- **Content hash of the tagged line(s)** + a search window — robust to movement,
-  breaks on edit of the line itself, ambiguous when the line text recurs.
-- **Tree-sitter node path** — most principled, and OpenTUI already bundles
-  tree-sitter (`TreeSitterClient`), but ties us to per-language grammars.
-- **Composite:** symbol + line-content hash + line number as a tiebreak, with a
-  documented resolution order and an explicit "lost" state.
+**Resolved — there is no anchor, because a tag is not a location. It is a
+query.** Two findings turned this over.
 
-Recommendation: composite, since each anchor fails in a different direction and
-the resolver can fall through. Make "lost" a first-class outcome — a stale tag
-that silently paints the wrong line is worse than one that reports itself gone.
+**1. This codebase's existing answer to "surviving edits" is *don't store a
+position*.** There is no anchor machinery anywhere in the repo — `grep -rn
+"anchor"` over `aperture/` and `sdks/aperture-vscode/` returns nothing, and
+nothing maps an old line number to a new one. What ships instead:
 
-**Store:** new `line-tag-store.ts`, per-project, per-Lens, alongside
-`subfacet-store.ts`. Unlike the sweep results these are **expensive to
-regenerate** (they encode an agent's reasoning, not a re-runnable classification)
-— so persist them in the **project directory** with the Lens defs, not global KV.
-That also makes a Search Lens shareable and committable, which is the natural
-extension of the sprint-1 decision to project-scope Lenses.
+- `extentsOf(content)` re-cuts a file's extents from **disk content on every
+  payload read** (`extents.ts:62`, from `finalize` at `aperture.ts:1180-1259`).
+  Line numbers are always freshly computed and never persisted.
+- `subNodeID(relPath, name)` (`extents.ts:265`) is durable precisely because it
+  is content- *and* position-independent.
+- `parseHunkRanges` / `extentChangeFacets` derive exact changed line ranges per
+  read and throw them away.
+- The VSCode extension resolves *nothing*. `fetchExtents` takes server-supplied
+  `startLine`/`endLine` verbatim; nothing in `sdks/aperture-vscode/src/` calls
+  `document.getText`, `lineAt` or `lineCount`. S3's original premise — "anchors
+  resolve in the extension against live buffer content, which is the edit-robust
+  choice already established for extents" — described something that did not
+  exist.
 
-**Payload:** new optional `lineTags` keyed by file node id, derived at the read
-boundary like `extents`/`composition`. Bump `PAYLOAD_VERSION` to 8.
+**2. Deterministic re-evaluation is effectively free.** `Ripgrep.Service` already
+exists (`packages/core/src/filesystem/ripgrep.ts`) returning `{path,
+line_number, submatches:[{start,end}]}`, and `Ripgrep.defaultLayer` is
+self-providable exactly like the `Git.defaultLayer` that `Aperture.defaultLayer`
+already provides. Measured on this repo: **13,066 matches whole-repo in 67ms.**
 
-**Open:** whether a Search Lens is a distinct type on the Lens model or an
-Overview Lens with a flag. Leaning distinct type — different paint policy,
-different interactions, different persistence, and the picker should group them
-separately.
+The original "the key insight that makes this affordable: we do not sweep" was an
+argument about **model** cost. It does not apply to a grep.
 
-### S2 — Deterministic tagging tool for Explore/Build agents
+So: the agent's contribution is the judgment about *what to look for* and *what
+facet it means* — not the enumeration of hits, which is the part a machine does
+better and the part participants noticed the agent already did well. **Persist
+the finder; derive the lines at the read boundary.** A deleted usage has one
+fewer hit on the next evaluation and its paint disappears; a new usage is painted
+with no user intervention. That is the behaviour the probe asked for, arriving as
+a property of the model rather than as edit-tracking machinery. The anchoring
+problem is not solved — it is deleted, by the same move the codebase already made
+for extents.
 
-New tool `lens_tag_lines` (mirroring `tool/lens-facet-files.ts` conventions,
-registered in `tool/registry.ts`): takes a file path, a line or range, a facet id
-from the active Search Lens, and an optional note. Deterministic — no model call,
-it just resolves the anchor and writes the store.
+**Coverage — what a rule-only model reaches, and what it doesn't.** This is the
+analysis that decided against a judgment tier.
 
-**Prompt work:** the Aperture-awareness block in `session/system.ts` must teach
-agents *when* to call it. The goal is that answering "where do we handle X?"
-leaves a persistent, paintable Search Lens behind. Applies to Explore as well as
-build/plan, which is a widening of the current injection (Aperture awareness is
-currently injected for `build`/`plan` only).
+| Case | `pattern` | `symbol` | `structural` | |
+| --- | --- | --- | --- | --- |
+| Particular functions (`retryWithBackoff`) | over-matches call sites | exact | exact | **covered** |
+| Method + particular argument | only when textually local | no | across lines/whitespace | **covered** |
+| All uses of a class/module | textual; over-matches comments/strings, under-matches aliased imports and re-exports | no | identifier nodes, still not resolution-aware | **gap, named below** |
+| Anti-patterns (empty `catch`, `await` in a loop, `any` casts) | brittle | no | what it is for | **covered** |
+| Config/markup/YAML concerns | yes (language-agnostic) | no (`extentsOf` is TS/JS/Python) | needs a grammar | **covered** |
+| "This is the retry path" / "assumes single-tenant" | no | no | no | **not covered** |
+| "Everything that transitively depends on X" | no | no | no | **not covered** |
 
-**Also needed:** creating a Search Lens should be as light as creating an
-Overview Lens — a binary probe shouldn't require the full Lens-design flow.
+Two things make the uncovered set smaller than it looks. Judgment concerns
+usually *have a name* — "the retry path" is normally a declaration called
+`retryWithBackoff`, so `{kind:"symbol"}` plus a free-text `note` captures the
+judgment with no anchoring, at that declaration's own granularity. And
+natural-language judgment over code is **already served, at the
+right granularity, by the Overview Lens** — a line-level LLM tier would be a
+third mechanism competing with the painter, with a worse cost model and a "lost"
+state to render.
+
+**Decided: rule-only.** The frustration the study actually recorded was *"the
+agents can grep and the paint can't"* — a query gap, not a judgment gap, and
+rule-only closes it exactly. Every piece of the judgment tier (durable line-tag
+store, composite anchor, "lost" state, background re-assessment) is machinery
+rule-only never needs. The rule union has room for a fourth `kind` if real use
+demands one, so the decision is reversible; building it now is not.
+
+**Rejected: from/to beacon patterns** for the "flexible length" problem. A beacon
+pair is a second query with the same fragility as the first, and the flexible
+length turns out to be better supplied by the structural finder itself — a pattern
+matching a `catch` clause paints the clause, one matching a call paints the call.
+See the span policy in S1, where widening in general is measured and rejected.
+
+### S1 — The rule model
+
+Rules attach to `Lens` in `.opencode/aperture/lenses.json` (`lens-store.ts:31-43`)
+— small, hand-authored, readable, diffable, committable, shareable. That is a
+better justification than the original "expensive to regenerate": rule *hits* are
+cheap to regenerate, and the *rule* is the thing worth keeping.
+
+```ts
+// lenses.ts — added to the existing Lens interface
+readonly rules?: ReadonlyArray<Rule>
+readonly search?: true   // rendering policy only — see below
+
+interface Rule {
+  readonly id: string
+  readonly facet: string        // a facet id on this Lens
+  readonly find: Finder
+  readonly note?: string        // the agent's reason; shown on hover, never re-evaluated
+  readonly createdBy?: string   // agent name, for the study log
+}
+
+type Finder =
+  | { kind: "pattern"; pattern: string; glob?: ReadonlyArray<string>; caseSensitive?: boolean }
+  | { kind: "symbol"; name: string; path?: string }
+  | { kind: "structural"; pattern: string; language: string; glob?: ReadonlyArray<string> }
+```
+
+**`rules` and `search` are deliberately orthogonal.** A rule assigns a facet and
+every Lens has facets, so a rule can contribute to an Overview Lens too. `search`
+only says *how to render*: hit density and a sparse gutter rather than a
+partition. The common case — a binary probe where everything is `NONE_FACET`
+until a rule says otherwise — is a default the creation path sets up, not a type.
+
+**Open decision #5 resolved: an optional field + an `isSearch()` predicate, not a
+distinct type.** `deterministic?: DeterministicKind` is the shipped precedent for
+"a Lens whose facets come from the repo rather than the painter", and it already
+delivers everything a distinct type was wanted for — a different paint policy
+(`supportsExtents`, `aperture.ts:1190`), different persistence (computed, not
+stored), picker grouping, and a wire flag on `LensInfo` (`payload.ts:110`) so
+clients switch behaviour. Taking the same shape keeps lens
+list/select/cycle/edit, the legend and O4's filter working unchanged instead of
+forking each of them.
+
+**Span policy — `line` only in v1; `enclosing` is measured and rejected.** A
+finder yields hit positions and `span` decides the painted region. `line` (the
+matched line(s), and a structural match's full node range) is enough, because a
+structural pattern already *chooses* its own extent: match the `catch` clause and
+you get the clause, match the call and you get the call.
+
+`enclosing` was meant to widen a point hit to something meaningful. Measured
+against this repo's 21 changed lines in `aperture.ts`, the enclosing region is:
+
+| widener | enclosing region | over-paint |
+| --- | --- | --- |
+| `extentsOf` (next-decl arithmetic) | `layer`, 1833 lines | 87× |
+| smallest enclosing structural callable | `finalize`'s generator, 1113–1294 = 182 lines | 8.7× |
+
+Structural is **10× tighter**, so the earlier framing that blamed `extentsOf`'s
+regex was directionally right — but 8.7× is still not a useful paint. **The lesson
+is that widening is the wrong policy, not that we picked the wrong widener**, which
+is exactly what the git-changed probe concluded independently by emitting hunks
+unwidened. So `span` ships as `line` alone; if a case later needs widening, it
+should resolve through the structural backend with a max-size guard, never through
+next-declaration arithmetic.
+
+**The sparse-layer constraint — structural, and easy to get wrong.** Extents
+**tile a file exhaustively**, and that byte contract is what `attributeFileBytes`
+→ `computeComposition` → the treemap → the Explorer pip all depend on
+(`extents.ts:167-220`). Line tags are sparse and do not tile, so **they must
+never enter `attributeFileBytes` or `composition`.** They are a separate overlay:
+
+- **Payload:** `lineTags?: Record<fileNodeID, LineTag[]>`, optional and derived at
+  the read boundary alongside `extents`. **No `PAYLOAD_VERSION` bump** — the same
+  posture that let `composition` widen from directories-only to per-node without
+  one (`payload.ts:164-176`). The earlier "S1 takes it to 8" is superseded.
+- **Gutter:** `decorationFor(hue)` + `rangesByColor` already builds one
+  `vscode.Range(line,0,line,0)` per line (`extension.ts:204-240`) — exactly the
+  shape sparse tags need, so S3's extension work is small. Where a file has both,
+  **line tags win the lines they cover** and extents paint the rest.
+- **TUI:** a `search` Lens draws hit density, not a partition.
+- **Explorer pip:** has-hits / no-hits. A one-colour pip cannot express density.
+
+**Evaluation and freshness** — derived, memoized in memory, never persisted.
+The read boundary (`finalize`) evaluates the active Lens's rules over the window,
+memoized per `(lensID, rulesHash, scope)` in the existing per-directory cache; a
+file change drops that file's memo (`onFileChanged` already reschedules on
+`file.edited` / `file.watcher.updated`); adding or editing a rule drops the
+Lens's memo. No new SSE event — `aperture.invalidated` already exists and already
+carries the `location` the extension requires (A6).
+
+**Guardrails.** A Search Lens is meant to be sparse and the failure mode is a
+loose regex silently painting 30% of the repo. Cap hits per rule
+(`MAX_RULE_HITS`, ~500) and rules per Lens (`MAX_RULES`, ~32); over the cap a
+rule is stored but reported as too broad rather than painted.
+
+The caps and the error paths are kept **in full**, despite this being a research
+prototype rather than a shipping tool — the opposite of the usual prototype trade.
+The reason is that the cost of a failure here is not a bug report, it is a lost
+participant session: a flooded view or a crashed pass during a study run cannot be
+re-run, and unattended participants are exactly who finds the degenerate cases.
+Cross-platform handling stays for the same reason, since participants supply the
+machines.
+
+**Structural backend — decided: `@ast-grep/napi` (measured, see S0 probes).**
+Note tree-sitter's availability is *not* a TUI-vs-editor question: the ~35
+grammars in `parsers-config.ts` are fetched by OpenTUI at TUI startup for terminal
+syntax highlighting, while rule evaluation runs in the **server** process, where
+only `tree-sitter-bash` and `tree-sitter-powershell` wasm ship
+(`tool/shell.ts:320-344`) and nothing under `src/aperture/` imports tree-sitter.
+
+`@ast-grep/napi` 0.45.1 is a native NAPI addon whose nine per-platform
+`optionalDependencies` mirror **`@parcel/watcher` 2.5.1, which
+`packages/opencode` already ships** — so the packaging precedent exists. Measured
+on this repo under Bun:
+
+| | |
+| --- | --- |
+| whole-repo structural pass | **~240–285ms** (vs ripgrep's 67ms) — memoization is mandatory, not optional |
+| single 130KB file | **14ms parse + 3ms query** — the file-change path is cheap |
+| `.gitignore` | respected (0 `node_modules` hits scanning from the repo root) |
+| invalid pattern | throws an actionable message ("Multiple AST nodes are detected"), which the tool returns so the agent self-corrects |
+
+The base package covers TypeScript / Tsx / JavaScript / Html / Css directly.
+**Python is included** via `@ast-grep/lang-python` + `registerDynamicLanguage`,
+verified working (`requests.get($$$A)` and `def $F($$$P): $$$BODY` both match).
+Two costs to note and accept: it is a 0.x package, and its postinstall is blocked
+by Bun's default trust policy, so `packages/opencode/package.json` needs a
+`trustedDependencies` entry. Study tasks span Python, so the coverage is worth it;
+adding further languages (Go, Rust, Java, …) is the same `registerDynamicLanguage`
+call against another `@ast-grep/lang-*` package.
+
+**`symbol` is kept, but not for the reason first given.** The initial argument —
+"it's ~20 lines over `extentsOf`, and it's what makes `span: enclosing` work" — is
+wrong on both halves once `structural` is a dependency anyway and `enclosing` turns
+out to be the weak part (below). The real reason is **idiom-blindness**, and it
+took measuring this repo to see it.
+
+`aperture.ts` contains 153 `arrow_function`, 60 `function` (expression), 52
+`generator_function` and only **8** `function_declaration` nodes — because the
+codebase is Effect-shaped: `Effect.fn(...)(function* ...)`, `Effect.gen(function*
+...)`, `const x = (...) => ...`. So an agent writing the obvious structural pattern
+`function $F($$$P) { $$$B }` to find "all the functions" finds **8 of 265** — a
+silent 97% miss. `extentsOf`'s dumb column-0 regex finds `paintStale` by *name*
+whether it is a const-arrow, a generator or a declaration, because it never looks
+at the right-hand side.
+
+The two finders therefore answer different questions and neither subsumes the
+other: **`symbol` = "paint the thing I can name"** (robust, idiom-blind, coarse
+span); **`structural` = "paint every instance of this shape"** (precise, exact
+ranges, requires knowing the idiom). The hit-count in `lens_mark`'s return value is
+what makes the structural hazard survivable — `8 hits` where the agent expected
+hundreds is a visible signal to re-ask.
+
+**Known gap, deliberately accepted.** `references` (LSP `textDocument/references`)
+is not a v1 finder. `LSP.references` / `workspaceSymbol` / `documentSymbol` do
+exist server-side (`lsp/lsp.ts:133-138`) and are the only correct answer to "all
+uses of a class/module" through aliased imports and re-exports. Revisit if it
+bites in use.
+
+### S2 — `lens_mark`, the rule-installation tool
+
+Supersedes the originally-planned `lens_tag_lines`, whose name no longer
+describes what it does. Follows the `lens_*` conventions in
+`tool/lens-facet-files.ts:11-28` (Effect `Schema.Struct` params with
+`.annotate({description})`, an **inline** description string — no sibling `.txt`),
+registered at the four sites in `tool/registry.ts`. `Aperture.Service` is already
+in the layer's requirements, so no new layer wiring.
+
+Deterministic — no model call. It validates the finder, evaluates it once, and
+**returns the hit count plus a sample of matched lines**. That return value is the
+whole safety mechanism: an agent that writes a bad regex sees `412 lines across 87
+files` and narrows it instead of silently repainting the repo.
+
+**Explore cannot see any lens tool today.** `agent.ts:178-198` is `"*": "deny"`
+plus an allow-list of `grep/glob/list/bash/webfetch/websearch/read/
+external_directory`. Add `lens_mark` and `lens_list`. (`lens_facet_files` is
+likewise missing from the `lens` agent's own allow-list at `:200-226` — the same
+oversight, worth fixing while there.)
+
+**Light Search Lens creation.** Every Lens today routes through the `/lens`
+designer agent and `lens_create`'s ~13 parameters. `lens_mark` auto-creates when
+its `lens` argument names one that doesn't exist: two facets (`hit` +
+`NONE_FACET`), `search: true`, `scope: "project"`. That satisfies "a binary probe
+shouldn't require the full Lens-design flow" at zero extra steps.
+
+**Prompt.** `session/system.ts:86` gates the Aperture block on `agent.name ===
+"build" || "plan"`. Widen to `explore`, with a subagent-appropriate variant — the
+current text assumes a user conversation and `todowrite`. The goal is that
+answering "where do we handle X?" leaves a persistent, paintable Search Lens
+behind.
+
+**Study instrumentation — a first-class requirement, not an afterthought.**
+Aperture is a research prototype supporting a paper, and the central claim of the
+rule reframe is that *agents write good queries*. That is only arguable with data,
+and it is the one thing the existing log cannot infer.
+
+`study-log.ts` already carries most of the load for free: every tool call lands in
+the unified `events.jsonl` as `type: "tool"` with an `aperture: true` flag and a
+rolling `manifest.json` counter, so `lens_mark` invocation counts need no new code.
+Two things it cannot see, both written through the existing
+`ApertureStudyLog.record(sessionID, rec)` writer:
+
+- **Rule content + hit count at creation** — finder `kind`, the pattern itself,
+  facet, `span`, and how many lines across how many files it matched. This is the
+  measure of query *quality*: a rule matching 3 lines and a rule matching 4,000
+  are different events, and the difference is invisible in a tool-call count.
+- **Rule lifecycle** — created / superseded / rejected-over-cap, with the
+  authoring agent. The last field is what evidences whether widening the injection
+  to Explore actually changed behaviour, which is otherwise an assumption.
+
+*Not instrumented, deliberately:* hit-set drift across a session, and participant
+clicks on painted hits. Both are cheap to add later if the analysis wants them —
+drift especially, since re-evaluation already happens on every file change and
+would only need the count recorded.
 
 ### S3 — Line-level painting in the editor and the View
 
 Extend `sdks/aperture-vscode` to paint line tags as gutter strips. The decoration
 machinery is already there (`decorationFor`, per-hue reused decoration types) —
-the change is fetching `lineTags` alongside `extents`, and painting a
-Search Lens's sparse tags rather than an Overview Lens's exhaustive extents.
-Anchors resolve **in the extension** against live buffer content, which is the
-edit-robust choice already established for extents.
+the change is fetching `lineTags` alongside `extents` and painting a Search Lens's
+sparse tags rather than an Overview Lens's exhaustive extents. Resolution stays
+**server-side against disk content**, which is the established pattern (S0
+finding 1), not client-side against the buffer.
 
 In the TUI, a Search Lens's file/directory blocks show hit density rather than a
 partition — the visual question is "where are the hits", not "what is this made
 of".
+
+**The sparse layer is built and verified, via line-level git-changed.** Chosen as
+S0's second probe because it needs no rule code and is independently useful: the
+whole path — sparse ranges → `lineTags` in the payload → `rangesByColor` in the
+extension → both layers coexisting — is exercised before any of S1 exists.
+
+`changedRangesFor` already had exact hunk ranges and `extentChangeFacets` was
+widening them up to the enclosing declaration. Emitting them unwidened, at the
+file's own magnitude heat, measured on this repo's working tree:
+
+| file | lines actually changed | lines the extent striped | |
+| --- | --- | --- | --- |
+| `aperture.ts` | 21 | **1833** (`layer`, 344–2176) | 1% |
+| `payload.ts` | 30 | 60 | 50% |
+| `extents.ts` | 36 | 51 | 71% |
+
+**The `aperture.ts` row is the finding.** `extentsOf` cuts top-level declarations
+only, and `layer` is one 1833-line `Layer.effect(...)`, so 21 changed lines striped
+87× their extent. That is not a rounding error, it is the gutter saying nothing —
+and it is precisely why `extension.ts` had a blanket `if (data.lens?.deterministic)
+return undefined`, whose comment blamed git-changed for *"whole-file strips
+[burying] the added/removed markers"*. The concept was never the problem; the
+widening was. The gate now returns line tags for deterministic Lenses while still
+withholding extents, so git-changed paints exactly what changed and Edit
+recency/Bus factor (which carry no tags, being file-level) still paint nothing.
+
+Two implementation notes worth keeping:
+
+- **`repaintEditor` resolves a hue per *line*, not ranges per hue.** The layers
+  overlap by construction — extents tile, tags mark lines inside them — so a
+  `Map<line, hue>` written extents-first and tags-second gives the "line tags win
+  the lines they cover" precedence for free and dedupes on the way. Two decorations
+  on one line would double-draw the `before` strip.
+- **`clampRanges` (`extents.ts`) clamps, sorts and merges.** `git diff` reports
+  hunks against the file *git* sees while `finalize` re-reads from disk, so a write
+  landing between the two yields a range past the end — a decoration on a line the
+  buffer does not have. Adjacent ranges merge because `[4,6]` + `[7,9]` is one
+  visual strip, and leaving them split would double the hit count a Search Lens
+  reports. 8 cases in `test/aperture/extents.test.ts`.
+
+**Verified:** the composition partition contract still holds across all 19
+in-window nodes (painted bytes ≤ subtree bytes, zero violations) with tags present,
+and the existing composition/facet-map tests pass untouched — the assertion that
+the sparse layer stayed out of `attributeFileBytes`.
 
 ### S4 — Legend filtering for Search Lenses
 
@@ -491,10 +776,10 @@ confirming it behaves on 2–3 facet Lenses.
 Participants wanted richer interaction with a Lens: from the legend, open every
 file with a given facet. Cap at **8–10 files** with a clear indication when the
 set was truncated (and, ideally, an ordering rule better than alphabetical —
-most tags, or most recently tagged).
+most hits, or most recently tagged).
 
-Each file should open **scrolled to its first tagged line**, which is the payoff
-for S1's anchoring. Mechanism: extend the existing `tui.file.open` event
+Each file should open **scrolled to its first tagged line** — now a derived hit
+rather than a stored anchor. Mechanism: extend the existing `tui.file.open` event
 (TUI → server → extension) with an optional line, and have the extension reveal
 that range.
 
@@ -974,8 +1259,9 @@ before the Explorer could show facets would have left no file-level facet view
 anywhere. O2 also produced the bulk endpoint S5 is specified to consume.
 
 **Immediately:**
-- **S1** — the anchoring design is the long pole of the sprint; start the design
-  early even if implementation waits.
+- **S0 ✅** — the anchoring design was expected to be the long pole of the sprint.
+  It turned out to be a non-problem: a tag is a persisted *query*, not a location,
+  so S1 shrank from "the hard part" to a schema plus a pure evaluator.
 
 O4 whenever convenient — it's small, self-contained, immediately useful, and now
 has a second consumer: it should drive O2's Explorer `focus` as well as the TUI.
@@ -1005,8 +1291,8 @@ cross-surface half of the problem visible.
 | 1b | ~~How the Explorer pip carries colour + a multi-facet mix under VSCode's one-colour/one-glyph budget~~ — **decided:** one contributed colour id per exact palette hex (exact legend hue, no facet-count limit); colour = focused facet, shade glyph = its byte share; `focus` a parameter, defaulting to dominant | O2 ✅ |
 | 2 | ~~What dimension replaces the file tier in the top bar~~ — **decided:** the child list goes, leaving one row of directory blocks; the scope's own files return as a packed alphabetical grid of one-line tiles, each banded by its *own* facet mix (the only surface that shows a file's minority facets — the Explorer pip is dominant-only) | O1 ✅ |
 | 3 | ~~Whether filtered-off facets keep their treemap area~~ — **decided:** keep it, greying in place; weights are never touched, so no surface re-flows on a filter click. The Explorer pip is the deliberate exception (one colour, so it must subtract) | O4 ✅ |
-| 4 | Line-tag anchoring mechanism (composite recommended) | S1 |
-| 5 | Search Lens as a distinct type on the model vs. a flag | S1 |
+| 4 | ~~Line-tag anchoring mechanism (composite recommended)~~ — **decided: there is no anchor.** A tag is a persisted *query* (pattern / symbol / structural), and lines are derived at the read boundary, which is what `extentsOf` already does for extents. A deleted usage loses its paint and a new one gains it, with no edit-tracking, no "lost" state and no durable line-tag store | S0 ✅ |
+| 5 | ~~Search Lens as a distinct type on the model vs. a flag~~ — **decided: an optional `search` field + an `isSearch()` predicate**, following the shipped `deterministic?: DeterministicKind` idiom, which already delivers a distinct paint policy, distinct persistence, picker grouping and a wire flag. `rules` is a *separate* field, so a rule can mark facets on any Lens | S0 ✅ |
 | 6 | ~~Activity View in the sidebar vs. the top bar~~ — **decided: the sidebar, vertically, and the orientation experiment is off.** One step is one row, so the path is intrinsically vertical; the top bar's 13-row wide budget wants a different shape and a shared renderer would collapse to a config blob. Segmentation stays pure and orientation-free in `activity-steps.ts`, so a horizontal variant could still reuse the model | G2+G3 ✅ |
 | 8 | ~~Where activity data comes from and how it gains per-session durability~~ — **decided:** derived from the durable message store on every read, never recorded. The `session.next.*` tracker was dead by default and in-memory; deriving makes durability, retroactive history and Lens-switch recolouring free, and removes the second source of truth | G1 ✅ |
 | 7 | ~~Whether to fix truecolor detection upstream in OpenTUI or locally~~ — **decided:** neither. Putting every paintable colour on an exact xterm-256 entry makes quantisation a no-op, so truecolor stops mattering for colour *identity* | C1 ✅ |
@@ -1129,8 +1415,10 @@ deepest one, and the bar ignores a scope it is already at.
 
 Persistence:
 - Project directory (`.opencode/aperture/`): Lens defs (`lenses.json`) + active
-  pointer (`active.json`). Shareable/committable, agent-readable. **Line tags
-  join these (S1).**
+  pointer (`active.json`). Shareable/committable, agent-readable. **Search rules
+  join these (S1)** — as a field on the Lens, not a store of their own. Line
+  *tags* are never persisted anywhere: they are derived from the rules at the
+  read boundary, like `extents`.
 - Durable KV (`storage/storage.ts`, string[] keys): structure caches under
   `["aperture", projectID, "structure", scopeKey]`; file facets and sub-file
   facets namespaced per Lens id. Large, churny, free to regenerate.
@@ -1152,7 +1440,9 @@ Config: `packages/core/src/v1/config/config.ts` — `aperture.painter.context`
 
 `PAYLOAD_VERSION` is currently **7**; bump it whenever the payload shape or
 extractor semantics change (a stale cache from an older extractor being served
-was a real, hard-to-find bug). S1 takes it to 8.
+was a real, hard-to-find bug). **S1 does *not* bump it** — `lineTags` is optional
+and derived at the read boundary, the same posture that let `composition` widen
+from directories-only to per-node without a bump.
 
 Module/style conventions: see `AGENTS.md` (flat exports + self-reexport, Effect
 v4 rules, snake_case Drizzle, run `bun typecheck` from package dirs).

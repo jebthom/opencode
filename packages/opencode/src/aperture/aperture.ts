@@ -1189,6 +1189,7 @@ export const layer = Layer.effect(
         // diff` hunks; mtime-recency can't subdivide a file, so it carries no extents.
         const supportsExtents = !det || lens.deterministic === "git-changed"
         let extents: Record<string, ReadonlyArray<AperturePayload.Extent>> | undefined
+        let lineTags: Record<string, ReadonlyArray<AperturePayload.LineTag>> | undefined
         if (supportsExtents) {
           // In-window file nodes by path; a drilled file that's off-window is skipped
           // (its tiles would render on no tile).
@@ -1203,6 +1204,7 @@ export const layer = Layer.effect(
             // Semantic Lenses read the per-function store once for all targets.
             const subStore = det ? undefined : yield* ApertureSubfacetStore.read(storage, ctx.project.id, lens.id)
             const built: Record<string, ReadonlyArray<AperturePayload.Extent>> = {}
+            const builtTags: Record<string, ReadonlyArray<AperturePayload.LineTag>> = {}
             for (const file of targets) {
               const fileId = idByPath.get(file)!
               const content = yield* readFileText(ctx.directory, file)
@@ -1229,6 +1231,23 @@ export const layer = Layer.effect(
                   changed: fileFacet,
                   unchanged: "unchanged",
                 })
+                // The same hunks, *un*widened (S1). `extentChangeFacets` above folds each
+                // range up to its enclosing declaration, which is the right unit for a tile
+                // but loses the precision git already gave us: three edited lines colour a
+                // 200-line function. Emitting the ranges themselves as line tags lets the
+                // gutter mark exactly what changed, at the file's own magnitude heat, while
+                // the extents keep tiling for the treemap. Nothing here reaches composition.
+                if (fileChanged && ranges.length) {
+                  const tags = ApertureExtents.clampRanges(ranges, content).map(
+                    ([startLine, endLine]): AperturePayload.LineTag => ({
+                      startLine,
+                      endLine,
+                      facet: fileFacet,
+                      ...(colorByFacet.get(fileFacet) ? { hue: colorByFacet.get(fileFacet)! } : {}),
+                    }),
+                  )
+                  if (tags.length) builtTags[fileId] = tags
+                }
               } else if (lens.parent && store[fileId]?.facet === NONE_FACET) {
                 // Out of a drill-down's domain: the file is greyed at file level and the gate
                 // refuses to function-paint it, so paint its tiles the same "Other" grey
@@ -1255,6 +1274,7 @@ export const layer = Layer.effect(
               })
             }
             if (Object.keys(built).length) extents = built
+            if (Object.keys(builtTags).length) lineTags = builtTags
           }
         }
         // The legend filter rides out with the colours it modifies (O4). Read here rather
@@ -1269,6 +1289,7 @@ export const layer = Layer.effect(
           lens: lensInfo,
           ...(filtered?.size ? { suppressed: [...filtered] } : {}),
           ...(extents ? { extents } : {}),
+          ...(lineTags ? { lineTags } : {}),
         }
       })
 

@@ -152,6 +152,31 @@ export const Extent = Schema.Struct({
 })
 export type Extent = typeof Extent.Type
 
+// One line-level facet assignment (S1): a *sparse* range, unlike `Extent` above.
+//
+// The contrast with Extent is the whole point and is easy to get wrong. Extents tile a
+// file exhaustively, which is the byte contract `attributeFileBytes` → `computeComposition`
+// → the treemap → the Explorer pip all rely on. Line tags do not tile: they mark the few
+// lines that answer a query, so they must never enter that attribution pipeline — a
+// directory's facet weights would stop summing to its files' bytes. They are an overlay
+// layer, read only by the surfaces that paint lines (the VSCode gutter) or count hits (a
+// Search Lens's TUI blocks).
+//
+// Lines are 1-based inclusive, clamped to the file's real line count. `facet`/`hue` are
+// resolved server-side against the active Lens's legend, exactly as `Extent`'s are.
+// `rule` names the Search Lens rule that produced the hit (absent for the deterministic
+// git-changed tags, which come from diff hunks rather than a rule); `note` carries the
+// authoring agent's reason for hover detail.
+export const LineTag = Schema.Struct({
+  startLine: Schema.Int,
+  endLine: Schema.Int,
+  facet: Schema.String,
+  hue: Schema.optional(Schema.String),
+  rule: Schema.optional(Schema.String),
+  note: Schema.optional(Schema.String),
+})
+export type LineTag = typeof LineTag.Type
+
 export const Payload = Schema.Struct({
   version: Schema.Int,
   nodes: Schema.Array(Node),
@@ -174,6 +199,11 @@ export const Payload = Schema.Struct({
   // file (at most one key in practice); derived at the read boundary like
   // `composition`, so it's backward compatible with structure caches.
   extents: Schema.optional(Schema.Record(Schema.String, Schema.Array(Extent))),
+  // Sparse line-level facets (S1), keyed by *file* node id like `extents`. Derived at the
+  // read boundary from the active Lens's rules (or, for git-changed, from diff hunks), so
+  // it is backward compatible with structure caches and needs no PAYLOAD_VERSION bump —
+  // the same posture that let `composition` widen from directories-only to per-node.
+  lineTags: Schema.optional(Schema.Record(Schema.String, Schema.Array(LineTag))),
   // Facets the user has toggled off in the legend (O4), merged in at the read boundary like
   // `lens`. The renderer greys these instead of painting their Lens colour — the *colours*
   // still ship true, so a client can toggle one off and back on without a refetch, and the

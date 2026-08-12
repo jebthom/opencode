@@ -157,6 +157,9 @@ export function activate(context: vscode.ExtensionContext) {
   }
 
   type Extent = { name: string; startLine: number; endLine: number; facet?: string; hue?: string }
+  // A sparse line-level facet (PLAN S1). Unlike an Extent these do not tile the file — they
+  // mark only the lines that answer a query (or, for git-changed, that actually changed).
+  type LineTag = { startLine: number; endLine: number; facet?: string; hue?: string; note?: string }
   type GraphNode = { id: string; path: string; kind: string }
 
   // The colour a function's stripe paints, honouring the legend filter (PLAN O4).
@@ -166,37 +169,46 @@ export function activate(context: vscode.ExtensionContext) {
   // filtered legend — which is the same table with suppressed facets swapped to the muted
   // role — is what greys the gutter alongside the chips. `ex.hue` remains the fallback for
   // an extent whose facet isn't in the legend (notably "Other").
-  function hueForExtent(ex: Extent): string | undefined {
+  // Takes anything carrying a facet/hue pair, so line tags resolve through the same filtered
+  // legend as extents — the two layers must not disagree about what a facet looks like.
+  function hueForExtent(ex: { facet?: string; hue?: string }): string | undefined {
     if (ex.facet === undefined) return ex.hue
     return facetLegend.find((e) => e.facet === ex.facet)?.color ?? ex.hue
   }
 
-  async function fetchExtents(relPath: string): Promise<Extent[] | undefined> {
+  async function fetchExtents(relPath: string): Promise<{ extents: Extent[]; lineTags: LineTag[] }> {
+    const none = { extents: [], lineTags: [] }
     const dir = directory()
-    if (!dir) return undefined
+    if (!dir) return none
     // Scope the window at the file's parent dir so the file's node is in-window and the
     // server attaches its extents (a root-scoped window omits deep files).
     const scope = relPath.split("/").slice(0, -1).join("/")
     const url = `${baseUrl()}/aperture?drill=${encodeURIComponent(relPath)}&scope=${encodeURIComponent(scope)}`
     const res = await fetch(url, { headers: { "x-opencode-directory": dir } })
-    if (!res.ok) return undefined
+    if (!res.ok) return none
     const data = (await res.json()) as {
       nodes?: GraphNode[]
       extents?: Record<string, Extent[]>
+      lineTags?: Record<string, LineTag[]>
       lens?: { id: string; deterministic?: boolean }
     }
-    // Deterministic built-in Lenses (Changed since last commit, Edit recency, Bus factor)
-    // don't paint the gutter: git-changed duplicates VSCode's own diff gutter (and its
-    // whole-file strips bury the added/removed markers), and the other two are file-level.
-    // Returning undefined here both skips painting and clears any strips left from a
-    // previously-active painted Lens.
-    if (data.lens?.deterministic) return undefined
-    // `extents` is keyed by file node id and carries EVERY drilled file still in the
-    // window — not just the one we asked for. Select by this file's node id; taking the
-    // first entry would paint a sibling's extents onto the current file.
+    // `extents`/`lineTags` are keyed by file node id and carry EVERY drilled file still in
+    // the window — not just the one we asked for. Select by this file's node id; taking the
+    // first entry would paint a sibling's ranges onto the current file.
     const node = data.nodes?.find((n) => n.kind === "file" && n.path === relPath)
-    if (!node) return undefined
-    return data.extents?.[node.id]
+    if (!node) return none
+    const lineTags = data.lineTags?.[node.id] ?? []
+    // Deterministic built-in Lenses don't paint *extents* in the gutter: Edit recency and
+    // Bus factor are file-level, and git-changed's declaration-wide strips buried the
+    // added/removed markers of VSCode's own diff gutter — a whole function striped because
+    // three lines changed.
+    //
+    // Their sparse LINE TAGS are a different matter, and are the reason this is no longer a
+    // blanket skip. git-changed already knows exactly which lines changed (it widens diff
+    // hunks up to declarations to build its tiles), so marking just those lines adds the
+    // magnitude *heat* VSCode's own gutter has no notion of without burying anything.
+    if (data.lens?.deterministic) return { extents: [], lineTags }
+    return { extents: data.extents?.[node.id] ?? [], lineTags }
   }
 
   // Fetch one editor's file extents and (re)apply its gutter. The fetch also drills the
@@ -205,31 +217,41 @@ export function activate(context: vscode.ExtensionContext) {
     if (editor.document.uri.scheme !== "file") return
     const relPath = vscode.workspace.asRelativePath(editor.document.uri, false).replace(/\\/g, "/")
 
-    let extents: Extent[] | undefined
+    let extents: Extent[] = []
+    let lineTags: LineTag[] = []
     try {
-      extents = await fetchExtents(relPath)
+      ;({ extents, lineTags } = await fetchExtents(relPath))
     } catch (e) {
       log(`fetch FAILED for ${relPath}: ${String(e)} (baseUrl=${baseUrl()} dir=${directory()})`)
       return
     }
-    const painted = (extents ?? []).filter((e) => {
+    const painted = extents.filter((e) => {
       const hue = hueForExtent(e)
       return hue !== undefined && resolveHue(hue) !== undefined
     }).length
-    log(`drill ${relPath}: ${extents?.length ?? 0} extents, ${painted} painted`)
+    log(`drill ${relPath}: ${extents.length} extents, ${painted} painted, ${lineTags.length} line tags`)
 
-    // Group line ranges by hue; a painted function carries a hue we can resolve (hex or
-    // a known theme-role token). Functions with no/unresolvable hue stay unpainted. One
-    // range per line: the `before` strip only renders at a range's start, so a multi-line
+    // Resolve a hue per LINE rather than accumulating ranges per hue, because the two layers
+    // overlap: extents tile the file, line tags mark a few lines inside them, and a line
+    // covered by both must paint one colour. Writing tags after extents into a line→hue map
+    // gives the precedence rule ("line tags win the lines they cover") for free, and dedupes
+    // overlapping ranges on the way — two decorations on one line would double-draw the strip.
+    const hueByLine = new Map<number, string>()
+    const put = (startLine: number, endLine: number, hue: string | undefined) => {
+      if (!hue || resolveHue(hue) === undefined) return
+      for (let line = startLine - 1; line <= endLine - 1; line++) {
+        if (line >= 0) hueByLine.set(line, hue)
+      }
+    }
+    for (const ex of extents) put(ex.startLine, ex.endLine, hueForExtent(ex))
+    for (const tag of lineTags) put(tag.startLine, tag.endLine, hueForExtent(tag))
+
+    // One range per line: the `before` strip only renders at a range's start, so a multi-line
     // range would leave every line but the first un-striped.
     const rangesByColor = new Map<string, vscode.Range[]>()
-    for (const ex of extents ?? []) {
-      const hue = hueForExtent(ex)
-      if (!hue || resolveHue(hue) === undefined) continue
+    for (const [line, hue] of hueByLine) {
       const list = rangesByColor.get(hue) ?? []
-      for (let line = ex.startLine - 1; line <= ex.endLine - 1; line++) {
-        list.push(new vscode.Range(line, 0, line, 0))
-      }
+      list.push(new vscode.Range(line, 0, line, 0))
       rangesByColor.set(hue, list)
     }
 

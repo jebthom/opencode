@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import {
   attributeFileBytes,
+  clampRanges,
   extentsOf,
   extentText,
   fileComposition,
@@ -300,6 +301,79 @@ describe("aperture extents (sub-file resolution)", () => {
     test("no ranges + no fallback marks every extent unchanged", () => {
       const facets = extentChangeFacets(content, [], false)
       expect([...facets.values()].every((f) => f === "unchanged")).toBe(true)
+    })
+  })
+
+  // Sparse line ranges (S1) — the *un*widened counterpart to extentChangeFacets. These
+  // deliberately do NOT tile, so assertTiles must not be applied to them.
+  describe("clampRanges", () => {
+    // 5 lines.
+    const five = "a\nb\nc\nd\ne"
+
+    test("passes through ranges already inside the file", () => {
+      expect(clampRanges([[2, 3]], five)).toEqual([[2, 3]])
+    })
+
+    test("clamps a range running past the end of the file", () => {
+      // git reported a hunk against content newer than what finalize read from disk.
+      expect(clampRanges([[4, 99]], five)).toEqual([[4, 5]])
+    })
+
+    test("drops a range entirely beyond the file", () => {
+      expect(clampRanges([[80, 99]], five)).toEqual([])
+    })
+
+    test("merges overlapping and adjacent ranges into one strip", () => {
+      // [1,2] and [3,4] merge on adjacency; [2,3] overlaps both.
+      expect(clampRanges(
+        [
+          [1, 2],
+          [3, 4],
+        ],
+        five,
+      )).toEqual([[1, 4]])
+      expect(clampRanges(
+        [
+          [1, 3],
+          [2, 3],
+        ],
+        five,
+      )).toEqual([[1, 3]])
+    })
+
+    test("keeps a genuine gap unmerged", () => {
+      expect(clampRanges(
+        [
+          [1, 1],
+          [4, 4],
+        ],
+        five,
+      )).toEqual([
+        [1, 1],
+        [4, 4],
+      ])
+    })
+
+    test("sorts out-of-order input", () => {
+      expect(clampRanges(
+        [
+          [5, 5],
+          [1, 1],
+        ],
+        five,
+      )).toEqual([
+        [1, 1],
+        [5, 5],
+      ])
+    })
+
+    test("normalizes a reversed range and a sub-1 start", () => {
+      expect(clampRanges([[3, 2]], five)).toEqual([[2, 3]])
+      expect(clampRanges([[0, 2]], five)).toEqual([[1, 2]])
+    })
+
+    test("an empty file has no tags however many ranges are reported", () => {
+      expect(clampRanges([[1, 5]], "")).toEqual([])
     })
   })
 })

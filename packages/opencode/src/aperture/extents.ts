@@ -258,6 +258,42 @@ export function parseHunkRanges(patch: string): Array<[number, number]> {
   return ranges
 }
 
+// Normalize raw line ranges (1-based inclusive) against the file they refer to, for use as
+// *sparse* line tags rather than as a tiling of the file. Clamps to [1, lineCount], drops
+// ranges that fall entirely outside it, then sorts and merges overlapping or adjacent ones.
+//
+// Clamping matters because a range's source and the content can disagree: `git diff` reports
+// hunks against the file git sees, and finalize re-reads from disk, so a write landing
+// between the two yields a range past the end. Painting that is a decoration on a line the
+// buffer doesn't have. Merging matters because two ranges that touch (`[4,6]` and `[7,9]`)
+// are one visual strip, and emitting them separately makes the client paint the same lines
+// twice — harmless for colour, but it doubles the tag count that a Search Lens reports as
+// its hit total.
+export function clampRanges(
+  ranges: ReadonlyArray<readonly [number, number]>,
+  content: string,
+): Array<[number, number]> {
+  const total = lineCount(content)
+  if (total === 0) return []
+  const kept: Array<[number, number]> = []
+  for (const [rawStart, rawEnd] of ranges) {
+    const start = Math.max(1, Math.min(rawStart, rawEnd))
+    const end = Math.min(total, Math.max(rawStart, rawEnd))
+    if (start > total || end < start) continue
+    kept.push([start, end])
+  }
+  if (kept.length === 0) return []
+  kept.sort((a, b) => a[0] - b[0] || a[1] - b[1])
+  const merged: Array<[number, number]> = [kept[0]!]
+  for (const [start, end] of kept.slice(1)) {
+    const last = merged[merged.length - 1]!
+    // `start <= last[1] + 1` merges adjacency as well as overlap.
+    if (start <= last[1] + 1) last[1] = Math.max(last[1], end)
+    else merged.push([start, end])
+  }
+  return merged
+}
+
 // Stable id for a sub-file (function-level) node: the file's repo-relative path
 // plus the (file-unique) declaration name. The "#" keeps it from colliding with
 // the file's own node id (which hashes the bare path). Stable across edits that
