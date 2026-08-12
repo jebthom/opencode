@@ -64,8 +64,9 @@ O3 ✅ (always-extent) ┬──► O1 ✅ (top bar simplify)
 O4 (legend filter) ──────────────────────────────► shared with S4
                      └──► also drives O2's `focus` (Explorer pips)
 
-S0 ✅ (tag = query) ──► S1 (rule model) ──► S2 (lens_mark) ──► S3 (line painting, sparse
-                    └──► S3's sparse layer ✅ (line-level git-changed)      layer ✅) ──► S5
+S0 ✅ (tag = query) ──► S1a ✅ (rule model) ──► S2 (lens_mark) ──► S3 (line painting, sparse
+                    ├──► S3's sparse layer ✅ (line-level git-changed)      layer ✅) ──► S5
+                    └──► S1b (ast-grep structural backend) — only S1 piece outstanding
 
 G1 ✅ (activity data) ──► G2+G3 ✅ (the Activity Path) ──► ✅ track complete
 
@@ -495,7 +496,70 @@ length turns out to be better supplied by the structural finder itself — a pat
 matching a `catch` clause paints the clause, one matching a call paints the call.
 See the span policy in S1, where widening in general is measured and rejected.
 
-### S1 — The rule model
+### S1 — The rule model ✅ (S1a; structural backend outstanding as S1b)
+
+**Split in two, risk-ordered.** `@ast-grep/napi` is the only part of S1 that can fail for
+reasons unrelated to the design — a native addon, a 0.x package, a postinstall Bun's trust
+policy blocks, and an all-platform install the standalone build needs. `pattern` and
+`symbol` need no new dependency and exercise every other piece end-to-end, so **S1a**
+(schema, persistence, evaluator, read-boundary wiring, tests) landed first and **S1b** (the
+structural backend) is the only thing left. A `structural` rule is meanwhile stored,
+validated and reported as an unsupported-backend diagnostic rather than silently ignored —
+so S2 and S3 are unblocked either way.
+
+**Landed:** `aperture/rules.ts` (new — hashing, evaluation, the two finders, per-rule
+diagnostics), `Rule`/`Finder`/`isSearch`/`isValidFinder`/`MAX_RULES`/`MAX_RULE_HITS` on
+`lenses.ts` (still dependency-free), rule normalisation in `lens-store.ts`'s existing
+`migrate` pass, `LensInfo.search` on the wire, the memo + emit block in `aperture.ts`, and
+19 evaluator cases + 5 store cases (`test/aperture/rules.test.ts`, `lens-store.test.ts`).
+
+**Two things only running it could find.**
+
+- **An invalid regex reported `0 hits` and no error.** Ripgrep exits 2 for an uncompilable
+  pattern and `Ripgrep.search` maps that to `partial: true` with an *empty* item list, so
+  discarding `partial` turned "your regex is broken" into "the code isn't there" — which is
+  precisely the reading an agent would act on, and the exact failure the diagnostic exists to
+  prevent. `partial` is now surfaced as the rule's `error`. Not pre-validated with
+  `new RegExp` instead: ripgrep speaks rust-regex, which accepts the `(?i)` inline flag that
+  `caseSensitive: false` generates and JS rejects, so a JS pre-check would reject valid
+  patterns.
+- **The cap has to be applied before touching the disk.** `clampRanges` needs each matched
+  file's content, and the deliberately-loose probe (`const ` on this repo — 46,063 matched
+  lines across 2,300 files) spent ~1.2s of the 1.4s pass reading files whose ranges were then
+  thrown away unpainted. The over-cap check moved ahead of the reads, and reports *raw
+  matched lines* rather than merged ranges — which is also the more faithful reading of a cap
+  whose job is to catch "this paints a third of the repo", since merging only ever shrinks
+  the number.
+
+**Cost, measured on this repo:** a whole-repo pass over 6 rules ≈ 1.0s (dominated by the
+degenerate rule above; the three realistic rules are a few hundred ms), one file ≈ 0.2s. The
+memo is therefore not optional even before ast-grep, whose whole-repo pass is 240–285ms
+against 17ms for a single file.
+
+**Verified live** against this repo with a hand-authored Lens in `lenses.json` — which is
+also the intended authoring path until S2: `lens.search` ships `true`; `lineTags` arrive
+keyed by file node id carrying `facet`/`hue`/`rule`/`note`; a `pattern` rule marks exactly
+its matched lines (`extents.ts:272`) while a `symbol` rule paints its declaration's whole
+extent (`extentsOf`, lines 62–100) in the same payload; the over-cap rule paints nothing;
+and `composition` still reports all 19 in-window nodes, unchanged — the assertion that the
+sparse layer stayed out of `attributeFileBytes`. **No VSCode extension change was involved
+at any point**, which is the real proof that S0's sparse layer generalised from git hunks to
+rules.
+
+**Not verified live: the per-file incremental invalidation.** `serve` never constructs the
+file watcher (no `watcher backend` log line, and `Watcher.layer` needs a `Location.Service`
+that a headless server doesn't stand up), so no `file.edited` reaches `onFileChanged` there.
+The tell is that the *shipped* structure cache missed the same edits — a newly created file
+never became a node — so this is the environment, not the wiring. What is verified: a cold
+pass picks up an edit correctly, and `evaluate`'s `files` restriction (the thing the stale
+set drives) is unit-tested. Exercising the hook itself needs the TUI, which does start the
+watcher.
+
+**One subtlety the incremental path forced.** A rule over the cap is dropped from the full
+pass, so re-evaluating a *single* changed file would find it perfectly narrow and paint it.
+The memo therefore carries the over-cap rule ids forward from the last full pass and filters
+incremental results through them. A rule that only becomes too broad after edits stays
+painted until the next full pass — accepted, since a full pass follows every turn.
 
 Rules attach to `Lens` in `.opencode/aperture/lenses.json` (`lens-store.ts:31-43`)
 — small, hand-authored, readable, diffable, committable, shareable. That is a
@@ -1263,10 +1327,15 @@ anywhere. O2 also produced the bulk endpoint S5 is specified to consume.
   It turned out to be a non-problem: a tag is a persisted *query*, not a location,
   so S1 shrank from "the hard part" to a schema plus a pure evaluator.
 
+- **S1a ✅** — the rule model. Landed as a schema plus a pure evaluator, exactly the shape
+  S0 predicted once anchoring was deleted.
+
 O4 whenever convenient — it's small, self-contained, immediately useful, and now
 has a second consumer: it should drive O2's Explorer `focus` as well as the TUI.
 
-**Then:** S2 → S3 → S5 in sequence, all gated on S1.
+**Then:** S2 → S3 → S5 in sequence, no longer gated (S1a unblocked them). **S1b** — the
+ast-grep structural backend — is independent of that chain and can land whenever the native
+dependency is convenient to take; nothing downstream waits on it.
 
 **Track G**: G0 → G1 → G2+G3 landed and the path is working end-to-end. **G4**
 (affordances — height, words, click-to-open, expandable survey rows, hover detail) is
@@ -1357,7 +1426,8 @@ Aperture files:
   function extents), `semantic-store.ts` (file-level facets),
   `subfacet-store.ts` (function-level facets), `semantics.ts`, `lenses.ts` +
   `lens-store.ts`, `deterministic.ts` (git/mtime/bus-factor built-ins),
-  `event.ts`, `dump.ts`, `study-log.ts`, `activity.ts` (G1 vocabulary + wire
+  `rules.ts` (S1 — search-rule evaluation into sparse line ranges; pure per file,
+  memoized by the caller), `event.ts`, `dump.ts`, `study-log.ts`, `activity.ts` (G1 vocabulary + wire
   shapes, dependency-free) + `activity-model.ts` (the pure turn derivation over
   stored messages).
 - Tools: `tool/lens-{create,list,select,edit,merge-facets,facet-files}.ts`,

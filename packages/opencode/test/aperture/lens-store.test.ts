@@ -4,7 +4,7 @@ import fs from "fs/promises"
 import os from "os"
 import path from "path"
 import { ApertureLensStore } from "@/aperture/lens-store"
-import { ARCHITECTURE_ID, BUILTIN_LENSES } from "@/aperture/lenses"
+import { ARCHITECTURE_ID, BUILTIN_LENSES, MAX_RULES } from "@/aperture/lenses"
 
 // A3: Lens definitions + the active pointer persist in the project directory
 // under .opencode/aperture/ (not global KV), so a Lens is shareable/committable.
@@ -210,5 +210,77 @@ describe("aperture lens-store (drill-downs)", () => {
       child.id,
       grandchild.id,
     ])
+  })
+})
+
+// S1: search rules live on the Lens in lenses.json — small, hand-authored, diffable and
+// committable — so the store has to survive a hand-edited or stale rule without losing the
+// Lens. Everything here is SHAPE validation; whether a regex compiles or matched 4,000 lines
+// is the evaluator's question, because those must be reported rather than silently dropped.
+describe("aperture lens-store — search rules", () => {
+  let dir: string
+  beforeAll(async () => {
+    dir = await fs.mkdtemp(path.join(os.tmpdir(), "aperture-lens-rules-"))
+  })
+  afterAll(async () => {
+    await fs.rm(dir, { recursive: true, force: true })
+  })
+
+  // Rules arrive via lens_mark (S2), so seed them the way a hand edit or that tool would:
+  // straight into the committed doc.
+  const seed = async (rules: unknown[]) => {
+    const lens = await Effect.runPromise(ApertureLensStore.create(dir, { ...CREATE, name: `L${Math.random()}` }))
+    const file = path.join(dir, ".opencode", "aperture", "lenses.json")
+    const doc = JSON.parse(await fs.readFile(file, "utf8"))
+    doc[lens.id].rules = rules
+    await fs.writeFile(file, JSON.stringify(doc, null, 2))
+    const all = await Effect.runPromise(ApertureLensStore.list(dir))
+    return all.find((l) => l.id === lens.id)!
+  }
+
+  test("a well-formed rule round-trips", async () => {
+    const lens = await seed([{ id: "r1", facet: "login", find: { kind: "pattern", pattern: "signIn" }, note: "why" }])
+    expect(lens.rules).toEqual([
+      { id: "r1", facet: "login", find: { kind: "pattern", pattern: "signIn" }, note: "why" } as never,
+    ])
+  })
+
+  test("drops a rule naming a facet the Lens doesn't have", async () => {
+    // The live hazard: facet ids are slugs and mergeFacets can retire one, so a stale rule
+    // would otherwise ask the painter for a colour that no longer exists.
+    const lens = await seed([{ id: "r1", facet: "ghost", find: { kind: "pattern", pattern: "x" } }])
+    expect(lens.rules ?? []).toEqual([])
+  })
+
+  test("drops malformed finders but keeps the rest of the Lens", async () => {
+    const lens = await seed([
+      { id: "r1", facet: "login", find: { kind: "nonsense", pattern: "x" } },
+      { id: "r2", facet: "login", find: { kind: "pattern" } },
+      { id: "r3", facet: "login", find: { kind: "symbol", name: "" } },
+      { id: "", facet: "login", find: { kind: "pattern", pattern: "x" } },
+      { id: "r5", facet: "login", find: { kind: "pattern", pattern: "keeper" } },
+    ])
+    expect(lens.rules!.map((r) => r.id)).toEqual(["r5"])
+    expect(lens.facets.length).toBe(2)
+  })
+
+  test("truncates past MAX_RULES", async () => {
+    const many = Array.from({ length: MAX_RULES + 5 }, (_, i) => ({
+      id: `r${i}`,
+      facet: "login",
+      find: { kind: "pattern", pattern: `p${i}` },
+    }))
+    const lens = await seed(many)
+    expect(lens.rules!.length).toBe(MAX_RULES)
+  })
+
+  test("merging facets carries a rule onto the survivor rather than orphaning it", async () => {
+    const lens = await seed([{ id: "r1", facet: "login", find: { kind: "pattern", pattern: "signIn" } }])
+    await Effect.runPromise(ApertureLensStore.mergeFacets(dir, lens.id, "login", "tokens"))
+    const all = await Effect.runPromise(ApertureLensStore.list(dir))
+    const updated = all.find((l) => l.id === lens.id)!
+    // Without the rewrite, normalizeRules would drop this on the very next read: a cosmetic
+    // merge would silently destroy a query an agent had to think to write.
+    expect(updated.rules!.map((r) => r.facet)).toEqual(["tokens"])
   })
 })

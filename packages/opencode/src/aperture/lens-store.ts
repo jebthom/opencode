@@ -7,11 +7,14 @@ import {
   type Facet,
   type LensParent,
   type PaletteId,
+  type Rule,
   ARCHITECTURE_ID,
   BUILTIN_LENSES,
   PALETTES,
   MAX_FACETS,
+  MAX_RULES,
   assignColors,
+  isValidFinder,
   orderForest,
   slugify,
 } from "./lenses"
@@ -93,7 +96,38 @@ function resolvePalette(stored: string | undefined): PaletteId {
 // swap of the palette table would otherwise have done to every Lens on disk).
 function migrate(lens: Lens): Lens {
   const palette = resolvePalette(lens.palette)
-  return { ...lens, palette, facets: assignColors(palette, lens.facets) }
+  const facets = assignColors(palette, lens.facets)
+  const rules = normalizeRules(lens.rules, facets)
+  return { ...lens, palette, facets, ...(rules.length ? { rules } : { rules: undefined }) }
+}
+
+// Drop stored rules that can't paint, on the same read-time pass that re-derives facet
+// colour. `lenses.json` is committable and hand-editable, so this has to be total — a
+// mistyped finder must cost that one rule, never the Lens.
+//
+// Three ways a rule dies here, all of them *shape*: it isn't an object with an id and a
+// well-formed finder; its facet isn't on this Lens (facet ids are slugs, and mergeFacets
+// can retire one out from under a rule — the same hazard `facetsWithin` guards for the O4
+// legend filter); or it is past MAX_RULES.
+//
+// Everything else a rule can be wrong about — a regex that won't compile, an ast-grep
+// pattern that won't parse, a pattern that matches 4,000 lines — is deliberately NOT
+// checked here. Those must be *reported* so the authoring agent can narrow them, and the
+// store has nowhere to report to; they belong to the evaluator (`rules.ts`), which returns
+// a diagnostic per rule.
+function normalizeRules(rules: ReadonlyArray<Rule> | undefined, facets: ReadonlyArray<Facet>): Rule[] {
+  if (!Array.isArray(rules)) return []
+  const known = new Set(facets.map((f) => f.id))
+  const out: Rule[] = []
+  for (const raw of rules) {
+    if (out.length >= MAX_RULES) break
+    if (typeof raw !== "object" || raw === null) continue
+    if (typeof raw.id !== "string" || !raw.id) continue
+    if (typeof raw.facet !== "string" || !known.has(raw.facet)) continue
+    if (!isValidFinder(raw.find)) continue
+    out.push(raw)
+  }
+  return out
 }
 
 // All user-defined Lenses for a project (empty when none defined yet).
@@ -366,7 +400,17 @@ export const mergeFacets = (
     if (!prev) return undefined
     if (from === into) return prev
     if (!prev.facets.some((t) => t.id === from) || !prev.facets.some((t) => t.id === into)) return undefined
-    const next: Lens = { ...prev, facets: prev.facets.filter((t) => t.id !== from) }
+    // A rule naming the retired facet has to follow it, for the same reason a drill-down
+    // scoped to it does (below): otherwise normalizeRules drops the rule on the next read
+    // as naming a facet that no longer exists, and a query the agent wrote is silently lost
+    // by a *cosmetic* merge. Rules are the one thing here that cost judgement rather than
+    // tokens, so they are the last thing that should evaporate.
+    const rules = prev.rules?.map((r) => (r.facet === from ? { ...r, facet: into } : r))
+    const next: Lens = {
+      ...prev,
+      facets: prev.facets.filter((t) => t.id !== from),
+      ...(rules?.length ? { rules } : {}),
+    }
     project[id] = next
     // A drill-down scoped to the facet that just went away has to follow it, or its domain
     // would name a facet that no longer exists and it would paint nothing at all. (The

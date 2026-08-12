@@ -23,6 +23,7 @@ import { ApertureEvent } from "./event"
 import { ApertureSemanticStore } from "./semantic-store"
 import { ApertureSubfacetStore } from "./subfacet-store"
 import { ApertureExtents } from "./extents"
+import { ApertureRules } from "./rules"
 import { AperturePainter } from "./painter"
 import { ApertureLensStore } from "./lens-store"
 import { ApertureDeterministic } from "./deterministic"
@@ -48,6 +49,7 @@ import {
   MAX_LENS_DEPTH,
   isBuiltinLens,
   isDeterministic,
+  isSearch,
   dependsOnDeterministic,
 } from "./lenses"
 
@@ -415,6 +417,70 @@ export const layer = Layer.effect(
         return files
       })
 
+    // Evaluated search rules (S1) per directory. Line tags are *derived* — never persisted,
+    // never cached to disk — so this is the only thing standing between the read boundary and
+    // a fresh whole-repo grep on every fetch, and finalize runs constantly.
+    //
+    // Keyed on (lensID, rulesHash) as fields rather than as a map key: exactly one entry per
+    // directory, replaced wholesale when either changes, so switching Lens or editing a rule
+    // can never leak an entry and the map cannot grow.
+    interface RuleMemo {
+      readonly lensID: string
+      readonly hash: string
+      readonly byFile: Map<string, ReadonlyArray<ApertureRules.RuleHit>>
+      // Rule ids the last FULL pass found too broad. Carried because the incremental path
+      // below re-evaluates a single file, where a rule matching a third of the repo looks
+      // perfectly narrow — without this, one edit would un-suppress it.
+      readonly overCap: ReadonlySet<string>
+      // Files edited since the last evaluation, re-derived lazily on the next read.
+      readonly stale: Set<string>
+    }
+    const ruleMemo = new Map<string, RuleMemo>()
+
+    // The active Lens's rule hits, whole-repo, memoized. Returns an empty map for a Lens with
+    // no rules (the overwhelmingly common case, and it costs nothing).
+    //
+    // The incremental path is the point of the whole structure: every finder is a pure
+    // function of one file's content (see rules.ts), so a changed file can be re-derived
+    // alone. Measured on this repo, a whole-repo pass is ~1s and one file is ~0.2s — and
+    // S1b's ast-grep backend widens that gap, since a whole-repo structural pass is
+    // 240-285ms against 17ms for a single file.
+    const ruleHitsFor = (directory: string, lens: Lens) =>
+      Effect.gen(function* () {
+        const rules = lens.rules ?? []
+        if (rules.length === 0) return new Map<string, ReadonlyArray<ApertureRules.RuleHit>>()
+        const hash = ApertureRules.rulesHash(rules)
+        const memo = ruleMemo.get(directory)
+        if (!memo || memo.lensID !== lens.id || memo.hash !== hash) {
+          const result = yield* ApertureRules.evaluate(directory, rules)
+          const overCap = new Set(result.diagnostics.filter((d) => d.overCap).map((d) => d.rule))
+          ruleMemo.set(directory, {
+            lensID: lens.id,
+            hash,
+            byFile: new Map(result.byFile),
+            overCap,
+            stale: new Set(),
+          })
+          for (const d of result.diagnostics)
+            if (d.overCap || d.error) log.warn("rule not painted", { lens: lens.id, ...d })
+          return result.byFile
+        }
+        if (memo.stale.size) {
+          const files = [...memo.stale]
+          memo.stale.clear()
+          const result = yield* ApertureRules.evaluate(directory, rules, files)
+          // Delete first, then re-add: a file whose last matching line was just deleted has
+          // no entry in the new result at all, and merging alone would leave the stale one.
+          // This is where "a deleted usage loses its paint" actually happens.
+          for (const file of files) memo.byFile.delete(file)
+          for (const [file, hits] of result.byFile) {
+            const kept = hits.filter((h) => !memo.overCap.has(h.rule))
+            if (kept.length) memo.byFile.set(file, kept)
+          }
+        }
+        return memo.byFile
+      })
+
     // Working-tree change set for the deterministic "Changed since last commit" built-in,
     // cached per directory because the TUI refetches constantly (so finalize runs often)
     // but git state only moves when files change. Dropped from the same file-event /
@@ -713,6 +779,7 @@ export const layer = Layer.effect(
       caches.delete(directory)
       subtreeCache.delete(directory)
       gitStatusCache.delete(directory)
+      ruleMemo.delete(directory)
       busFactorCache.delete(directory)
       busFactorHead.delete(directory)
       busFactorInFlight.delete(directory)
@@ -1176,7 +1243,20 @@ export const layer = Layer.effect(
           // Signals a deterministic built-in (git/mtime, no painter) so a client can
           // suppress editor-gutter painting for it — see LensInfo in payload.ts.
           ...(det ? { deterministic: true } : {}),
+          // Signals a probe rather than a partition, so a client draws hit density instead
+          // of a composition treemap (S3).
+          ...(isSearch(lens) ? { search: true } : {}),
         }
+        // In-window file nodes by path. Hoisted out of the drill-in block below because the
+        // search-rule block needs the same lookup: both turn a repo-relative path into the
+        // node id the payload keys line data by.
+        const idByPath = new Map<string, string>()
+        for (const n of structure.nodes) if (n.kind === "file") idByPath.set(n.path, n.id)
+        // Sparse line tags, accumulated from two independent sources — git-changed's
+        // unwidened diff hunks (below) and the active Lens's search rules (further below).
+        // Declared out here so both can contribute to one record; a file can carry tags from
+        // either or, in principle, both.
+        const builtTags: Record<string, AperturePayload.LineTag[]> = {}
         // Drill-in (A5): attach function-level tiles for every file that has been
         // drilled in this directory AND is in the current window — not just the file the
         // user just clicked. Once a file is function-painted it keeps its measured band
@@ -1189,12 +1269,8 @@ export const layer = Layer.effect(
         // diff` hunks; mtime-recency can't subdivide a file, so it carries no extents.
         const supportsExtents = !det || lens.deterministic === "git-changed"
         let extents: Record<string, ReadonlyArray<AperturePayload.Extent>> | undefined
-        let lineTags: Record<string, ReadonlyArray<AperturePayload.LineTag>> | undefined
         if (supportsExtents) {
-          // In-window file nodes by path; a drilled file that's off-window is skipped
-          // (its tiles would render on no tile).
-          const idByPath = new Map<string, string>()
-          for (const n of structure.nodes) if (n.kind === "file") idByPath.set(n.path, n.id)
+          // A drilled file that's off-window is skipped (its tiles would render on no tile).
           const targets = new Set<string>()
           for (const f of drilledFiles.get(ctx.directory) ?? []) if (idByPath.has(f)) targets.add(f)
           // The freshly-clicked file is already in drilledFiles (the drill path adds it
@@ -1204,7 +1280,6 @@ export const layer = Layer.effect(
             // Semantic Lenses read the per-function store once for all targets.
             const subStore = det ? undefined : yield* ApertureSubfacetStore.read(storage, ctx.project.id, lens.id)
             const built: Record<string, ReadonlyArray<AperturePayload.Extent>> = {}
-            const builtTags: Record<string, ReadonlyArray<AperturePayload.LineTag>> = {}
             for (const file of targets) {
               const fileId = idByPath.get(file)!
               const content = yield* readFileText(ctx.directory, file)
@@ -1274,9 +1349,43 @@ export const layer = Layer.effect(
               })
             }
             if (Object.keys(built).length) extents = built
-            if (Object.keys(builtTags).length) lineTags = builtTags
           }
         }
+        // Search rules (S1): sparse line tags derived from the Lens's persisted finders.
+        //
+        // Deliberately outside the `supportsExtents` / `targets.size` gates above. Those
+        // guard the *drill-in* path — extents exist only for files the user (or the
+        // extension) drilled into — but a rule answers "where in the repo is this", so it has
+        // to paint files nobody drilled. The two layers meet only here, in `builtTags`.
+        //
+        // Nothing in this block touches `attributeFileBytes` or `composition`. Extents tile a
+        // file exhaustively and that byte contract is what the treemap, the directory bands
+        // and the Explorer pip are all built on; line tags are sparse and would break the sum
+        // (see LineTag in payload.ts). Keeping them in a separate record is what enforces it.
+        if (lens.rules?.length) {
+          const hits = yield* ruleHitsFor(ctx.directory, lens)
+          for (const [file, fileHits] of hits) {
+            // Out of the current window: the file has no node here, so a tag on it would key
+            // nothing. The memo still holds it for when the window moves.
+            const fileId = idByPath.get(file)
+            if (!fileId) continue
+            const tags: AperturePayload.LineTag[] = []
+            for (const hit of fileHits) {
+              const hue = hit.facet === NONE_FACET ? NONE_HUE : colorByFacet.get(hit.facet)
+              for (const [startLine, endLine] of hit.ranges)
+                tags.push({
+                  startLine,
+                  endLine,
+                  facet: hit.facet,
+                  ...(hue ? { hue } : {}),
+                  rule: hit.rule,
+                  ...(hit.note ? { note: hit.note } : {}),
+                })
+            }
+            if (tags.length) builtTags[fileId] = [...(builtTags[fileId] ?? []), ...tags]
+          }
+        }
+        const lineTags = Object.keys(builtTags).length ? builtTags : undefined
         // The legend filter rides out with the colours it modifies (O4). Read here rather
         // than baked into the structure cache: finalize runs on every fetch, so a filter set
         // from the VSCode picker is picked up by the next TUI poll even if the event was
@@ -1520,6 +1629,14 @@ export const layer = Layer.effect(
         // git change set is likewise stale (the edit may have changed what's modified).
         subtreeCache.delete(directory)
         gitStatusCache.delete(directory)
+        // Rule hits for THIS file only. Not a whole-memo drop: every finder is a pure
+        // function of one file's content, so one file's result can never depend on another's
+        // — which is what lets an edit cost one re-derivation instead of a whole-repo pass.
+        const memo = ruleMemo.get(directory)
+        if (memo) {
+          memo.byFile.delete(rel)
+          memo.stale.add(rel)
+        }
         for (const scope of container.scopes.keys()) {
           if (!isWithinWindow(scope, rel)) continue
           container.dirty.add(scope)
@@ -1569,6 +1686,11 @@ export const layer = Layer.effect(
         subtreeCache.delete(directory)
         gitStatusCache.delete(directory)
         isRepoCache.delete(directory)
+        // The whole rule memo, not per-file: shell ops (mv/rm/scaffolding, git checkout)
+        // mutate the tree without firing a single file event, so after a turn we don't know
+        // *which* files moved and the per-file staleness set can't be trusted. Same reasoning
+        // as the subtree/git drops above.
+        ruleMemo.delete(directory)
         yield* wakeBackground(directory)
         // A turn may have changed the working set via shell ops that fire no file event
         // (mv/rm/scaffolding, git add/commit); with the git cache dropped above, re-seed the

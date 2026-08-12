@@ -108,6 +108,13 @@ export const LensInfo = Schema.Struct({
   // strips bury the added/removed markers. The TUI ignores it (it still tiles their
   // composition/extents); the VSCode extension skips gutter paint when it's set.
   deterministic: Schema.optional(Schema.Boolean),
+  // True for a *Search* Lens: a narrow binary/ternary probe whose facets mark where
+  // something is, rather than a partition of the codebase into what each file is. Purely a
+  // rendering signal — the client draws hit density and a sparse gutter instead of a
+  // composition treemap, because the question is "where are the hits", not "what is this
+  // made of". Says nothing about where the facets come from; a Search Lens and a rule-
+  // carrying Overview Lens are independent (see `rules` vs `search` on Lens).
+  search: Schema.optional(Schema.Boolean),
 })
 export type LensInfo = typeof LensInfo.Type
 

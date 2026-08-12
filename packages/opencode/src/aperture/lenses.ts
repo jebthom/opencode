@@ -47,6 +47,117 @@ export interface LensParent {
 // child can be placed), so the chain is capped rather than unbounded.
 export const MAX_LENS_DEPTH = 3
 
+// --- search rules (S1) ------------------------------------------------------
+
+// A *finder*: the persisted half of a line-level facet assignment. The key move (S0) is
+// that a line tag is NOT a location — it is a query. Nothing about a hit is stored; the
+// finder is stored and the lines are re-derived from disk at every payload read, exactly
+// as `extentsOf` re-cuts a file's extents. So a deleted usage silently loses its paint and
+// a new one gains it, with no anchoring, no edit-tracking and no "lost" state to render.
+//
+// Three kinds, and none subsumes the others:
+//   pattern    — a ripgrep regex. Language-agnostic (config, YAML, markup), over-matches
+//                comments and strings. Span = the matched line.
+//   symbol     — a top-level declaration by NAME, via extentsOf's column-0 regex. Coarse
+//                (the whole declaration) but *idiom-blind*: it finds `paintStale` whether
+//                it is a const-arrow, a generator or a declaration, because it never looks
+//                at the right-hand side. This repo is Effect-shaped — aperture.ts has 265
+//                callables and only 8 `function_declaration` nodes — so the obvious
+//                structural pattern for "all the functions" silently finds 3% of them.
+//   structural — an ast-grep pattern. Precise and exact-ranged, but requires knowing the
+//                idiom. (Backend lands in S1b; until then it reports rather than paints.)
+//
+// There is deliberately no `span` field. Widening a point hit to its enclosing region was
+// measured against this repo and rejected: `extentsOf`'s next-declaration arithmetic
+// over-painted 87×, and even the smallest enclosing structural callable over-painted 8.7×.
+// Each finder instead *chooses its own extent* — match a `catch` clause and you paint the
+// clause, match a call and you paint the call.
+export type Finder =
+  | {
+      readonly kind: "pattern"
+      readonly pattern: string
+      readonly glob?: ReadonlyArray<string>
+      readonly caseSensitive?: boolean
+    }
+  | { readonly kind: "symbol"; readonly name: string; readonly path?: string }
+  | {
+      readonly kind: "structural"
+      readonly pattern: string
+      readonly language: string
+      readonly glob?: ReadonlyArray<string>
+    }
+
+export interface Rule {
+  readonly id: string
+  // A facet id on THIS Lens. Rules are orthogonal to `search`: every Lens has facets, so a
+  // rule can contribute to an Overview Lens too.
+  readonly facet: string
+  readonly find: Finder
+  // The authoring agent's reason. Shown on hover; never re-evaluated. This is what carries
+  // the judgement a rule-only model otherwise can't express ("this is the retry path"),
+  // pinned to a declaration the finder *can* name.
+  readonly note?: string
+  // Agent name, for the study log — the evidence for whether widening the tool injection to
+  // Explore actually changed authoring behaviour.
+  readonly createdBy?: string
+}
+
+// A Search Lens is meant to be *sparse*, and the failure mode is a loose regex silently
+// painting a third of the repo. Over the hit cap a rule is stored and reported as too broad
+// rather than painted, so the agent (or the user reading lenses.json) can see and narrow it.
+//
+// The caps and the error paths are kept in full despite this being a research prototype —
+// the opposite of the usual prototype trade. A flooded view or a crashed pass during an
+// unattended participant session is a lost session, not a bug report.
+export const MAX_RULES = 32
+export const MAX_RULE_HITS = 500
+
+// Whether a Lens renders as a *probe* (hit density, sparse gutter) rather than as a
+// partition of the codebase. Rendering policy only — it says nothing about where the facets
+// come from, which is why it is a separate field from `rules`. Deliberately the same shape
+// as `isDeterministic` below, whose `deterministic?: DeterministicKind` idiom already
+// delivers everything a distinct Lens *type* was wanted for: a different paint policy,
+// different persistence, picker grouping and a wire flag — without forking lens
+// list/select/cycle/edit, the legend or the O4 filter.
+export function isSearch(lens: Pick<Lens, "search">): boolean {
+  return lens.search === true
+}
+
+// Shape predicate for a stored finder. Total and pure: `lenses.json` is hand-editable and
+// committable, so a malformed entry must be *droppable* rather than throwing — the same
+// posture that makes `orderForest` cycle-safe.
+//
+// Shape only. Whether the regex compiles, the ast-grep pattern parses, or the rule matched
+// 4,000 lines are all the evaluator's questions, because those need to be *reported* back
+// to the agent and the store has nowhere to report.
+export function isValidFinder(value: unknown): value is Finder {
+  if (typeof value !== "object" || value === null) return false
+  const find = value as Record<string, unknown>
+  const strings = (key: string) =>
+    find[key] === undefined ||
+    (Array.isArray(find[key]) && (find[key] as unknown[]).every((g) => typeof g === "string"))
+  switch (find["kind"]) {
+    case "pattern":
+      return typeof find["pattern"] === "string" && find["pattern"].length > 0 && strings("glob")
+    case "symbol":
+      return (
+        typeof find["name"] === "string" &&
+        find["name"].length > 0 &&
+        (find["path"] === undefined || typeof find["path"] === "string")
+      )
+    case "structural":
+      return (
+        typeof find["pattern"] === "string" &&
+        find["pattern"].length > 0 &&
+        typeof find["language"] === "string" &&
+        find["language"].length > 0 &&
+        strings("glob")
+      )
+    default:
+      return false
+  }
+}
+
 export interface Lens {
   readonly id: string
   readonly name: string
@@ -80,6 +191,12 @@ export interface Lens {
   // Present only on a *drill-down* Lens: the parent Lens + the subset of its facets this
   // Lens is scoped to (see LensParent). Absent on every root Lens, including all built-ins.
   readonly parent?: LensParent
+  // Persisted line-level finders (S1). Lives on the Lens rather than in a store of its own
+  // because a rule is small, hand-authored, readable, diffable, committable and shareable —
+  // and because the rule is the thing worth keeping: its *hits* are free to regenerate.
+  readonly rules?: ReadonlyArray<Rule>
+  // Renders as a probe rather than a partition (see isSearch). Orthogonal to `rules`.
+  readonly search?: true
 }
 
 // --- palettes --------------------------------------------------------------
