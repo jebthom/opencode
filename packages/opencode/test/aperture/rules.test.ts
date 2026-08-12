@@ -9,9 +9,11 @@ import { MAX_RULE_HITS, type Rule } from "@/aperture/lenses"
 // S1: a line tag is a persisted *query*, not a location. These exercise the evaluator that
 // turns a Lens's finders into sparse line ranges at the read boundary.
 
+// A rule's facet names the CONCERN, never the search — S2 dropped the binary `hit` facet the
+// track originally proposed, because the name is what the user reads in the legend.
 const rule = (id: string, find: Rule["find"], extra: Partial<Rule> = {}): Rule => ({
   id,
-  facet: "hit",
+  facet: "retry-path",
   find,
   ...extra,
 })

@@ -16,6 +16,7 @@ import type { Agent } from "@/agent/agent"
 import { Permission } from "@/permission"
 import { Skill } from "@/skill"
 import { ApertureLensStore } from "@/aperture/lens-store"
+import { ApertureLenses } from "@/aperture/lenses"
 
 export function provider(model: Provider.Model) {
   if (model.api.id.includes("gpt-4") || model.api.id.includes("o1") || model.api.id.includes("o3"))
@@ -90,6 +91,24 @@ export const layer = Layer.effect(
         const all = yield* ApertureLensStore.list(ctx.directory)
         const active = yield* ApertureLensStore.getActive(ctx.directory)
         const others = all.filter((c) => c.id !== active.id).map((c) => c.name)
+        // The Search Lenses and their concerns, injected rather than left to a lens_list round
+        // trip — this is the vocabulary the agent has to paste into an Explore task prompt (see
+        // DELEGATING EXPLORATION), and it is what stops it minting `retry-path-2` beside an
+        // existing `retry-path`.
+        const searchLenses = all.filter((c) => ApertureLenses.isSearch(c))
+        const rosters = searchLenses.map((lens) => {
+          const roster = ApertureLenses.concernRoster(lens)
+          const free = ApertureLenses.MAX_FACETS - roster.length
+          return (
+            `Search Lens "${lens.name}" [${lens.id}] — ` +
+            (roster.length
+              ? roster
+                  .map((c) => `${c.label} [${c.facet}] ${c.colorName} (${c.rules} rule${c.rules === 1 ? "" : "s"})`)
+                  .join(", ")
+              : "no concerns yet") +
+            `. ${free} concern slot${free === 1 ? "" : "s"} free.`
+          )
+        })
 
         return [
           "<aperture>",
@@ -98,6 +117,7 @@ export const layer = Layer.effect(
           "is a two-way visual channel between you and them.",
           `Active Lens: "${active.name}" — facets: ${active.facets.map((t) => t.label).join(", ")}.`,
           ...(others.length ? [`Other Lenses: ${others.join(", ")}.`] : []),
+          ...rosters,
           "",
           "When the user EXPLICITLY drives the Lens — e.g. they ran /lens, they approved a schema",
           "the lens agent just proposed, or they asked you to create or switch to a specific",
@@ -106,7 +126,7 @@ export const layer = Layer.effect(
           "route an explicit user request through a subagent, and do NOT pass activate:false.",
           "",
           "PAINT AND EXPLORE IN PARALLEL. When a sensemaking question warrants a Lens (e.g.",
-          "\"what are the X features\", \"how does Y work\", \"which files touch Z\"), call",
+          '"what are the X features", "how does Y work", "which files touch Z"), call',
           "lens_create FIRST so the painter starts immediately, then proceed to explore the",
           "relevant files (grep/read, or a subagent) in the SAME turn — do not wait for the",
           "paint to finish. The Lens fills in asynchronously while you explore, so the user",
@@ -127,11 +147,43 @@ export const layer = Layer.effect(
           "Never switch the active Lens (lens_select) without asking the user first —",
           "switching changes what they are viewing.",
           "For this opportunistic path, delegate to the lens agent via the task tool (subagent_type",
-          "\"lens\"). In the task prompt, describe the feature/question and state that this is a",
+          '"lens"). In the task prompt, describe the feature/question and state that this is a',
           "NON-INTERACTIVE subagent invocation: it should design AND create the Lens directly",
           "(no waiting for approval) with activate:false so the user's current view is undisturbed,",
           "then report the Lens name and facets. Afterwards tell the user the Lens exists",
           "and ask whether to switch to it (it paints once active).",
+          "",
+          "MARKING CONCERNS. A Lens paints whole files by judgement; lens_mark paints individual",
+          'LINES by a query. Use it whenever you answer a "where do we do X?" question, so the',
+          "answer survives as something the user can look at instead of scrolling away.",
+          "- What is stored is the QUERY (a regex, or a declaration name), never line numbers. It is",
+          "  re-run against the files on every read, so a deleted usage loses its paint and a new one",
+          "  gains it with no intervention from you.",
+          "- It costs no model call and repaints nothing. It is cheap in a way lens_create is not, so",
+          '  the "at most one per question" restraint above does NOT apply to marking.',
+          '- Name the CONCERN, never the search: "retry-path", "any-casts", "feature-flag-reads".',
+          '  The name is what the user reads in the legend, so "hit" or "match" says nothing.',
+          "- Check BOTH numbers it returns, and the samples. They catch different mistakes. A count of",
+          "  hundreds where you expected a dozen means the query is too broad — narrow it with a glob",
+          "  or a tighter pattern and mark again (past the cap a rule is stored but paints nothing).",
+          "  READ THE SAMPLE LINES: a small, plausible count can still be entirely the wrong lines,",
+          '  and a `pattern` rule matches comments and strings too. Searching for "as any" finds the',
+          '  prose "has anything" and "has any descendant", which looks like a perfectly narrow 2-hit',
+          "  result and is not a type assertion at all. If the samples are not what you meant, re-mark",
+          "  with a pattern anchored to real syntax rather than accepting the count.",
+          "- Several loosely-related concerns are EXPECTED to share one Search Lens: the user greys",
+          "  out the ones they don't want by clicking the legend. So prefer adding a concern to an",
+          "  existing Search Lens over creating another one, and reuse a concern id when a new rule",
+          "  fits it.",
+          "- Marks are invisible until that Lens is active. Do not pass activate:true unasked — say",
+          "  which concerns now exist, with their hit counts and colours, and offer lens_select.",
+          "",
+          "DELEGATING EXPLORATION. Explore subagents have NO Lens tools, deliberately — they are",
+          "read-only, and installing a rule is a persistent, committable write. They propose; you",
+          'install. When you dispatch subagent_type "explore" for a where-is or how-does question,',
+          "put in the task prompt (a) the concern ids from the Search Lens roster above, and (b) the",
+          'sentence: "End your report with a PROPOSED MARKS section." Then call lens_mark for each',
+          "proposal worth keeping, reusing a listed concern rather than minting a near-duplicate.",
           ...(agent.name === "build"
             ? [
                 "",
@@ -155,10 +207,14 @@ export const layer = Layer.effect(
             ? [
                 "",
                 "PLANNING A FEATURE. When your plan is for a feature that spans several files or areas, propose a Lens",
-                "alongside it: in your final plan, add a short \"Aperture Lens\" section naming the Lens,",
+                'alongside it: in your final plan, add a short "Aperture Lens" section naming the Lens,',
                 "its palette, and its 1–6 facets (the feature's sub-areas) each with a one-line",
                 "definition. Do NOT create the Lens here — plan mode is read-only. The build agent will",
                 "create it first so the user watches the feature paint as it is built.",
+                'lens_mark is the exception, and planning is its best fit: "where does X happen today?" is',
+                "most of what planning asks, and a mark costs no model call, repaints nothing and changes",
+                "no code. Mark the concerns your plan depends on as you establish them, and reference them",
+                "in the plan by name and colour so the reader can see them in the view.",
               ]
             : []),
           "</aperture>",

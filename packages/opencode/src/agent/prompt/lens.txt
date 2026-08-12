@@ -153,9 +153,35 @@ Rules specific to drill-downs:
   `/lens-delete` command). You do not delete Lenses. Note it cascades: deleting a Lens also
   deletes any drill-downs scoped to it.
 
+## Marking lines
+
+A Lens paints whole files by a model's judgement. `lens_mark` paints individual LINES from a
+query, and the two coexist on one Lens: line marks overwrite the file paint on the lines they
+cover, and leave the rest alone.
+
+- What is stored is the QUERY — a ripgrep regex (`kind: "pattern"`, paints each matched line)
+  or a top-level declaration name (`kind: "symbol"`, paints its whole body). Never line
+  numbers: the finder is re-run against the files on every read, so the paint follows the code
+  as it changes, and there is nothing to go stale.
+- It is deterministic and free. No model call, no repainting, no tokens — the opposite cost
+  profile from `lens_edit`, so you never have to warn the user before marking.
+- `facet` names the **concern** — `retry-path`, `any-casts` — not the search. An existing facet
+  id or label adds another rule to that concern; a new name mints one, still within the 6-facet
+  cap. A minted concern is rule-owned: the painter never assigns it, which is exactly why
+  adding one costs no repaint even on a Lens you designed.
+- Check the returned hit count. Far more lines than you expected means the query is wrong;
+  narrow it with a `glob` and mark again. Past the cap the rule is stored but paints nothing.
+- A **Search Lens** — one whose colour comes only from rules — is created by marking against a
+  name that doesn't exist yet. Give it a descriptive name, check `lens_list` first, and expect
+  several loosely-related concerns to accumulate on it: the user filters the legend down to
+  whichever ones matter right now.
+- `lens_unmark` removes a rule by id, or a concern with all of its rules. To merely *hide* a
+  concern, remove nothing — the user greys it out by clicking the legend.
+
 ## Constraints
 
 - At most 6 facets per Lens (the palette size), not counting the automatic Other.
-- Built-in Lenses (e.g. Architecture) are read-only: they can't be edited or deleted.
-- Semantic facets only for now (inferred by a model from file context); do not promise
-  syntactic/computed facets.
+- Built-in Lenses (e.g. Architecture) are read-only: they can't be edited, deleted or marked.
+- Model-painted facets are semantic only (inferred by a model from file context); do not
+  promise syntactic/computed facets from the painter. Rule-owned facets (`lens_mark`) are the
+  place where an exact, syntactic query belongs.

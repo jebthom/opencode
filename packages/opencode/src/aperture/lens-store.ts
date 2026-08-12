@@ -1,10 +1,11 @@
-import { Effect } from "effect"
+import { Effect, Semaphore } from "effect"
 import { createHash } from "crypto"
 import path from "path"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import {
   type Lens,
   type Facet,
+  type Finder,
   type LensParent,
   type PaletteId,
   type Rule,
@@ -14,8 +15,10 @@ import {
   MAX_FACETS,
   MAX_RULES,
   assignColors,
+  isSearch,
   isValidFinder,
   orderForest,
+  paintedFacets,
   slugify,
 } from "./lenses"
 
@@ -64,6 +67,41 @@ function writeDoc(file: string, content: unknown): Effect.Effect<void> {
     const fs = yield* FSUtil.Service
     yield* fs.writeWithDirs(file, JSON.stringify(content, null, 2))
   }).pipe(Effect.provide(FSUtil.defaultLayer), Effect.ignore)
+}
+
+// The same write, but reporting whether it landed. Used by `mark`/`unmark`, whose entire
+// value is durability: telling an agent "14 lines marked as retry-path" after a failed write
+// is the worst outcome available — it will move on, and the rule is gone. Every other
+// mutation here keeps the swallowing `writeDoc`, where the caller has no way to act on a
+// failure anyway.
+function writeDocResult(file: string, content: unknown): Effect.Effect<boolean> {
+  return Effect.gen(function* () {
+    const fs = yield* FSUtil.Service
+    yield* fs.writeWithDirs(file, JSON.stringify(content, null, 2))
+    return true
+  }).pipe(
+    Effect.provide(FSUtil.defaultLayer),
+    Effect.catchCause(() => Effect.succeed(false)),
+  )
+}
+
+// Every mutation here is a read-modify-write over one `lenses.json`, and until S2 the
+// comment on `create` was right that a plain RMW was fine: Lens creation is a rare,
+// deliberate act. `lens_mark` breaks that assumption — marks are frequent, several land in
+// one turn, and the `lens` subagent holds the tool too, so a primary marking while a
+// subagent marks is reachable (tool calls serialize within a *session*, not within an
+// instance). A lost rule would be silent, because the loser's write simply wins with stale
+// content.
+//
+// One permit per directory, allocated on first use. In-process only: cross-process
+// concurrency has never been in scope for this store (no lockfile, no atomic rename), and an
+// in-process mutex is what closes the reachable hole — including the pre-existing
+// create/update race.
+const gates = new Map<string, Semaphore.Semaphore>()
+function withDoc<A>(directory: string, body: Effect.Effect<A>): Effect.Effect<A> {
+  let gate = gates.get(directory)
+  if (!gate) gates.set(directory, (gate = Semaphore.makeUnsafe(1)))
+  return gate.withPermits(1)(body)
 }
 
 // Palettes that existed before C1 collapsed the set to two. A stored Lens still names one,
@@ -223,12 +261,22 @@ export interface CreateInput {
 
 // Mint a unique project Lens id: name slug + a short content hash so two
 // Lenses with the same name never collide and ids stay stable/inspectable.
-function mintId(input: CreateInput): string {
+function mintId(name: string, facetLabels: ReadonlyArray<string>): string {
   const hash = createHash("sha256")
-    .update(JSON.stringify({ name: input.name, facets: input.facets.map((t) => t.label), at: Date.now() }))
+    .update(JSON.stringify({ name, facets: facetLabels, at: Date.now() }))
     .digest("hex")
     .slice(0, 8)
-  return `${slugify(input.name)}-${hash}`
+  return `${slugify(name)}-${hash}`
+}
+
+// A rule's id: its facet's slug plus a content hash of the *finder*. Two consequences, both
+// wanted. Re-marking an identical query is idempotent — it replaces in place rather than
+// stacking a duplicate rule that would paint the same lines twice and double the hit count a
+// Search Lens reports. And the id is legible in a committed `lenses.json`, so a human reading
+// the diff can see which concern a rule belongs to without cross-referencing.
+function mintRuleId(facet: string, find: Finder): string {
+  const hash = createHash("sha256").update(JSON.stringify(find)).digest("hex").slice(0, 8)
+  return `${slugify(facet)}-${hash}`
 }
 
 // Persist a new user-defined Lens (additive: a fresh id, existing Lenses
@@ -255,7 +303,10 @@ export const create = (directory: string, input: CreateInput): Effect.Effect<Len
     )
 
     const lens: Lens = {
-      id: mintId(input),
+      id: mintId(
+        input.name,
+        input.facets.map((t) => t.label),
+      ),
       name: input.name,
       description: input.description,
       palette: input.palette,
@@ -269,14 +320,14 @@ export const create = (directory: string, input: CreateInput): Effect.Effect<Len
     }
 
     // Additive read-modify-write: load the existing project doc, add the fresh
-    // Lens, write back. Lens mutations are infrequent and single-user, so the
-    // plain RMW (vs. the old storage.update write-lock) is fine.
+    // Lens, write back. Serialized per directory (see withDoc) so a concurrent
+    // create/update/mark can't win with stale content.
     const project = yield* readProject(directory)
     project[lens.id] = lens
     yield* writeDoc(lensesFile(directory), project)
 
     return lens
-  })
+  }).pipe((body) => withDoc(directory, body))
 
 // Trim, drop empties, and strip leading/trailing slashes so directory prefixes match
 // the repo-relative paths the painter walks (which never start with "/").
@@ -309,7 +360,10 @@ function resolveFacets(
       let n = 2
       while (seen.has(id)) id = `${slugify(t.label)}-${n++}`
       seen.add(id)
-      return { id, label: t.label, description: t.description }
+      // Carry `ruleOnly` forward with the id. `lens_edit` restates the whole facet list and
+      // has no way to express the flag, so without this a single edit would silently hand a
+      // marked concern to the painter — which would then assign it to files no rule matched.
+      return { id, label: t.label, description: t.description, ...(carried?.ruleOnly ? { ruleOnly: true } : {}) }
     }),
   )
 }
@@ -346,8 +400,29 @@ export const update = (directory: string, id: string, input: UpdateInput): Effec
 
     // `prev` came through readProject, so its palette is already normalised.
     const palette = input.palette ?? prev.palette ?? "categorical"
-    const facets = input.facets ? resolveFacets(palette, input.facets, prev.facets) : prev.facets
-    if (facets.length === 0) return yield* Effect.die(new Error("a Lens needs at least one facet"))
+    // `input.facets` is the complete replacement list for the *painter's* facets — but it can't
+    // express a rule-owned one (lens_edit has no such parameter, and an agent editing the Lens
+    // has no way to know a concern was marked on it). Restating the list therefore has to
+    // preserve them, or a routine edit would silently delete every query lens_mark installed.
+    // This is the same reasoning that makes mergeFacets rewrite `rule.facet` instead of
+    // orphaning it: rules cost judgement to write, so they are the last thing to evaporate.
+    //
+    // Rule-owned facets go last so the painter's facets keep the low, stable palette indices.
+    const reserved = prev.facets.filter((t) => t.ruleOnly)
+    const facets = input.facets
+      ? assignColors(palette, [
+          ...resolveFacets(palette, input.facets, paintedFacets(prev)),
+          ...reserved.map((t) => ({ id: t.id, label: t.label, description: t.description, ruleOnly: true as const })),
+        ])
+      : prev.facets
+    // A Search Lens's facet set belongs to `mark`/`unmark`, and unmarking the last concern
+    // legitimately empties it — so a zero-facet Search Lens is a reachable state, and dying
+    // here would kill the fiber on something as innocent as renaming it. Every other Lens
+    // still needs at least one facet or the painter has nothing to classify into.
+    if (facets.length === 0 && !isSearch(prev)) return yield* Effect.die(new Error("a Lens needs at least one facet"))
+    // Unreachable from the tools: aperture.editLens refuses over-cap first (counting the
+    // reserved facets, which is what makes this reachable at all), so this stays the backstop
+    // it has always been.
     if (facets.length > MAX_FACETS)
       return yield* Effect.die(new Error(`a Lens can have at most ${MAX_FACETS} facets (palette size)`))
     // Re-colour when the palette changed but the facet set didn't (so colours track the
@@ -356,9 +431,18 @@ export const update = (directory: string, id: string, input: UpdateInput): Effec
 
     const prompt = input.prompt ?? prev.prompt
     const context = input.context ?? prev.context
-    const prevById = new Map(prev.facets.map((t) => [t.id, t]))
-    const facetsAddedOrRemoved = coloured.length !== prev.facets.length || coloured.some((t) => !prevById.has(t.id))
-    const definitionChanged = coloured.some(
+    // `structural` means "the painter would classify files differently now", and the caller
+    // answers it by wiping this Lens's facet stores and every descendant's — a whole-repo
+    // repaint. So it must be computed over the *painter's* vocabulary only: a rule-owned
+    // facet was never offered to the painter (facetEnumIds excludes it), so adding or
+    // dropping one cannot change any judgement it already made. Charging a repaint for a
+    // `lens_mark` would make marking a concern onto an Overview Lens cost real money.
+    const prevPainted = paintedFacets(prev)
+    const nextPainted = paintedFacets({ facets: coloured })
+    const prevById = new Map(prevPainted.map((t) => [t.id, t]))
+    const facetsAddedOrRemoved =
+      nextPainted.length !== prevPainted.length || nextPainted.some((t) => !prevById.has(t.id))
+    const definitionChanged = nextPainted.some(
       (t) => prevById.get(t.id) && prevById.get(t.id)!.description !== t.description,
     )
     const structural = facetsAddedOrRemoved || definitionChanged || prompt !== prev.prompt || context !== prev.context
@@ -382,7 +466,7 @@ export const update = (directory: string, id: string, input: UpdateInput): Effec
     yield* writeDoc(lensesFile(directory), project)
 
     return { lens: next, structural }
-  })
+  }).pipe((body) => withDoc(directory, body))
 
 // Deterministically combine two facets of a *user* Lens: drop `from` from the
 // facet list (keeping `into` and all other facets with their existing ids/colours). The
@@ -422,7 +506,253 @@ export const mergeFacets = (
     }
     yield* writeDoc(lensesFile(directory), project)
     return next
-  })
+  }).pipe((body) => withDoc(directory, body))
+
+// --- search rules: mark / unmark (S2) ---------------------------------------
+
+// Persist a new Search Lens together with its first concern and rule, in one write.
+//
+// A Search Lens is a Lens whose facets come from *rules* rather than from the painter, so
+// its base state is that every extent is NONE_FACET — deliberately unmarked "Other" grey
+// rather than unpainted — and colour arrives only where a rule matches. Its `prompt` is
+// empty because nothing will ever read it: `usesPainter` gates the painter off entirely.
+//
+// Creation and the first mark are the same call on purpose. The alternative — create empty,
+// then mark — would persist a facet-less Lens between the two writes, and a `lens_mark` that
+// then failed validation would leave a permanent empty Lens behind. (Zero facets is still a
+// reachable state via `unmark`, which is why `update` tolerates it.)
+export const createSearch = (
+  directory: string,
+  input: {
+    readonly name: string
+    readonly description: string
+    readonly facet: { readonly label: string; readonly description: string }
+    readonly rule: Omit<Rule, "id" | "facet">
+  },
+): Effect.Effect<{ readonly lens: Lens; readonly facet: Facet; readonly rule: Rule }> =>
+  Effect.gen(function* () {
+    const facet = assignColors("categorical", [
+      {
+        id: slugify(input.facet.label),
+        label: input.facet.label,
+        description: input.facet.description,
+        ruleOnly: true,
+      },
+    ])[0]!
+    const rule: Rule = { id: mintRuleId(facet.id, input.rule.find), facet: facet.id, ...input.rule }
+    const lens: Lens = {
+      id: mintId(input.name, [input.facet.label]),
+      name: input.name,
+      description: input.description,
+      palette: "categorical",
+      prompt: "",
+      facets: [facet],
+      scope: "project",
+      search: true,
+      rules: [rule],
+    }
+    const project = yield* readProject(directory)
+    project[lens.id] = lens
+    yield* writeDocResult(lensesFile(directory), project)
+    return { lens, facet, rule }
+  }).pipe((body) => withDoc(directory, body))
+
+export interface MarkInput {
+  // A facet id (add another rule to that concern), a facet label (same, case-insensitively),
+  // or a new name — which mints a concern. The permissive id-or-label resolution is the same
+  // convention `mergeFacets` uses.
+  readonly facet: string
+  // Legend definition for a newly-minted concern. Ignored when the facet already exists.
+  readonly definition?: string
+  readonly find: Finder
+  readonly note?: string
+  readonly createdBy?: string
+}
+
+export type MarkResult =
+  | {
+      readonly status: "ok"
+      readonly lens: Lens
+      readonly facet: Facet
+      readonly rule: Rule
+      readonly minted: boolean
+      // Set when an identical finder was already on this concern: the rule id is a content
+      // hash, so re-marking replaces rather than duplicates.
+      readonly replaced?: Rule
+      // False when the write itself failed (see writeDocResult) — the caller must not claim
+      // the mark landed.
+      readonly written: boolean
+    }
+  | { readonly status: "not-found" }
+  | { readonly status: "builtin" }
+  | { readonly status: "facet-cap"; readonly max: number }
+  | { readonly status: "rule-cap"; readonly max: number }
+
+// Attach a rule to a Lens, minting its concern if that concern is new. One atomic RMW —
+// minting a facet and appending its rule cannot be two writes, or a failure between them
+// leaves a concern with nothing to paint it.
+//
+// The finder is assumed already *evaluated* by the caller (aperture.markLens), which is what
+// keeps a rule that cannot possibly paint — an uncompilable regex, a structural pattern with
+// no backend — out of a committed file.
+export const mark = (directory: string, id: string, input: MarkInput): Effect.Effect<MarkResult> =>
+  Effect.gen(function* () {
+    const project = yield* readProject(directory)
+    const prev = project[id]
+    // A built-in has to be refused explicitly, and this is the one guard whose absence
+    // would be invisible rather than noisy: built-ins live in code, not in the project doc,
+    // so the RMW below would happily write a project entry keyed `architecture`, `list()`
+    // would then hold two Lenses with that id, and `get` returns the built-in — leaving the
+    // rule persisted, unreachable and unexplainable.
+    if (!prev)
+      return BUILTIN_LENSES.some((l) => l.id === id) ? { status: "builtin" as const } : { status: "not-found" as const }
+
+    const wanted = input.facet.trim()
+    const existing =
+      prev.facets.find((t) => t.id === wanted) ??
+      prev.facets.find((t) => t.label.toLowerCase() === wanted.toLowerCase())
+    if (!existing && prev.facets.length >= MAX_FACETS) return { status: "facet-cap" as const, max: MAX_FACETS }
+
+    const palette = prev.palette ?? "categorical"
+    const facets = existing
+      ? prev.facets
+      : assignColors(palette, [
+          ...prev.facets,
+          {
+            id: uniqueFacetId(prev.facets, wanted),
+            label: wanted,
+            description: input.definition?.trim() || `Lines matched by the "${wanted}" search rules.`,
+            // Minted facets are always rule-owned: excluded from the painter's vocabulary, so
+            // this addition owes no repaint even on an Overview Lens. See Facet.ruleOnly.
+            ruleOnly: true as const,
+          },
+        ])
+    const facet = existing ?? facets[facets.length - 1]!
+
+    const rule: Rule = {
+      id: mintRuleId(facet.id, input.find),
+      facet: facet.id,
+      find: input.find,
+      ...(input.note ? { note: input.note } : {}),
+      ...(input.createdBy ? { createdBy: input.createdBy } : {}),
+    }
+    const rules = [...(prev.rules ?? [])]
+    const at = rules.findIndex((r) => r.id === rule.id)
+    const replaced = at >= 0 ? rules[at] : undefined
+    // The cap is enforced here rather than left to `normalizeRules`, which *silently
+    // truncates* past MAX_RULES on read — so an unchecked append would report success and
+    // then vanish on the next payload.
+    if (at >= 0) rules[at] = rule
+    else if (rules.length >= MAX_RULES) return { status: "rule-cap" as const, max: MAX_RULES }
+    else rules.push(rule)
+
+    const next: Lens = { ...prev, facets, rules }
+    project[id] = next
+    const written = yield* writeDocResult(lensesFile(directory), project)
+    return {
+      status: "ok" as const,
+      lens: next,
+      facet,
+      rule,
+      minted: !existing,
+      ...(replaced ? { replaced } : {}),
+      written,
+    }
+  }).pipe((body) => withDoc(directory, body))
+
+// A facet id unique within the Lens, mirroring `create`/`resolveFacets`' de-dup loop so a
+// concern named the same as an existing facet can't collide with it.
+function uniqueFacetId(existing: ReadonlyArray<Facet>, label: string): string {
+  const taken = new Set(existing.map((t) => t.id))
+  let id = slugify(label)
+  let n = 2
+  while (taken.has(id)) id = `${slugify(label)}-${n++}`
+  return id
+}
+
+export type UnmarkResult =
+  | {
+      readonly status: "ok"
+      readonly lens: Lens
+      readonly removedRules: ReadonlyArray<Rule>
+      readonly removedFacet?: Facet
+      // Facets whose hue moved as a consequence. Facet colour is derived from array position
+      // (see `migrate` -> `assignColors`), so removing anything but the last facet re-hues
+      // every facet after it. Reported rather than prevented: a stored colour slot would be a
+      // second source of truth and a wire change through payload.ts and the extension's
+      // generated colour ids, for an event that is rare and always user- or agent-initiated.
+      // O4's suppressed set is keyed by facet id, so an active legend filter survives.
+      readonly recolored: ReadonlyArray<{
+        readonly facet: string
+        readonly label: string
+        readonly from: string
+        readonly to: string
+      }>
+      readonly written: boolean
+    }
+  | { readonly status: "not-found" }
+  | { readonly status: "builtin" }
+  | { readonly status: "unknown-rule"; readonly rule: string }
+  | { readonly status: "unknown-facet"; readonly facet: string }
+
+// Remove one rule by id, or a whole concern and every rule naming it.
+//
+// Removing a facet takes its rules with it deliberately: leaving them behind means
+// `normalizeRules` drops them on the next read as naming a facet that no longer exists, so
+// the choice is between deleting them visibly here and deleting them silently there.
+export const unmark = (
+  directory: string,
+  id: string,
+  input: { readonly rule?: string; readonly facet?: string },
+): Effect.Effect<UnmarkResult> =>
+  Effect.gen(function* () {
+    const project = yield* readProject(directory)
+    const prev = project[id]
+    if (!prev)
+      return BUILTIN_LENSES.some((l) => l.id === id) ? { status: "builtin" as const } : { status: "not-found" as const }
+
+    const prevRules = prev.rules ?? []
+    let removedRules: Rule[] = []
+    let removedFacet: Facet | undefined
+    let facets = prev.facets
+
+    if (input.rule) {
+      const victim = prevRules.find((r) => r.id === input.rule)
+      if (!victim) return { status: "unknown-rule" as const, rule: input.rule }
+      removedRules = [victim]
+    } else if (input.facet) {
+      const wanted = input.facet.trim()
+      const target =
+        prev.facets.find((t) => t.id === wanted) ??
+        prev.facets.find((t) => t.label.toLowerCase() === wanted.toLowerCase())
+      if (!target) return { status: "unknown-facet" as const, facet: wanted }
+      removedFacet = target
+      removedRules = prevRules.filter((r) => r.facet === target.id)
+      facets = assignColors(
+        prev.palette ?? "categorical",
+        prev.facets.filter((t) => t.id !== target.id),
+      )
+    } else return { status: "unknown-rule" as const, rule: "" }
+
+    const removedIds = new Set(removedRules.map((r) => r.id))
+    const rules = prevRules.filter((r) => !removedIds.has(r.id))
+    const before = new Map(prev.facets.map((t) => [t.id, t.color]))
+    const recolored = facets
+      .filter((t) => before.get(t.id) !== t.color)
+      .map((t) => ({ facet: t.id, label: t.label, from: before.get(t.id)!, to: t.color }))
+
+    const next: Lens = { ...prev, facets, ...(rules.length ? { rules } : { rules: undefined }) }
+    project[id] = next
+    const written = yield* writeDocResult(lensesFile(directory), project)
+    return {
+      status: "ok" as const,
+      lens: next,
+      removedRules,
+      ...(removedFacet ? { removedFacet } : {}),
+      recolored,
+      written,
+    }
+  }).pipe((body) => withDoc(directory, body))
 
 // Remove a *user* Lens and every drill-down scoped to it, transitively: a drill-down's
 // domain is defined by its parent's facets, so without the parent it has no meaning and
@@ -437,7 +767,7 @@ export const remove = (directory: string, id: string): Effect.Effect<string[]> =
     for (const victim of removed) delete project[victim]
     yield* writeDoc(lensesFile(directory), project)
     return removed
-  })
+  }).pipe((body) => withDoc(directory, body))
 
 // Convenience for the tools: a tiny summary of both palettes for the agent to pick from
 // when proposing a schema. `kind` is the whole decision — the two hold the same six

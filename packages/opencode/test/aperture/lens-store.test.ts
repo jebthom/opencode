@@ -4,7 +4,7 @@ import fs from "fs/promises"
 import os from "os"
 import path from "path"
 import { ApertureLensStore } from "@/aperture/lens-store"
-import { ARCHITECTURE_ID, BUILTIN_LENSES, MAX_RULES } from "@/aperture/lenses"
+import { ARCHITECTURE_ID, BUILTIN_LENSES, MAX_FACETS, MAX_RULES } from "@/aperture/lenses"
 
 // A3: Lens definitions + the active pointer persist in the project directory
 // under .opencode/aperture/ (not global KV), so a Lens is shareable/committable.
@@ -282,5 +282,238 @@ describe("aperture lens-store — search rules", () => {
     // Without the rewrite, normalizeRules would drop this on the very next read: a cosmetic
     // merge would silently destroy a query an agent had to think to write.
     expect(updated.rules!.map((r) => r.facet)).toEqual(["tokens"])
+  })
+})
+
+// S2: lens_mark's store half. `mark` mints a concern and appends its rule in ONE write, and
+// `createSearch` mints the Lens, its first concern and its first rule together — so a refused
+// mark can never leave an empty concern or an empty Lens behind.
+describe("aperture lens-store — mark / unmark (S2)", () => {
+  let dir: string
+  beforeEach(async () => {
+    dir = await fs.mkdtemp(path.join(os.tmpdir(), "aperture-mark-"))
+  })
+  afterEach(async () => {
+    await fs.rm(dir, { recursive: true, force: true })
+  })
+
+  const PATTERN = { kind: "pattern" as const, pattern: "withRetry\\(" }
+  const searchInput = {
+    name: "Retry Handling",
+    description: "Where retries happen",
+    facet: { label: "retry-path", description: "the retry path" },
+    rule: { find: PATTERN },
+  }
+
+  test("createSearch writes a search Lens with its first concern and rule", async () => {
+    const created = await Effect.runPromise(ApertureLensStore.createSearch(dir, searchInput))
+    expect(created.lens.search).toBe(true)
+    expect(created.lens.scope).toBe("project")
+    expect(created.facet.ruleOnly).toBe(true)
+    expect(created.rule.facet).toBe("retry-path")
+
+    // It has to survive the migrate() pass every read goes through — normalizeRules is total
+    // and drops anything it doesn't recognise, so a rule this store wrote itself must not be
+    // one of those things.
+    const all = await Effect.runPromise(ApertureLensStore.list(dir))
+    const back = all.find((l) => l.id === created.lens.id)!
+    expect(back.search).toBe(true)
+    expect(back.rules!.map((r) => r.id)).toEqual([created.rule.id])
+    expect(back.facets[0]!.ruleOnly).toBe(true)
+  })
+
+  test("a second concern takes the next colour and does not move the first", async () => {
+    const created = await Effect.runPromise(ApertureLensStore.createSearch(dir, searchInput))
+    const firstColor = created.facet.color
+    const marked = await Effect.runPromise(
+      ApertureLensStore.mark(dir, created.lens.id, {
+        facet: "any-casts",
+        find: { kind: "pattern", pattern: "as any" },
+      }),
+    )
+    expect(marked.status).toBe("ok")
+    if (marked.status !== "ok") return
+    expect(marked.minted).toBe(true)
+    // Append stability is the whole reason colour-by-index is tolerable: the concern the user
+    // is already looking at must not change hue because another one was added.
+    expect(marked.lens.facets[0]!.color).toBe(firstColor)
+    expect(marked.lens.facets[1]!.color).not.toBe(firstColor)
+  })
+
+  test("re-marking an identical finder replaces rather than duplicating", async () => {
+    const created = await Effect.runPromise(ApertureLensStore.createSearch(dir, searchInput))
+    const again = await Effect.runPromise(
+      ApertureLensStore.mark(dir, created.lens.id, { facet: "retry-path", find: PATTERN, note: "second thoughts" }),
+    )
+    expect(again.status).toBe("ok")
+    if (again.status !== "ok") return
+    // The rule id is a content hash of the finder, so the same query lands on the same id.
+    expect(again.replaced?.id).toBe(created.rule.id)
+    expect(again.minted).toBe(false)
+    expect(again.lens.rules!.length).toBe(1)
+    expect(again.lens.rules![0]!.note).toBe("second thoughts")
+  })
+
+  test("an existing facet id or label adds a rule without minting", async () => {
+    const created = await Effect.runPromise(ApertureLensStore.createSearch(dir, searchInput))
+    const byLabel = await Effect.runPromise(
+      ApertureLensStore.mark(dir, created.lens.id, {
+        facet: "RETRY-PATH",
+        find: { kind: "symbol", name: "retryWithBackoff" },
+      }),
+    )
+    expect(byLabel.status).toBe("ok")
+    if (byLabel.status !== "ok") return
+    expect(byLabel.minted).toBe(false)
+    expect(byLabel.lens.facets.length).toBe(1)
+    expect(byLabel.lens.rules!.length).toBe(2)
+  })
+
+  test("marking an Overview Lens mints a rule-owned facet and stays non-structural", async () => {
+    const lens = await Effect.runPromise(ApertureLensStore.create(dir, CREATE))
+    const marked = await Effect.runPromise(
+      ApertureLensStore.mark(dir, lens.id, { facet: "any-casts", find: { kind: "pattern", pattern: "as any" } }),
+    )
+    expect(marked.status).toBe("ok")
+    if (marked.status !== "ok") return
+    expect(marked.facet.ruleOnly).toBe(true)
+
+    // The point of ruleOnly: a later lens_edit must not read this as a facet the painter
+    // gained, because `structural` costs a whole-repo repaint of the Lens and every descendant.
+    const edited = await Effect.runPromise(
+      ApertureLensStore.update(dir, lens.id, { facets: CREATE.facets.map((f) => ({ ...f })) }),
+    )
+    expect(edited!.structural).toBe(false)
+    // And it survives that edit, which restates the whole facet list and cannot express the flag.
+    expect(edited!.lens.facets.find((f) => f.id === "any-casts")?.ruleOnly).toBe(true)
+    expect(edited!.lens.rules!.length).toBe(1)
+  })
+
+  test("refuses a built-in without writing a shadow entry into the project doc", async () => {
+    const result = await Effect.runPromise(ApertureLensStore.mark(dir, ARCHITECTURE_ID, { facet: "x", find: PATTERN }))
+    expect(result.status).toBe("builtin")
+    // The failure this guards is invisible rather than noisy: a project entry keyed
+    // `architecture` would be shadowed by the built-in on every read, so the rule would be
+    // persisted, unreachable and unexplainable.
+    const file = path.join(dir, ".opencode", "aperture", "lenses.json")
+    const onDisk = await fs.readFile(file, "utf8").catch(() => "{}")
+    expect(JSON.parse(onDisk)[ARCHITECTURE_ID]).toBeUndefined()
+  })
+
+  test("refuses past MAX_FACETS rather than wrapping the palette", async () => {
+    const created = await Effect.runPromise(ApertureLensStore.createSearch(dir, searchInput))
+    for (let i = 1; i < MAX_FACETS; i++) {
+      const r = await Effect.runPromise(
+        ApertureLensStore.mark(dir, created.lens.id, { facet: `c${i}`, find: { kind: "pattern", pattern: `p${i}` } }),
+      )
+      expect(r.status).toBe("ok")
+    }
+    const over = await Effect.runPromise(
+      ApertureLensStore.mark(dir, created.lens.id, { facet: "one-too-many", find: { kind: "pattern", pattern: "z" } }),
+    )
+    expect(over).toEqual({ status: "facet-cap", max: MAX_FACETS })
+    const all = await Effect.runPromise(ApertureLensStore.list(dir))
+    expect(all.find((l) => l.id === created.lens.id)!.facets.length).toBe(MAX_FACETS)
+  })
+
+  test("refuses past MAX_RULES instead of letting normalizeRules truncate silently", async () => {
+    const created = await Effect.runPromise(ApertureLensStore.createSearch(dir, searchInput))
+    for (let i = 1; i < MAX_RULES; i++) {
+      const r = await Effect.runPromise(
+        ApertureLensStore.mark(dir, created.lens.id, {
+          facet: "retry-path",
+          find: { kind: "pattern", pattern: `p${i}` },
+        }),
+      )
+      expect(r.status).toBe("ok")
+    }
+    // Without this cap the append would report success and then vanish on the next read, since
+    // migrate()'s normalizeRules stops at MAX_RULES without saying so.
+    const over = await Effect.runPromise(
+      ApertureLensStore.mark(dir, created.lens.id, { facet: "retry-path", find: { kind: "pattern", pattern: "last" } }),
+    )
+    expect(over).toEqual({ status: "rule-cap", max: MAX_RULES })
+  })
+
+  test("unmark by rule id removes just that rule", async () => {
+    const created = await Effect.runPromise(ApertureLensStore.createSearch(dir, searchInput))
+    const second = await Effect.runPromise(
+      ApertureLensStore.mark(dir, created.lens.id, { facet: "retry-path", find: { kind: "symbol", name: "retry" } }),
+    )
+    if (second.status !== "ok") throw new Error("setup failed")
+    const result = await Effect.runPromise(ApertureLensStore.unmark(dir, created.lens.id, { rule: created.rule.id }))
+    expect(result.status).toBe("ok")
+    if (result.status !== "ok") return
+    expect(result.removedRules.map((r) => r.id)).toEqual([created.rule.id])
+    expect(result.lens.rules!.map((r) => r.id)).toEqual([second.rule.id])
+    expect(result.lens.facets.length).toBe(1)
+  })
+
+  test("unmark by facet takes its rules with it and reports the recolour", async () => {
+    const created = await Effect.runPromise(ApertureLensStore.createSearch(dir, searchInput))
+    const second = await Effect.runPromise(
+      ApertureLensStore.mark(dir, created.lens.id, {
+        facet: "any-casts",
+        find: { kind: "pattern", pattern: "as any" },
+      }),
+    )
+    if (second.status !== "ok") throw new Error("setup failed")
+    const secondColor = second.facet.color
+
+    const result = await Effect.runPromise(ApertureLensStore.unmark(dir, created.lens.id, { facet: "retry-path" }))
+    expect(result.status).toBe("ok")
+    if (result.status !== "ok") return
+    expect(result.removedFacet?.id).toBe("retry-path")
+    // Rules follow the facet: leaving them would mean normalizeRules dropping them on the next
+    // read, i.e. the same deletion but silent.
+    expect(result.removedRules.map((r) => r.id)).toEqual([created.rule.id])
+    expect(result.lens.rules!.map((r) => r.id)).toEqual([second.rule.id])
+    // Colour is derived from position, so removing a non-last concern re-hues the survivors —
+    // reported so lens_unmark can tell the user rather than letting the legend shift silently.
+    expect(result.recolored).toEqual([
+      { facet: "any-casts", label: "any-casts", from: secondColor, to: result.lens.facets[0]!.color },
+    ])
+  })
+
+  test("unmark reports an unknown rule or concern without touching the Lens", async () => {
+    const created = await Effect.runPromise(ApertureLensStore.createSearch(dir, searchInput))
+    expect(await Effect.runPromise(ApertureLensStore.unmark(dir, created.lens.id, { rule: "nope" }))).toEqual({
+      status: "unknown-rule",
+      rule: "nope",
+    })
+    expect(await Effect.runPromise(ApertureLensStore.unmark(dir, created.lens.id, { facet: "nope" }))).toEqual({
+      status: "unknown-facet",
+      facet: "nope",
+    })
+  })
+
+  test("a Search Lens survives an edit at zero facets", async () => {
+    const created = await Effect.runPromise(ApertureLensStore.createSearch(dir, searchInput))
+    await Effect.runPromise(ApertureLensStore.unmark(dir, created.lens.id, { facet: "retry-path" }))
+    // `update` used to Effect.die on an empty facet list, which would kill the fiber on
+    // something as innocent as a rename. Zero concerns is a reachable state for a Search Lens.
+    const renamed = await Effect.runPromise(ApertureLensStore.update(dir, created.lens.id, { name: "Renamed" }))
+    expect(renamed!.lens.name).toBe("Renamed")
+    expect(renamed!.lens.facets).toEqual([])
+  })
+
+  test("concurrent marks all land", async () => {
+    const created = await Effect.runPromise(ApertureLensStore.createSearch(dir, searchInput))
+    // Every mutation is a read-modify-write over one file. Unserialized, the losers of the race
+    // write stale content and their rules vanish with no error anywhere — and the `lens`
+    // subagent holds lens_mark too, so a primary marking while a subagent marks is reachable.
+    await Effect.runPromise(
+      Effect.all(
+        Array.from({ length: 8 }, (_, i) =>
+          ApertureLensStore.mark(dir, created.lens.id, {
+            facet: "retry-path",
+            find: { kind: "pattern", pattern: `p${i}` },
+          }),
+        ),
+        { concurrency: "unbounded" },
+      ),
+    )
+    const all = await Effect.runPromise(ApertureLensStore.list(dir))
+    expect(all.find((l) => l.id === created.lens.id)!.rules!.length).toBe(9)
   })
 })

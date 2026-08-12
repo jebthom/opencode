@@ -33,8 +33,11 @@ import { Database } from "@opencode-ai/core/database/database"
 import { Git } from "@/git"
 import {
   type Lens,
+  type Facet,
+  type Finder,
   type LensParent,
   type PaletteId,
+  type Rule,
   legend as lensLegend,
   facetsWithin,
   orderForest,
@@ -46,10 +49,12 @@ import {
   ARCHITECTURE_ID,
   BUS_FACTOR,
   BUS_FACTOR_ID,
+  MAX_FACETS,
   MAX_LENS_DEPTH,
   isBuiltinLens,
   isDeterministic,
   isSearch,
+  usesPainter,
   dependsOnDeterministic,
 } from "./lenses"
 
@@ -107,6 +112,14 @@ const WORKING_SET_PAINT_CAP = 200
 // releases the permit and pauses between slices. Must not exceed the painter's own
 // per-pass file cap (MAX_PER_PASS) or the tail of a slice would be silently dropped.
 const EXTENT_DRAIN_BATCH = 240
+
+// --- marks (S2) ------------------------------------------------------------
+// How many matched lines `lens_mark` echoes back, and how wide. The sample exists to let an
+// agent recognise that its query matched the *wrong* thing — a regex hitting comments and
+// strings is obvious from three lines and no clearer from thirty — while the hit *count* is
+// what tells it the query is too broad. Bounded because each sample costs a file read.
+const MARK_SAMPLE_FILES = 5
+const MARK_SAMPLE_CHARS = 120
 
 // --- activity (G1) ---------------------------------------------------------
 // How many recent turns `activity` reports when the caller doesn't say, and the ceiling it
@@ -181,6 +194,87 @@ export interface EditLensInput {
   readonly context?: "minimal" | "medium"
 }
 
+// Install a search rule on a Lens, minting its concern if new (S2). A mark is deterministic:
+// no model call, no repaint, and the finder is re-evaluated from disk at every payload read.
+export interface MarkLensInput {
+  // Id or name of the Lens. A name that resolves to nothing creates a Search Lens — the
+  // agent is responsible for checking the roster first (its system prompt carries it), the
+  // same contract lens_create already has for avoiding duplicates.
+  readonly lens: string
+  // The concern: an existing facet id/label (add another rule to it) or a new name (mint it).
+  readonly facet: string
+  // Legend definition for a newly-minted concern.
+  readonly definition?: string
+  // Lens description, used only when this call creates the Lens.
+  readonly about?: string
+  readonly find: Finder
+  readonly note?: string
+  // The authoring agent, recorded on the rule (Rule.createdBy) for the study log.
+  readonly agent?: string
+  // Switch the user's view to this Lens. Defaults to false — the Aperture system prompt
+  // tells the agent never to switch the active Lens without asking, and a mark that hijacked
+  // the view would contradict the instruction it is given in the same breath.
+  readonly activate?: boolean
+}
+
+// One matched line, for the sample `lens_mark` shows the agent.
+export interface MarkSample {
+  readonly file: string
+  readonly line: number
+  readonly text: string
+}
+
+export type MarkOutcome =
+  | {
+      readonly status: "ok"
+      readonly lens: Lens
+      readonly facet: Facet
+      readonly rule: Rule
+      readonly createdLens: boolean
+      readonly minted: boolean
+      readonly replaced?: Rule
+      // hits / files / overCap for the finder as evaluated over the whole repo. The hit count
+      // is the entire safety mechanism: an agent that sees "4,182 lines across 903 files"
+      // narrows the query instead of silently repainting a third of the repo.
+      readonly diagnostic: ApertureRules.RuleDiagnostic
+      readonly samples: ReadonlyArray<MarkSample>
+      readonly activated: boolean
+      readonly isActive: boolean
+      // False when the write to lenses.json failed — the caller must not claim it landed.
+      readonly written: boolean
+    }
+  // The finder cannot ever paint (uncompilable regex, absent structural backend). Nothing was
+  // stored, and `detail` is the evaluator's own message so the agent can self-correct.
+  | { readonly status: "dead-rule"; readonly detail: string }
+  // Matched nothing. Also not stored: a mistyped symbol name would otherwise become a
+  // permanently invisible grey concern that looks installed.
+  | { readonly status: "no-hits" }
+  | { readonly status: "not-found" }
+  | { readonly status: "builtin" }
+  | { readonly status: "facet-cap"; readonly lens: Lens; readonly max: number }
+  | { readonly status: "rule-cap"; readonly lens: Lens; readonly max: number }
+
+export type UnmarkOutcome =
+  | {
+      readonly status: "ok"
+      readonly lens: Lens
+      readonly removedRules: ReadonlyArray<Rule>
+      readonly removedFacet?: Facet
+      // Facets whose hue moved because colour is derived from position — see
+      // ApertureLensStore.UnmarkResult. The caller must tell the user.
+      readonly recolored: ReadonlyArray<{
+        readonly facet: string
+        readonly label: string
+        readonly from: string
+        readonly to: string
+      }>
+      readonly written: boolean
+    }
+  | { readonly status: "not-found" }
+  | { readonly status: "builtin" }
+  | { readonly status: "unknown-rule"; readonly lens: Lens; readonly rule: string }
+  | { readonly status: "unknown-facet"; readonly lens: Lens; readonly facet: string }
+
 // Outcome of an edit/merge/delete: a resolved Lens or why it was refused. The
 // built-in (global) Lenses are immutable, so they refuse with "builtin".
 export type LensMutation =
@@ -191,6 +285,14 @@ export type LensMutation =
   // The edit would drop a facet that a drill-down is scoped to, leaving it with a domain
   // that no longer exists. Names the dependents so the caller can re-scope or delete them.
   | { readonly status: "facet-in-use"; readonly facet: string; readonly lenses: ReadonlyArray<string> }
+  // The edit's facet list plus the Lens's rule-owned concerns (which an edit preserves — see
+  // ApertureLensStore.update) exceeds the palette. `reserved` names the concerns, so the caller
+  // can either shorten the list or drop a concern with lens_unmark.
+  | {
+      readonly status: "facet-cap"
+      readonly max: number
+      readonly reserved: ReadonlyArray<{ readonly facet: string; readonly label: string }>
+    }
 
 // Outcome of creating a Lens: the new Lens, or why the requested drill-down scope was
 // refused. A root Lens (no `parent`) can only ever succeed.
@@ -312,6 +414,16 @@ export interface Interface {
   // Deterministically fold one facet into another for a user Lens (no re-paint, no
   // tokens): drops `from` and re-labels its files as `into`. Both id or label.
   readonly mergeFacets: (lens: string, from: string, into: string) => Effect.Effect<LensMutation>
+  // Install a search rule (S2), minting its concern and the Search Lens itself if needed.
+  // Deterministic — no model call, no repaint. Evaluates the finder once over the whole repo
+  // and returns the hit count plus a sample; refuses to store a rule that cannot paint.
+  readonly markLens: (input: MarkLensInput) => Effect.Effect<MarkOutcome>
+  // Remove one rule by id, or a whole concern with every rule naming it.
+  readonly unmarkLens: (input: {
+    readonly lens: string
+    readonly rule?: string
+    readonly facet?: string
+  }) => Effect.Effect<UnmarkOutcome>
   // Delete a user Lens (and its facets), falling back to the built-in active
   // Lens when the deleted one was active. Not exposed to the lens agent.
   readonly deleteLens: (idOrName: string) => Effect.Effect<DeleteOutcome>
@@ -587,20 +699,40 @@ export const layer = Layer.effect(
         }
       })
 
+    // Every file in the subtree at NONE_FACET — a Search Lens's base. Not an *empty* store: a
+    // file with no entry renders UNTAGGED ("Non-code" #444444, the dimmer grey for specs, assets
+    // and not-yet-swept code), while NONE renders "Other" (#8A8A8A, meaningful context you may
+    // still want to read). "Deliberately unmarked" is the second of those, and the difference is
+    // visible on every surface.
+    //
+    // Shaped like `deterministicStoreFor`'s output so it flows through `attributeFileBytes` and
+    // `computeComposition` unchanged — this is a whole-file attribution, which is what keeps the
+    // byte contract intact. A line tag is the thing that must never enter those. `hash` is empty
+    // for the same reason the deterministic stores leave it so: it is only the painter's
+    // staleness key, and nothing here is ever painted.
+    const searchBaseStore = (subtree: ReadonlyArray<ApertureDeterministic.SubtreeFile>): ApertureSemanticStore.Store =>
+      Object.fromEntries(subtree.map((node) => [node.id, { facet: NONE_FACET, hash: "" }]))
+
     // --- drill-down domain gate ---------------------------------------------
 
-    // A Lens's facet store as seen by its children — the "witness" store. Mirrors finalize's
-    // three-way branch exactly: the cheap deterministic built-ins (git-changed / mtime) are
-    // computed inline, everything else is read from the persisted semantic store. Bus-factor
-    // is the trap — it is deterministic but its store is *persisted* precisely because
-    // computing it means a whole-history `git log` (~10s), so it must be READ here. Sending
-    // it through deterministicStoreFor would fire that walk inside every paint batch.
+    // A Lens's facet store as seen by its children — the "witness" store. Mirrors
+    // `facetStoreFor`'s branch exactly (keep the two in step): the cheap deterministic
+    // built-ins (git-changed / mtime) are computed inline, a Search Lens is all NONE, and
+    // everything else is read from the persisted semantic store. Bus-factor is the trap — it
+    // is deterministic but its store is *persisted* precisely because computing it means a
+    // whole-history `git log` (~10s), so it must be READ here. Sending it through
+    // deterministicStoreFor would fire that walk inside every paint batch.
     const witnessStoreFor = (lens: Lens, directory: string, projectID: string) =>
       Effect.gen(function* () {
         if (isDeterministic(lens) && lens.deterministic !== "bus-factor") {
           const subtree = yield* subtreeFor(directory)
           return yield* deterministicStoreFor(lens, directory, subtree)
         }
+        // A drill-down of a Search Lens is a strange thing to build, but it has to behave
+        // predictably rather than by accident. Its parent witnesses NONE for every file, so a
+        // child scoped to a *concern* gets an empty domain (correct: no file-level facet carries
+        // a line-level concern) and one scoped to "Other" gets the whole repo.
+        if (isSearch(lens)) return searchBaseStore(yield* subtreeFor(directory))
         const store = yield* ApertureSemanticStore.read(storage, projectID, lens.id)
         // A cold bus-factor store witnesses nothing, so a drill-down of it paints nothing
         // this pass (fail closed) — kick the background refresh and let the next sweep place
@@ -656,7 +788,7 @@ export const layer = Layer.effect(
         // Fill the files the parent hasn't placed yet. Only a semantic parent can be filled;
         // a deterministic store already covers every file in the subtree by construction.
         const pending = files.filter((f) => store[f.id] === undefined)
-        if (pending.length > 0 && !isDeterministic(parent)) {
+        if (pending.length > 0 && usesPainter(parent)) {
           const parentDomain = yield* resolveDomain(parent, directory, projectID, pending, origin, depth + 1)
           yield* AperturePainter.paintStale(
             { storage, events, provider, config },
@@ -913,8 +1045,9 @@ export const layer = Layer.effect(
         if (!files) drilledFiles.set(directory, (files = new Set()))
         for (const rel of relPaths) files.add(rel)
         const lens = yield* activeUsable(directory, projectID)
-        // Deterministic built-ins are fully computed; nothing to model-paint.
-        if (isDeterministic(lens)) return
+        // Deterministic built-ins are fully computed and a Search Lens is painted by its
+        // rules; neither has anything to model-paint.
+        if (!usesPainter(lens)) return
         let pending = extentPending.get(directory)
         if (!pending) extentPending.set(directory, (pending = new Map()))
         // Per-file dedup against what a slice is already painting, preserved from the
@@ -936,7 +1069,7 @@ export const layer = Layer.effect(
           // Re-read the Lens each slice (like backgroundLoop) so switching mid-drain takes
           // effect on the next one rather than painting into the previous Lens's store.
           const lens = yield* activeUsable(directory, projectID)
-          if (isDeterministic(lens)) return
+          if (!usesPainter(lens)) return
           const pending = extentPending.get(directory)!
           const entries = [...pending].slice(0, EXTENT_DRAIN_BATCH)
           const slice = entries.map(([rel]) => rel)
@@ -1010,11 +1143,12 @@ export const layer = Layer.effect(
     // (scheduleExtentPaint): dedup, stale-skip, the shared gate, and drilledFiles bookkeeping
     // all apply, and switching Lens re-paints from that Lens alone. Capped (WORKING_SET_PAINT_CAP)
     // so an uncommitted repo can't turn this into a whole-repo function paint. Deterministic
-    // Lenses compute their function tiles offline in finalize, so there's nothing to model-paint.
+    // Lenses compute their function tiles offline in finalize and a Search Lens's colour comes
+    // from its rules, so for neither is there anything to model-paint.
     const scheduleWorkingSetPaint = (directory: string, projectID: string) =>
       Effect.gen(function* () {
         const lens = yield* activeUsable(directory, projectID)
-        if (isDeterministic(lens)) return
+        if (!usesPainter(lens)) return
         // No git work tree → no working set (and git.status would error). Bail quietly.
         if (!(yield* isRepoFor(directory))) return
         const git = yield* gitChangedFor(directory)
@@ -1107,15 +1241,18 @@ export const layer = Layer.effect(
         }).pipe(Effect.ensuring(Effect.sync(() => busFactorInFlight.delete(directory))))
       })
 
-    // A Lens's file-level facet store as a *reader* sees it — the three-way branch shared
-    // by finalize, facetFiles and facetMap. The cheap deterministic built-ins (git-changed /
-    // mtime) are computed inline from the repo: no painter, no tokens, always fresh.
-    // Everything else reads the persisted store.
+    // A Lens's file-level facet store as a *reader* sees it — the branch shared by finalize,
+    // facetFiles and facetMap. The cheap deterministic built-ins (git-changed / mtime) are
+    // computed inline from the repo: no painter, no tokens, always fresh. Everything else
+    // reads the persisted store.
     //
     // Bus-factor is the trap it exists to contain: it is deterministic but its store is
     // *persisted* precisely because computing it means a whole-history `git log` (~10s), so
     // it must be read, not computed, and its background HEAD-keyed refresh kicked so a
     // stale/empty store self-heals without blocking the read.
+    //
+    // A Search Lens gets `searchBaseStore` — NONE_FACET for every file, the honest base for a
+    // Lens whose colour arrives only where a rule matches.
     const facetStoreFor = (lens: Lens, directory: string, projectID: string) =>
       Effect.gen(function* () {
         if (lens.deterministic === "bus-factor") {
@@ -1123,6 +1260,7 @@ export const layer = Layer.effect(
           return yield* ApertureSemanticStore.read(storage, projectID, lens.id)
         }
         if (isDeterministic(lens)) return yield* deterministicStoreFor(lens, directory, yield* subtreeFor(directory))
+        if (isSearch(lens)) return searchBaseStore(yield* subtreeFor(directory))
         return yield* ApertureSemanticStore.read(storage, projectID, lens.id)
       })
 
@@ -1189,6 +1327,12 @@ export const layer = Layer.effect(
         // Deterministic built-ins (git-changed / mtime-buckets) compute their facets from the
         // repo instead of reading the persisted store: no painter, no tokens, always fresh.
         const det = isDeterministic(lens)
+        // Separate from `det` on purpose. `det` still selects the git-changed diff branches
+        // below (a Search Lens must not take those), while this is the "should the model run"
+        // question — false for a deterministic built-in AND for a Search Lens, whose facets
+        // come from its rules. Folding the two would either sweep a Search Lens or send it
+        // down git-changed's hunk path.
+        const paint = usesPainter(lens)
         // Bus-factor is deterministic but *expensive*, so it reads its persisted store and
         // self-heals in the background rather than computing inline — facetStoreFor owns that
         // distinction for every reader.
@@ -1222,19 +1366,23 @@ export const layer = Layer.effect(
         // sub-facet store (git-changed derives its function tiles offline from the diff,
         // and its file-level facet already describes the whole file's heat), so they keep
         // the plain file-level attribution.
-        const mixes = det ? {} : yield* ApertureSubfacetStore.readMixes(storage, ctx.project.id, lens.id)
+        // A Search Lens has no sub-facet store either, and never will: its facets are
+        // line-level, and a line tag deliberately never enters attributeFileBytes.
+        const mixes = paint ? yield* ApertureSubfacetStore.readMixes(storage, ctx.project.id, lens.id) : {}
         const composition = computeComposition(structure.nodes, subtree, store, mixes, lens)
         // Fill in the mixes of files function-painted before this ran (see backfillMixes):
         // forked, so the view renders from what's persisted now and re-merges when it lands.
-        if (!det)
+        if (paint)
           yield* forkProactivePaint(
             "mix backfill failed",
             ctx.project.id,
             backfillMixes(ctx.directory, ctx.project.id, lens),
           )
-        // Deterministic Lenses are fully painted above; only semantic ones schedule
-        // the foreground painter for the in-window files + boundary targets.
-        if (!det)
+        // Deterministic and Search Lenses are fully painted above; only painter-owned ones
+        // schedule the foreground painter for the in-window files + boundary targets. This is
+        // the hottest of the painter gates — it fires on every window fetch — so a Search Lens
+        // reaching it would sweep the repo from the moment it was activated.
+        if (paint)
           yield* schedulePaint(ctx.directory, ctx.project.id, scope, structure.nodes, structure.boundaries ?? [], lens)
         const lensInfo: AperturePayload.LensInfo = {
           id: lens.id,
@@ -1277,8 +1425,9 @@ export const layer = Layer.effect(
           // before finalize), but include it defensively against ordering changes.
           if (drillFile && idByPath.has(drillFile)) targets.add(drillFile)
           if (targets.size) {
-            // Semantic Lenses read the per-function store once for all targets.
-            const subStore = det ? undefined : yield* ApertureSubfacetStore.read(storage, ctx.project.id, lens.id)
+            // Painter-owned Lenses read the per-function store once for all targets. A Search
+            // Lens has no such store (see the `!paint` branch below), so it must not read one.
+            const subStore = paint ? yield* ApertureSubfacetStore.read(storage, ctx.project.id, lens.id) : undefined
             const built: Record<string, ReadonlyArray<AperturePayload.Extent>> = {}
             for (const file of targets) {
               const fileId = idByPath.get(file)!
@@ -1289,8 +1438,11 @@ export const layer = Layer.effect(
               // declaration. The mix records which (more than one extent ⇒ finely cut) —
               // the same high-water rule the painter applies. Deterministic Lenses carry no
               // mix and derive their tiles from the diff, so they always cut per declaration.
+              // A Search Lens has no mix either, and would otherwise fall to "file" and collapse
+              // the file to a single whole-file tile — the least useful cut for a probe. Cutting
+              // per declaration keeps the structure a line tag can sit inside (S3).
               const granularity: ApertureExtents.Granularity =
-                det || (mixes[file]?.subtreeCount ?? 0) > 1 ? "declaration" : "file"
+                !paint || (mixes[file]?.subtreeCount ?? 0) > 1 ? "declaration" : "file"
               const exs = ApertureExtents.extentsOf(content, granularity)
               // name → facet id for this file's extents.
               let facetByName: Map<string, string>
@@ -1328,6 +1480,18 @@ export const layer = Layer.effect(
                 // refuses to function-paint it, so paint its tiles the same "Other" grey
                 // rather than leaving them the *unpainted* grey — which would read as "not
                 // swept yet" and invite the user to wait for a paint that will never come.
+                facetByName = new Map(exs.map((e) => [e.name, NONE_FACET]))
+              } else if (!paint) {
+                // A Search Lens: no per-function store, so every tile takes the same NONE
+                // ("Other") grey as its file-level base. The tiles still ship so a client can
+                // see the file's declaration structure and place a sparse strip inside the one
+                // containing a hit; they simply carry no facet of their own, because a rule's
+                // unit is a line and lines arrive via `lineTags` below.
+                //
+                // This branch is required, not just tidy: the `else` below dereferences
+                // `subStore!`, which is only ever safe because `det` took an earlier branch.
+                // Leaving a Search Lens to fall through would be a TypeError inside
+                // `finalize` — i.e. Effect.orDie on the whole payload fetch.
                 facetByName = new Map(exs.map((e) => [e.name, NONE_FACET]))
               } else {
                 facetByName = new Map()
@@ -1425,11 +1589,11 @@ export const layer = Layer.effect(
           // re-walks the repo painting for the *new* Lens; cached entries make a
           // re-walk of an already-painted Lens free.
           const lens = yield* activeUsable(directory, projectID)
-          // Deterministic built-ins are painted synchronously in finalize — there's nothing
-          // for the whole-repo sweep to do. Park until a Lens switch (or file change)
-          // wakes us; the next pass re-reads the active Lens and resumes the sweep if
-          // it's switched back to a semantic one.
-          if (isDeterministic(lens)) {
+          // Deterministic built-ins are painted synchronously in finalize and a Search Lens is
+          // painted by its rules — neither leaves the whole-repo sweep anything to do. Park
+          // until a Lens switch (or file change) wakes us; the next pass re-reads the active
+          // Lens and resumes the sweep if it's switched back to a painter-owned one.
+          if (!usesPainter(lens)) {
             yield* Queue.take(wake)
             continue
           }
@@ -1777,6 +1941,43 @@ export const layer = Layer.effect(
         yield* wakeBackground(directory)
       })
 
+    // Re-paint every viewed scope after the active Lens's *rules* changed (S2). Marks each
+    // cached scope dirty and publishes an invalidation, and deliberately nothing else.
+    //
+    // Emphatically NOT onLensChanged, for three reasons in descending order of damage:
+    //
+    //  1. It clears the O4 legend filter. A Search Lens is designed to hold several
+    //     loosely-related concerns that the user filters down to the one they care about — so
+    //     resetting the filter on every mark would break the mechanism marks exist to feed.
+    //     Marking is also the act most likely to happen *while* a filter is on, since the
+    //     agent is working the area the user is looking at.
+    //  2. It bumps lensEpoch and wakes the background sweep. No facet definition moved and
+    //     the painter is not involved, so there is nothing to sweep and nothing to abandon.
+    //  3. It forks a repaint of the drilled files and the working set. Same reason.
+    //
+    // No memo drop either: ruleMemo is keyed on rulesHash, so adding or editing a rule moves
+    // the hash and the next read replaces the entry wholesale. (Removing the *last* rule is
+    // the exception — see unmarkLens.)
+    const onRulesChanged = (directory: string) =>
+      Effect.gen(function* () {
+        const container = caches.get(directory)
+        if (!container) return
+        for (const scope of container.scopes.keys()) {
+          container.dirty.add(scope)
+          // The location is mandatory, not defensive: the VSCode extension is the only
+          // HTTP-SSE consumer and the /event filter drops a location-less event, so without
+          // this the gutter would keep painting the pre-mark tags until something else
+          // invalidated the scope.
+          yield* events
+            .publish(
+              ApertureEvent.Event.Invalidated,
+              { scope },
+              { location: { directory: AbsolutePath.make(directory) } },
+            )
+            .pipe(Effect.ignore)
+        }
+      })
+
     const lenses = Effect.fn("Aperture.lenses")(function* () {
       const ctx = yield* InstanceState.context
       // Hide deterministic built-ins whose prerequisite is unmet (git-changed off-git).
@@ -1879,6 +2080,17 @@ export const layer = Layer.effect(
       // no longer exists, and it would quietly paint nothing forever. Merging the facet away
       // is the supported path (mergeFacets re-scopes its children onto the survivor); this
       // just names the dependents so they can be deleted or re-scoped first.
+      // An edit preserves rule-owned concerns (the store's `reserved` set) because lens_edit
+      // cannot express them, so the palette has to be shared between the two. Refuse here
+      // rather than in the store, which has no way to report and would have to die.
+      const reserved = found.facets.filter((t) => t.ruleOnly)
+      if (input.facets && input.facets.length + reserved.length > MAX_FACETS)
+        return {
+          status: "facet-cap",
+          max: MAX_FACETS,
+          reserved: reserved.map((t) => ({ facet: t.id, label: t.label })),
+        } as const
+
       const children = yield* ApertureLensStore.childrenOf(ctx.directory, found.id)
       if (input.facets && children.length) {
         // Mirror resolveFacets' id-carrying rule: a facet survives when the edit names its
@@ -1973,6 +2185,171 @@ export const layer = Layer.effect(
       return { status: "ok", lens: updated, structural: false } as const
     })
 
+    // Install a search rule (S2). The ORDER here is the design:
+    //
+    //  1. resolve or create the Lens,
+    //  2. EVALUATE the finder before touching the store,
+    //  3. only then persist.
+    //
+    // Evaluating first is what keeps a rule that can never paint — an uncompilable regex, a
+    // structural pattern with no backend, a finder matching nothing — out of a committed
+    // `lenses.json`. It also means a refused mark leaves nothing behind: no freshly-minted
+    // empty concern, and no empty Search Lens created for a call that then failed.
+    const markLens = Effect.fn("Aperture.markLens")(function* (input: MarkLensInput) {
+      const ctx = yield* InstanceState.context
+      const all = yield* ApertureLensStore.list(ctx.directory)
+      const found = resolveLens(all, input.lens)
+      // A built-in refuses before anything else: its definition lives in code, so a rule
+      // written against it could only land in the project doc under a shadowed id.
+      if (found && isBuiltinLens(found)) return { status: "builtin" } as const
+
+      // Evaluate under a provisional id — the store re-mints the real one from the resolved
+      // facet id, and the hit set doesn't depend on either.
+      const probe: Rule = { id: "probe", facet: "probe", find: input.find }
+      const result = yield* ApertureRules.evaluate(ctx.directory, [probe])
+      const diagnostic = result.diagnostics[0]
+      if (!diagnostic || diagnostic.error) {
+        return { status: "dead-rule", detail: diagnostic?.error ?? "the finder could not be evaluated" } as const
+      }
+      if (diagnostic.hits === 0) return { status: "no-hits" } as const
+
+      // Over-cap is NOT a refusal: the rule stores and is reported as too broad rather than
+      // painted, so the agent can narrow it or drop it deliberately (see MAX_RULE_HITS).
+      const facetLabel = input.facet.trim()
+      let lens: Lens
+      let facet: Facet
+      let rule: Rule
+      let createdLens = false
+      let minted = false
+      let replaced: Rule | undefined
+      let written: boolean
+
+      if (!found) {
+        const created = yield* ApertureLensStore.createSearch(ctx.directory, {
+          name: input.lens,
+          description: input.about?.trim() || `Search Lens: ${input.lens}.`,
+          facet: {
+            label: facetLabel,
+            description: input.definition?.trim() || `Lines matched by the "${facetLabel}" search rules.`,
+          },
+          rule: {
+            find: input.find,
+            ...(input.note ? { note: input.note } : {}),
+            ...(input.agent ? { createdBy: input.agent } : {}),
+          },
+        })
+        lens = created.lens
+        facet = created.facet
+        rule = created.rule
+        createdLens = true
+        minted = true
+        written = true
+      } else {
+        const marked = yield* ApertureLensStore.mark(ctx.directory, found.id, {
+          facet: facetLabel,
+          ...(input.definition ? { definition: input.definition } : {}),
+          find: input.find,
+          ...(input.note ? { note: input.note } : {}),
+          ...(input.agent ? { createdBy: input.agent } : {}),
+        })
+        if (marked.status === "not-found") return { status: "not-found" } as const
+        if (marked.status === "builtin") return { status: "builtin" } as const
+        if (marked.status === "facet-cap") return { status: "facet-cap", lens: found, max: marked.max } as const
+        if (marked.status === "rule-cap") return { status: "rule-cap", lens: found, max: marked.max } as const
+        lens = marked.lens
+        facet = marked.facet
+        rule = marked.rule
+        minted = marked.minted
+        replaced = marked.replaced
+        written = marked.written
+      }
+
+      // Samples come from the evaluated hits, which carry ranges only — the line's text has to
+      // be read here. Capped at MARK_SAMPLE_FILES so a rule matching 500 lines doesn't read
+      // 500 files to show five of them.
+      const samples: MarkSample[] = []
+      for (const [file, hits] of result.byFile) {
+        if (samples.length >= MARK_SAMPLE_FILES) break
+        const first = hits[0]?.ranges[0]
+        if (!first) continue
+        const content = yield* readFileText(ctx.directory, file)
+        if (content === undefined) continue
+        const text = content.split("\n")[first[0] - 1]?.trim()
+        if (text) samples.push({ file, line: first[0], text: text.slice(0, MARK_SAMPLE_CHARS) })
+      }
+
+      const activeId = yield* ApertureLensStore.getActiveId(ctx.directory)
+      let activated = false
+      if (input.activate === true && activeId !== lens.id) {
+        yield* ApertureLensStore.setActive(ctx.directory, lens.id)
+        // A genuine Lens change: the vocabulary the user is looking at is different now, so
+        // the full treatment (filter cleared, epoch bumped, sweep woken) is correct.
+        yield* onLensChanged(ctx.directory)
+        activated = true
+      } else if (activeId === lens.id) {
+        // Same Lens, new rules — the narrow invalidation. See onRulesChanged for why routing
+        // this through onLensChanged would wipe the user's legend filter on every mark.
+        yield* onRulesChanged(ctx.directory)
+      }
+      // A mark on a non-active Lens needs nothing at all: ruleMemo is keyed by lens id, so it
+      // cannot be holding stale hits for a Lens nobody is viewing.
+
+      return {
+        status: "ok",
+        lens,
+        facet,
+        rule,
+        createdLens,
+        minted,
+        ...(replaced ? { replaced } : {}),
+        diagnostic,
+        samples,
+        activated,
+        isActive: activated || activeId === lens.id,
+        written,
+      } as const
+    })
+
+    const unmarkLens = Effect.fn("Aperture.unmarkLens")(function* (input: {
+      readonly lens: string
+      readonly rule?: string
+      readonly facet?: string
+    }) {
+      const ctx = yield* InstanceState.context
+      const all = yield* ApertureLensStore.list(ctx.directory)
+      const found = resolveLens(all, input.lens)
+      if (!found) return { status: "not-found" } as const
+      if (isBuiltinLens(found)) return { status: "builtin" } as const
+
+      const result = yield* ApertureLensStore.unmark(ctx.directory, found.id, {
+        ...(input.rule ? { rule: input.rule } : {}),
+        ...(input.facet ? { facet: input.facet } : {}),
+      })
+      if (result.status === "not-found") return { status: "not-found" } as const
+      if (result.status === "builtin") return { status: "builtin" } as const
+      if (result.status === "unknown-rule") return { status: "unknown-rule", lens: found, rule: result.rule } as const
+      if (result.status === "unknown-facet")
+        return { status: "unknown-facet", lens: found, facet: result.facet } as const
+
+      // The one case the hash-keyed memo can't self-invalidate: `ruleHitsFor` returns early for
+      // a rule-less Lens *before* consulting the memo, so removing the last rule would leave
+      // the previous hit set resident for the life of the process. Harmless for correctness
+      // (nothing reads it), but it is a leak and the next mark would compare against it.
+      if (!result.lens.rules?.length) ruleMemo.delete(ctx.directory)
+
+      const activeId = yield* ApertureLensStore.getActiveId(ctx.directory)
+      if (activeId === result.lens.id) yield* onRulesChanged(ctx.directory)
+
+      return {
+        status: "ok",
+        lens: result.lens,
+        removedRules: result.removedRules,
+        ...(result.removedFacet ? { removedFacet: result.removedFacet } : {}),
+        recolored: result.recolored,
+        written: result.written,
+      } as const
+    })
+
     const deleteLens = Effect.fn("Aperture.deleteLens")(function* (idOrName: string) {
       const ctx = yield* InstanceState.context
       const all = yield* ApertureLensStore.list(ctx.directory)
@@ -2062,9 +2439,7 @@ export const layer = Layer.effect(
       const store = yield* facetStoreFor(lens, ctx.directory, ctx.project.id)
       // Deterministic Lenses carry no function-level mix (see finalize), so every file
       // attributes whole to its file-level facet.
-      const mixes = isDeterministic(lens)
-        ? {}
-        : yield* ApertureSubfacetStore.readMixes(storage, ctx.project.id, lens.id)
+      const mixes = usesPainter(lens) ? yield* ApertureSubfacetStore.readMixes(storage, ctx.project.id, lens.id) : {}
 
       // NONE_FACET is appended rather than being part of the legend: it is a real stored
       // value ("Other — not this Lens") but never a Lens facet, so it needs an index the
@@ -2082,6 +2457,9 @@ export const layer = Layer.effect(
           name: lens.name,
           legend: lensLegend(lens),
           ...(isDeterministic(lens) ? { deterministic: true } : {}),
+          // Carried here as well as from finalize: a client that only ever fetches the facet
+          // map (the VSCode Explorer pips) would otherwise never learn the Lens is a probe.
+          ...(isSearch(lens) ? { search: true } : {}),
         },
       }
     })
@@ -2173,11 +2551,9 @@ export const layer = Layer.effect(
 
       const lens = yield* activeUsable(ctx.directory, ctx.project.id)
       const store = yield* facetStoreFor(lens, ctx.directory, ctx.project.id)
-      // Deterministic Lenses carry no function-level mix (see finalize), so every file
-      // attributes whole to its file-level facet.
-      const mixes = isDeterministic(lens)
-        ? {}
-        : yield* ApertureSubfacetStore.readMixes(storage, ctx.project.id, lens.id)
+      // Deterministic and Search Lenses carry no function-level mix (see finalize), so every
+      // file attributes whole to its file-level facet.
+      const mixes = usesPainter(lens) ? yield* ApertureSubfacetStore.readMixes(storage, ctx.project.id, lens.id) : {}
       const facets = [...lens.facets.map((t) => t.id), NONE_FACET]
 
       return {
@@ -2197,6 +2573,7 @@ export const layer = Layer.effect(
           name: lens.name,
           legend: lensLegend(lens),
           ...(isDeterministic(lens) ? { deterministic: true } : {}),
+          ...(isSearch(lens) ? { search: true } : {}),
         },
       }
     })
@@ -2285,6 +2662,8 @@ export const layer = Layer.effect(
       cycleLens: (direction) => cycleLens(direction),
       editLens: (input) => editLens(input),
       mergeFacets: (lens, from, into) => mergeFacets(lens, from, into),
+      markLens: (input) => markLens(input),
+      unmarkLens: (input) => unmarkLens(input),
       deleteLens: (idOrName) => deleteLens(idOrName),
       facetFiles: (lens, facets) => facetFiles(lens, facets),
       facetMap: () => facetMap(),

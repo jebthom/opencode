@@ -105,6 +105,16 @@ export const LensEditTool = Tool.define(
                   "Either keep that facet, fold it into another with lens_merge_facets (which re-scopes the drill-downs onto the survivor), or delete the drill-downs first.",
                 ].join(" "),
               }
+            case "facet-cap":
+              return {
+                title: "Too many facets",
+                metadata: {},
+                output: [
+                  `That's ${params.facets?.length} facets plus ${result.reserved.length} marked concern(s) on this Lens — ${result.reserved.map((r) => `"${r.label}" [${r.facet}]`).join(", ")} — which is over the limit of ${result.max}.`,
+                  "Marked concerns share the palette and are kept across an edit (lens_edit can't restate them),",
+                  "so either shorten your facet list or remove a concern with lens_unmark first.",
+                ].join(" "),
+              }
             case "ok":
               return {
                 title: `Edited ${result.lens.name}`,

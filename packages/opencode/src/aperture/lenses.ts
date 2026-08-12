@@ -20,6 +20,19 @@ export interface Facet {
   readonly label: string
   readonly description: string
   readonly color: string
+  // Set when this facet is defined by *rules* rather than by the painter — i.e. it was
+  // minted by `lens_mark` (S2). The distinction is not cosmetic: a rule-owned facet is
+  // excluded from `facetEnumIds`/`buildSystemPrompt`, so the painter's vocabulary is
+  // literally unchanged by minting one. That is what makes marking a concern onto an
+  // *Overview* Lens free — `lens_edit`'s `structural` flag (which wipes both facet stores
+  // for the Lens and every descendant, i.e. a whole-repo repaint) is not owed, because no
+  // already-painted file was classified without an option it should have had. It also stops
+  // the painter assigning "any-casts" to a file by judgement, which would quietly break the
+  // rule's meaning: a rule-owned facet appears exactly where its rules match, nowhere else.
+  //
+  // It IS in the legend, the palette and O4's filter set — the user must see and be able to
+  // filter it like any other facet.
+  readonly ruleOnly?: true
 }
 
 export type LensScope = "global" | "project"
@@ -123,6 +136,23 @@ export function isSearch(lens: Pick<Lens, "search">): boolean {
   return lens.search === true
 }
 
+// Does the LLM painter own this Lens's facets? False for the deterministic built-ins
+// (computed from git/mtime) and for a Search Lens (computed from rules) — the two ways a
+// Lens gets its colour without spending a token.
+//
+// This is the predicate every painter *gate* asks, and it exists as one function because the
+// alternative is what shipped: eleven sites each testing `isDeterministic` and therefore
+// each an independent chance to miss the new case. `isSearch` was added in S1 as a wire flag
+// with no gate behind it, so before S2 an active Search Lens would have triggered a
+// whole-repo model sweep to classify every file into a vocabulary that means nothing.
+//
+// Keep using `isDeterministic`/`isSearch` directly where the branch cares *which*
+// alternative source it is (git hunks vs rule hits); use this only for "should the model
+// run".
+export function usesPainter(lens: Pick<Lens, "deterministic" | "search">): boolean {
+  return !isDeterministic(lens) && !isSearch(lens)
+}
+
 // Shape predicate for a stored finder. Total and pure: `lenses.json` is hand-editable and
 // committable, so a malformed entry must be *droppable* rather than throwing — the same
 // posture that makes `orderForest` cycle-safe.
@@ -131,30 +161,46 @@ export function isSearch(lens: Pick<Lens, "search">): boolean {
 // 4,000 lines are all the evaluator's questions, because those need to be *reported* back
 // to the agent and the store has nowhere to report.
 export function isValidFinder(value: unknown): value is Finder {
-  if (typeof value !== "object" || value === null) return false
+  return finderProblem(value) === undefined
+}
+
+// Why a finder is unusable, as prose that names the fix — or `undefined` when it is
+// well-formed. `isValidFinder` delegates here so the guard and the message can never drift.
+//
+// The message matters as much as the verdict, and that is a consequence of how `lens_mark`
+// takes its parameters. A `Schema.Union` over the three finder kinds would reject a
+// malformed one during *decode*, upstream of the tool's `execute`, where the harness turns it
+// into `InvalidArgumentsError`'s generic "Please rewrite the input so it satisfies the
+// expected schema" — uninterceptable and telling the agent nothing. So the tool takes a flat
+// struct and validates here instead, where "you gave kind:symbol a pattern" can be said out
+// loud. Same reason the store can't do this job: it has nowhere to report to.
+export function finderProblem(value: unknown): string | undefined {
+  if (typeof value !== "object" || value === null) return "the finder must be an object"
   const find = value as Record<string, unknown>
-  const strings = (key: string) =>
-    find[key] === undefined ||
-    (Array.isArray(find[key]) && (find[key] as unknown[]).every((g) => typeof g === "string"))
+  const nonEmpty = (key: string) => typeof find[key] === "string" && (find[key] as string).length > 0
+  const globProblem = () =>
+    find["glob"] !== undefined &&
+    !(Array.isArray(find["glob"]) && (find["glob"] as unknown[]).every((g) => typeof g === "string"))
+      ? '"glob" must be an array of strings, e.g. ["packages/*/src/**/*.ts"]'
+      : undefined
   switch (find["kind"]) {
     case "pattern":
-      return typeof find["pattern"] === "string" && find["pattern"].length > 0 && strings("glob")
+      if (!nonEmpty("pattern")) return 'kind "pattern" needs a non-empty "pattern" (a ripgrep/rust-regex)'
+      return globProblem()
     case "symbol":
-      return (
-        typeof find["name"] === "string" &&
-        find["name"].length > 0 &&
-        (find["path"] === undefined || typeof find["path"] === "string")
-      )
+      if (!nonEmpty("name"))
+        return 'kind "symbol" needs a non-empty "name" — the exact top-level declaration name. For a regex, use kind "pattern" instead'
+      if (find["path"] !== undefined && typeof find["path"] !== "string")
+        return '"path" must be a string (a repo-relative file or directory prefix)'
+      return undefined
     case "structural":
-      return (
-        typeof find["pattern"] === "string" &&
-        find["pattern"].length > 0 &&
-        typeof find["language"] === "string" &&
-        find["language"].length > 0 &&
-        strings("glob")
-      )
+      if (!nonEmpty("pattern")) return 'kind "structural" needs a non-empty "pattern" (an ast-grep pattern)'
+      if (!nonEmpty("language")) return 'kind "structural" needs a "language", e.g. "ts", "tsx", "js", "py"'
+      return globProblem()
     default:
-      return false
+      return `"kind" must be "pattern", "symbol" or "structural"${
+        typeof find["kind"] === "string" ? `; you passed "${find["kind"]}"` : ""
+      }`
   }
 }
 
@@ -283,6 +329,21 @@ const CATEGORICAL = [
   "#00AFD7", //  38 cyan
   "#5F5FD7", //  62 indigo
 ] as const
+
+// The six hues by name, so a tool can hand an agent a word the user can act on ("the
+// crimson lines") instead of a hex it would have to describe itself. Keyed by exact hex, so
+// it covers both palettes — they are the same six colours in two orders. The two greys are
+// included because NONE_FACET is a real, reportable facet value.
+export const COLOR_NAMES: Record<string, string> = {
+  "#D7005F": "crimson",
+  "#AF5F00": "amber",
+  "#AFAF00": "chartreuse",
+  "#00875F": "emerald",
+  "#00AFD7": "cyan",
+  "#5F5FD7": "indigo",
+  [NONE_HUE]: "grey",
+  [UNTAGGED_HUE]: "dark grey",
+}
 
 export const PALETTES: Record<PaletteId, Palette> = {
   // Min pairwise CIEDE2000 among the six = 32.3, and ≥24.5 from either grey. Chosen by
@@ -623,17 +684,84 @@ export function isValidFacet(lens: Lens, id: unknown): id is string {
   return typeof id === "string" && lens.facets.some((t) => t.id === id)
 }
 
-// A facet the painter is allowed to store: one of the Lens's facets or the universal
-// NONE_FACET escape. Used to filter the model's structured output.
+// A facet the painter is allowed to store: one of the Lens's painter-owned facets or the
+// universal NONE_FACET escape. Used to filter the model's structured output.
+//
+// Rule-owned facets are excluded here as well as from `facetEnumIds`. The enum should make
+// one unreachable, but this is the write path — belt and braces is cheap, and a rule-owned
+// facet landing in the painted store would put a concern's colour on files no rule matched.
 export function isAssignableFacet(lens: Lens, id: unknown): id is string {
-  return id === NONE_FACET || isValidFacet(lens, id)
+  return id === NONE_FACET || (isValidFacet(lens, id) && !lens.facets.find((t) => t.id === id)?.ruleOnly)
 }
 
-// The closed set of facet ids the model may echo back: the Lens's facets plus the
-// NONE_FACET escape. Drives the painter's structured-output enum.
+// The closed set of facet ids the model may echo back: the Lens's *painter-owned* facets
+// plus the NONE_FACET escape. Drives the painter's structured-output enum.
+//
+// `ruleOnly` facets are excluded — they belong to their rules, and offering one to the
+// painter would let it appear on files no rule matches. Excluding them here is also what
+// makes minting one cost no repaint (see Facet.ruleOnly). A Search Lens has only rule-owned
+// facets, so this returns just [NONE_FACET] for one — consistent with `usesPainter` gating
+// its painter off entirely.
 export function facetEnumIds(lens: Lens): [string, ...string[]] {
   // NONE_FACET first so the result types as a non-empty tuple; enum order is irrelevant.
-  return [NONE_FACET, ...lens.facets.map((t) => t.id)]
+  return [NONE_FACET, ...lens.facets.filter((t) => !t.ruleOnly).map((t) => t.id)]
+}
+
+// The facets the painter classifies into: everything except the rule-owned ones. Kept
+// beside `facetEnumIds` so the two can't disagree about what the painter's vocabulary is.
+export function paintedFacets(lens: Pick<Lens, "facets">): Facet[] {
+  return lens.facets.filter((t) => !t.ruleOnly)
+}
+
+// One facet as an agent needs to see it: its id, its hue *by name*, and how many rules point
+// at it. Used by `lens_mark`/`lens_unmark`, which ship the whole roster on every call (success
+// or refusal), and by the build/plan system prompt, which injects it so the main agent knows
+// which concerns already exist without a lens_list round trip.
+//
+// Shipping it everywhere is deliberate: the roster is what stops an agent minting
+// `retry-path-2` beside `retry-path`, tells it how close it is to MAX_FACETS, and gives it a
+// colour word to narrate to the user ("the crimson lines"). Deriving it here rather than in
+// each caller is what keeps those three readings identical.
+export interface ConcernSummary {
+  readonly facet: string
+  readonly label: string
+  readonly color: string
+  readonly colorName: string
+  readonly ruleOnly: boolean
+  readonly rules: number
+}
+
+// A finder as one readable line. Lives here so `lens_mark` (echoing back what it stored) and
+// `lens_list` (showing what is already installed) cannot describe the same rule two ways —
+// which matters because the agent compares the two to decide whether to reuse a concern.
+export function describeFinder(find: Finder): string {
+  switch (find.kind) {
+    case "pattern":
+      return (
+        `pattern /${find.pattern}/` +
+        (find.glob?.length ? ` glob ${find.glob.join(", ")}` : "") +
+        (find.caseSensitive === false ? " (case-insensitive)" : "")
+      )
+    case "symbol":
+      return `symbol ${find.name}` + (find.path ? ` in ${find.path}` : "")
+    case "structural":
+      return (
+        `structural /${find.pattern}/ (${find.language})` + (find.glob?.length ? ` glob ${find.glob.join(", ")}` : "")
+      )
+  }
+}
+
+export function concernRoster(lens: Pick<Lens, "facets" | "rules">): ConcernSummary[] {
+  const counts = new Map<string, number>()
+  for (const rule of lens.rules ?? []) counts.set(rule.facet, (counts.get(rule.facet) ?? 0) + 1)
+  return lens.facets.map((t) => ({
+    facet: t.id,
+    label: t.label,
+    color: t.color,
+    colorName: COLOR_NAMES[t.color] ?? t.color,
+    ruleOnly: t.ruleOnly === true,
+    rules: counts.get(t.id) ?? 0,
+  }))
 }
 
 // The renderer's legend: ordered facet → label + colour. Drives both the swatch row
@@ -686,7 +814,9 @@ export function buildSystemPrompt(lens: Lens, parent?: Lens): string {
     lens.prompt,
     ...scope,
     "Facets:",
-    ...lens.facets.map((t) => `- ${t.id}: ${t.description}`),
+    // Rule-owned facets are deliberately absent: the painter must not be able to assign one
+    // (see Facet.ruleOnly). facetEnumIds applies the same filter to the output schema.
+    ...paintedFacets(lens).map((t) => `- ${t.id}: ${t.description}`),
     `- ${NONE_FACET}: none of the above — the file is unrelated to every facet`,
     `Assign each source file exactly one facet, using "${NONE_FACET}" when it fits none rather than forcing a fit.`,
     lens.context === "medium"

@@ -64,7 +64,7 @@ O3 ✅ (always-extent) ┬──► O1 ✅ (top bar simplify)
 O4 (legend filter) ──────────────────────────────► shared with S4
                      └──► also drives O2's `focus` (Explorer pips)
 
-S0 ✅ (tag = query) ──► S1a ✅ (rule model) ──► S2 (lens_mark) ──► S3 (line painting, sparse
+S0 ✅ (tag = query) ──► S1a ✅ (rule model) ──► S2 ✅ (lens_mark) ──► S3 (line painting, sparse
                     ├──► S3's sparse layer ✅ (line-level git-changed)      layer ✅) ──► S5
                     └──► S1b (ast-grep structural backend) — only S1 piece outstanding
 
@@ -717,37 +717,194 @@ exist server-side (`lsp/lsp.ts:133-138`) and are the only correct answer to "all
 uses of a class/module" through aliased imports and re-exports. Revisit if it
 bites in use.
 
-### S2 — `lens_mark`, the rule-installation tool
+### S2 — `lens_mark` / `lens_unmark`, the rule-installation tools ✅
 
 Supersedes the originally-planned `lens_tag_lines`, whose name no longer
 describes what it does. Follows the `lens_*` conventions in
 `tool/lens-facet-files.ts:11-28` (Effect `Schema.Struct` params with
 `.annotate({description})`, an **inline** description string — no sibling `.txt`),
 registered at the four sites in `tool/registry.ts`. `Aperture.Service` is already
-in the layer's requirements, so no new layer wiring.
+in the layer's requirements, so no new layer wiring. **Implemented.**
 
 Deterministic — no model call. It validates the finder, evaluates it once, and
 **returns the hit count plus a sample of matched lines**. That return value is the
 whole safety mechanism: an agent that writes a bad regex sees `412 lines across 87
 files` and narrows it instead of silently repainting the repo.
 
-**Explore cannot see any lens tool today.** `agent.ts:178-198` is `"*": "deny"`
-plus an allow-list of `grep/glob/list/bash/webfetch/websearch/read/
-external_directory`. Add `lens_mark` and `lens_list`. (`lens_facet_files` is
-likewise missing from the `lens` agent's own allow-list at `:200-226` — the same
-oversight, worth fixing while there.)
+**Two decisions revised the spec below before it was built.**
 
-**Light Search Lens creation.** Every Lens today routes through the `/lens`
-designer agent and `lens_create`'s ~13 parameters. `lens_mark` auto-creates when
-its `lens` argument names one that doesn't exist: two facets (`hit` +
-`NONE_FACET`), `search: true`, `scope: "project"`. That satisfies "a binary probe
-shouldn't require the full Lens-design flow" at zero extra steps.
+**Resolved — Explore agents get NO Lens tools.** The original plan added
+`lens_mark` + `lens_list` to the `explore` allow-list and widened the prompt gate
+to `explore`. Both cancelled. Three reasons, the first two concrete:
+
+- **`lenses.json` is a plain read-modify-write.** Explore's whole purpose is
+  parallel fan-out, and the loser of a race writes stale content — a rule vanishes
+  with no error anywhere. (S2 added a per-directory mutex regardless, since the
+  `lens` subagent holds the tool and tool calls serialize per *session*, not per
+  instance. But fan-out is the case that makes it routine rather than rare.)
+- **The facet vocabulary is a whole-task decision.** Concerns cap at 6. Three
+  parallel Explores each minting from its own local view produce `retry`,
+  `retry-path`, `retries` and burn the budget; only the main agent sees all three
+  reports.
+- It contradicts `agent/prompt/explore.txt:16` ("Do not create any files, or run
+  bash commands that modify the user's system state in any way"), and marking
+  repaints a view the user cannot watch from inside a subagent session (G0: the
+  sidebar is hidden there outright).
+
+So **Explore proposes and the main agent installs**: a `PROPOSED MARKS` section in
+its report (`concern | kind | pattern or name | glob | reason`), conditionally
+worded in `explore.txt` since that prompt is shared by every Explore call
+including ones with no Aperture involvement. The *format* lives in `explore.txt`
+(stable); the *vocabulary* rides in the task prompt (dynamic), which the main agent
+has because `system.ts` now injects the Search Lens roster. `createdBy` still
+records authorship, so the field already distinguishes `explore` if we ever widen.
+
+This turned out to need **almost no `agent.ts` change**: `build`, `plan` and
+`general` inherit `"*": "allow"` and get both tools free; `explore` is deny-all and
+gets neither without an edit. The one change is the `lens` agent's allow-list,
+which gains `lens_mark`, `lens_unmark` and — the flagged oversight, which is a
+**live bug** — `lens_facet_files`, a tool `prompt/lens.txt` has told it to call
+twice since it was written but which `Permission.disabled` *removed from the
+request*.
+
+**Resolved — a Search Lens is additive, not a binary `hit` probe.** The original
+auto-create made two facets, `hit` + `NONE_FACET`. Instead every rule names a
+**concern** (`retry-path`, `any-casts`) and either reuses an existing facet or mints
+one, up to `MAX_FACETS`. `hit` appears nowhere: the facet name is what the user
+reads in the legend, so a generic one says nothing. The base state is that every
+extent is `NONE_FACET` — deliberately unmarked "Other" grey (`#8A8A8A`), *not*
+unpainted "Non-code" grey (`#444444`), which is a visible difference on every
+surface and the honest reading of "nothing marked yet".
+
+The same mechanism therefore applies to an **Overview Lens**: rules overwrite its
+extent partition on the lines they cover. What makes that free is a new
+`Facet.ruleOnly` flag — a rule-owned facet is excluded from `facetEnumIds` and
+`buildSystemPrompt`, so the painter's vocabulary is *literally unchanged* by
+minting one and `lens_edit`'s `structural` wipe (a whole-repo repaint of the Lens
+and every descendant) is not owed. It also stops the painter assigning `any-casts`
+to a file by judgement, which would quietly break the rule's meaning.
+
+O4's legend filter is what makes several loosely-related concerns on one Lens
+workable, so **filtering, not unmarking, is the way to hide one**; `lens_unmark`
+is for a rule that is actually wrong. Overlapping rules need no resolution
+machinery: last-writer-wins in `lens.rules` order, which is what the extension's
+`Map<line, hue>` already does.
+
+**Four things only running the code found.**
+
+- **The painter was gated only on `isDeterministic`, never `isSearch`** —
+  `aperture.ts` had eleven such sites, including the *foreground* painter that
+  fires on every window fetch. Nothing set `search: true` before S2, so the bug was
+  latent and S2 is its first producer: activating a Search Lens would have swept the
+  whole repo with the model to classify every file into a vocabulary that means
+  nothing. Fixed with one shared predicate, `usesPainter(lens)` =
+  `!isDeterministic && !isSearch`, so the next alternative facet source has one place
+  to be added rather than eleven. `det` is kept *alongside* it in `finalize` because
+  it still selects the git-changed hunk branches.
+- **`onLensChanged` clears the O4 legend filter.** Routing a mark through it would
+  wipe the filter on every mark — the exact mechanism the generalized design rests
+  on, and marking is the act most likely to happen *while* a filter is on. Hence
+  `onRulesChanged`, which marks the viewed scopes dirty and publishes (with a
+  location) and does nothing else: no epoch bump, no sweep wake, no drilled-file
+  repaint, since no facet definition moved.
+- **`lens_edit` would have silently deleted every marked concern.** Its `facets`
+  parameter is the complete replacement list and cannot express `ruleOnly`, so an
+  agent editing a Lens — with no way to know a concern was marked on it — would drop
+  the lot. `update` now preserves rule-owned facets across an edit (the same
+  reasoning that makes `mergeFacets` rewrite `rule.facet` rather than orphan it), and
+  `editLens` refuses over-cap with a new `facet-cap` variant on `LensMutation`
+  because the two now share the palette. **Caught by a test, not by reading.**
+- **`update` also died on zero facets**, which `unmark` makes reachable — so
+  renaming a Search Lens whose last concern had been removed would have killed the
+  fiber. Relaxed for `isSearch` only.
+
+**Landed:** `Facet.ruleOnly` / `usesPainter` / `finderProblem` / `paintedFacets` /
+`concernRoster` / `describeFinder` / `COLOR_NAMES` on `lenses.ts` (still
+dependency-free); a per-directory mutex, `writeDocResult`, `createSearch`, `mark`,
+`unmark` and `mintRuleId` on `lens-store.ts`; the gate swap, `searchBaseStore`,
+the `!paint` extents branch, `onRulesChanged`, `markLens`/`unmarkLens` on
+`aperture.ts`; `tool/lens-mark.ts` + `tool/lens-unmark.ts`; rules in `lens_list`'s
+output; `Summary.rules` in `study-log.ts`; the roster + `MARKING CONCERNS` +
+`DELEGATING EXPLORATION` prompt blocks; and 15 store cases + 6 lenses cases + 2
+JSON-Schema snapshots.
+
+**Parameters are a flat struct with a `Schema.Literals` discriminator, not a
+`Schema.Union` over the three finder kinds** — and the reason is the
+actionable-error requirement, not style. A union mismatch fails during *decode*,
+upstream of the tool's `execute`, where the harness reports
+`InvalidArgumentsError`'s generic *"Please rewrite the input so it satisfies the
+expected schema"* — uninterceptable, and telling the agent nothing. Flat means every
+shape mistake lands inside `execute`, where `finderProblem` can say `kind "symbol"
+needs "name"` out loud. Corroborating: `Schema.Union` appears in **zero** tool
+parameter schemas in this repo, and nested `anyOf` is the weakest part of
+JSON-Schema support across providers. The snapshot in
+`test/tool/parameters.test.ts` is what makes drift back toward it visible.
+
+**Refusing to store is as important as storing.** `markLens` evaluates *before*
+mutating, so a dead rule (uncompilable regex, absent structural backend) or a
+0-hit finder persists nothing — no freshly-minted empty concern, no Search Lens
+created for a call that then failed. An **over-cap** rule is the deliberate
+exception: it stores and is reported as too broad, because the agent needs to be
+able to narrow it or drop it by id.
+
+**`activate` defaults to false.** The same prompt block already says *"Never switch
+the active Lens (lens_select) without asking the user first"*, and a mark that
+hijacked the view would contradict the instruction it is given in the same breath.
+
+**Verified live** against this repo: a Search Lens created with three concerns;
+`usesPainter` false and `facetEnumIds` = `["none"]`, so the painter is genuinely
+off; three rules evaluated whole-repo in **406ms** (a `pattern` rule marking exact
+lines in `github.handler.ts`, a `symbol` rule marking `paintStale`'s whole
+222–480 extent in `painter.ts`); the deliberately-loose `const ` rule matching
+**46,291 lines**, stored, reported over-cap and painted nowhere; `structural`
+refused with the S1b message verbatim; and `unmark` taking a concern's rules with it
+and reporting the survivor's recolour.
 
 **Prompt.** `session/system.ts:86` gates the Aperture block on `agent.name ===
-"build" || "plan"`. Widen to `explore`, with a subagent-appropriate variant — the
-current text assumes a user conversation and `todowrite`. The goal is that
-answering "where do we handle X?" leaves a persistent, paintable Search Lens
-behind.
+"build" || "plan"`. **The gate stays** (see Decision A), extended with three
+blocks: the Search Lens roster, `MARKING CONCERNS`, and `DELEGATING EXPLORATION`.
+`plan` **may** mark — a mark costs no model call, repaints nothing and changes no
+code, and "where does X happen today?" is most of what planning asks — while the
+prohibition on `lens_create` in plan mode stands.
+
+**The editor gutter is verified live** — a `pattern` rule over
+`packages/opencode/src/**/*` (168 hits, 53 files) paints its concern's colour on
+exactly the matched lines. It needed **no extension change**: `extension.ts:247`
+puts every tag's hue with no lens gating, courtesy of S0's git-changed probe. So a
+mark is readable at line level from S2, while the *aggregate* "where are the hits"
+reading stays S3.
+
+*Debugging note for the next person, because it cost a false alarm:* the extension
+must be rebuilt and reloaded, or marks appear as the uniform NONE grey of the
+extents layer with no concern colour anywhere. That symptom is indistinguishable by
+eye from a real emit failure. Check the server first and it is unambiguous — `curl
+"…/aperture?drill=<file>&scope=<parent dir>"` and look for `lineTags` carrying a
+`hue`; the payload is the seam, so if the hue is there the fault is downstream of
+it. The extension's own `Aperture` output channel logs `N extents, N painted, N
+line tags` per drill, which answers the same question from the client side.
+
+**The painter gate is verified live**, and the timing is the evidence. `perf/painter.log`'s
+last entry is `2026-08-12T16:43:28Z` under `lens: "architecture"` — **two seconds before**
+`active.json` was rewritten to the Search Lens at `16:43:30` — and it stayed silent for the
+following 13 minutes. Immediately before the switch the painter was demonstrably working: a
+`bg pass-start` over 2288 files, real extent paints, and foreground `skip` probes on a steady
+5-second cadence (`:53 :58 :03 :08 :13 :18 :23 :24 :28`) that stopped dead at the switch.
+
+The control is what makes it conclusive rather than merely consistent: a `GET
+/aperture?drill=…` **during** the silent window returned `lineTags` and `search: true`, so
+`finalize` ran under the Search Lens and scheduled nothing. Without `usesPainter` on
+`schedulePaint` that single fetch would have queued a foreground pass, and the background
+loop would have opened a 2288-file sweep against a Lens whose only facet the painter is not
+even allowed to assign.
+
+**The legend filter survives a mark** — verified by hand (suppress a concern, mark another,
+the suppression holds). That is the `onRulesChanged`-vs-`onLensChanged` distinction paying
+off: routing a mark through `onLensChanged` would have cleared the filter on every mark, and
+the failure would have been silent and easy to mistake for the user's own click. Not
+unit-testable without the full layer, so the two-gesture manual check is the coverage.
+
+S2 is therefore verified end to end: rule model, store, painter gate, editor gutter, and the
+filter interaction.
 
 **Study instrumentation — a first-class requirement, not an afterthought.**
 Aperture is a research prototype supporting a paper, and the central claim of the
@@ -784,7 +941,12 @@ finding 1), not client-side against the buffer.
 
 In the TUI, a Search Lens's file/directory blocks show hit density rather than a
 partition — the visual question is "where are the hits", not "what is this made
-of".
+of". Files could show an approximation of the actual hit locations and extents
+rather than a sorted aggregation, with a rule that any contained hits must always
+be represented in the approximation, no matter how small -- this is they key to 
+visual search, which might encompass a single line hit in a multi-thousand line
+file. Directories can aggregate as they do now, and the design should fit into the
+current aggregation scheme for both the TUI and VSCode glyphs. 
 
 **The sparse layer is built and verified, via line-level git-changed.** Chosen as
 S0's second probe because it needs no rule code and is independently useful: the
@@ -1330,12 +1492,19 @@ anywhere. O2 also produced the bulk endpoint S5 is specified to consume.
 - **S1a ✅** — the rule model. Landed as a schema plus a pure evaluator, exactly the shape
   S0 predicted once anchoring was deleted.
 
-O4 whenever convenient — it's small, self-contained, immediately useful, and now
-has a second consumer: it should drive O2's Explorer `focus` as well as the TUI.
+- **S2 ✅** — `lens_mark` / `lens_unmark`. Two decisions revised the spec (Explore gets no
+  Lens tools; a Search Lens is additive with named concerns rather than a binary `hit`
+  probe), and the build found the missing `isSearch` painter gate — a latent whole-repo
+  model sweep that S2 would have been the first thing to trigger.
 
-**Then:** S2 → S3 → S5 in sequence, no longer gated (S1a unblocked them). **S1b** — the
-ast-grep structural backend — is independent of that chain and can land whenever the native
-dependency is convenient to take; nothing downstream waits on it.
+O4 (already implemented — the diagram above lagged the code) drives O2's Explorer `focus`
+as well as the TUI.
+
+**Then:** S3 → S5 in sequence. **S1b** — the ast-grep structural backend — is independent of
+that chain and can land whenever the native dependency is convenient to take; nothing
+downstream waits on it. S3's first item is now clear: the TUI's aggregate hit-density
+reading, since S2 leaves a Search Lens's top bar uniformly "Other" grey while the editor
+gutter already paints its marks.
 
 **Track G**: G0 → G1 → G2+G3 landed and the path is working end-to-end. **G4**
 (affordances — height, words, click-to-open, expandable survey rows, hover detail) is
@@ -1362,6 +1531,8 @@ cross-surface half of the problem visible.
 | 3 | ~~Whether filtered-off facets keep their treemap area~~ — **decided:** keep it, greying in place; weights are never touched, so no surface re-flows on a filter click. The Explorer pip is the deliberate exception (one colour, so it must subtract) | O4 ✅ |
 | 4 | ~~Line-tag anchoring mechanism (composite recommended)~~ — **decided: there is no anchor.** A tag is a persisted *query* (pattern / symbol / structural), and lines are derived at the read boundary, which is what `extentsOf` already does for extents. A deleted usage loses its paint and a new one gains it, with no edit-tracking, no "lost" state and no durable line-tag store | S0 ✅ |
 | 5 | ~~Search Lens as a distinct type on the model vs. a flag~~ — **decided: an optional `search` field + an `isSearch()` predicate**, following the shipped `deterministic?: DeterministicKind` idiom, which already delivers a distinct paint policy, distinct persistence, picker grouping and a wire flag. `rules` is a *separate* field, so a rule can mark facets on any Lens | S0 ✅ |
+| 5b | ~~Whether Explore agents can install rules~~ — **decided: no Lens tools for Explore at all.** It proposes (`PROPOSED MARKS` in its report) and build/plan/lens install. `lenses.json` is an unlocked RMW and Explore's purpose is parallel fan-out, so concurrent marks would lose rules silently; the 6-concern vocabulary is a whole-task decision only the main agent can make; and marking repaints a view the user cannot watch from inside a subagent session. Needed almost no permission change — build/plan inherit `"*": "allow"`, explore is deny-all | S2 ✅ |
+| 5c | ~~What a light Search Lens starts as (`hit` + NONE_FACET)~~ — **decided: named concerns, minted on demand.** Base state is every extent at `NONE_FACET` ("Other" grey, not unpainted grey); each rule reuses or mints a concern up to `MAX_FACETS`; `hit` appears nowhere. `Facet.ruleOnly` excludes a minted concern from the painter's vocabulary, which is what lets the same mechanism mark an **Overview** Lens without owing `lens_edit`'s whole-repo repaint | S2 ✅ |
 | 6 | ~~Activity View in the sidebar vs. the top bar~~ — **decided: the sidebar, vertically, and the orientation experiment is off.** One step is one row, so the path is intrinsically vertical; the top bar's 13-row wide budget wants a different shape and a shared renderer would collapse to a config blob. Segmentation stays pure and orientation-free in `activity-steps.ts`, so a horizontal variant could still reuse the model | G2+G3 ✅ |
 | 8 | ~~Where activity data comes from and how it gains per-session durability~~ — **decided:** derived from the durable message store on every read, never recorded. The `session.next.*` tracker was dead by default and in-memory; deriving makes durability, retroactive history and Lens-switch recolouring free, and removes the second source of truth | G1 ✅ |
 | 7 | ~~Whether to fix truecolor detection upstream in OpenTUI or locally~~ — **decided:** neither. Putting every paintable colour on an exact xterm-256 entry makes quantisation a no-op, so truecolor stops mattering for colour *identity* | C1 ✅ |
@@ -1427,11 +1598,15 @@ Aperture files:
   `subfacet-store.ts` (function-level facets), `semantics.ts`, `lenses.ts` +
   `lens-store.ts`, `deterministic.ts` (git/mtime/bus-factor built-ins),
   `rules.ts` (S1 — search-rule evaluation into sparse line ranges; pure per file,
-  memoized by the caller), `event.ts`, `dump.ts`, `study-log.ts`, `activity.ts` (G1 vocabulary + wire
+  memoized by the caller; rules are *written* by S2's `mark`/`unmark` in `lens-store.ts`,
+  never here), `event.ts`, `dump.ts`, `study-log.ts`, `activity.ts` (G1 vocabulary + wire
   shapes, dependency-free) + `activity-model.ts` (the pure turn derivation over
   stored messages).
-- Tools: `tool/lens-{create,list,select,edit,merge-facets,facet-files}.ts`,
-  registered in `tool/registry.ts`.
+- Tools: `tool/lens-{create,list,select,edit,merge-facets,facet-files,mark,unmark}.ts`,
+  registered in `tool/registry.ts` (four sites) **and** gated per agent in
+  `agent/agent.ts` — the `lens` agent is `"*": "deny"` plus an allow-list, so a tool absent
+  from it is *removed from the request* rather than refused at call time. `build`/`plan`
+  inherit `"*": "allow"`; `explore` deliberately sees no lens tool at all (S2).
 - HTTP: `server/routes/instance/httpapi/groups/aperture.ts` (+ `handlers/`),
   registered in `server.ts` and `api.ts`. Routes: `get`, `facets` (O2's bulk
   whole-repo file→facet-mix map), `activity` (G1's per-turn agent activity for a
@@ -1489,6 +1664,14 @@ Persistence:
   join these (S1)** — as a field on the Lens, not a store of their own. Line
   *tags* are never persisted anywhere: they are derived from the rules at the
   read boundary, like `extents`.
+  Every mutation is a plain read-modify-write over the one `lenses.json`, now
+  serialized by a **per-directory in-process mutex** (`withDoc`, S2). Marks made that
+  necessary: they are frequent, several land per turn, and the `lens` subagent holds
+  `lens_mark` too — tool calls serialize per *session*, not per instance, so the loser
+  of a race would write stale content and lose a rule with no error anywhere.
+  `mark`/`unmark` also use `writeDocResult` rather than the swallowing `writeDoc`, since
+  reporting "14 lines marked" after a failed write is the worst available outcome. Cross-
+  process concurrency remains out of scope, as it always has been here.
 - Durable KV (`storage/storage.ts`, string[] keys): structure caches under
   `["aperture", projectID, "structure", scopeKey]`; file facets and sub-file
   facets namespaced per Lens id. Large, churny, free to regenerate.
@@ -1510,9 +1693,19 @@ Config: `packages/core/src/v1/config/config.ts` — `aperture.painter.context`
 
 `PAYLOAD_VERSION` is currently **7**; bump it whenever the payload shape or
 extractor semantics change (a stale cache from an older extractor being served
-was a real, hard-to-find bug). **S1 does *not* bump it** — `lineTags` is optional
+was a real, hard-to-find bug). **Neither S1 nor S2 bumps it** — `lineTags` is optional
 and derived at the read boundary, the same posture that let `composition` widen
-from directories-only to per-node without a bump.
+from directories-only to per-node without a bump. `Facet.ruleOnly` (S2) travels on the
+Lens definition rather than the payload, and `LensInfo.search` was already optional
+from S1, so nothing on the wire changed shape.
+
+Painter gating: **one predicate, `usesPainter(lens)`** in `lenses.ts` —
+`!isDeterministic && !isSearch`. Use it at every "should the model run" site (S2 fixed
+eleven that tested `isDeterministic` alone, which is how a Search Lens would have swept
+the whole repo). Keep `isDeterministic`/`isSearch` for branches that care *which*
+alternative facet source it is — `finalize` needs both, since `det` still selects the
+git-changed hunk path. `grep -n isDeterministic src/aperture/aperture.ts` is the review
+check that a new site did not slip back.
 
 Module/style conventions: see `AGENTS.md` (flat exports + self-reexport, Effect
 v4 rules, snake_case Drizzle, run `bun typecheck` from package dirs).

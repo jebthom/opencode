@@ -3,38 +3,38 @@
     "id": "agent-architecture-f43eb025",
     "name": "Agent Architecture",
     "description": "Maps where agents are defined, configured, managed, and tested across the codebase.",
-    "palette": "bright",
+    "palette": "categorical",
     "prompt": "Classify each file by its role in the agent system: configuration files that define agents, service implementations that manage them, CLI commands for user interaction, integration points with sessions/plugins, or tests covering agent functionality.",
     "facets": [
       {
         "id": "configuration",
         "label": "Configuration",
         "description": "Agent definition files in .opencode/agent/ and config loaders that parse agent markdown files",
-        "color": "#4E79A7"
+        "color": "#D7005F"
       },
       {
         "id": "service-layer",
         "label": "Service & Layer",
         "description": "Agent service implementations, Effect layers, and core business logic for managing agent state",
-        "color": "#F28E2B"
+        "color": "#AF5F00"
       },
       {
         "id": "cli-commands",
         "label": "CLI & Commands",
         "description": "Agent command handling and CLI interface for creating, listing, and managing agents",
-        "color": "#59A14F"
+        "color": "#AFAF00"
       },
       {
         "id": "integration",
         "label": "Integration",
         "description": "Agent integration with plugins, sessions, events, and message types",
-        "color": "#E15759"
+        "color": "#00875F"
       },
       {
         "id": "testing",
         "label": "Testing",
         "description": "Agent tests, test fixtures, test utilities, and test coverage",
-        "color": "#B07AA1"
+        "color": "#00AFD7"
       }
     ],
     "scope": "project",
@@ -48,44 +48,44 @@
     "id": "tui-features-architecture-1146ff62",
     "name": "TUI Features & Architecture",
     "description": "Maps TUI features across architectural layers—from core app to context providers, UI components, feature plugins, and utilities.",
-    "palette": "earthy",
+    "palette": "categorical",
     "prompt": "Classify each file by its layer in the TUI architecture: the main app and routing layer, state management contexts, reusable UI components and dialogs, full-page routes, modular feature plugins, or utilities and configuration helpers.",
     "facets": [
       {
         "id": "app-routing",
         "label": "App & Routing",
         "description": "Main app entry point, global routing, keymaps, and app lifecycle (app.tsx, routes setup)",
-        "color": "#8C7A5B"
+        "color": "#D7005F"
       },
       {
         "id": "contexts-providers",
         "label": "Contexts & Providers",
         "description": "State management providers for project, editor, theme, sync, SDK, dialog, and other global state",
-        "color": "#A65E2E"
+        "color": "#AF5F00"
       },
       {
         "id": "ui-components-dialogs",
         "label": "UI Components & Dialogs",
         "description": "Reusable UI widgets, dialog components, spinners, toasts, and form components",
-        "color": "#6B8E5A"
+        "color": "#AFAF00"
       },
       {
         "id": "routes-pages",
         "label": "Routes & Pages",
         "description": "Full-page views and route implementations like home and session screens",
-        "color": "#C2A878"
+        "color": "#00875F"
       },
       {
         "id": "feature-plugins",
         "label": "Feature Plugins",
         "description": "Modular feature implementations (session, sidebar, home, system) that extend the app",
-        "color": "#5B6C5D"
+        "color": "#00AFD7"
       },
       {
         "id": "utilities-config",
         "label": "Utilities & Config",
         "description": "Helper functions, configuration, editor integration, audio, clipboard, and keybindings",
-        "color": "#9C6B4F"
+        "color": "#5F5FD7"
       }
     ],
     "scope": "project",
@@ -97,32 +97,32 @@
     "id": "attack-surface-pii-656fc57d",
     "name": "Attack Surface & PII",
     "description": "Maps code handling secrets, authentication, authorization, external IO boundaries, and cryptographic operations across the codebase.",
-    "palette": "dark",
+    "palette": "categorical",
     "prompt": "Classify files by their role in the attack surface: Secrets & PII (stores or handles sensitive credentials, tokens, API keys, redacts secrets), Auth & Authz (authentication, authorization, permissions, OAuth), External IO (HTTP endpoints, clients, API boundaries, webhooks), or Cryptographic Ops (hashing, encryption, signing, key derivation). Everything else falls into the automatic \"Other\" bucket.",
     "facets": [
       {
         "id": "secrets-pii",
         "label": "Secrets & PII",
         "description": "Stores, transmits, redacts, or manages sensitive credentials (API keys, tokens, passwords, OAuth tokens, private keys)",
-        "color": "#AF5F5F"
+        "color": "#D7005F"
       },
       {
         "id": "auth-authz",
         "label": "Auth & Authz",
         "description": "Authentication middleware, permission rules, OAuth flows, credential validation, and access control",
-        "color": "#875F00"
+        "color": "#AF5F00"
       },
       {
         "id": "external-io",
         "label": "External IO",
         "description": "HTTP clients, servers, API endpoints, webhooks, and boundaries with external systems",
-        "color": "#5F875F"
+        "color": "#AFAF00"
       },
       {
         "id": "cryptographic-ops",
         "label": "Cryptographic Ops",
         "description": "Hashing, encoding, signing, encryption, or cryptographic utilities",
-        "color": "#008787"
+        "color": "#00875F"
       }
     ],
     "scope": "project"
@@ -131,26 +131,26 @@
     "id": "top-bar-rendering-a9d443de",
     "name": "Top Bar Rendering",
     "description": "Maps TUI code by likelihood of being the source of top bar rendering issues.",
-    "palette": "bright-ordinal",
+    "palette": "ordinal",
     "prompt": "Classify TUI files by how directly they affect the top bar's rendering. Likely files directly paint the aperture visualization. Possible files manage its container, layout, or dimensions. Adjacent files provide data or styling but don't directly render the bar.",
     "facets": [
       {
         "id": "likely",
         "label": "Likely",
         "description": "Core aperture rendering logic: the aperture plugin, treemap layout, cell rendering, and direct display of the visualization grid/tiles",
-        "color": "#4E5BA6"
+        "color": "#5F5FD7"
       },
       {
         "id": "possible",
         "label": "Possible",
         "description": "Container and layout management: session layout, flex constraints, viewport sizing, scrollbox configuration, and height/width calculations that might cause aperture to be clipped or misaligned",
-        "color": "#3AAFA9"
+        "color": "#00AFD7"
       },
       {
         "id": "adjacent",
         "label": "Adjacent",
         "description": "Related but indirect: aperture data fetching, lens picker, activity tracking, theme/styling, and event handlers that feed the aperture but don't directly render it",
-        "color": "#59A14F"
+        "color": "#00875F"
       }
     ],
     "scope": "project"
@@ -159,44 +159,44 @@
     "id": "textbox-input-debug-5622a8b3",
     "name": "Textbox & Input Debug",
     "description": "Maps TUI code by its role in textbox functionality—from core input rendering and event handling to state management and integrations.",
-    "palette": "bright",
+    "palette": "categorical",
     "prompt": "Classify TUI files by their role in textbox functionality: core input mechanics, event handling and keyboard, text state management, autocomplete/suggestions, rendering and display, or features that use text input.",
     "facets": [
       {
         "id": "core-input",
         "label": "Core Input",
         "description": "The main prompt component, textarea rendering, and low-level input mechanics (prompt/index.tsx, TextareaRenderable, @opentui integration)",
-        "color": "#4E79A7"
+        "color": "#D7005F"
       },
       {
         "id": "events",
         "label": "Events",
         "description": "Keyboard event capture, key bindings, clipboard handling, and input event dispatch (event.ts, keymap, clipboard.ts)",
-        "color": "#F28E2B"
+        "color": "#AF5F00"
       },
       {
         "id": "state",
         "label": "State",
         "description": "Text state management, undo/redo, history, stash, and prompt value mutation (prompt/history.tsx, prompt/part.ts, prompt/stash.tsx, store operations)",
-        "color": "#59A14F"
+        "color": "#AFAF00"
       },
       {
         "id": "completion",
         "label": "Completion",
         "description": "Autocomplete, suggestions, traits detection, and contextual features (prompt/autocomplete.tsx, prompt/traits.ts, prompt/cwd.ts)",
-        "color": "#E15759"
+        "color": "#00875F"
       },
       {
         "id": "rendering",
         "label": "Rendering",
         "description": "Visual rendering, styling, cursor position, selection, and terminal dimension handling (border components, spinner, theme context)",
-        "color": "#B07AA1"
+        "color": "#00AFD7"
       },
       {
         "id": "features",
         "label": "Features",
         "description": "Feature plugins and dialogs that embed text input (feature-plugins/*, dialogs that use prompt or text input)",
-        "color": "#EDC948"
+        "color": "#5F5FD7"
       }
     ],
     "scope": "project",
@@ -208,28 +208,81 @@
     "id": "terminal-bottlenecks-f4f273b4",
     "name": "Terminal Bottlenecks",
     "description": "Identifies likely locations of critical performance bottlenecks—database operations, external I/O, and data processing.",
-    "palette": "bright",
+    "palette": "categorical",
     "prompt": "Classify each file by the type of terminal bottleneck it's most likely to contain. Categorize as Database & Persistence if it handles SQL queries, ORM operations, schema definitions, or migrations. Categorize as External I/O if it makes HTTP requests, calls LLM providers, or integrates with external services. Categorize as Data Processing if it performs serialization, parsing, searching, fuzzy matching, or algorithmic data transformations. A file may touch multiple areas; choose the bottleneck that would be most critical if that file became slow.",
     "facets": [
       {
         "id": "database-persistence",
         "label": "Database & Persistence",
         "description": "SQL queries, ORM operations, schema definitions, migrations, and direct database access. Files dealing with data persistence and query execution.",
-        "color": "#4E79A7"
+        "color": "#D7005F"
       },
       {
         "id": "external-i-o",
         "label": "External I/O",
         "description": "API requests, HTTP calls, LLM provider integrations, and external service communications. Files that make blocking network or third-party calls.",
-        "color": "#F28E2B"
+        "color": "#AF5F00"
       },
       {
         "id": "data-processing",
         "label": "Data Processing",
         "description": "Serialization, parsing (JSON, imports, Git data), searching, fuzzy matching, and compute-heavy transformations. Files with algorithmic work on data.",
-        "color": "#59A14F"
+        "color": "#AFAF00"
       }
     ],
     "scope": "project"
+  },
+  "failure-modes-129059e4": {
+    "id": "failure-modes-129059e4",
+    "name": "Failure Modes",
+    "description": "Search Lens: Failure Modes.",
+    "palette": "categorical",
+    "prompt": "",
+    "facets": [
+      {
+        "id": "failures",
+        "label": "failures",
+        "description": "Effect.orDie calls that crash the program on error",
+        "ruleOnly": true,
+        "color": "#D7005F"
+      },
+      {
+        "id": "error-throws",
+        "label": "error-throws",
+        "description": "Effect.die calls that explicitly throw errors or abort execution",
+        "ruleOnly": true,
+        "color": "#AF5F00"
+      }
+    ],
+    "scope": "project",
+    "search": true,
+    "rules": [
+      {
+        "id": "failures-d61f5fd1",
+        "facet": "failures",
+        "find": {
+          "kind": "pattern",
+          "pattern": "Effect\\.orDie",
+          "glob": [
+            "packages/opencode/src/**/*"
+          ]
+        },
+        "note": "Unrecoverable failure point that terminates execution",
+        "createdBy": "build"
+      },
+      {
+        "id": "error-throws-f52cb2cf",
+        "facet": "error-throws",
+        "find": {
+          "kind": "pattern",
+          "pattern": "Effect\\.die",
+          "glob": [
+            "packages/opencode/src/**/*"
+          ]
+        },
+        "note": "Deliberate error throwing, often for testing or validation",
+        "createdBy": "build"
+      }
+    ]
   }
 }

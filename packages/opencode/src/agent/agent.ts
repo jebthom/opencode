@@ -220,6 +220,13 @@ export const layer = Layer.effect(
                 lens_select: "allow",
                 lens_merge_facets: "allow",
                 lens_edit: "allow",
+                // `prompt/lens.txt` has told this agent to call lens_facet_files since it was
+                // written, but the tool was never on this list — and a "*": "deny" default
+                // *removes* a tool from the request rather than refusing it at call time, so
+                // the instruction referred to something the agent could not see.
+                lens_facet_files: "allow",
+                lens_mark: "allow",
+                lens_unmark: "allow",
                 external_directory: readonlyExternalDirectory,
               }),
               user,

@@ -54,14 +54,20 @@ export const LensMergeFacetsTool = Tool.define(
                 metadata: {},
                 output: `Facet "${result.facet}" isn't in that Lens. Run lens_list / lens_select to see its facets.`,
               }
-            // mergeFacets never refuses for this reason — it re-scopes dependent drill-downs
-            // onto the surviving facet rather than rejecting. Present only to keep the switch
-            // exhaustive over LensMutation.
+            // mergeFacets never refuses for these reasons — it re-scopes dependent drill-downs
+            // onto the surviving facet rather than rejecting, and a merge only ever *shrinks*
+            // the facet list. Present only to keep the switch exhaustive over LensMutation.
             case "facet-in-use":
               return {
                 title: "Facet in use",
                 metadata: {},
                 output: `Facet "${result.facet}" is in use by a drill-down Lens.`,
+              }
+            case "facet-cap":
+              return {
+                title: "Too many facets",
+                metadata: {},
+                output: `That Lens is over the limit of ${result.max} facets.`,
               }
             case "ok":
               return {

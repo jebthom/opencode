@@ -14,6 +14,8 @@ import { Parameters as Edit } from "../../src/tool/edit"
 import { Parameters as Glob } from "../../src/tool/glob"
 import { Parameters as Grep } from "../../src/tool/grep"
 import { Parameters as Invalid } from "../../src/tool/invalid"
+import { Parameters as LensMark } from "../../src/tool/lens-mark"
+import { Parameters as LensUnmark } from "../../src/tool/lens-unmark"
 import { Parameters as Lsp } from "../../src/tool/lsp"
 import { Parameters as Plan } from "../../src/tool/plan"
 import { Parameters as Question } from "../../src/tool/question"
@@ -42,6 +44,12 @@ describe("tool parameters", () => {
     test("glob", () => expect(toJsonSchema(Glob)).toMatchSnapshot())
     test("grep", () => expect(toJsonSchema(Grep)).toMatchSnapshot())
     test("invalid", () => expect(toJsonSchema(Invalid)).toMatchSnapshot())
+    // The snapshot is what documents lens_mark's flat-struct decision: a Schema.Union over the
+    // three Finder kinds would emit a nested anyOf, whose decode failures land upstream of the
+    // tool's execute() as an opaque "rewrite the input" message. Drift back toward that shape
+    // shows up here as a diff.
+    test("lens_mark", () => expect(toJsonSchema(LensMark)).toMatchSnapshot())
+    test("lens_unmark", () => expect(toJsonSchema(LensUnmark)).toMatchSnapshot())
     test("lsp", () => expect(toJsonSchema(Lsp)).toMatchSnapshot())
     test("plan", () => expect(toJsonSchema(Plan)).toMatchSnapshot())
     test("question", () => expect(toJsonSchema(Question)).toMatchSnapshot())

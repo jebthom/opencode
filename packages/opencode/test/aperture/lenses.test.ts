@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
 import {
+  type Lens,
+  COLOR_NAMES,
   PALETTES,
   PALETTE_IDS,
   ORDINAL_PALETTE_IDS,
@@ -18,7 +20,12 @@ import {
   isBuiltinLens,
   isDeterministic,
   isValidFacet,
+  isValidFinder,
   isAssignableFacet,
+  usesPainter,
+  paintedFacets,
+  concernRoster,
+  finderProblem,
   facetEnumIds,
   NONE_FACET,
   NONE_HUE,
@@ -224,6 +231,137 @@ describe("aperture lenses", () => {
     expect(slugify("Auth Flow!")).toBe("auth-flow")
     expect(slugify("  --weird__Name  ")).toBe("weird-name")
     expect(slugify("")).toBe("lens")
+  })
+})
+
+// S2. `usesPainter` is the predicate behind every painter gate in aperture.ts, and rule-owned
+// facets are what let a marked concern live on a painted Lens for free. Both are single points
+// of truth for behaviour that is otherwise spread across a dozen call sites, so they are pinned
+// here rather than left to an integration test that needs the whole layer.
+describe("aperture lenses — search rules (S2)", () => {
+  const SEARCH: Lens = {
+    id: "retry-handling-0000",
+    name: "Retry Handling",
+    description: "where retries happen",
+    palette: "categorical",
+    prompt: "",
+    scope: "project",
+    search: true,
+    facets: assignColors("categorical", [
+      { id: "retry-path", label: "retry-path", description: "the retry path", ruleOnly: true },
+    ]),
+    rules: [{ id: "retry-path-abc", facet: "retry-path", find: { kind: "pattern", pattern: "withRetry\\(" } }],
+  }
+
+  test("usesPainter is false for exactly the Lenses that cost no tokens", () => {
+    // The whole point: before S2 every gate tested isDeterministic alone, so a Search Lens
+    // would have triggered a whole-repo model sweep the moment it was activated.
+    expect(usesPainter(ARCHITECTURE)).toBe(true)
+    for (const builtin of [GIT_CHANGED, MTIME_RECENCY]) expect(usesPainter(builtin)).toBe(false)
+    expect(usesPainter(SEARCH)).toBe(false)
+    expect(usesPainter({ ...SEARCH, deterministic: "git-changed" })).toBe(false)
+    expect(usesPainter({ search: undefined, deterministic: undefined })).toBe(true)
+  })
+
+  test("a rule-owned facet is in the legend and the palette but not the painter's vocabulary", () => {
+    const mixed: Lens = {
+      ...ARCHITECTURE,
+      facets: assignColors("categorical", [
+        ...ARCHITECTURE.facets.slice(0, 2).map((t) => ({ id: t.id, label: t.label, description: t.description })),
+        { id: "any-casts", label: "any-casts", description: "casts to any", ruleOnly: true },
+      ]),
+    }
+    // Excluded from the painter, which is what makes minting one owe no repaint — and what
+    // stops the painter assigning "any-casts" to a file by judgement.
+    expect(facetEnumIds(mixed)).not.toContain("any-casts")
+    expect(buildSystemPrompt(mixed)).not.toContain("any-casts")
+    expect(isAssignableFacet(mixed, "any-casts")).toBe(false)
+    // Present everywhere the *user* meets a facet.
+    expect(paintedFacets(mixed).map((t) => t.id)).toEqual(mixed.facets.slice(0, 2).map((t) => t.id))
+    expect(legend(mixed).map((e) => e.facet)).toContain("any-casts")
+    expect(facetsWithin(mixed, ["any-casts"])).toEqual(new Set(["any-casts"]))
+    expect(mixed.facets.find((t) => t.id === "any-casts")!.color).toBe(PALETTES.categorical.colors[2])
+    // Still a facet of the Lens — `isValidFacet` answers membership, not paintability.
+    expect(isValidFacet(mixed, "any-casts")).toBe(true)
+  })
+
+  test("a Search Lens offers the painter nothing but the escape facet", () => {
+    expect(facetEnumIds(SEARCH)).toEqual([NONE_FACET])
+    expect(paintedFacets(SEARCH)).toEqual([])
+  })
+
+  test("concernRoster counts rules per concern and names the hue", () => {
+    const roster = concernRoster(SEARCH)
+    expect(roster).toEqual([
+      {
+        facet: "retry-path",
+        label: "retry-path",
+        color: PALETTES.categorical.colors[0]!,
+        colorName: "crimson",
+        ruleOnly: true,
+        rules: 1,
+      },
+    ])
+    // A concern with no rules yet still shows, at 0 — that state is reachable via lens_unmark
+    // by rule id, and it is exactly what the agent needs to see to reuse rather than mint.
+    expect(concernRoster({ facets: SEARCH.facets, rules: [] })[0]!.rules).toBe(0)
+    for (const hex of PALETTES.categorical.colors) expect(COLOR_NAMES[hex]).toBeTruthy()
+  })
+
+  test("finderProblem names the fix, and isValidFinder agrees with it", () => {
+    const ok: unknown[] = [
+      { kind: "pattern", pattern: "x" },
+      { kind: "pattern", pattern: "x", glob: ["a/**"], caseSensitive: false },
+      { kind: "symbol", name: "retryWithBackoff" },
+      { kind: "symbol", name: "f", path: "packages/opencode" },
+      { kind: "structural", pattern: "$A.get($$$B)", language: "ts" },
+    ]
+    for (const find of ok) {
+      expect(finderProblem(find)).toBeUndefined()
+      expect(isValidFinder(find)).toBe(true)
+    }
+
+    // Each message has to name the missing field, because this is the *only* place a shape
+    // mistake can be reported: lens_mark takes a flat struct precisely so these land inside
+    // execute() instead of as an opaque schema-decode failure the tool can't intercept.
+    const bad: Array<[unknown, string]> = [
+      [{ kind: "pattern" }, "pattern"],
+      [{ kind: "pattern", pattern: "" }, "pattern"],
+      [{ kind: "pattern", pattern: "x", glob: "a/**" }, "glob"],
+      [{ kind: "symbol" }, "name"],
+      [{ kind: "symbol", name: "f", path: 3 }, "path"],
+      [{ kind: "structural", pattern: "x" }, "language"],
+      [{ kind: "structural", language: "ts" }, "pattern"],
+      [{ kind: "regex", pattern: "x" }, "regex"],
+      [{}, "kind"],
+      [null, "object"],
+      ["nope", "object"],
+    ]
+    for (const [find, mentions] of bad) {
+      const problem = finderProblem(find)
+      expect(problem, JSON.stringify(find)).toContain(mentions)
+      expect(isValidFinder(find)).toBe(false)
+    }
+  })
+
+  // KNOWN AND DELIBERATE: facet colour is derived from array position, so removing a facet
+  // re-hues every facet after it. lens_unmark reports the shift (see UnmarkResult.recolored)
+  // rather than persisting a colour slot, which would be a second source of truth and a wire
+  // change through payload.ts and the extension's generated colour ids. Pinned here so nobody
+  // "fixes" it silently and quietly breaks that contract.
+  test("removing a middle facet re-colours the ones after it", () => {
+    const three = assignColors("categorical", [
+      { id: "a", label: "a", description: "" },
+      { id: "b", label: "b", description: "" },
+      { id: "c", label: "c", description: "" },
+    ])
+    const without = assignColors(
+      "categorical",
+      three.filter((t) => t.id !== "b"),
+    )
+    expect(without.find((t) => t.id === "a")!.color).toBe(three[0]!.color)
+    expect(without.find((t) => t.id === "c")!.color).toBe(three[1]!.color)
+    expect(without.find((t) => t.id === "c")!.color).not.toBe(three[2]!.color)
   })
 })
 

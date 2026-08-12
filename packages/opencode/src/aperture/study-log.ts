@@ -46,6 +46,15 @@ interface Summary {
   painterTokens: { input: number; output: number }
   cost: number
   clicks: Record<string, number>
+  // Search-rule lifecycle (S2). The central claim of the rule reframe is that *agents write
+  // good queries*, and this is the only place that can evidence it: `toolCalls.lens_mark`
+  // counts attempts, but a rule matching 3 lines and one matching 4,000 are different events
+  // and the tally cannot tell them apart. `byOp` separates created/replaced/removed from
+  // over-cap and the three rejection modes; `byAgent` attributes authorship (which is what
+  // makes "did widening the tool to Explore change behaviour" answerable, should we ever
+  // widen it); `hits` is the raw distribution, kept per-rule rather than averaged so the
+  // analysis can look at its shape.
+  rules: { byOp: Record<string, number>; byAgent: Record<string, number>; hits: number[] }
   models: string[]
   startedMs: number
   lastMs: number
@@ -87,6 +96,7 @@ function freshSummary(startedMs: number): Summary {
     painterTokens: { input: 0, output: 0 },
     cost: 0,
     clicks: {},
+    rules: { byOp: {}, byAgent: {}, hits: [] },
     models: [],
     startedMs,
     lastMs: startedMs,
@@ -156,8 +166,15 @@ function applySummary(entry: Entry, rec: Record<string, unknown>): void {
     s.clicks[kind] = (s.clicks[kind] ?? 0) + 1
     // Lens switch/select/delete via the top-bar are user-driven Aperture ops.
     if (kind.startsWith("lens.")) s.apertureToolCalls.byUser += 1
-  } else if (type === "lens-op" && rec.by === "user") {
-    s.apertureToolCalls.byUser += 1
+  } else if (type === "rule") {
+    // Deliberately does NOT touch apertureToolCalls: the `type: "tool"` branch above already
+    // counted this call (every lens_* name is flagged `aperture: true` by processor.ts), and
+    // adding to it here would double-count and corrupt an existing series.
+    const op = typeof rec.op === "string" ? rec.op : "unknown"
+    s.rules.byOp[op] = (s.rules.byOp[op] ?? 0) + 1
+    const agent = typeof rec.agent === "string" ? rec.agent : "unknown"
+    s.rules.byAgent[agent] = (s.rules.byAgent[agent] ?? 0) + 1
+    if (typeof rec.hits === "number") s.rules.hits.push(rec.hits)
   }
 }
 
