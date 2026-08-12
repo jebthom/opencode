@@ -119,7 +119,7 @@ export class ApertureTree implements vscode.TreeDataProvider<Node>, vscode.TreeD
     // there is nothing left to re-resolve when the editor theme changes.
     item.iconPath = this.ctx.icons.for(chipSegments(weights, facets, legend, { layout, suppressed }), layout)
 
-    const breakdown = chipTooltip(weights, facets, legend)
+    const breakdown = chipTooltip(weights, facets, legend, this.ctx.model().marks(node.rel, node.dir))
     const tooltip = new vscode.MarkdownString()
     tooltip.appendMarkdown(`**${node.name}**\n\n${breakdown}`)
     item.tooltip = tooltip

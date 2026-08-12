@@ -105,6 +105,26 @@ describe("aperture rules — evaluation", () => {
     expect(res.diagnostics).toEqual([{ rule: "r", hits: 3, files: 2 }])
   })
 
+  // S3: the aggregates need a magnitude, and it is measured over the MERGED ranges so a line
+  // counts exactly once — the same property that keeps the diagnostic's hit count honest.
+  test("a hit measures its merged lines and bytes", async () => {
+    const res = await run(ApertureRules.evaluate(dir, [rule("r", { kind: "pattern", pattern: "needle" })]))
+    const hit = res.byFile.get("src/hits.ts")![0]!
+    // Lines 1, 2 and 4 matched; [1,2] merged, so 3 lines across 2 strips.
+    expect(hit.lines).toBe(3)
+    // Bytes include each line's terminator, exactly as extents are measured, so a mark and an
+    // extent covering the same lines report the same number.
+    expect(hit.bytes).toBe("const one = needle\n".length + "const two = needle\n".length + "const four = needle\n".length)
+  })
+
+  test("a symbol hit measures the whole declaration it paints", async () => {
+    const res = await run(ApertureRules.evaluate(dir, [rule("r", { kind: "symbol", name: "generatorStyle" })]))
+    const hit = res.byFile.get("src/idioms.ts")![0]!
+    const [start, end] = hit.ranges[0]!
+    expect(hit.lines).toBe(end - start + 1)
+    expect(hit.bytes).toBeGreaterThan(hit.lines)
+  })
+
   test("pattern honours a glob", async () => {
     const res = await run(
       ApertureRules.evaluate(dir, [rule("r", { kind: "pattern", pattern: "needle", glob: ["src/**"] })]),

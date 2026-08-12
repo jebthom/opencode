@@ -23,19 +23,29 @@ import { MAX_RULE_HITS, type Finder, type Rule } from "./lenses"
 // file can never invalidate another file's result, so an edit costs one file's work instead
 // of a whole-repo pass.
 //
-// The output feeds `lineTags` in the payload and NOTHING else. Line tags are sparse and do
-// not tile a file, so they must never enter `attributeFileBytes` / `computeComposition` —
-// the byte contract the treemap, the directory bands and the Explorer pip all depend on
-// would stop summing (see the note on LineTag in payload.ts).
+// The output feeds `lineTags` and `marks` in the payload and NOTHING else. Line tags are
+// sparse and do not tile a file, so they must never enter `attributeFileBytes` /
+// `computeComposition` — the byte contract the treemap, the directory bands and the Explorer
+// pip all depend on would stop summing (see the note on LineTag in payload.ts). `marks` (S3)
+// is the aggregate reading of the same hits and is a separate overlay for the same reason.
 
 // One rule's hits inside one file. `ranges` are 1-based inclusive line ranges, already
 // clamped to the file and merged, so a range is one visual gutter strip and the hit count
 // is not inflated by adjacency.
+//
+// `lines`/`bytes` are the magnitude the aggregate surfaces need (S3), measured over those
+// same merged ranges so a line counts exactly once. Both are carried for the same reason
+// `FacetWeight` carries `count` and `bytes`: `lines` is what a human reads ("14 lines
+// marked") and what a client can roll up by plain summation, while `bytes` is the unit the
+// composition bands are already drawn in, so a mark band is commensurate with them without
+// the renderer having to mix units.
 export interface RuleHit {
   readonly rule: string
   readonly facet: string
   readonly note?: string
   readonly ranges: ReadonlyArray<readonly [number, number]>
+  readonly lines: number
+  readonly bytes: number
 }
 
 // What a rule did, for the caller to report rather than silently swallow. This is the whole
@@ -99,16 +109,16 @@ export const evaluate = (
         ),
       )
       let hits = 0
-      for (const ranges of outcome.perFile.values()) hits += ranges.length
+      for (const measured of outcome.perFile.values()) hits += measured.ranges.length
       // An over-cap rule is stored but never painted, so its hits are dropped here rather
       // than at the emit site: that keeps "too broad ⇒ invisible" in one place and lets a
       // caller hand `byFile` straight to the payload.
       const over = outcome.overCap !== undefined || hits > MAX_RULE_HITS
       if (!over) {
-        for (const [file, ranges] of outcome.perFile) {
-          if (ranges.length === 0) continue
+        for (const [file, measured] of outcome.perFile) {
+          if (measured.ranges.length === 0) continue
           const list = byFile.get(file) ?? []
-          list.push({ rule: rule.id, facet: rule.facet, ...(rule.note ? { note: rule.note } : {}), ranges })
+          list.push({ rule: rule.id, facet: rule.facet, ...(rule.note ? { note: rule.note } : {}), ...measured })
           byFile.set(file, list)
         }
       }
@@ -124,8 +134,17 @@ export const evaluate = (
     return { byFile, diagnostics }
   })
 
+// One file's hits for one rule, normalised and measured — the shape both finders hand back
+// and the shape `RuleHit` spreads. Distinct from the raw `[start, end]` lists the finders
+// accumulate, which are neither clamped nor merged and so cannot be measured yet.
+interface Measured {
+  readonly ranges: ReadonlyArray<readonly [number, number]>
+  readonly lines: number
+  readonly bytes: number
+}
+
 interface Outcome {
-  readonly perFile: Map<string, Array<readonly [number, number]>>
+  readonly perFile: Map<string, Measured>
   readonly error?: string
   // Raw match totals, set ONLY when a backend bailed out early because the rule was already
   // past MAX_RULE_HITS. `perFile` is then empty — not because nothing matched, but because
@@ -208,7 +227,9 @@ const patternHits = (
     // pre-check would reject valid patterns.
     if (result.partial)
       return {
-        perFile,
+        // Normally empty (exit 2 comes back with no items at all), but a partial read that
+        // still produced matches keeps them rather than discarding work the user can see.
+        perFile: yield* clampAll(directory, perFile),
         error: `ripgrep rejected this pattern or could not read some files (exit 2) — check the regex syntax`,
       }
     // Bail before touching the disk when the rule is already too broad. `clampAll` reads
@@ -261,7 +282,7 @@ const symbolHits = (
     }
 
     const fs = yield* FSUtil.Service
-    const perFile = new Map<string, Array<readonly [number, number]>>()
+    const perFile = new Map<string, Measured>()
     for (const rel of candidates) {
       const content = yield* fs
         .readFileStringSafe(path.join(directory, rel))
@@ -275,7 +296,9 @@ const symbolHits = (
         if (extent.name !== find.name && !extent.name.startsWith(find.name + "~")) continue
         ranges.push([extent.startLine, extent.endLine])
       }
-      if (ranges.length) perFile.set(rel, ApertureExtents.clampRanges(ranges, content))
+      if (ranges.length === 0) continue
+      const measured = measure(ranges, content)
+      if (measured) perFile.set(rel, measured)
     }
     return { perFile }
   }).pipe(Effect.provide(Ripgrep.defaultLayer), Effect.provide(FSUtil.defaultLayer))
@@ -289,17 +312,39 @@ const symbolHits = (
 const clampAll = (directory: string, perFile: Map<string, Array<readonly [number, number]>>) =>
   Effect.gen(function* () {
     const fs = yield* FSUtil.Service
-    const out = new Map<string, Array<readonly [number, number]>>()
+    const out = new Map<string, Measured>()
     for (const [rel, ranges] of perFile) {
       const content = yield* fs
         .readFileStringSafe(path.join(directory, rel))
         .pipe(Effect.orElseSucceed(() => undefined as string | undefined))
       if (content === undefined) continue
-      const clamped = ApertureExtents.clampRanges(ranges, content)
-      if (clamped.length) out.set(rel, clamped)
+      const measured = measure(ranges, content)
+      if (measured) out.set(rel, measured)
     }
     return out
   }).pipe(Effect.provide(FSUtil.defaultLayer))
+
+// Clamp + merge one file's ranges and measure what they cover. Separate from `clampAll` so
+// `symbolHits`, which already holds the content it cut extents from, measures without a
+// second read — and so the measurement has one definition rather than one per finder.
+//
+// Bytes are counted per line *including* its terminator, exactly as `fileComposition` counts
+// an extent's (extents.ts): a mark's bytes and an extent's bytes have to be the same unit or
+// the aggregates cannot put them on one scale. Returns undefined when nothing survives the
+// clamp, which is the caller's signal to omit the file entirely.
+function measure(ranges: ReadonlyArray<readonly [number, number]>, content: string): Measured | undefined {
+  const clamped = ApertureExtents.clampRanges(ranges, content)
+  if (clamped.length === 0) return undefined
+  const rawLines = content.split("\n")
+  const lineBytes = rawLines.map((l, i) => Buffer.byteLength(l) + (i < rawLines.length - 1 ? 1 : 0))
+  let lines = 0
+  let bytes = 0
+  for (const [start, end] of clamped) {
+    lines += end - start + 1
+    for (let i = start - 1; i <= end - 1; i++) bytes += lineBytes[i] ?? 0
+  }
+  return { ranges: clamped, lines, bytes }
+}
 
 // Ripgrep already strips a leading "./" (see `clean`), but it reports native separators on
 // Windows while every path in the payload is "/"-joined repo-relative.

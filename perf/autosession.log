@@ -192,3 +192,11 @@
 {"ts":"2026-08-12T16:59:42.157Z","pid":99244,"where":"server.prompt","event":"received","sessionID":"ses_0092930c3ffe6XwYU0k6Evcx0U","messageID":"msg_ff6ea5cc1001AlbU46zgcqZDhY","model":{"providerID":"anthropic","modelID":"claude-haiku-4-5"},"agent":"build","isDefaultTitle":false}
 {"ts":"2026-08-12T17:00:09.231Z","pid":99244,"where":"tui.submit","event":"send","sessionID":"ses_0092930c3ffe6XwYU0k6Evcx0U","wasNewSession":false,"mode":"normal","agent":"build","model":{"providerID":"anthropic","modelID":"claude-haiku-4-5","variant":"high"},"messageID":"msg_ff6eac68f001axLPuEp03EY3vS"}
 {"ts":"2026-08-12T17:00:09.239Z","pid":99244,"where":"server.prompt","event":"received","sessionID":"ses_0092930c3ffe6XwYU0k6Evcx0U","messageID":"msg_ff6eac68f001axLPuEp03EY3vS","model":{"providerID":"anthropic","modelID":"claude-haiku-4-5"},"agent":"build","isDefaultTitle":false}
+{"ts":"2026-08-12T17:38:58.663Z","pid":130367,"where":"tui.autocreate","event":"creating","agent":"build","model":{"providerID":"anthropic","modelID":"claude-haiku-4-5","variant":"high"}}
+{"ts":"2026-08-12T17:38:58.926Z","pid":130367,"where":"tui.autocreate","event":"created","sessionID":"ses_008f1ad2dffewDqf9dNkmlS3m1"}
+{"ts":"2026-08-12T17:49:41.736Z","pid":137577,"where":"tui.autocreate","event":"creating","agent":"build","model":{"providerID":"anthropic","modelID":"claude-haiku-4-5","variant":"high"}}
+{"ts":"2026-08-12T17:49:42.075Z","pid":137577,"where":"tui.autocreate","event":"created","sessionID":"ses_008e7dd47ffeJFV7MejQ1d5yv3"}
+{"ts":"2026-08-12T18:01:09.299Z","pid":154751,"where":"tui.autocreate","event":"creating","agent":"build","model":{"providerID":"anthropic","modelID":"claude-haiku-4-5","variant":"high"}}
+{"ts":"2026-08-12T18:01:09.399Z","pid":154751,"where":"tui.autocreate","event":"created","sessionID":"ses_008dd6018ffem6tNStem8zIBQl"}
+{"ts":"2026-08-12T18:13:01.024Z","pid":162354,"where":"tui.autocreate","event":"creating","agent":"build","model":{"providerID":"anthropic","modelID":"claude-haiku-4-5","variant":"high"}}
+{"ts":"2026-08-12T18:13:01.090Z","pid":162354,"where":"tui.autocreate","event":"created","sessionID":"ses_008d2841cffeLedO6fJdL0abzH"}

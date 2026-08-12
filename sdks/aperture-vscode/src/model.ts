@@ -9,7 +9,14 @@ import type { FacetWeight } from "./chip"
 
 // One file's entry in GET /aperture/facets: `t` is its attributed byte total and `w` its
 // mix as integer percentages of that total, descending.
-export type FacetFile = { t: number; w: ReadonlyArray<FacetWeight> }
+//
+// `m` is its Search-rule marks (S3): `l` marked lines and `b` marked bytes per facet, as raw
+// counts. Counts rather than percentages precisely so this module can roll them up by plain
+// summation — the drift `t` exists to absorb never arises, and nothing can be rounded away on
+// the way to a folder chip. A file can carry `m` with an empty `w`: a rule can glob a file
+// the extractor never walks, and its mark still has to reach the tree.
+export type FacetMark = { f: number; l: number; b: number }
+export type FacetFile = { t: number; w: ReadonlyArray<FacetWeight>; m?: ReadonlyArray<FacetMark> }
 export type FacetFiles = Record<string, FacetFile>
 
 export interface Entry {
@@ -26,6 +33,10 @@ export interface TreeModel {
   // A node's facet mix: the file's own for a file, the subtree rollup for a directory.
   // undefined = nothing painted below here, so the row gets no chip.
   readonly weights: (rel: string, dir: boolean) => ReadonlyArray<FacetWeight> | undefined
+  // Marked lines per facet below this node (S3), for the tooltip. The chip itself reads
+  // `weights`, which already has the marks merged in — this is only the exact count, which
+  // the chip necessarily rounds up to a whole cell.
+  readonly marks: (rel: string, dir: boolean) => ReadonlyArray<{ f: number; l: number }> | undefined
   readonly has: (rel: string) => boolean
   // Tracked explicitly rather than inferred from "has no children": a directory the user
   // just created is real and empty, and guessing would call it a file.
@@ -103,12 +114,17 @@ export function buildModel(
   // to prevent.
   //
   // O(files x depth) once per facet-map fetch; ~2300 files at depth ~5 is nothing.
+  //
+  // Marks (S3) roll up alongside in their own accumulators, never into the byte one: they are
+  // sparse and would break the partition `bytes` reports. The two meet in `toWeights` below.
   const bytes = new Map<string, Float64Array>()
-  const accumulator = (rel: string) => {
-    let acc = bytes.get(rel)
+  const markBytes = new Map<string, Float64Array>()
+  const markLines = new Map<string, Float64Array>()
+  const accumulator = (into: Map<string, Float64Array>, rel: string) => {
+    let acc = into.get(rel)
     if (!acc) {
       acc = new Float64Array(facetCount)
-      bytes.set(rel, acc)
+      into.set(rel, acc)
     }
     return acc
   }
@@ -118,8 +134,16 @@ export function buildModel(
     if (!seen.has(path)) continue
     let parent = ""
     const add = (rel: string) => {
-      const acc = accumulator(rel)
+      const acc = accumulator(bytes, rel)
       for (const w of entry.w) if (w.f < facetCount) acc[w.f]! += (entry.t * w.p) / 100
+      if (!entry.m?.length) return
+      const mb = accumulator(markBytes, rel)
+      const ml = accumulator(markLines, rel)
+      for (const m of entry.m) {
+        if (m.f >= facetCount) continue
+        mb[m.f]! += m.b
+        ml[m.f]! += m.l
+      }
     }
     add("")
     const parts = path.split("/")
@@ -131,33 +155,70 @@ export function buildModel(
 
   // Converting an accumulator to percentages is the same reduction the server runs per
   // file, so a folder chip and a file chip are read the same way.
+  //
+  // Marks overlay it by `max` per facet, never additively: an Overview Lens has already
+  // counted the marked lines' bytes under whatever facet their extent had, so adding would
+  // count them twice. On a Search Lens the composition is entirely "Other" and every mark
+  // band is new, which is the case this exists for.
+  const toWeights = (acc: Float64Array | undefined, marks: Float64Array | undefined) => {
+    if (!acc && !marks) return undefined
+    const merged = new Float64Array(facetCount)
+    let total = 0
+    for (let f = 0; f < facetCount; f++) {
+      merged[f] = Math.max(acc?.[f] ?? 0, marks?.[f] ?? 0)
+      total += merged[f]!
+    }
+    if (total <= 0) return undefined
+    const weights: FacetWeight[] = []
+    for (let f = 0; f < facetCount; f++) {
+      // Floored at 1% for any facet with bytes under the folder, matching the per-file
+      // reduction on the server: a folder chip must not drop a facet its own children's
+      // chips are showing. Rounding alone hid one small painted file in a large folder — and
+      // a mark is the extreme of that case, routinely one line in a thousand.
+      if (merged[f]! > 0) weights.push({ f, p: Math.max(1, Math.round((merged[f]! / total) * 100)) })
+    }
+    weights.sort((a, b) => b.p - a.p || a.f - b.f)
+    return weights.length ? weights : undefined
+  }
+
   const rolled = new Map<string, ReadonlyArray<FacetWeight> | undefined>()
   const dirWeights = (rel: string) => {
     if (rolled.has(rel)) return rolled.get(rel)
-    const acc = bytes.get(rel)
-    let result: ReadonlyArray<FacetWeight> | undefined
-    if (acc) {
-      let total = 0
-      for (const b of acc) total += b
-      if (total > 0) {
-        const weights: FacetWeight[] = []
-        for (let f = 0; f < acc.length; f++) {
-          // Floored at 1% for any facet with bytes under the folder, matching the per-file
-          // reduction on the server: a folder chip must not drop a facet its own children's
-          // chips are showing. Rounding alone hid one small painted file in a large folder.
-          if (acc[f]! > 0) weights.push({ f, p: Math.max(1, Math.round((acc[f]! / total) * 100)) })
-        }
-        weights.sort((a, b) => b.p - a.p || a.f - b.f)
-        if (weights.length) result = weights
-      }
-    }
+    const result = toWeights(bytes.get(rel), markBytes.get(rel))
     rolled.set(rel, result)
     return result
   }
 
+  // A file's own bytes, re-derived from what the wire carries, so the same `max` merge runs
+  // for a file row as for a folder row. Without it a file's chip would show the extent
+  // partition alone and disagree with the folder above it about the same mark.
+  const fileWeights = (rel: string) => {
+    const entry = files[rel]
+    if (!entry) return undefined
+    if (!entry.m?.length) return entry.w.length ? entry.w : undefined
+    const acc = new Float64Array(facetCount)
+    for (const w of entry.w) if (w.f < facetCount) acc[w.f]! += (entry.t * w.p) / 100
+    const marks = new Float64Array(facetCount)
+    for (const m of entry.m) if (m.f < facetCount) marks[m.f]! += m.b
+    return toWeights(acc, marks)
+  }
+
+  const markCounts = (acc: Float64Array | undefined) => {
+    if (!acc) return undefined
+    const out: { f: number; l: number }[] = []
+    for (let f = 0; f < facetCount; f++) if (acc[f]! > 0) out.push({ f, l: acc[f]! })
+    return out.length ? out : undefined
+  }
+
   return {
     children: (rel) => children.get(rel) ?? [],
-    weights: (rel, dir) => (dir ? dirWeights(rel) : files[rel]?.w),
+    weights: (rel, dir) => (dir ? dirWeights(rel) : fileWeights(rel)),
+    marks: (rel, dir) =>
+      dir
+        ? markCounts(markLines.get(rel))
+        : files[rel]?.m?.length
+          ? files[rel]!.m!.map((m) => ({ f: m.f, l: m.l }))
+          : undefined,
     has: (rel) => rel === "" || seen.has(rel),
     isDir: (rel) => rel === "" || dirs.has(rel),
     fileCount: paths.length,

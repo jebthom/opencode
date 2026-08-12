@@ -345,14 +345,24 @@ export type FacetFilesOutcome =
 // same folder — the exact class of disagreement O3's single-classification model exists
 // to prevent. With `t` the client's rollup is `t * p / 100` summed per facet, which is
 // `attributeFileBytes` re-associated, so the two cannot drift.
+//
+// `m` is the same file's *marks* (S3): rule-hit magnitude per facet, as raw counts rather
+// than percentages, precisely because a count rolls up by plain summation — the folder chip
+// adds its descendants' marks with no denominator and no floor. It is a separate field from
+// `w` and not folded into it for the reason stated on `MarkWeight`: marks are sparse and
+// would break the byte partition `w` reports. A file may carry `m` with an empty `w` — a
+// rule can glob a file the extractor never walks, and the mark still has to reach the tree.
+export interface FacetMapFile {
+  readonly t: number
+  readonly w: ReadonlyArray<{ readonly f: number; readonly p: number }>
+  readonly m?: ReadonlyArray<{ readonly f: number; readonly l: number; readonly b: number }>
+}
+
 export interface FacetMap {
   readonly lens: AperturePayload.LensInfo
   // Facet ids in legend order, with NONE_FACET appended, so `f` indexes into this.
   readonly facets: ReadonlyArray<string>
-  readonly files: Record<
-    string,
-    { readonly t: number; readonly w: ReadonlyArray<{ readonly f: number; readonly p: number }> }
-  >
+  readonly files: Record<string, FacetMapFile>
   // The facets currently toggled off in the legend (O4), so a client that arrives late or
   // reconnects paints the same filter the others are painting. Empty when nothing is filtered.
   readonly suppressed: ReadonlyArray<string>
@@ -1526,8 +1536,14 @@ export const layer = Layer.effect(
         // file exhaustively and that byte contract is what the treemap, the directory bands
         // and the Explorer pip are all built on; line tags are sparse and would break the sum
         // (see LineTag in payload.ts). Keeping them in a separate record is what enforces it.
+        let marks: Record<string, ReadonlyArray<AperturePayload.MarkWeight>> | undefined
         if (lens.rules?.length) {
           const hits = yield* ruleHitsFor(ctx.directory, lens)
+          // The aggregate reading of the same hits (S3), so a mark shows up in the top bar
+          // and the tree chips and not only in the gutter of a file already open. One more
+          // consumer of the memoized map — no second evaluation.
+          const built = computeMarks(structure.nodes, hits, lens)
+          if (Object.keys(built).length) marks = built
           for (const [file, fileHits] of hits) {
             // Out of the current window: the file has no node here, so a tag on it would key
             // nothing. The memo still holds it for when the window moves.
@@ -1563,6 +1579,7 @@ export const layer = Layer.effect(
           ...(filtered?.size ? { suppressed: [...filtered] } : {}),
           ...(extents ? { extents } : {}),
           ...(lineTags ? { lineTags } : {}),
+          ...(marks ? { marks } : {}),
         }
       })
 
@@ -2445,9 +2462,13 @@ export const layer = Layer.effect(
       // value ("Other — not this Lens") but never a Lens facet, so it needs an index the
       // client can resolve without it polluting the legend the swatch row draws.
       const facets = [...lens.facets.map((t) => t.id), NONE_FACET]
+      // Marks ride the same response (S3), so the tree chips carry a rule's concern exactly
+      // as the top bar does. Memoized per (directory, lensID, rulesHash), so the extension's
+      // 20s self-heal poll costs one map lookup rather than a repo pass.
+      const hits = lens.rules?.length ? yield* ruleHitsFor(ctx.directory, lens) : undefined
       return {
         facets,
-        files: computeFacetMapFiles(subtree, store, mixes, facets),
+        files: computeFacetMapFiles(subtree, store, mixes, facets, hits),
         // The legend filter rides the same response the colours do, so a client that
         // reconnects (or starts after the filter was set) picks it up from its ordinary
         // refresh instead of waiting for the next FacetsFiltered event — which it missed.
@@ -2812,6 +2833,63 @@ export function computeComposition(
   return result
 }
 
+// Per-node mark aggregate, keyed by node id (S3) — the aggregate reading of the same rule
+// hits `lineTags` carries per line. A marked facet reaches a directory block, a file tile and
+// a tree chip through this and nothing else.
+//
+// **Deliberately not part of `computeComposition`.** Extents tile a file exhaustively and
+// that byte partition is what the treemap, the directory bands and `computeFacetMapFiles`
+// all rest on; marks are sparse and would stop the sum. They ride out as a parallel record
+// and each renderer merges them into its own band list (`max` per facet, never additive —
+// on an Overview Lens the marked lines' bytes are already counted under the facet their
+// extent had, so adding would double them).
+//
+// **Keyed off the hit paths, not the subtree file set.** A rule can glob a file the extractor
+// never walks (`*.yaml`, `*.md`), which has no file node and never will. Its ancestor
+// directories do exist, so the concern still colours the block it lives under even though
+// there is no tile to drill into — and the gutter still paints the file when it is opened.
+// Attributing to the subtree instead would silently drop those hits.
+export function computeMarks(
+  nodes: AperturePayload.Payload["nodes"],
+  hits: ReadonlyMap<string, ReadonlyArray<ApertureRules.RuleHit>>,
+  lens: Lens,
+): Record<string, ReadonlyArray<AperturePayload.MarkWeight>> {
+  if (hits.size === 0) return {}
+  const dirs = nodes.filter((n) => n.kind === "directory").map((d) => ({ id: d.id, prefix: d.path + "/" }))
+  const fileIDByPath = new Map(nodes.filter((n) => n.kind === "file").map((n) => [n.path, n.id] as const))
+  const byNode = new Map<string, Map<string, { lines: number; bytes: number }>>()
+  const add = (nodeID: string, hit: ApertureRules.RuleHit) => {
+    let byFacet = byNode.get(nodeID)
+    if (!byFacet) byNode.set(nodeID, (byFacet = new Map()))
+    const w = byFacet.get(hit.facet) ?? { lines: 0, bytes: 0 }
+    w.lines += hit.lines
+    w.bytes += hit.bytes
+    byFacet.set(hit.facet, w)
+  }
+  for (const [file, fileHits] of hits) {
+    // Two rules on one facet can overlap (nothing dedupes across rules — last-writer-wins is
+    // the whole resolution model, see PLAN S2), so a line can be counted twice here. Accepted:
+    // the magnitude only ever decides how much *extra* area a mark claims beyond its
+    // guaranteed cell, and marks are capped at MAX_RULE_HITS lines per rule anyway.
+    const fileID = fileIDByPath.get(file)
+    for (const hit of fileHits) {
+      if (fileID) add(fileID, hit)
+      for (const dir of dirs) if (file.startsWith(dir.prefix)) add(dir.id, hit)
+    }
+  }
+  // Lens facet order, matching computeComposition, so a node's chip, its block in the TUI bar
+  // and the legend all sequence their colours alike.
+  const order = [...lens.facets.map((t) => t.id), NONE_FACET]
+  const result: Record<string, ReadonlyArray<AperturePayload.MarkWeight>> = {}
+  for (const [id, byFacet] of byNode) {
+    const weights = order
+      .filter((facet) => (byFacet.get(facet)?.lines ?? 0) > 0)
+      .map((facet) => ({ facet, ...byFacet.get(facet)! }))
+    if (weights.length) result[id] = weights
+  }
+  return result
+}
+
 // The per-file half of `facetMap` (O2): every painted file's facet mix, as percentages.
 // Split out from the service and exported so the reduction can be tested against
 // `computeComposition` — the two MUST agree, since they are the Explorer pip and the
@@ -2824,13 +2902,41 @@ export function computeFacetMapFiles(
   store: ApertureSemanticStore.Store,
   mixes: ApertureSubfacetStore.Mixes,
   facets: ReadonlyArray<string>,
-): Record<string, { t: number; w: ReadonlyArray<{ f: number; p: number }> }> {
+  // Rule hits keyed by repo-relative path (S3), so the tree chips carry marks the same way
+  // the top bar does. Empty for a Lens with no rules.
+  hits: ReadonlyMap<string, ReadonlyArray<ApertureRules.RuleHit>> = new Map(),
+): Record<string, FacetMapFile> {
   const indexByFacet = new Map(facets.map((id, i) => [id, i]))
-  const result: Record<string, { t: number; w: ReadonlyArray<{ f: number; p: number }> }> = {}
+  const result: Record<string, FacetMapFile> = {}
+  // A file's marks as facet-indexed counts. **Raw counts, not percentages**: unlike `p`, a
+  // count rolls up by plain summation, so a folder chip can add its descendants' marks with
+  // no denominator and no floor — the drift `t` exists to absorb simply never arises.
+  const marksOf = (path: string) => {
+    const fileHits = hits.get(path)
+    if (!fileHits?.length) return undefined
+    const byFacet = new Map<number, { l: number; b: number }>()
+    for (const hit of fileHits) {
+      const f = indexByFacet.get(hit.facet)
+      if (f === undefined || hit.lines <= 0) continue
+      const m = byFacet.get(f) ?? { l: 0, b: 0 }
+      m.l += hit.lines
+      m.b += hit.bytes
+      byFacet.set(f, m)
+    }
+    // Ascending `f` so the output is byte-stable, which is what the extension's
+    // compare-before-fire guard against tree flicker depends on.
+    return byFacet.size ? [...byFacet.entries()].sort((a, b) => a[0] - b[0]).map(([f, m]) => ({ f, ...m })) : undefined
+  }
   for (const file of files) {
+    const m = marksOf(file.path)
     const attribution = ApertureExtents.attributeFileBytes(file.size, mixes[file.path], store[file.id]?.facet)
     const total = attribution.weights.reduce((sum, w) => sum + w.bytes, 0)
-    if (total <= 0) continue
+    // Unpainted, but a mark still has to reach the tree — the marked-facet-must-show rule
+    // outranks "files with nothing painted are omitted".
+    if (total <= 0) {
+      if (m) result[file.path] = { t: 0, w: [], m }
+      continue
+    }
     // Percent of the file's *attributed* bytes, descending so a client reading only the head
     // gets the dominant facet. A facet holding any bytes at all is floored at 1% rather than
     // rounded away: existence outranks proportion on these surfaces (the TUI treemap and the
@@ -2848,7 +2954,16 @@ export function computeFacetMapFiles(
       .sort((a, b) => b.p - a.p)
     // `t` is the pre-rounding denominator, so a client's `t * p / 100` rollup carries the
     // file's real weight even where the percentages were rounded or a sliver dropped.
-    if (weights.length) result[file.path] = { t: total, w: weights }
+    if (weights.length || m) result[file.path] = { t: total, w: weights, ...(m ? { m } : {}) }
+  }
+  // Marked files the walk above never reaches: a rule can glob a file the extractor does not
+  // walk (`*.yaml`, `*.md`), so it is in `hits` but never in `files` and has no painted half
+  // at all. Emitting it anyway is what keeps a marked concern visible in the tree — the same
+  // reason `computeMarks` attributes from the hit paths rather than the subtree file set.
+  for (const path of hits.keys()) {
+    if (result[path]) continue
+    const m = marksOf(path)
+    if (m) result[path] = { t: 0, w: [], m }
   }
   return result
 }

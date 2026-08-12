@@ -137,3 +137,74 @@ describe("buildModel — byte rollup", () => {
     expect(model.weights("a", true)).toBeUndefined()
   })
 })
+
+// S3. A Search rule marks a handful of lines and the tree has to show that facet's colour on
+// the file and on every folder above it, whatever the proportions say. The rollup is by plain
+// summation of raw counts — the reason the wire carries `l`/`b` rather than percentages.
+describe("buildModel — marks", () => {
+  test("a one-line mark in a huge file survives to the file's own chip", () => {
+    const model = buildModel(
+      ["src/big.ts"],
+      { "src/big.ts": { t: 100_000, w: [{ f: 0, p: 100 }], m: [{ f: 1, l: 1, b: 30 }] } },
+      FACET_COUNT,
+    )
+    // 30 bytes against 100,000 is 0.03% — floored to 1% rather than rounded away, which is
+    // what lets `apportion` give it a slot.
+    expect(model.weights("src/big.ts", false)).toEqual([
+      { f: 0, p: 100 },
+      { f: 1, p: 1 },
+    ])
+  })
+
+  test("...and to every folder above it", () => {
+    const model = buildModel(
+      ["src/deep/big.ts"],
+      { "src/deep/big.ts": { t: 100_000, w: [{ f: 0, p: 100 }], m: [{ f: 1, l: 1, b: 30 }] } },
+      FACET_COUNT,
+    )
+    for (const dir of ["", "src", "src/deep"]) {
+      expect(model.weights(dir, true)!.some((w) => w.f === 1)).toBe(true)
+    }
+  })
+
+  test("marks merge by max, never additively", () => {
+    // The whole file is facet 1 AND 40 of its bytes are marked facet 1. Adding would report
+    // 140 bytes of a 100-byte file; max reports the truth, which is 100.
+    const model = buildModel(
+      ["a/one.ts"],
+      { "a/one.ts": { t: 100, w: [{ f: 1, p: 100 }], m: [{ f: 1, l: 2, b: 40 }] } },
+      FACET_COUNT,
+    )
+    expect(model.weights("a", true)).toEqual([{ f: 1, p: 100 }])
+  })
+
+  test("a file with marks and nothing painted still gets a chip", () => {
+    const model = buildModel(
+      ["config.yaml"],
+      { "config.yaml": { t: 0, w: [], m: [{ f: 2, l: 3, b: 60 }] } },
+      FACET_COUNT,
+    )
+    expect(model.weights("config.yaml", false)).toEqual([{ f: 2, p: 100 }])
+    expect(model.weights("", true)).toEqual([{ f: 2, p: 100 }])
+  })
+
+  test("marked lines roll up as exact counts, for the tooltip the chip cannot carry", () => {
+    const model = buildModel(
+      ["src/a.ts", "src/b.ts"],
+      {
+        "src/a.ts": { t: 100, w: [{ f: 0, p: 100 }], m: [{ f: 1, l: 3, b: 30 }] },
+        "src/b.ts": { t: 100, w: [{ f: 0, p: 100 }], m: [{ f: 1, l: 4, b: 40 }] },
+      },
+      FACET_COUNT,
+    )
+    expect(model.marks("src", true)).toEqual([{ f: 1, l: 7 }])
+    expect(model.marks("src/a.ts", false)).toEqual([{ f: 1, l: 3 }])
+    expect(model.marks("src/b.ts", false)).toEqual([{ f: 1, l: 4 }])
+  })
+
+  test("an unmarked node reports no marks", () => {
+    const model = buildModel(PATHS, FILES, FACET_COUNT)
+    expect(model.marks("src", true)).toBeUndefined()
+    expect(model.marks("src/aperture/chip.ts", false)).toBeUndefined()
+  })
+})

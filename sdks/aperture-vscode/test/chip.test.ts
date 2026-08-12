@@ -3,6 +3,7 @@ import {
   CHIP_CELLS,
   chipSegments,
   chipSvg,
+  chipTooltip,
   emptyChipSvg,
   hexFor,
   MIN_SEGMENT_FRAC,
@@ -352,5 +353,52 @@ describe("chipSegments — mosaic", () => {
     // ...and it lands in the narrow third, so it costs the dominant a twelfth rather than a
     // sixth of the chip.
     expect(segments.at(-1)!.frac).toBeCloseTo(1 / 12, 10)
+  })
+})
+
+// S3. A marked facet arrives from `buildModel` already floored to 1% — the chip's job is not
+// to lose it from there. This is the same "every facet present gets a slot" guarantee the
+// rest of the file pins, stated at the magnitude a Search Lens actually produces: one marked
+// line in a large file, which is the case the whole rule model exists for.
+describe("chipSegments — a floored mark (PLAN S3)", () => {
+  const marked = [
+    { f: 0, p: 100 },
+    { f: 1, p: 1 },
+  ]
+
+  test("a 1% mark keeps a cell in bar6", () => {
+    expect(bar(marked).some((s) => s.color === "#F28E2B")).toBe(true)
+  })
+
+  test("a 1% mark keeps a cell in mosaic6", () => {
+    expect(mosaic(marked).some((s) => s.color === "#F28E2B")).toBe(true)
+  })
+
+  test("three concerns at 1% each all survive alongside a dominant facet", () => {
+    const weights = [
+      { f: 3, p: 100 },
+      { f: 0, p: 1 },
+      { f: 1, p: 1 },
+      { f: 2, p: 1 },
+    ]
+    for (const segments of [bar(weights), mosaic(weights)]) {
+      for (const color of ["#4E79A7", "#F28E2B", "#59A14F"]) {
+        expect(segments.some((s) => s.color === color)).toBe(true)
+      }
+    }
+  })
+})
+
+describe("chipTooltip — marks", () => {
+  test("marked lines lead, in lines rather than the percent the chip rounds", () => {
+    expect(chipTooltip([{ f: 0, p: 100 }], FACETS, LEGEND, [{ f: 1, l: 3 }])).toBe("Server 3 lines marked · Parsing 100%")
+  })
+
+  test("one line is singular", () => {
+    expect(chipTooltip([], FACETS, LEGEND, [{ f: 1, l: 1 }])).toBe("Server 1 line marked")
+  })
+
+  test("no marks reads exactly as it did before", () => {
+    expect(chipTooltip([{ f: 0, p: 100 }], FACETS, LEGEND)).toBe("Parsing 100%")
   })
 })

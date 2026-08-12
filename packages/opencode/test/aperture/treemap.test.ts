@@ -46,6 +46,22 @@ describe("ApertureTreemap.allocateCells", () => {
     expect(alloc.reduce((s, a) => s + a.n, 0)).toBe(8)
   })
 
+  // The tightest case the bar can produce, and the one S3's marks make routine: a full
+  // six-facet Lens plus "Other" plus the grey remainder is 8 bands, and `blockCells` floors
+  // the budget at the band count — so the steal loop runs at exactly cells === parts.length,
+  // where its `big.n > 1` guard has the least room. Every band must still keep a cell; if a
+  // future constant change breaks that, a marked concern silently disappears from a block.
+  it("gives every band a cell when the budget is exactly the band count", () => {
+    const bands = [
+      { key: "dominant", value: 10_000 },
+      ...["a", "b", "c", "d", "e", "f", "grey"].map((key) => ({ key, value: 1 })),
+    ]
+    const alloc = allocateCells(bands, bands.length)
+    expect(alloc).toHaveLength(bands.length)
+    expect(alloc.every((a) => a.n >= 1)).toBe(true)
+    expect(alloc.reduce((s, a) => s + a.n, 0)).toBe(bands.length)
+  })
+
   it("preserves input order so color bands are stable", () => {
     const alloc = allocateCells(
       [

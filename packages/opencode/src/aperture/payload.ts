@@ -184,6 +184,27 @@ export const LineTag = Schema.Struct({
 })
 export type LineTag = typeof LineTag.Type
 
+// The *aggregate* reading of the same line tags (S3): how much of a node carries each marked
+// facet, summed over its whole subtree. This is what lets a mark show up in a directory
+// block, a file tile and a tree chip, where `LineTag`'s line ranges say nothing.
+//
+// It is a **separate overlay from `Composition`, not a widening of it**, for the reason
+// stated above: marks are sparse and do not tile, so folding them into `weights` would break
+// the sum `attributeFileBytes` guarantees. A renderer merges the two at its own band-building
+// step (`max` per facet, never additive — on an Overview Lens the marked lines' bytes are
+// already counted under whatever facet their extent had).
+//
+// `lines` and `bytes` are carried for the same reason `FacetWeight` carries `count` and
+// `bytes`: `lines` is the magnitude a human reads and a client rolls up by plain summation,
+// `bytes` is the unit the composition bands are drawn in. Never emitted with zero lines — a
+// zero band would be granted a cell by the renderers' "every present facet keeps one" rule.
+export const MarkWeight = Schema.Struct({
+  facet: Schema.String,
+  lines: Schema.Int,
+  bytes: Schema.Int,
+})
+export type MarkWeight = typeof MarkWeight.Type
+
 export const Payload = Schema.Struct({
   version: Schema.Int,
   nodes: Schema.Array(Node),
@@ -211,6 +232,10 @@ export const Payload = Schema.Struct({
   // it is backward compatible with structure caches and needs no PAYLOAD_VERSION bump —
   // the same posture that let `composition` widen from directories-only to per-node.
   lineTags: Schema.optional(Schema.Record(Schema.String, Schema.Array(LineTag))),
+  // Per-node mark aggregate (S3), keyed like `composition` — every in-window node, file or
+  // directory, that has anything marked below it. Derived at the read boundary from the same
+  // rule hits `lineTags` comes from, so it needs no PAYLOAD_VERSION bump either.
+  marks: Schema.optional(Schema.Record(Schema.String, Schema.Array(MarkWeight))),
   // Facets the user has toggled off in the legend (O4), merged in at the read boundary like
   // `lens`. The renderer greys these instead of painting their Lens colour — the *colours*
   // still ship true, so a client can toggle one off and back on without a refetch, and the

@@ -81,6 +81,14 @@ const LensSummary = Schema.Struct({
 // rolled up — a client aggregating a directory from its files would weight every file
 // equally and disagree with the byte-weighted directory treemap — so `t` is what lets the
 // VSCode tree's folder chips reproduce `attributeFileBytes` exactly.
+//
+// `m` is the file's *marks* (S3): a Search rule's hits per facet, as `l` marked lines and
+// `b` marked bytes. Raw counts rather than percentages by the same argument `t` answers, one
+// step further — a count needs no denominator at all, so a folder chip sums its
+// descendants' marks directly and nothing can be rounded away on the way up. Kept beside
+// `w` rather than merged into it because marks are sparse and do not tile, so they must not
+// enter the byte partition `w` reports (see MarkWeight in payload.ts). A file may carry `m`
+// with an empty `w`: a rule can glob a file the extractor never walks.
 const FacetMapResult = Schema.Struct({
   lens: AperturePayload.LensInfo,
   // Facet ids in legend order, with the "Other" facet appended (it is a real stored value
@@ -88,7 +96,11 @@ const FacetMapResult = Schema.Struct({
   facets: Schema.Array(Schema.String),
   files: Schema.Record(
     Schema.String,
-    Schema.Struct({ t: Schema.Int, w: Schema.Array(Schema.Struct({ f: Schema.Int, p: Schema.Int })) }),
+    Schema.Struct({
+      t: Schema.Int,
+      w: Schema.Array(Schema.Struct({ f: Schema.Int, p: Schema.Int })),
+      m: Schema.optional(Schema.Array(Schema.Struct({ f: Schema.Int, l: Schema.Int, b: Schema.Int }))),
+    }),
   ),
   // Facets currently toggled off in the legend (O4). Carried here as well as on the
   // aperture.facets.filtered event so a client that reconnects — or connects after the

@@ -60,6 +60,12 @@ type Composition = {
   subtreeBytes: number
 }
 
+// Per-node mark aggregate (S3): how much of a node's subtree carries each Search-rule
+// facet. A *separate* record from `composition` because marks are sparse and do not tile —
+// folding them into the byte partition would stop it summing (see MarkWeight in payload.ts)
+// — so `compositionBands` merges the two instead, and only there.
+type MarkWeight = { facet: string; lines: number; bytes: number }
+
 // An out-of-window one-hop import target (step 6). No position/size — it isn't
 // placed in the layer grid; the renderer draws it as a boundary tile under the
 // importing node. An edge's `to` may reference a boundary id.
@@ -72,6 +78,8 @@ type Graph = {
   boundaries?: GraphBoundary[]
   semantics: Record<string, { facets: readonly string[]; hue?: string }>
   composition?: Record<string, Composition>
+  // Search-rule marks per node (S3). Absent unless the active Lens carries rules.
+  marks?: Record<string, readonly MarkWeight[]>
   // The active Lens + legend (facet → label + colour), merged in server-side.
   lens?: { id: string; name: string; legend: readonly { facet: string; label: string; color: string }[] }
   // Facets already toggled off server-side when this payload was built (O4) — the filter
@@ -514,6 +522,13 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   const boundaries = () => (graph.error ? [] : (graph()?.boundaries ?? []))
   const edgeList = () => (graph.error ? [] : (graph()?.edges ?? []))
   const compositionOf = (nodeID: string) => (graph.error ? undefined : graph()?.composition?.[nodeID])
+  const marksOf = (nodeID: string) => (graph.error ? undefined : graph()?.marks?.[nodeID])
+  // The band vocabulary, in the order blocks lay their colours down: the Lens's own facets as
+  // the legend prints them, then NONE_FACET, which the legend never carries. Identical to the
+  // `facets` array the VSCode chip indexes into, so a directory's block and its tree chip
+  // sequence alike — and it is what keeps "Other" grey at the far end rather than at the
+  // front, where a Search Lens would otherwise put it (see compositionBands).
+  const facetOrder = createMemo(() => [...legendEntries().map((e) => e.facet), NONE_FACET])
 
   // The blocks in the strip: the scope's direct child *directories*, in payload order.
   // Layer-1 is no longer read at all — the bar shows one level, and what's below it is
@@ -548,7 +563,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   // is already stuck with, and losing that distinction is the reason the grid exists.
   const bandColors = (id: string, width: number): (TuiThemeCurrent["text"] | undefined)[] => {
     const comp = compositionOf(id)
-    const bands = comp ? compositionBands(comp) : []
+    const bands = comp ? compositionBands(comp, marksOf(id), facetOrder()) : []
     if (bands.length === 0) return Array.from({ length: width }, () => resolveColor(theme(), UNTAGGED_HUE))
     const alloc = allocateCells(bands, width)
     const flat: TuiThemeCurrent["text"][] = []
@@ -635,22 +650,39 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   // A file's facet mix as text — the band spelled out, since a 14-column strip of colour
   // can show that a file is mixed without saying what it is mixed *of*. Same reading the
   // VSCode Explorer pip puts in its tooltip.
+  const facetLabel = (facet: string) =>
+    facet === NONE_FACET ? NONE_LABEL : (legendEntries().find((e) => e.facet === facet)?.label ?? facet)
+
+  // What a node's Search rules found below it, in *lines* rather than percent (S3). A mark's
+  // share is the part the block necessarily rounds up to a whole cell, so the hover is the
+  // only place that can say what was actually found — and "3 lines" is the reading a probe is
+  // asked for anyway.
+  const describeMarks = (id: string) =>
+    (marksOf(id) ?? []).map((m) => `${facetLabel(m.facet)} ${m.lines} line${m.lines === 1 ? "" : "s"}`).join(" · ")
+
   const describeMix = (id: string) => {
     const comp = compositionOf(id)
     if (!comp) return undefined
+    const marked = describeMarks(id)
     const total = metricSubtree(comp)
-    if (total <= 0 || comp.weights.length === 0) return undefined
-    const labelOf = (facet: string) =>
-      facet === NONE_FACET ? NONE_LABEL : (legendEntries().find((e) => e.facet === facet)?.label ?? facet)
-    const parts = comp.weights.map((w) => `${labelOf(w.facet)} ${Math.round((metricValue(w) / total) * 100)}%`)
+    if (total <= 0 || comp.weights.length === 0) return marked || undefined
+    const parts = comp.weights.map((w) => `${facetLabel(w.facet)} ${Math.round((metricValue(w) / total) * 100)}%`)
     const untagged = total - metricTotal(comp)
     if (untagged > 0) parts.push(`${UNTAGGED_LABEL} ${Math.round((untagged / total) * 100)}%`)
-    return parts.join(" · ")
+    return [...(marked ? [marked] : []), ...parts].join(" · ")
   }
 
   // Hover text for a node: its path/size and — for a file — its facet mix spelled out.
   const hoverNode = (node: GraphNode) => {
-    const mix = node.kind === "file" ? describeMix(node.id) : undefined
+    // A directory still doesn't spell out its mix — that is what its treemap is for — but it
+    // does report what is *marked* below it, since a probe's whole question is "how much of
+    // this is in here" and one or two cells cannot answer it.
+    const mix =
+      node.kind === "file"
+        ? describeMix(node.id)
+        : (marksOf(node.id) ?? []).length
+          ? describeMarks(node.id)
+          : undefined
     const base = mix ? `${describeNode(node)} · ${mix}` : describeNode(node)
     // List out-of-window import targets so a dependency that left the window is
     // still legible even though it can't be drawn as an in-window highlight.
@@ -665,12 +697,15 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   // top of it; between them a small directory got a big empty box.
   const blockCells = (id: string) => {
     const comp = compositionOf(id)
-    const bands = comp ? compositionBands(comp) : []
+    const bands = comp ? compositionBands(comp, marksOf(id), facetOrder()) : []
     // Nothing under it the painter sees as code: one grey cell, so the box still reads as a
     // real-but-uninhabited directory rather than vanishing.
     if (!comp || bands.length === 0) return 1
     // Floor at the band count so every facet actually present gets at least one cell — a
-    // real facet is never an invisible sliver.
+    // real facet is never an invisible sliver. This is also what keeps `allocateCells`'s
+    // steal loop inside its `cells >= parts.length` guard now that a mark can add a band
+    // the composition doesn't carry (S3): a single marked line in a huge directory has no
+    // area to speak of and reaches the block only through that guarantee.
     return Math.min(
       BLOCK_CELL_CAP,
       Math.max(scaleCells(metricSubtree(comp), maxDirSubtree0(), BLOCK_CELL_CAP), bands.length),
@@ -965,6 +1000,8 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
               width={blockWidth(node.id)}
               borderColor={() => borderColorFor(node)}
               composition={() => compositionOf(node.id)}
+              marks={() => marksOf(node.id)}
+              order={facetOrder}
               colorFor={colorFor}
               theme={theme}
               onDrill={() => openDirectory(node.path)}
@@ -1025,6 +1062,8 @@ function DirBlock(props: {
   width?: number
   borderColor: () => TuiThemeCurrent["text"]
   composition: () => Composition | undefined
+  marks: () => readonly MarkWeight[] | undefined
+  order: () => readonly string[]
   colorFor: (key: string | null) => TuiThemeCurrent["text"]
   theme: () => TuiThemeCurrent
   onDrill: () => void
@@ -1051,6 +1090,8 @@ function DirBlock(props: {
       >
         <TreemapBlock
           composition={props.composition}
+          marks={props.marks}
+          order={props.order}
           colorFor={props.colorFor}
           rows={props.rows}
           cells={props.cells}
@@ -1073,6 +1114,8 @@ function DirBlock(props: {
 // painting the whole block.
 function TreemapBlock(props: {
   composition: () => Composition | undefined
+  marks: () => readonly MarkWeight[] | undefined
+  order: () => readonly string[]
   colorFor: (key: string | null) => TuiThemeCurrent["text"]
   rows: number
   cells: number
@@ -1080,7 +1123,7 @@ function TreemapBlock(props: {
 }) {
   const grid = createMemo(() => {
     const comp = props.composition()
-    const bands = comp ? compositionBands(comp) : []
+    const bands = comp ? compositionBands(comp, props.marks(), props.order()) : []
     // No descendant source files: keep the bordered box non-empty with one grey cell.
     if (bands.length === 0) return buildGrid([GREY_CELL], props.rows)
     const alloc = allocateCells(bands, props.cells)
@@ -1236,9 +1279,49 @@ function metricSubtree(c: Composition) {
 // collection starts fully grey and each tag only ever grows to its true proportion as
 // the background sweep fills in — instead of a few tagged files painting a whole
 // directory. Returns [] only when the directory has no descendant source files at all.
-function compositionBands(c: Composition): { key: string; value: number }[] {
-  const bands = c.weights.map((w) => ({ key: w.facet, value: metricValue(w) }))
-  const remainder = metricSubtree(c) - metricTotal(c)
+//
+// `marks` (S3) overlays the Search-rule hits below the node onto that partition. The rule is
+// **`max` per facet, never additive**: on an Overview Lens the marked lines' bytes are
+// already counted under whatever facet their extent had, so adding would count them twice; a
+// mark says "at least this much of this facet is here", which is also exactly right on a
+// Search Lens, where the composition is entirely NONE and every mark band is new. The grey
+// remainder absorbs whatever the overlay adds, so the bands still sum to the subtree and a
+// block's size is unaffected by what is marked inside it.
+//
+// This function does not floor anything. A single marked line in a large directory comes out
+// with a real but minuscule value, and it is `allocateCells`'s "every band with weight > 0
+// keeps a cell" guarantee — kept reachable by `blockCells` flooring the budget at the band
+// count — that turns it into a visible cell. That is deliberate: the floor belongs where the
+// cell budget is known, not here, or the two would have to agree about a number neither owns.
+// `order` is the Lens's facet ids with NONE_FACET appended — the same vocabulary the VSCode
+// chip indexes its `f` into, and the reason bands are laid down in *facet* order rather than
+// in the order the two inputs happened to supply them. Merging two maps by insertion put
+// NONE first on every Search Lens, because the composition contributes nothing else and each
+// concern arrived behind it: the one facet the user is not looking for took the whole left
+// edge of every block. Sorting by `order` fixes it at the root — NONE is last in the
+// vocabulary, so it is last in the block, before the grey remainder.
+function compositionBands(
+  c: Composition,
+  marks?: readonly MarkWeight[],
+  order?: readonly string[],
+): { key: string; value: number }[] {
+  const byFacet = new Map(c.weights.map((w) => [w.facet, metricValue(w)] as const))
+  for (const m of marks ?? []) {
+    const value = TREEMAP_METRIC === "bytes" ? m.bytes : m.lines
+    if (value > 0) byFacet.set(m.facet, Math.max(byFacet.get(m.facet) ?? 0, value))
+  }
+  // NONE is ranked last explicitly rather than by its position in `order`, so the rule holds
+  // even before the legend arrives (an empty `order` is just `[NONE_FACET]`, which would
+  // otherwise rank it first — the exact failure this fixes). A facet the legend has not caught
+  // up with sorts after the known ones but still ahead of NONE: it is a real colour, and
+  // burying it under the grey would be the same mistake one step removed.
+  const rank = (facet: string) => {
+    if (facet === NONE_FACET) return (order?.length ?? 0) + 1
+    const i = order?.indexOf(facet) ?? -1
+    return i === -1 ? (order?.length ?? 0) : i
+  }
+  const bands = [...byFacet].map(([key, value]) => ({ key, value })).sort((a, b) => rank(a.key) - rank(b.key))
+  const remainder = metricSubtree(c) - bands.reduce((sum, b) => sum + b.value, 0)
   if (remainder > 0) bands.push({ key: GREY_CELL, value: remainder })
   return bands
 }

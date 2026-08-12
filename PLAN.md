@@ -637,8 +637,12 @@ never enter `attributeFileBytes` or `composition`.** They are a separate overlay
   `vscode.Range(line,0,line,0)` per line (`extension.ts:204-240`) — exactly the
   shape sparse tags need, so S3's extension work is small. Where a file has both,
   **line tags win the lines they cover** and extents paint the rest.
-- **TUI:** a `search` Lens draws hit density, not a partition.
-- **Explorer pip:** has-hits / no-hits. A one-colour pip cannot express density.
+- **TUI / tree chip:** superseded by S3. Marks aggregate as an *overlay* on the
+  composition bands (`max` per facet, never additive), carried by a parallel
+  `marks` record so they still never touch `attributeFileBytes`. A facet with any
+  marked line always keeps a cell.
+- **Explorer pip:** dropped — no longer used, and a one-colour budget cannot honour
+  "never rounded away" without lying about the file's dominant facet (S3).
 
 **Evaluation and freshness** — derived, memoized in memory, never persisted.
 The read boundary (`finalize`) evaluates the active Lens's rules over the window,
@@ -930,7 +934,7 @@ clicks on painted hits. Both are cheap to add later if the analysis wants them �
 drift especially, since re-evaluation already happens on every file change and
 would only need the count recorded.
 
-### S3 — Line-level painting in the editor and the View
+### S3 — Line-level painting in the editor and the View ✅
 
 Extend `sdks/aperture-vscode` to paint line tags as gutter strips. The decoration
 machinery is already there (`decorationFor`, per-hue reused decoration types) —
@@ -939,14 +943,105 @@ sparse tags rather than an Overview Lens's exhaustive extents. Resolution stays
 **server-side against disk content**, which is the established pattern (S0
 finding 1), not client-side against the buffer.
 
-In the TUI, a Search Lens's file/directory blocks show hit density rather than a
-partition — the visual question is "where are the hits", not "what is this made
-of". Files could show an approximation of the actual hit locations and extents
-rather than a sorted aggregation, with a rule that any contained hits must always
-be represented in the approximation, no matter how small -- this is they key to 
-visual search, which might encompass a single line hit in a multi-thousand line
-file. Directories can aggregate as they do now, and the design should fit into the
-current aggregation scheme for both the TUI and VSCode glyphs. 
+The gutter half landed with S0/S2. What remained — and is what S3 built — is the
+**aggregate**: until now the top bar and the TreeView chips read only file/extent
+facets, so a Search Lens's bar was uniformly "Other" grey and a concern marked onto
+an Overview Lens was visible nowhere but the gutter of a file already open. A mark
+you have to already be looking at is not a search affordance.
+
+**Resolved — aggregate the facets; drop the positional approximation.** The
+original note proposed that a file tile approximate where its hits sit. Cancelled:
+it cannot apply to a TreeView glyph (a 16px chip has no room for a position) nor
+to a rule-based facet on a regular Overview Lens, so it would have been a fourth
+rendering rule for one of three surfaces. Marks aggregate exactly as extents do,
+and *where* is already answered — precisely, at line level — by the gutter strip
+and the overview-ruler mark the same decoration draws. Magnitude beyond the
+guaranteed minimum is proportional, measured in marked lines.
+
+**The one absolute: presence outranks proportion.** A single marked line must show
+its facet's colour in the top bar's file *and* directory aggregates and in the
+TreeView glyphs, and can never be eliminated by rounding. This is not a nicety —
+`aperture.ts` carries **1 marked line in 162 KB** under the probe this was built
+against, which is 0.0005%, and every reduction between the evaluator and the
+renderer is a chance to round it to nothing.
+
+**Marks are an overlay, never part of `composition`.** The `LineTag` contract holds
+unchanged: nothing here enters `attributeFileBytes` or `Composition`, so the byte
+partition and its tests are untouched. A parallel `marks` record ships alongside,
+and each renderer merges the two at its own band-building step.
+
+**The merge is `max` per facet, never additive.** On an Overview Lens the marked
+lines' bytes are *already* counted under whatever facet their extent had, so adding
+would count them twice; `max` says "at least this much of this facet is here",
+which is also exactly right on a Search Lens, where the composition is entirely
+`NONE_FACET` and every mark band is new. The grey remainder absorbs the difference,
+so a block's size never changes with what is marked inside it.
+
+**Where the floor lives, and why not on the wire.** Three reductions could each
+lose a sliver, and each is handled where the information to handle it exists:
+
+| reduction | rule |
+| --- | --- |
+| `RuleHit` → `marks` / `m` | **no floor** — raw `lines`/`bytes` counts. Counts roll up by plain summation, so a folder chip needs neither a `t`-style denominator nor a floor, and the drift `t` exists to absorb never arises |
+| bytes → integer percent (`model.ts`) | `Math.max(1, round(...))`, the floor already there for O2's per-file reduction — a mark is simply the extreme of the case it was written for |
+| share → cells (`allocateCells` / `apportion`) | the existing "every band with weight > 0 keeps a cell" guarantees, unchanged |
+
+`compositionBands` deliberately floors nothing: the floor belongs where the cell
+budget is known, or the two would have to agree about a number neither owns.
+`blockCells` already floors the cell budget at the band count, which is what keeps
+`allocateCells`'s steal loop inside its `cells >= parts.length` guard now that a
+mark can add a band the composition does not carry.
+
+**Two things only running it found.**
+
+- **`RuleHit` had no magnitude, and neither finder could be measured after the
+  fact.** `patternHits` normalises through `clampAll` while `symbolHits` called
+  `clampRanges` inline against content it already held, so a measurement bolted onto
+  either would have missed the other or read the file twice. Both now finish through
+  one `measure(ranges, content)`, which is also the only place the "bytes include the
+  line terminator" convention has to match `fileComposition`'s — and it must, or a
+  mark and an extent covering the same lines would report different numbers onto the
+  same band.
+- **Merging two maps by insertion put NONE *first* on every Search Lens.** The
+  composition contributes only `none`, so each concern arrived behind it and the one
+  facet the user is not looking for took the whole left edge of every block. The
+  VSCode chip never had the bug because it sorts by facet index and `NONE_FACET` is
+  the appended last entry — so the fix is to make the TUI sort the same way, by an
+  explicit facet-order vocabulary, with NONE ranked last *unconditionally* rather
+  than by its position (an empty legend is `[NONE_FACET]`, which would otherwise
+  rank it first again). Caught by eye in the running bar, not by a test.
+
+**Landed:** `lines`/`bytes` on `RuleHit` + the shared `measure` (`rules.ts`);
+`MarkWeight` + `Payload.marks` (`payload.ts`); `computeMarks`, the `hits` argument
+to `computeFacetMapFiles` and the `FacetMapFile` type (`aperture.ts`); `m` on the
+facet-map wire schema (`groups/aperture.ts`); `Graph.marks` / `marksOf` /
+`facetOrder` and the merged, facet-ordered `compositionBands` (`aperture.tsx`);
+`FacetFile.m`, the mark accumulators, `toWeights`, `fileWeights` and
+`TreeModel.marks` (`model.ts`); marks on `chipTooltip` and both its callers. No
+`PAYLOAD_VERSION` bump — `marks` is optional and derived at the read boundary, the
+same posture as `composition` / `extents` / `lineTags`.
+
+**Deliberately untouched: the Explorer pips.** No longer used — the tree chip sits
+beside them and is multi-colour, and a one-colour budget could only honour "never
+rounded away" by lying about the file's dominant facet.
+
+**Verified live** against this repo under the `failure-modes` Search Lens (2 rules,
+202 marked lines across 67 files). In the TUI: the repo-root `packages` block shows
+one cell of each concern against grey; `packages/opencode/src` shows a concern cell
+on 17 of its directory blocks; and in `src/aperture` the file tile for
+**`aperture.ts` — 1 marked line in 162 KB — ends in a single `#D7005F` cell** while
+every unmarked tile stays pure grey. Hover reports exact counts
+(`… · failures 22 lines · error-throws 8 lines`), and after the ordering fix every
+block leads with its concerns and ends with "Other". In VSCode the same file's chip
+carries a `#D7005F` mosaic cell and both concerns reach every ancestor folder up to
+the root. Legend filtering greys marks in place on both surfaces, area preserved.
+
+**Test gap, stated rather than papered over:** `compositionBands` is module-private
+to `aperture.tsx`, which has no test harness, so the band ordering and the `max`
+merge are covered on the TUI side only by the live check and by
+`allocateCells`'s own cases. The equivalent logic in `model.ts`/`chip.ts` *is* unit
+tested. Moving `compositionBands` into `aperture/treemap.ts` (already dependency-free
+and unit-tested) would close it, at the cost of plumbing `TREEMAP_METRIC` through.
 
 **The sparse layer is built and verified, via line-level git-changed.** Chosen as
 S0's second probe because it needs no rule code and is independently useful: the
@@ -1597,9 +1692,10 @@ Aperture files:
   function extents), `semantic-store.ts` (file-level facets),
   `subfacet-store.ts` (function-level facets), `semantics.ts`, `lenses.ts` +
   `lens-store.ts`, `deterministic.ts` (git/mtime/bus-factor built-ins),
-  `rules.ts` (S1 — search-rule evaluation into sparse line ranges; pure per file,
-  memoized by the caller; rules are *written* by S2's `mark`/`unmark` in `lens-store.ts`,
-  never here), `event.ts`, `dump.ts`, `study-log.ts`, `activity.ts` (G1 vocabulary + wire
+  `rules.ts` (S1 — search-rule evaluation into sparse line ranges, each measured in
+  lines and bytes for S3's aggregates; pure per file, memoized by the caller; rules are
+  *written* by S2's `mark`/`unmark` in `lens-store.ts`, never here), `event.ts`,
+  `dump.ts`, `study-log.ts`, `activity.ts` (G1 vocabulary + wire
   shapes, dependency-free) + `activity-model.ts` (the pure turn derivation over
   stored messages).
 - Tools: `tool/lens-{create,list,select,edit,merge-facets,facet-files,mark,unmark}.ts`,
@@ -1693,11 +1789,11 @@ Config: `packages/core/src/v1/config/config.ts` — `aperture.painter.context`
 
 `PAYLOAD_VERSION` is currently **7**; bump it whenever the payload shape or
 extractor semantics change (a stale cache from an older extractor being served
-was a real, hard-to-find bug). **Neither S1 nor S2 bumps it** — `lineTags` is optional
-and derived at the read boundary, the same posture that let `composition` widen
-from directories-only to per-node without a bump. `Facet.ruleOnly` (S2) travels on the
-Lens definition rather than the payload, and `LensInfo.search` was already optional
-from S1, so nothing on the wire changed shape.
+was a real, hard-to-find bug). **None of S1, S2 or S3 bumps it** — `lineTags` and
+S3's `marks` are both optional and derived at the read boundary, the same posture
+that let `composition` widen from directories-only to per-node without a bump.
+`Facet.ruleOnly` (S2) travels on the Lens definition rather than the payload, and
+`LensInfo.search` was already optional from S1, so nothing on the wire changed shape.
 
 Painter gating: **one predicate, `usesPainter(lens)`** in `lenses.ts` —
 `!isDeterministic && !isSearch`. Use it at every "should the model run" site (S2 fixed

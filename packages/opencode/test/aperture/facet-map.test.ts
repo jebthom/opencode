@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { computeComposition, computeFacetMapFiles } from "@/aperture/aperture"
+import { computeComposition, computeFacetMapFiles, computeMarks } from "@/aperture/aperture"
 import { NONE_FACET, type Lens } from "@/aperture/lenses"
 
 // The facet map is what paints the VSCode Explorer's per-file pips (O2). Its contract is
@@ -174,5 +174,104 @@ describe("computeComposition (per-file entries)", () => {
   test("file entries survive a window with no directories — the leaf case they exist for", () => {
     const result = computeComposition([FILE_NODE], [file], STORE, MIXES, LENS)
     expect(Object.keys(result)).toEqual([FILE_NODE.id])
+  })
+})
+
+// S3: the aggregate reading of a Search rule's hits. The contract that matters is that a
+// single marked line in a huge file survives every reduction between the evaluator and the
+// renderer — a Search Lens routinely marks one usage in a thousand-line file, and any step
+// that expresses it as a rounded share loses it.
+describe("computeMarks", () => {
+  const FILE_NODE = { id: "n_a", path: "src/a.ts", kind: "file" as const, size: 100_000, position: { layer: 0, index: 0 } }
+  const DEEP = { id: "n_d", path: "src/deep/b.ts", kind: "file" as const, size: 500, position: { layer: 1, index: 0 } }
+  const SUBDIR = { id: "d_2", path: "src/deep", kind: "directory" as const, size: 0, position: { layer: 0, index: 1 } }
+  const hit = (facet: string, lines: number, bytes: number) => ({ rule: "r1", facet, ranges: [], lines, bytes })
+
+  test("a one-line hit in a huge file reaches the file and every ancestor", () => {
+    const marks = computeMarks(
+      [DIR, FILE_NODE],
+      new Map([["src/a.ts", [hit("hot", 1, 20)]]]),
+      LENS,
+    )
+    expect(marks[FILE_NODE.id]).toEqual([{ facet: "hot", lines: 1, bytes: 20 }])
+    expect(marks[DIR.id]).toEqual([{ facet: "hot", lines: 1, bytes: 20 }])
+  })
+
+  test("a directory sums its whole subtree, at every level", () => {
+    const marks = computeMarks(
+      [DIR, SUBDIR, DEEP],
+      new Map([
+        ["src/a.ts", [hit("hot", 3, 60)]],
+        ["src/deep/b.ts", [hit("hot", 4, 80)]],
+      ]),
+      LENS,
+    )
+    expect(marks[SUBDIR.id]).toEqual([{ facet: "hot", lines: 4, bytes: 80 }])
+    expect(marks[DIR.id]).toEqual([{ facet: "hot", lines: 7, bytes: 140 }])
+  })
+
+  // The reason marks are attributed from the hit paths rather than from the subtree file set:
+  // a rule can glob a file the extractor never walks, which has no node and never will.
+  test("a hit in a file with no node still colours its ancestors", () => {
+    const marks = computeMarks([DIR], new Map([["src/config.yaml", [hit("cold", 2, 40)]]]), LENS)
+    expect(marks[DIR.id]).toEqual([{ facet: "cold", lines: 2, bytes: 40 }])
+  })
+
+  test("weights come out in Lens facet order, matching computeComposition", () => {
+    const marks = computeMarks(
+      [DIR],
+      new Map([["src/a.ts", [hit("cold", 1, 10), hit("likely", 1, 10), hit("hot", 1, 10)]]]),
+      LENS,
+    )
+    expect(marks[DIR.id]!.map((w) => w.facet)).toEqual(["likely", "hot", "cold"])
+  })
+
+  // A zero-line band would be handed a cell by the renderers' "every present facet keeps
+  // one" rule — a colour for something that isn't there.
+  test("a zero-line hit produces no band at all", () => {
+    expect(computeMarks([DIR], new Map([["src/a.ts", [hit("hot", 0, 0)]]]), LENS)).toEqual({})
+  })
+
+  test("marks never enter the composition partition", () => {
+    const hits = new Map([["src/a.ts", [hit("hot", 1, 20)]]])
+    const withHits = computeComposition([DIR, FILE_NODE], [{ ...FILE_NODE }], {}, {}, LENS)
+    expect(computeMarks([DIR, FILE_NODE], hits, LENS)[DIR.id]).toBeDefined()
+    // Same call, no marks argument anywhere: composition cannot see them by construction.
+    expect(withHits[DIR.id]!.weights).toEqual([])
+    expect(withHits[DIR.id]!.totalBytes).toBe(0)
+  })
+})
+
+describe("computeFacetMapFiles (marks)", () => {
+  const hit = (facet: string, lines: number, bytes: number) => ({ rule: "r1", facet, ranges: [], lines, bytes })
+
+  test("marks ride as raw counts beside the percentage mix", () => {
+    const entry = computeFacetMapFiles(
+      [file],
+      { n_a: { facet: "likely", hash: "h" } },
+      {},
+      FACETS,
+      new Map([["src/a.ts", [hit("hot", 2, 30)]]]),
+    )["src/a.ts"]!
+    expect(entry.w).toEqual([{ f: 0, p: 100 }])
+    expect(entry.m).toEqual([{ f: 1, l: 2, b: 30 }])
+  })
+
+  // "Files with nothing painted are omitted" is the older rule; a mark outranks it, or the
+  // tree would drop a concern the editor gutter is painting.
+  test("a marked file with nothing painted still gets an entry", () => {
+    const empty = { id: "n_c", path: "src/empty.ts", size: 0 }
+    const files = computeFacetMapFiles([empty], {}, {}, FACETS, new Map([["src/empty.ts", [hit("hot", 1, 12)]]]))
+    expect(files["src/empty.ts"]).toEqual({ t: 0, w: [], m: [{ f: 1, l: 1, b: 12 }] })
+  })
+
+  test("a marked file the extractor never walked gets an entry of its own", () => {
+    const files = computeFacetMapFiles([file], {}, {}, FACETS, new Map([["src/config.yaml", [hit("cold", 3, 45)]]]))
+    expect(files["src/config.yaml"]).toEqual({ t: 0, w: [], m: [{ f: 2, l: 3, b: 45 }] })
+  })
+
+  test("hits on a facet outside the Lens vocabulary are dropped, not indexed as -1", () => {
+    const files = computeFacetMapFiles([file], {}, {}, FACETS, new Map([["src/a.ts", [hit("gone", 3, 45)]]]))
+    expect(files["src/a.ts"]).toBeUndefined()
   })
 })
