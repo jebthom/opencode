@@ -52,12 +52,55 @@ const INDENT_COLS = 2
 // different actions. That alignment is what makes two steps comparable at a glance, and it
 // is worth the columns it costs the band. Wide enough for "Search" plus a clear gap.
 const VERB_COLS = 8
-const bandMax = (depth: number) =>
-  SIDEBAR_COLS - SPINE_COLS - VERB_COLS - 1 - COUNT_COLS - depth * INDENT_COLS
+// A mutation names its file, so its band must stay wide enough for a name to survive after
+// the change size has taken its columns. A guard rather than a working constraint: even
+// `+999 −999` on an indented lane leaves 13.
+const MIN_NAME_COLS = 10
+// The band fills whatever the tail leaves. A gathering row's tail is the `×n` gutter; a
+// mutation's is its change size, which is content-sized and so varies by row.
+const bandMax = (depth: number, tail: number) =>
+  SIDEBAR_COLS - SPINE_COLS - VERB_COLS - 1 - tail - depth * INDENT_COLS
+
+// The change a step made, split into the pieces that colour differently. Read straight off
+// the step — every number here was persisted by the tool that made the change, so nothing
+// is measured, recomputed, or generated to produce it.
+//
+// `−` is U+2212, not a hyphen: it is the width of `+` so two rows' numerals line up.
+// `Δ` marks a count of *files* rather than lines, which a `run` reports because a shell
+// command persists no diff of its own; reusing `+/−` there would imply a line-level
+// knowledge the snapshot patch behind it does not have.
+type Stats = { added?: string; removed?: string; changed?: string }
+
+// Three digits each, so a huge refactor cannot push the band below a readable name.
+const clampCount = (n: number) => (n >= 1000 ? `${Math.floor(n / 1000)}k` : `${n}`)
+
+function statsOf(step: Step): Stats | undefined {
+  const out: Stats = {}
+  if (step.additions !== undefined) out.added = `+${clampCount(step.additions)}`
+  if (step.deletions !== undefined) out.removed = `−${clampCount(step.deletions)}`
+  if (step.changed !== undefined) out.changed = `Δ${clampCount(step.changed)}`
+  return out.added ?? out.removed ?? out.changed ? out : undefined
+}
+
+// Columns the stats occupy, each piece drawn with its own leading space.
+const statsCols = (stats: Stats) =>
+  [stats.added, stats.removed, stats.changed].reduce((sum, part) => sum + (part ? part.length + 1 : 0), 0)
 
 // One word per action (G4). This replaced a glyph set (●⌕◆■⚙↗) inherited from the top bar's
 // deleted overlay row, where horizontal space was scarce enough to justify a legend the
 // reader had to memorise. With the taller budget the words fit, and they need no legend.
+// The reveal affordance, drawn in the column the verb padding was already spending. The
+// longest verb is "Search" (6), so padding the word to VERB_COLS - 1 and then appending the
+// icon still lands on exactly VERB_COLS: `Search ↗`. The icon costs the band nothing, and
+// the arithmetic bandMax subtracts is unchanged.
+//
+// A single-width glyph, deliberately: an emoji speech bubble is double-width and would
+// shear the left edge of every band on the row below it. Its *absence* is meaningful too —
+// a row with no icon is one the chat cannot show, which is how a sub-agent's steps read as
+// "this happened somewhere you cannot scroll to".
+const GO_CHAT = "↗"
+const VERB_TEXT_COLS = VERB_COLS - 1
+
 const VERBS: Record<Action, string> = {
   read: "Read",
   search: "Search",
@@ -83,7 +126,11 @@ type ActivityResult = {
 // three `<For>`s) is what lets the scrollbox treat the timeline as a simple list.
 type Row =
   | { kind: "turn"; key: string; promptedAt: number; agent: string }
-  | { kind: "lane"; key: string; agent: string; depth: number }
+  // A sub-agent lane. It carries the anchor because its *steps* deliberately do not: the
+  // child session's parts are absent from this transcript, so every step in the lane would
+  // point at the same one `task` call, and a dozen indented rows all revealing the same
+  // block is noise. One lane, one destination, one affordance.
+  | { kind: "lane"; key: string; agent: string; depth: number; messageID?: string; partID?: string }
   | { kind: "step"; key: string; step: Step }
   // One target of an expanded survey step (G4.4), indented a level exactly as a sub-agent
   // lane is. `path` is undefined for nothing; a place carries no facet mix, so it draws its
@@ -167,7 +214,15 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
         // Only sub-agent lanes announce themselves; the depth-0 spine is the turn itself
         // and naming it would cost a row per turn to say nothing.
         if (lane.depth > 0) {
-          out.push({ kind: "lane", key: `t${t}l${l}`, agent: lane.agent, depth: lane.depth })
+          // Every step in a lane shares the `task` anchor, so the first one speaks for all.
+          out.push({
+            kind: "lane",
+            key: `t${t}l${l}`,
+            agent: lane.agent,
+            depth: lane.depth,
+            messageID: lane.steps[0]?.messageID,
+            partID: lane.steps[0]?.partID,
+          })
         }
         lane.steps.forEach((step, s) => {
           const key = `t${t}l${l}s${s}`
@@ -256,14 +311,54 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     void props.api.client.tui.openFile({ path })
   }
 
+  // Scroll the chat to the tool call this row stands for, where the transcript already
+  // renders the full diff. That is the whole reason this section does not draw one itself:
+  // 36 columns cannot hold a patch, and the chat's `<diff>` is right there.
+  //
+  // Dispatched as a command rather than called: the chat's scrollbox ref is local to the
+  // session route, and a sidebar plugin has no path to it. `dispatchCommand` reaches the
+  // same keymap instance the session route registers into, and carries the payload.
+  const revealInChat = (target: { messageID?: string; partID?: string }) => {
+    if (!target.messageID && !target.partID) return
+    void props.api.client.aperture.interaction({
+      sessionID: props.session_id,
+      interaction: "chat.reveal",
+      lens: data()?.lens?.id ?? "",
+      detail: target.partID ?? target.messageID ?? "",
+    })
+    props.api.keymap.dispatchCommand("session.part.reveal", { payload: target })
+  }
+
   // What the pointer is over, as the lines to print beneath the path (G4.5).
   //
   // The text is the tools' own recorded titles wherever they have one — for a `Run` step
   // that is the model-written description of the command, which is the single most useful
   // thing this section can say and which the row itself has no room for. Falls back to the
   // paths when a step predates titles or the tool recorded none.
+  //
+  // A mutation is described rather than enumerated. Its row shows only a basename and a
+  // magnitude, so the two things the hover can add are the *directory* the change landed in
+  // and the size in words — and for a shell command, the step-level file count, phrased as
+  // the fact it actually is. `edit` already records its title as the relative path, so the
+  // title is appended only when it says something the path does not.
   const [hovered, setHovered] = createSignal<string>()
   const describe = (step: Step): string => {
+    if (step.mode !== "survey") {
+      const parts: string[] = []
+      const path = step.files[0]?.path
+      const title = step.titles[0]
+      if (path !== undefined) parts.push(path)
+      if (title !== undefined && title !== path) parts.push(title)
+      const size = statsOf(step)
+      if (size?.added ?? size?.removed) parts.push([size?.added, size?.removed].filter(Boolean).join(" "))
+      if (step.changed !== undefined) {
+        // Deliberately "in this step", not "by this command": the count comes from the
+        // snapshot patch closing the whole LLM step, so anything else that touched the
+        // worktree in that window is inside it too. The weaker sentence is the true one.
+        parts.push(`${step.changed} file${step.changed === 1 ? "" : "s"} changed in this step`)
+      }
+      if (parts.length > 0) return parts.join(" · ")
+    }
     if (step.titles.length > 0) return step.titles.join(" · ")
     const names = [...step.files.map((f) => f.path), ...step.places.map((p) => p.path || "(repo root)")]
     return names.length > 0 ? names.join(" · ") : step.agent
@@ -275,7 +370,9 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     const steps = rows().filter((r) => r.kind === "step").length
     const turns = rows().filter((r) => r.kind === "turn").length
     if (steps === 0) return ""
-    return `${steps} step${steps === 1 ? "" : "s"} over ${turns} turn${turns === 1 ? "" : "s"} · click a row to expand or open`
+    // The idle line is the only place the two hit zones can be taught, since nothing here
+    // takes keyboard focus and there is no tooltip to hang a hint on.
+    return `${steps} step${steps === 1 ? "" : "s"} over ${turns} turn${turns === 1 ? "" : "s"} · click a name to open it, a verb to find it in the chat`
   }
 
   const empty = () => rows().length === 0
@@ -314,7 +411,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
           >
             <For each={rows()}>
               {(row) => (
-                <Switch fallback={<LabelRow row={row} theme={theme} />}>
+                <Switch fallback={<LabelRow row={row} theme={theme} onReveal={revealInChat} />}>
                   <Match when={row.kind === "step" ? row : undefined}>
                     {(it) => (
                       <StepRow
@@ -324,6 +421,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                         colorsFor={bandColors}
                         onToggle={() => toggle(it().key)}
                         onOpen={openFile}
+                        onReveal={revealInChat}
                         onHover={() => setHovered(describe(it().step))}
                         onLeave={() => setHovered(undefined)}
                       />
@@ -367,29 +465,60 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
 
 // A turn separator or a sub-agent lane header — the two rows that carry words rather than
 // colour. Muted, so the coloured steps stay the thing the eye lands on.
-function LabelRow(props: { row: Row; theme: () => TuiThemeCurrent }) {
+//
+// A lane header is also the one place a sub-agent's work can be revealed: its steps happened
+// in a session this transcript does not render, and the `task` call that spawned them is the
+// nearest thing on screen. So the header, not the steps, carries the icon.
+function LabelRow(props: { row: Row; theme: () => TuiThemeCurrent; onReveal: (target: LaneAnchor) => void }) {
   const text = () => {
     const row = props.row
     if (row.kind === "turn") return `── ${relTime(row.promptedAt)} · ${row.agent} ${"─".repeat(SIDEBAR_COLS)}`
     if (row.kind === "lane") return `${" ".repeat(SPINE_COLS)}└ ${row.agent}`
     return ""
   }
+  const anchor = (): LaneAnchor | undefined => {
+    const row = props.row
+    if (row.kind !== "lane" || (!row.messageID && !row.partID)) return undefined
+    return { messageID: row.messageID, partID: row.partID }
+  }
   return (
-    <box height={1} flexShrink={0}>
-      <text fg={props.theme().textMuted} wrapMode="none">
-        {truncate(text(), SIDEBAR_COLS)}
+    <box flexDirection="row" height={1} flexShrink={0}>
+      {/* Only a row that draws the icon gives up the columns for it — a turn separator has
+          no anchor, so its rule still runs the full width. */}
+      <text fg={props.theme().textMuted} wrapMode="none" flexShrink={0}>
+        {truncate(text(), anchor() ? SIDEBAR_COLS - 2 : SIDEBAR_COLS)}
       </text>
+      <Show when={anchor()}>
+        {(target) => (
+          <text
+            fg={props.theme().textMuted}
+            wrapMode="none"
+            flexShrink={0}
+            onMouseDown={() => props.onReveal(target())}
+          >
+            {" " + GO_CHAT}
+          </text>
+        )}
+      </Show>
     </box>
   )
 }
 
+type LaneAnchor = { messageID?: string; partID?: string }
+
 // One step, one row: the spine, the action verb, then either a facet band (gathering) or a
 // named band (a changed file) or a plain label (a command, a fetch).
 //
-// Mouse-down means two different things, and the split is decided by what the row *stands
-// for* rather than by its mode: a row standing for many targets expands (G4.4), a row
-// standing for exactly one file opens it (G4.3). So there is never an ambiguity about what
-// a click will do — a row either has a `▸` or it names a file, never both.
+// The row has two hit areas, and which is which is decided by what the reader is pointing
+// at rather than by a modifier:
+//
+//   - the **verb and its icon** reveal the act in the chat, where the full diff is drawn;
+//   - the **band or label** keeps what it has always meant — a row standing for many targets
+//     expands (G4.4), a row standing for exactly one file opens it (G4.3).
+//
+// So the new gesture costs nothing: it spends the eight columns of the verb, which were
+// previously inert, and neither existing affordance loses any of its target. The band is the
+// bulk of the row, so expanding a gathering step is still an easy click.
 function StepRow(props: {
   step: Step
   expanded: boolean
@@ -397,11 +526,19 @@ function StepRow(props: {
   colorsFor: (paths: ReadonlyArray<string>, width: number) => TuiThemeCurrent["text"][]
   onToggle: () => void
   onOpen: (path: string) => void
+  onReveal: (target: LaneAnchor) => void
   onHover: () => void
   onLeave: () => void
 }) {
   const depth = () => props.step.depth
-  const verb = () => VERBS[dominantAction(props.step)].padEnd(VERB_COLS)
+  const verb = () => VERBS[dominantAction(props.step)].padEnd(VERB_TEXT_COLS)
+  // A sub-agent's steps happened in a session this chat does not render, so they get no
+  // icon and no gesture — their lane header carries both. Absence is the signal.
+  const anchor = (): LaneAnchor | undefined => {
+    if (props.step.depth > 0) return undefined
+    if (!props.step.messageID && !props.step.partID) return undefined
+    return { messageID: props.step.messageID, partID: props.step.partID }
+  }
   const count = () => stepWeight(props.step)
   const targets = () => props.step.files.length + props.step.places.length
 
@@ -414,19 +551,42 @@ function StepRow(props: {
   // whole point of showing a mutation. A survey step names nothing and scales instead.
   const named = () => (props.step.mode === "survey" ? undefined : props.step.files[0]?.path)
 
-  // Every band is the same length, so they all begin and end in the same columns.
+  // The change this step made, if it made one. Present exactly on mutations, which is why
+  // the renderer tests for it rather than for the mode.
+  const stats = createMemo(() => statsOf(props.step))
+
+  // What the row spends to the right of the band: the `×n` gutter for a gathering step, the
+  // change size for a mutation. A mutate step always weighs exactly 1 (only survey entries
+  // ever join an open draft), so its `×n` is always blank — the stats are reusing reserved
+  // columns rather than taking any from the band.
+  const tail = () => {
+    const s = stats()
+    return s === undefined ? COUNT_COLS : statsCols(s)
+  }
+
+  // Every *gathering* band is the same length, so they all begin and end in the same
+  // columns.
   //
   // This replaced an area-scaled width (sqrt of the file count against the largest step on
   // screen). Scaling made the bar carry magnitude, but at the cost of the one reading the
   // band is actually for: with ragged widths two steps' *proportions* cannot be compared by
   // eye, which is the whole point of painting a mix. Magnitude is carried by the trailing
   // `×n`, which states it exactly rather than implying it.
+  //
+  // A mutation's band ends a few columns short of that shared edge, because its tail is
+  // content-sized. That is the right trade rather than an erosion of the rule: the rule
+  // exists so two mixes can be compared by eye, and a mutate band has no mix — it is one
+  // solid colour carrying a name. Holding the edge would mean shrinking *every* gathering
+  // band to the worst case, costing real mix resolution (20 cells resolve a 5% facet; 15
+  // resolve only 6.7%) to protect a reading mutations do not participate in. The band is
+  // still capped at the gathering width, so a short tail widens nothing — the left edges
+  // stay aligned, which is the half of the alignment the eye actually follows.
   const width = () => {
     // No file means no mix to paint — a shell command or a fetch would otherwise draw a
     // full-width bar of untagged grey, which reads as an unpainted *file* rather than as an
     // act that touched none. The row spends those columns on its description instead.
     if (props.step.files.length === 0) return 0
-    return bandMax(depth())
+    return Math.max(MIN_NAME_COLS, Math.min(bandMax(depth(), tail()), bandMax(depth(), COUNT_COLS)))
   }
 
   const cells = createMemo(() => {
@@ -449,6 +609,7 @@ function StepRow(props: {
   const beatLabel = () =>
     props.step.titles[0] ?? (props.step.places.length > 0 ? "looked around" : props.step.agent)
 
+  // What the band or label does when clicked — unchanged from G4.3/G4.4.
   const click = () => {
     if (expandable()) return props.onToggle()
     const path = only()
@@ -460,28 +621,80 @@ function StepRow(props: {
       flexDirection="row"
       height={1}
       flexShrink={0}
-      onMouseDown={click}
       onMouseOver={() => props.onHover()}
       onMouseOut={() => props.onLeave()}
     >
-      {/* flexShrink=0: without it a long path in the sibling label shrinks this element and
-          clips the verb, which "Search" (the longest) hits first. */}
-      <text fg={props.theme().textMuted} wrapMode="none" flexShrink={0}>
-        {`${" ".repeat(depth() * INDENT_COLS)}${expandable() ? (props.expanded ? "▾ " : "▸ ") : " ".repeat(SPINE_COLS)}${verb()} `}
+      {/* The reveal zone. flexShrink=0: without it a long path in the sibling label shrinks
+          this element and clips the verb, which "Search" (the longest) hits first. */}
+      <text
+        fg={props.theme().textMuted}
+        wrapMode="none"
+        flexShrink={0}
+        onMouseDown={() => {
+          const target = anchor()
+          if (target) props.onReveal(target)
+        }}
+      >
+        {`${" ".repeat(depth() * INDENT_COLS)}${expandable() ? (props.expanded ? "▾ " : "▸ ") : " ".repeat(SPINE_COLS)}${verb()}${anchor() ? GO_CHAT : " "} `}
       </text>
       <Show
         when={cells().length > 0}
         fallback={
-          <text fg={props.theme().textMuted} wrapMode="none">
+          <text fg={props.theme().textMuted} wrapMode="none" onMouseDown={click}>
             {beatLabel()}
           </text>
         }
       >
-        <Band cells={cells()} theme={props.theme} />
+        <box flexDirection="row" height={1} flexShrink={0} onMouseDown={click}>
+          <Band cells={cells()} theme={props.theme} />
+        </box>
       </Show>
-      <text fg={props.theme().textMuted} wrapMode="none">
-        {count() > 1 ? ` ×${count()}` : ""}
-      </text>
+      {/* The change size sits OUTSIDE the band rather than inside it: band text is forced to
+          the background colour for contrast over the fill, which would throw away the
+          green/red — and the colour is most of why `+12 −3` parses without being read. */}
+      <Show
+        when={stats()}
+        fallback={
+          <text fg={props.theme().textMuted} wrapMode="none">
+            {count() > 1 ? ` ×${count()}` : ""}
+          </text>
+        }
+      >
+        {(s) => <StatsTail stats={s()} theme={props.theme} />}
+      </Show>
+    </box>
+  )
+}
+
+// The trailing change size. Three elements rather than one string, because each piece
+// carries its own colour — the same green and red the chat uses for this exact string, so a
+// magnitude means the same thing in the sidebar as it does in the transcript.
+function StatsTail(props: { stats: Stats; theme: () => TuiThemeCurrent }) {
+  return (
+    <box flexDirection="row" height={1} flexShrink={0}>
+      <Show when={props.stats.added}>
+        {(v) => (
+          <text fg={props.theme().diffAdded} wrapMode="none" flexShrink={0}>
+            {" " + v()}
+          </text>
+        )}
+      </Show>
+      <Show when={props.stats.removed}>
+        {(v) => (
+          <text fg={props.theme().diffRemoved} wrapMode="none" flexShrink={0}>
+            {" " + v()}
+          </text>
+        )}
+      </Show>
+      {/* Muted, not green: a file count is a weaker claim than a line count, and it should
+          not read as the same kind of fact. */}
+      <Show when={props.stats.changed}>
+        {(v) => (
+          <text fg={props.theme().textMuted} wrapMode="none" flexShrink={0}>
+            {" " + v()}
+          </text>
+        )}
+      </Show>
     </box>
   )
 }
@@ -504,7 +717,9 @@ function EntryRow(props: {
   onHover: () => void
   onLeave: () => void
 }) {
-  const width = () => bandMax(props.depth)
+  // An expanded child is a *read*, so it always draws against the gathering gutter — the
+  // aggregate it opened from does too, which is what keeps the two edges lined up.
+  const width = () => bandMax(props.depth, COUNT_COLS)
   const label = () => (props.place ? (props.path === "" ? "(repo root)" : props.path) : basename(props.path))
 
   const cells = createMemo(() => {

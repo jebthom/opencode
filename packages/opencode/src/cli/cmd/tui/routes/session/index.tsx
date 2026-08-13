@@ -420,6 +420,71 @@ export function Session() {
     dialog.clear()
   }
 
+  // Bring one tool call into view — the "reveal in chat" the Aperture Activity Path
+  // dispatches when a step's verb is clicked. The sidebar knows which part an act came from
+  // but cannot reach this scrollbox (its ref is local to this component), so the payload
+  // arrives through a keymap command and the scrolling stays here where `scroll` is in scope.
+  //
+  // A tool part renders under one of three ids depending on how it is being drawn, and the
+  // caller has no way to know which — so all three are tried. `content.findDescendantById`
+  // rather than `getChildren()`: tool parts are nested inside their message's box, and
+  // getChildren only returns direct children of the scroll content.
+  const TOOL_PART_PREFIXES = ["tool-block-", "tool-inline-subagent-", "tool-inline-"]
+
+  // The user message a given message belongs under, so a reveal has somewhere to land when
+  // the part itself is not in the tree. That is not an edge case: with tool details hidden
+  // every completed tool part is removed from the render tree entirely, so this fallback is
+  // what carries the feature for anyone running that way.
+  //
+  // Only a message that actually *drew* is a candidate. A synthetic user message (a
+  // tool-result injection, a background sub-agent completion, compaction) renders nothing
+  // and so has no id in the tree — walking back to the nearest `role === "user"` without
+  // this test would usually land on one of those and silently find no target. It is the same
+  // predicate `session.messages_last_user` uses, and the same rule the activity derivation
+  // uses to decide what opens a turn.
+  const enclosingPrompt = (messageID: string): string | undefined => {
+    const list = messages()
+    const index = list.findIndex((m) => m.id === messageID)
+    if (index < 0) return undefined
+    for (let i = index; i >= 0; i--) {
+      const message = list[i]!
+      if (message.role !== "user") continue
+      const parts = sync.data.part[message.id]
+      if (!Array.isArray(parts)) continue
+      if (parts.some((part) => part && part.type === "text" && !part.synthetic && !part.ignored)) return message.id
+    }
+    return undefined
+  }
+
+  const revealTarget = (target: { messageID?: string; partID?: string }): boolean => {
+    if (!scroll || scroll.isDestroyed) return false
+    if (target.partID) {
+      for (const prefix of TOOL_PART_PREFIXES) {
+        const child = scroll.content.findDescendantById(prefix + target.partID)
+        // One row below the top, the same landing the timeline dialog uses.
+        if (child) {
+          scroll.scrollBy(child.y - scroll.viewport.y - 1)
+          return true
+        }
+      }
+    }
+    const anchor = target.messageID ? enclosingPrompt(target.messageID) : undefined
+    if (!anchor) return false
+    const child = scroll.getChildren().find((c) => c.id === anchor)
+    if (!child) return false
+    scroll.scrollBy(child.y - scroll.y - 1)
+    return true
+  }
+
+  // Try once, then once more after layout has settled — the same 50ms `toBottom` uses, and
+  // for the same reason: a part streamed in this tick has not been laid out yet. A reveal
+  // that finds nothing does nothing, silently; failing to scroll must never break a click.
+  const revealPart = (target: { messageID?: string; partID?: string } | undefined) => {
+    if (!target || (!target.partID && !target.messageID)) return
+    if (revealTarget(target)) return
+    setTimeout(() => revealTarget(target), 50)
+  }
+
   function toBottom() {
     setTimeout(() => {
       if (!scroll || scroll.isDestroyed) return
@@ -755,6 +820,23 @@ export function Session() {
       run: () => {
         setShowGenericToolOutput((prev) => !prev)
         dialog.clear()
+      },
+    },
+    {
+      // Dispatched with a payload rather than bound to a key: the Aperture Activity Path
+      // calls it from the sidebar, which has the part id but not this scrollbox.
+      title: "Reveal in chat",
+      value: "session.part.reveal",
+      category: "Session",
+      hidden: true,
+      run: (ctx: { payload?: unknown }) => {
+        const payload = ctx?.payload
+        if (typeof payload !== "object" || payload === null) return
+        const { messageID, partID } = payload as { messageID?: unknown; partID?: unknown }
+        revealPart({
+          messageID: typeof messageID === "string" ? messageID : undefined,
+          partID: typeof partID === "string" ? partID : undefined,
+        })
       },
     },
     {

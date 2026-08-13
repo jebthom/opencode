@@ -32,6 +32,11 @@ export interface MessageLike {
 
 export interface PartLike {
   readonly type: string
+  // Every stored part carries both (SessionV1's partBase). They are what lets a rendered
+  // row point back at the place in the chat where this act is visible — the chat keys its
+  // tool renderables by part id.
+  readonly id?: string
+  readonly messageID?: string
   // Tool parts only.
   readonly callID?: string
   readonly tool?: string
@@ -47,6 +52,10 @@ export interface PartLike {
   readonly metadata?: Record<string, unknown>
   // Text parts only: set on prompts the *system* injected rather than the user.
   readonly synthetic?: boolean
+  // Patch parts only: the absolute paths that changed across one LLM step, recorded when
+  // the step's snapshot window closes (session/processor.ts). Names only — no patch text,
+  // which is why what is derived from it counts files rather than lines.
+  readonly files?: ReadonlyArray<string>
 }
 
 // A sub-agent session spawned from inside a turn, discovered from the `task` tool
@@ -57,6 +66,10 @@ export interface TurnChild {
   readonly sessionID: string
   readonly agent: string
   readonly callID: string
+  // The `task` call itself, which is the only part of this sub-agent's work that exists in
+  // the parent's transcript — and therefore the only place its entries can point at.
+  readonly messageID?: string
+  readonly partID?: string
 }
 
 export interface DerivedTurn {
@@ -111,14 +124,58 @@ export function deriveTurns(messages: ReadonlyArray<MessageLike>, options: Deriv
     if (message.info.role !== "assistant") continue
 
     const turn = current(created, agent)
+
+    // A shell command persists no diff of its own, so the only evidence it changed anything
+    // is the snapshot patch that closes its LLM step. One window per step: `step-start`
+    // opens it, the `patch` part closes it (processor.ts takes one snapshot per step and
+    // always clears it), and everything between is what the window covers.
+    //
+    // Two rules keep the number honest. The residual subtracts every path an entry in the
+    // window already named, so a step that edited a.ts and ran a command is not credited
+    // with a.ts twice. And a window holding more than one command credits *nobody*, because
+    // there is no way to say which of them did it. What survives is still a fact about the
+    // step rather than about the command — anything else that touched the worktree in that
+    // window (the user saving a file, say) is inside it too — which is exactly how the
+    // renderer phrases it.
+    let claimed = new Set<string>()
+    let runs: number[] = []
+    const closeWindow = (part: PartLike) => {
+      if (runs.length === 1) {
+        const residual = (part.files ?? [])
+          .map((file) => toRepoRelative(options.directory, file))
+          .filter((file): file is string => file !== undefined && !claimed.has(file))
+        const index = runs[0]!
+        const entry = turn.entries[index]
+        if (entry && residual.length > 0) turn.entries[index] = { ...entry, changed: residual.length }
+      }
+      claimed = new Set()
+      runs = []
+    }
+
     for (const part of message.parts) {
+      if (part.type === "step-start") {
+        claimed = new Set()
+        runs = []
+        continue
+      }
+      if (part.type === "patch") {
+        closeWindow(part)
+        continue
+      }
       if (part.type !== "tool" || !part.tool) continue
       // A call whose input hasn't finished streaming has no usable file path yet.
       if (part.state?.status === "pending") continue
 
       if (part.tool === "task") {
         const child = childSessionOf(part)
-        if (child) turn.children.push({ sessionID: child, agent: agentOfTask(part) ?? agent, callID: part.callID ?? "" })
+        if (child)
+          turn.children.push({
+            sessionID: child,
+            agent: agentOfTask(part) ?? agent,
+            callID: part.callID ?? "",
+            messageID: part.messageID,
+            partID: part.id,
+          })
         continue
       }
 
@@ -130,7 +187,10 @@ export function deriveTurns(messages: ReadonlyArray<MessageLike>, options: Deriv
         depth,
         callID: part.callID ?? "",
         timestamp: part.state?.time?.start ?? created,
+        messageID: part.messageID,
+        partID: part.id,
         ...titleOf(part),
+        ...statsOf(part),
       }
 
       // One apply_patch call changes many files at once, and each of those is a mutation
@@ -139,15 +199,21 @@ export function deriveTurns(messages: ReadonlyArray<MessageLike>, options: Deriv
       // metadata (tool/apply_patch.ts), since its *input* is patch text with no path
       // field at all; without this, patch-based edits would be a blind spot.
       if (part.tool === "apply_patch") {
-        for (const file of patchedFiles(part)) {
-          turn.entries.push({ ...base, action: file.action, target: "file", path: file.path })
+        for (const { path: file, action: act, ...stats } of patchedFiles(part)) {
+          turn.entries.push({ ...base, action: act, target: "file", path: file, ...stats })
+          claimed.add(file)
         }
         continue
       }
 
       const aim = targetOf(action, part, options.directory)
       if (!aim) continue
+      const index = turn.entries.length
       turn.entries.push({ ...base, action, ...aim })
+      // Claims are what the residual subtracts, so only a *file* counts: a search scope is
+      // not something the agent changed.
+      if (aim.target === "file" && aim.path !== undefined) claimed.add(aim.path)
+      if (action === "run") runs.push(index)
     }
   }
 
@@ -158,8 +224,19 @@ export function deriveTurns(messages: ReadonlyArray<MessageLike>, options: Deriv
 // Merge a sub-agent's entries into the turn that spawned it, keeping the turn's
 // entries in timeline order so a renderer can read a turn left-to-right regardless
 // of which session each action happened in.
-export function mergeChildEntries(turn: DerivedTurn, entries: ReadonlyArray<ActivityEntry>): void {
-  turn.entries.push(...entries)
+//
+// `anchor` re-points every merged entry at the `task` call that spawned it. The child
+// session's own parts do not appear in the parent's transcript, so an entry's own
+// message and part are unreachable there — the call that launched it is the only place the
+// user can be sent. Overwriting (rather than filling in a blank) is what makes nesting
+// correct: a depth-2 entry arrives already anchored to its depth-1 task, and the outer
+// merge replaces that with the depth-0 task, which is the one actually on screen.
+export function mergeChildEntries(
+  turn: DerivedTurn,
+  entries: ReadonlyArray<ActivityEntry>,
+  anchor?: { readonly messageID?: string; readonly partID?: string },
+): void {
+  turn.entries.push(...(anchor ? entries.map((entry) => ({ ...entry, ...anchor })) : entries))
   turn.entries.sort((a, b) => a.timestamp - b.timestamp)
 }
 
@@ -209,6 +286,52 @@ function titleOf(part: PartLike): { title?: string } {
   return { title: trimmed.slice(0, ApertureActivity.TITLE_MAX) }
 }
 
+// How big a change this act made, read from what the tool already persisted rather than
+// measured from the files themselves. Nothing here opens a file or runs a diff: `edit`
+// stores a `filediff` alongside its patch (tool/edit.ts) and `write` stores the content it
+// wrote, so both numbers are already sitting in the message store.
+//
+// `apply_patch` is absent by design — one call changes many files with a different count
+// each, so its stats belong to the fanned-out entries and are attached in `patchedFiles`.
+// Reading `metadata.diff` here instead would give every one of those entries the *combined*
+// total, which is worse than saying nothing.
+//
+// A `write` reports additions only. See ActivityEntry: the old content is not persisted
+// anywhere, so an overwrite's removed lines cannot be known, and inventing them is the one
+// thing this module must not do.
+function statsOf(part: PartLike): { additions?: number; deletions?: number } {
+  if (part.tool === "edit") {
+    const filediff = part.state?.metadata?.["filediff"]
+    if (typeof filediff !== "object" || filediff === null) return {}
+    const record = filediff as Record<string, unknown>
+    return counts(record["additions"], record["deletions"])
+  }
+  if (part.tool === "write") {
+    const content = part.state?.input?.["content"]
+    if (typeof content !== "string") return {}
+    return { additions: countLines(content) }
+  }
+  return {}
+}
+
+// Both counts, keeping only the ones the tool actually reported. Non-numbers and negatives
+// are dropped rather than coerced: a missing count renders as nothing, where a zero would
+// render as a confident "+0".
+function counts(additions: unknown, deletions: unknown): { additions?: number; deletions?: number } {
+  const out: { additions?: number; deletions?: number } = {}
+  if (typeof additions === "number" && Number.isFinite(additions) && additions >= 0) out.additions = additions
+  if (typeof deletions === "number" && Number.isFinite(deletions) && deletions >= 0) out.deletions = deletions
+  return out
+}
+
+// Lines in a written file. A trailing newline terminates the last line rather than starting
+// an empty one, so "a\nb\n" is two lines and not three — the count a user would give if
+// asked, and the one `wc -l` gives.
+function countLines(content: string): number {
+  if (content === "") return 0
+  return content.split("\n").length - (content.endsWith("\n") ? 1 : 0)
+}
+
 // The `display.type` a tool reported on its result ("file" | "directory" for `read`).
 // Absent on pending/running calls, which is why callers must have a fallback.
 function displayType(part: PartLike): string | undefined {
@@ -226,16 +349,27 @@ function displayType(part: PartLike): string | undefined {
 // A `delete` keeps its entry rather than being skipped here: the service drops
 // since-deleted paths through the same filter that handles every other vanished file, and
 // duplicating that judgement in the derivation would be a second opinion to keep in sync.
-function patchedFiles(part: PartLike): { path: string; action: ApertureActivity.Action }[] {
+//
+// Each file carries its *own* line counts, which is the whole reason to read this array
+// rather than the combined `metadata.diff` sitting beside it: a patch touching three files
+// should report three magnitudes, not one total repeated three times.
+function patchedFiles(
+  part: PartLike,
+): { path: string; action: ApertureActivity.Action; additions?: number; deletions?: number }[] {
   const files = part.state?.metadata?.["files"]
   if (!Array.isArray(files)) return []
-  const out: { path: string; action: ApertureActivity.Action }[] = []
+  const out: { path: string; action: ApertureActivity.Action; additions?: number; deletions?: number }[] = []
   for (const file of files) {
     if (typeof file !== "object" || file === null) continue
-    const rel = (file as Record<string, unknown>)["relativePath"]
+    const record = file as Record<string, unknown>
+    const rel = record["relativePath"]
     if (typeof rel !== "string" || rel === "") continue
     // "add" creates a whole file; "update"/"move"/"delete" change one that existed.
-    out.push({ path: rel, action: (file as Record<string, unknown>)["type"] === "add" ? "create" : "edit" })
+    out.push({
+      path: rel,
+      action: record["type"] === "add" ? "create" : "edit",
+      ...counts(record["additions"], record["deletions"]),
+    })
   }
   return out
 }

@@ -2622,7 +2622,14 @@ export const layer = Layer.effect(
         for (const turn of turns) {
           for (const child of turn.children.slice(0, ACTIVITY_MAX_CHILDREN)) {
             const childTurns = yield* readTurns(directory, child.sessionID, ACTIVITY_CHILD_TURNS, depth + 1)
-            for (const childTurn of childTurns) ApertureActivityModel.mergeChildEntries(turn, childTurn.entries)
+            // Anchored to the `task` call, not to the child's own parts: those live in a
+            // session this transcript does not render, so the call that spawned them is the
+            // only place a click can land.
+            for (const childTurn of childTurns)
+              ApertureActivityModel.mergeChildEntries(turn, childTurn.entries, {
+                messageID: child.messageID,
+                partID: child.partID,
+              })
           }
         }
         return turns

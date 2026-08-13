@@ -75,6 +75,19 @@ export interface Step {
   // an aggregated survey step has one per distinct call, which is what its hover line
   // enumerates. Capped because a survey run is unbounded and the hover shows two lines.
   readonly titles: ReadonlyArray<string>
+  // The size of the change this step made, summed from its entries. Absent on a survey
+  // step, which changes nothing — so the renderer can treat "has a magnitude" and "is a
+  // mutation" as the same test rather than checking the mode separately.
+  readonly additions?: number
+  readonly deletions?: number
+  readonly changed?: number
+  // Where to find this step in the chat, taken from its FIRST entry. First rather than last
+  // because `startedAt` is the first entry's too, so a row's identity and its destination
+  // agree — and a gathering run reads better from its opening than from its close. A step
+  // whose entries carried no anchor has none, which is the renderer's signal that there is
+  // nothing to reveal.
+  readonly messageID?: string
+  readonly partID?: string
 }
 
 // Enough to fill two 36-column hover lines several times over; beyond that the row's `×n`
@@ -101,6 +114,11 @@ interface Draft {
   readonly places: Map<string, StepPlace>
   readonly beats: Map<Action, StepBeat>
   readonly titles: Set<string>
+  additions?: number
+  deletions?: number
+  changed?: number
+  readonly messageID?: string
+  readonly partID?: string
 }
 
 export function stepsForTurn(turn: Turn): TurnSteps {
@@ -160,6 +178,9 @@ function openDraft(lane: Draft[], entry: ActivityEntry, mode: Mode): Draft {
     places: new Map(),
     beats: new Map(),
     titles: new Set(),
+    // Set here and never in `absorb`, so a run keeps the anchor of the entry that opened it.
+    messageID: entry.messageID,
+    partID: entry.partID,
   }
   lane.push(draft)
   return draft
@@ -169,6 +190,14 @@ function absorb(step: Draft, entry: ActivityEntry): void {
   step.endedAt = Math.max(step.endedAt, entry.timestamp)
   // A Set, so a run that read the same file twice doesn't say so twice.
   if (entry.title !== undefined && step.titles.size < TITLES_MAX) step.titles.add(entry.title)
+
+  // Summed rather than assigned. Today a mutate step is a single entry by construction, so
+  // every one of these is a one-term sum — but summing costs nothing and means the step
+  // rule could change without silently reporting only the last entry's magnitude. A survey
+  // entry carries no counts, so a survey step is left with all three undefined.
+  if (entry.additions !== undefined) step.additions = (step.additions ?? 0) + entry.additions
+  if (entry.deletions !== undefined) step.deletions = (step.deletions ?? 0) + entry.deletions
+  if (entry.changed !== undefined) step.changed = (step.changed ?? 0) + entry.changed
 
   if (entry.path !== undefined && entry.target === "file") {
     const prev = step.files.get(entry.path)
@@ -198,6 +227,13 @@ function freeze(draft: Draft): Step {
     places: [...draft.places.values()],
     beats: [...draft.beats.values()],
     titles: [...draft.titles],
+    // Spread conditionally, so a survey Step has no such keys at all rather than three
+    // explicit undefineds — `"additions" in step` stays a usable test.
+    ...(draft.additions !== undefined ? { additions: draft.additions } : {}),
+    ...(draft.deletions !== undefined ? { deletions: draft.deletions } : {}),
+    ...(draft.changed !== undefined ? { changed: draft.changed } : {}),
+    ...(draft.messageID !== undefined ? { messageID: draft.messageID } : {}),
+    ...(draft.partID !== undefined ? { partID: draft.partID } : {}),
   }
 }
 

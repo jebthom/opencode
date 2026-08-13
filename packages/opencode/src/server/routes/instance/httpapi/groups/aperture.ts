@@ -144,6 +144,18 @@ const ActivityEntrySchema = Schema.Struct({
   // The tool's own one-line description, already persisted on its completed part — for
   // `bash` the model-written summary the chat renders. Nothing is generated to produce it.
   title: Schema.optional(Schema.String),
+  // How big the change was, read from the diff the tool already persisted rather than
+  // recomputed. `deletions` is absent on a whole-file write (the old content is not stored,
+  // so removed lines are unknowable and are not guessed); `changed` counts *files* and only
+  // appears on a shell command, which persists no diff of its own.
+  additions: Schema.optional(Schema.Int),
+  deletions: Schema.optional(Schema.Int),
+  changed: Schema.optional(Schema.Int),
+  // Where this act is visible in the *viewed* session's chat, which the client uses to
+  // reveal it. Sub-agent entries carry the parent's `task` call rather than their own part:
+  // the child session's parts are not in this transcript at all.
+  messageID: Schema.optional(Schema.String),
+  partID: Schema.optional(Schema.String),
 })
 
 // One user turn. A turn is a non-synthetic user message: the synthetic ones (tool-result

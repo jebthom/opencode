@@ -19,6 +19,13 @@ A row marked `▸` stands for several targets and **expands** when clicked; a ro
 file **opens** it in the editor. Hovering any row fills the two lines under the path with
 detail — for a `Run` step, the description of the command it actually ran.
 
+**G5 adds two things to check on every block below.** A mutation states its size inline
+(`Edit  activity-model.ts  +12 −3`, green and red), and the verb column carries a `↗`.
+Clicking the **verb or its icon** scrolls the chat to that exact tool call, where the full
+diff is already drawn; clicking the **file name** still opens the file. So each block has a
+second question: does the size match what the tool actually did, and does the icon land on
+the right place in the transcript?
+
 ---
 
 ### 0. Framing
@@ -46,9 +53,9 @@ Do exactly this, in order, nothing else:
 
 ```
 Do exactly this, in order, nothing else. Create each file with the write tool:
-1. Write packages/opencode/src/aperture/__smoke__/alpha.ts containing exactly: export const alpha = 1
-2. Write packages/opencode/src/aperture/__smoke__/beta.ts containing exactly: export const beta = 1
-3. Write packages/opencode/src/aperture/__smoke__/gamma.ts containing exactly: export const gamma = 1
+1. Write packages/opencode/src/aperture/__smoke__/alpha.ts containing a comment stating that this file is an Interface file, and the code exactly: export const alpha = 1
+2. Write packages/opencode/src/aperture/__smoke__/beta.ts containing a comment stating that this file is an Application file, and the code exactly: export const beta = 1
+3. Write packages/opencode/src/aperture/__smoke__/gamma.ts containing a comment stating that this file is a Domain file, and the code exactly: export const gamma = 1
 ```
 
 ### 3
@@ -155,6 +162,32 @@ containing exactly: export const long = 1
 
 Then, without prompting again, open the command palette (`ctrl+p`), choose **Switch Lens**,
 and pick a different Lens.
+
+### 13b. The G5 checks
+
+Nothing to prompt — these are read off the rows the blocks above already produced.
+
+1. **Sizes are real.** Every `Edit` row from block 3 and 5 shows `+n −n`; every `Write` row
+   from block 2 shows `+n` and **no** deletion count (the old content is not stored, so a
+   removed-line count would be invented). Cross-check one against the chat: the numbers must
+   equal what the transcript's own diff shows for that call.
+2. **The band still fits.** With the size taking columns, a mutation's band ends flush at the
+   right edge and its name is still legible. Block 13's long filename is the truncation case.
+3. **Reveal lands.** Click the verb of an `Edit` row from block 3 — the chat scrolls to that
+   edit's diff, one row below the top. Do it for the *second* of the three edits to
+   alpha.ts: the three are separate steps and must reveal three different places.
+4. **Reveal survives hidden tool details.** Toggle tool details off, then click a verb again.
+   It should land on the enclosing user message rather than doing nothing — with details off
+   there is no tool block in the tree at all, and this fallback is what carries the feature.
+5. **Sub-agents read as unreachable.** In block 11's three lanes, the *step* rows carry no
+   `↗` (their session is not in this transcript); the lane header `└ Explore` carries one,
+   and clicking it reveals the `task` call that spawned that lane.
+6. **A command reports its step, not itself.** Block 5's `Run` rows may show a muted `Δn`.
+   Hovering says "n files changed in this step" — check the wording: it is a claim about the
+   step, because the snapshot patch it comes from covers the whole step.
+7. **Block 4's `echo` shows no `Δ`.** It changed nothing, and absent is not `Δ0`.
+8. **The Lens switch at the end of block 13** recolours the bands while every size, icon and
+   destination stays byte-identical — sizes and anchors are facts about the act, not the Lens.
 
 ### 14. Cleanup
 

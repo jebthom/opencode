@@ -5097,6 +5097,7 @@ export type ApertureGetResponses = {
         color: string
       }>
       deterministic?: boolean
+      search?: boolean
     }
     extents?: {
       [key: string]: Array<{
@@ -5105,6 +5106,23 @@ export type ApertureGetResponses = {
         endLine: number
         facet?: string
         hue?: string
+      }>
+    }
+    lineTags?: {
+      [key: string]: Array<{
+        startLine: number
+        endLine: number
+        facet: string
+        hue?: string
+        rule?: string
+        note?: string
+      }>
+    }
+    marks?: {
+      [key: string]: Array<{
+        facet: string
+        lines: number
+        bytes: number
       }>
     }
     suppressed?: Array<string>
@@ -5146,6 +5164,7 @@ export type ApertureFacetMapResponses = {
         color: string
       }>
       deterministic?: boolean
+      search?: boolean
     }
     facets: Array<string>
     files: {
@@ -5154,6 +5173,11 @@ export type ApertureFacetMapResponses = {
         w: Array<{
           f: number
           p: number
+        }>
+        m?: Array<{
+          f: number
+          l: number
+          b: number
         }>
       }
     }
@@ -5198,6 +5222,7 @@ export type ApertureActivityResponses = {
         color: string
       }>
       deterministic?: boolean
+      search?: boolean
     }
     facets: Array<string>
     turns: Array<{
@@ -5213,6 +5238,9 @@ export type ApertureActivityResponses = {
         callID: string
         timestamp: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
         title?: string
+        additions?: number
+        deletions?: number
+        changed?: number
       }>
     }>
     files: {
@@ -5263,6 +5291,7 @@ export type ApertureCycleLensResponses = {
       color: string
     }>
     deterministic?: boolean
+    search?: boolean
   }
 }
 
@@ -5303,6 +5332,7 @@ export type ApertureDeleteLensResponses = {
         color: string
       }>
       deterministic?: boolean
+      search?: boolean
     }
   }
 }
@@ -5382,6 +5412,7 @@ export type ApertureSelectLensResponses = {
         color: string
       }>
       deterministic?: boolean
+      search?: boolean
     }
   }
 }

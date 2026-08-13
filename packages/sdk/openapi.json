@@ -557,6 +557,1435 @@
         ]
       }
     },
+    "/aperture": {
+      "get": {
+        "tags": ["aperture"],
+        "operationId": "aperture.get",
+        "parameters": [
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "refresh",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": ["true", "false"]
+            },
+            "required": false
+          },
+          {
+            "name": "drill",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The deterministic Aperture payload",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "version": {
+                      "type": "integer"
+                    },
+                    "nodes": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "path": {
+                            "type": "string"
+                          },
+                          "kind": {
+                            "type": "string",
+                            "enum": ["file", "directory"]
+                          },
+                          "size": {
+                            "type": "integer"
+                          },
+                          "position": {
+                            "type": "object",
+                            "properties": {
+                              "layer": {
+                                "type": "integer"
+                              },
+                              "index": {
+                                "type": "integer"
+                              }
+                            },
+                            "required": ["layer", "index"],
+                            "additionalProperties": false
+                          }
+                        },
+                        "required": ["id", "path", "kind", "size", "position"],
+                        "additionalProperties": false
+                      }
+                    },
+                    "edges": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "from": {
+                            "type": "string"
+                          },
+                          "to": {
+                            "type": "string"
+                          },
+                          "kind": {
+                            "type": "string",
+                            "enum": ["import"]
+                          }
+                        },
+                        "required": ["from", "to", "kind"],
+                        "additionalProperties": false
+                      }
+                    },
+                    "boundaries": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "path": {
+                            "type": "string"
+                          },
+                          "kind": {
+                            "type": "string",
+                            "enum": ["file", "directory"]
+                          }
+                        },
+                        "required": ["id", "path", "kind"],
+                        "additionalProperties": false
+                      }
+                    },
+                    "semantics": {
+                      "type": "object",
+                      "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                          "facets": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          },
+                          "hue": {
+                            "type": "string"
+                          }
+                        },
+                        "required": ["facets"],
+                        "additionalProperties": false
+                      }
+                    },
+                    "composition": {
+                      "type": "object",
+                      "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                          "weights": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "facet": {
+                                  "type": "string"
+                                },
+                                "count": {
+                                  "type": "integer"
+                                },
+                                "bytes": {
+                                  "type": "integer"
+                                }
+                              },
+                              "required": ["facet", "count", "bytes"],
+                              "additionalProperties": false
+                            }
+                          },
+                          "totalCount": {
+                            "type": "integer"
+                          },
+                          "totalBytes": {
+                            "type": "integer"
+                          },
+                          "subtreeCount": {
+                            "type": "integer"
+                          },
+                          "subtreeBytes": {
+                            "type": "integer"
+                          }
+                        },
+                        "required": ["weights", "totalCount", "totalBytes", "subtreeCount", "subtreeBytes"],
+                        "additionalProperties": false
+                      }
+                    },
+                    "lens": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string"
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "legend": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "facet": {
+                                "type": "string"
+                              },
+                              "label": {
+                                "type": "string"
+                              },
+                              "color": {
+                                "type": "string"
+                              }
+                            },
+                            "required": ["facet", "label", "color"],
+                            "additionalProperties": false
+                          }
+                        },
+                        "deterministic": {
+                          "type": "boolean"
+                        },
+                        "search": {
+                          "type": "boolean"
+                        }
+                      },
+                      "required": ["id", "name", "legend"],
+                      "additionalProperties": false
+                    },
+                    "extents": {
+                      "type": "object",
+                      "additionalProperties": {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "name": {
+                              "type": "string"
+                            },
+                            "startLine": {
+                              "type": "integer"
+                            },
+                            "endLine": {
+                              "type": "integer"
+                            },
+                            "facet": {
+                              "type": "string"
+                            },
+                            "hue": {
+                              "type": "string"
+                            }
+                          },
+                          "required": ["name", "startLine", "endLine"],
+                          "additionalProperties": false
+                        }
+                      }
+                    },
+                    "lineTags": {
+                      "type": "object",
+                      "additionalProperties": {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "startLine": {
+                              "type": "integer"
+                            },
+                            "endLine": {
+                              "type": "integer"
+                            },
+                            "facet": {
+                              "type": "string"
+                            },
+                            "hue": {
+                              "type": "string"
+                            },
+                            "rule": {
+                              "type": "string"
+                            },
+                            "note": {
+                              "type": "string"
+                            }
+                          },
+                          "required": ["startLine", "endLine", "facet"],
+                          "additionalProperties": false
+                        }
+                      }
+                    },
+                    "marks": {
+                      "type": "object",
+                      "additionalProperties": {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "facet": {
+                              "type": "string"
+                            },
+                            "lines": {
+                              "type": "integer"
+                            },
+                            "bytes": {
+                              "type": "integer"
+                            }
+                          },
+                          "required": ["facet", "lines", "bytes"],
+                          "additionalProperties": false
+                        }
+                      }
+                    },
+                    "suppressed": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "required": ["version", "nodes", "edges", "semantics"],
+                  "additionalProperties": false,
+                  "description": "The deterministic Aperture payload"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Retrieve the deterministic Aperture payload for the active instance.",
+        "summary": "Get Aperture view",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.aperture.get({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/aperture/facets": {
+      "get": {
+        "tags": ["aperture"],
+        "operationId": "aperture.facetMap",
+        "parameters": [
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Every painted file in the repo with its facet mix",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "lens": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string"
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "legend": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "facet": {
+                                "type": "string"
+                              },
+                              "label": {
+                                "type": "string"
+                              },
+                              "color": {
+                                "type": "string"
+                              }
+                            },
+                            "required": ["facet", "label", "color"],
+                            "additionalProperties": false
+                          }
+                        },
+                        "deterministic": {
+                          "type": "boolean"
+                        },
+                        "search": {
+                          "type": "boolean"
+                        }
+                      },
+                      "required": ["id", "name", "legend"],
+                      "additionalProperties": false
+                    },
+                    "facets": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "files": {
+                      "type": "object",
+                      "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                          "t": {
+                            "type": "integer"
+                          },
+                          "w": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "f": {
+                                  "type": "integer"
+                                },
+                                "p": {
+                                  "type": "integer"
+                                }
+                              },
+                              "required": ["f", "p"],
+                              "additionalProperties": false
+                            }
+                          },
+                          "m": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "f": {
+                                  "type": "integer"
+                                },
+                                "l": {
+                                  "type": "integer"
+                                },
+                                "b": {
+                                  "type": "integer"
+                                }
+                              },
+                              "required": ["f", "l", "b"],
+                              "additionalProperties": false
+                            }
+                          }
+                        },
+                        "required": ["t", "w"],
+                        "additionalProperties": false
+                      }
+                    },
+                    "suppressed": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "required": ["lens", "facets", "files", "suppressed"],
+                  "additionalProperties": false,
+                  "description": "Every painted file in the repo with its facet mix"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Every painted source file in the repo with its facet mix under the active Lens, for bulk file-tree decoration.",
+        "summary": "Get the whole-repo facet map",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.aperture.facetMap({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/aperture/activity": {
+      "get": {
+        "tags": ["aperture"],
+        "operationId": "aperture.activity",
+        "parameters": [
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "sessionID",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": true
+          },
+          {
+            "name": "turns",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The session's recent turns with each touched file's facet mix",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "lens": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string"
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "legend": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "facet": {
+                                "type": "string"
+                              },
+                              "label": {
+                                "type": "string"
+                              },
+                              "color": {
+                                "type": "string"
+                              }
+                            },
+                            "required": ["facet", "label", "color"],
+                            "additionalProperties": false
+                          }
+                        },
+                        "deterministic": {
+                          "type": "boolean"
+                        },
+                        "search": {
+                          "type": "boolean"
+                        }
+                      },
+                      "required": ["id", "name", "legend"],
+                      "additionalProperties": false
+                    },
+                    "facets": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "turns": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "promptedAt": {
+                            "anyOf": [
+                              {
+                                "type": "number"
+                              },
+                              {
+                                "type": "string",
+                                "enum": ["NaN"]
+                              },
+                              {
+                                "type": "string",
+                                "enum": ["Infinity"]
+                              },
+                              {
+                                "type": "string",
+                                "enum": ["-Infinity"]
+                              },
+                              {
+                                "type": "string",
+                                "enum": ["Infinity", "-Infinity", "NaN"]
+                              }
+                            ]
+                          },
+                          "agent": {
+                            "type": "string"
+                          },
+                          "entries": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "path": {
+                                  "type": "string"
+                                },
+                                "action": {
+                                  "type": "string",
+                                  "enum": ["read", "search", "create", "edit", "run", "fetch"]
+                                },
+                                "target": {
+                                  "type": "string",
+                                  "enum": ["file", "place", "none"]
+                                },
+                                "agent": {
+                                  "type": "string"
+                                },
+                                "sessionID": {
+                                  "type": "string"
+                                },
+                                "depth": {
+                                  "type": "integer"
+                                },
+                                "callID": {
+                                  "type": "string"
+                                },
+                                "timestamp": {
+                                  "anyOf": [
+                                    {
+                                      "type": "number"
+                                    },
+                                    {
+                                      "type": "string",
+                                      "enum": ["NaN"]
+                                    },
+                                    {
+                                      "type": "string",
+                                      "enum": ["Infinity"]
+                                    },
+                                    {
+                                      "type": "string",
+                                      "enum": ["-Infinity"]
+                                    },
+                                    {
+                                      "type": "string",
+                                      "enum": ["Infinity", "-Infinity", "NaN"]
+                                    }
+                                  ]
+                                },
+                                "title": {
+                                  "type": "string"
+                                },
+                                "additions": {
+                                  "type": "integer"
+                                },
+                                "deletions": {
+                                  "type": "integer"
+                                },
+                                "changed": {
+                                  "type": "integer"
+                                }
+                              },
+                              "required": ["action", "target", "agent", "sessionID", "depth", "callID", "timestamp"],
+                              "additionalProperties": false
+                            }
+                          }
+                        },
+                        "required": ["promptedAt", "agent", "entries"],
+                        "additionalProperties": false
+                      }
+                    },
+                    "files": {
+                      "type": "object",
+                      "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                          "t": {
+                            "type": "integer"
+                          },
+                          "w": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "f": {
+                                  "type": "integer"
+                                },
+                                "p": {
+                                  "type": "integer"
+                                }
+                              },
+                              "required": ["f", "p"],
+                              "additionalProperties": false
+                            }
+                          }
+                        },
+                        "required": ["t", "w"],
+                        "additionalProperties": false
+                      }
+                    },
+                    "suppressed": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "required": ["lens", "facets", "turns", "files", "suppressed"],
+                  "additionalProperties": false,
+                  "description": "The session's recent turns with each touched file's facet mix"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Per-turn agent read/edit/write activity for a session, with the facet of each touched file under the active Lens. Derived from the message store on read, so switching Lens recolours history without re-recording it.",
+        "summary": "Get a session's Aperture activity",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.aperture.activity({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/aperture/lens/cycle": {
+      "get": {
+        "tags": ["aperture"],
+        "operationId": "aperture.cycleLens",
+        "parameters": [
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "direction",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": ["next", "prev"]
+            },
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The newly-active Lens",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "legend": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "facet": {
+                            "type": "string"
+                          },
+                          "label": {
+                            "type": "string"
+                          },
+                          "color": {
+                            "type": "string"
+                          }
+                        },
+                        "required": ["facet", "label", "color"],
+                        "additionalProperties": false
+                      }
+                    },
+                    "deterministic": {
+                      "type": "boolean"
+                    },
+                    "search": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": ["id", "name", "legend"],
+                  "additionalProperties": false,
+                  "description": "The newly-active Lens"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Switch the active Aperture Lens to the next or previous one, wrapping at the ends.",
+        "summary": "Cycle active Lens",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.aperture.cycleLens({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/aperture/lens/delete": {
+      "get": {
+        "tags": ["aperture"],
+        "operationId": "aperture.deleteLens",
+        "parameters": [
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "lens",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The outcome and the now-active Lens",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": ["ok", "not-found", "builtin"]
+                    },
+                    "active": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string"
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "legend": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "facet": {
+                                "type": "string"
+                              },
+                              "label": {
+                                "type": "string"
+                              },
+                              "color": {
+                                "type": "string"
+                              }
+                            },
+                            "required": ["facet", "label", "color"],
+                            "additionalProperties": false
+                          }
+                        },
+                        "deterministic": {
+                          "type": "boolean"
+                        },
+                        "search": {
+                          "type": "boolean"
+                        }
+                      },
+                      "required": ["id", "name", "legend"],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": ["status"],
+                  "additionalProperties": false,
+                  "description": "The outcome and the now-active Lens"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Delete a user-defined Aperture Lens by id or name. Built-in Lenses are immutable.",
+        "summary": "Delete a Lens",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.aperture.deleteLens({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/aperture/lens/list": {
+      "get": {
+        "tags": ["aperture"],
+        "operationId": "aperture.listLenses",
+        "parameters": [
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "All available Lenses (built-in + user), with the active one marked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "description": {
+                        "type": "string"
+                      },
+                      "scope": {
+                        "type": "string",
+                        "enum": ["global", "project"]
+                      },
+                      "builtin": {
+                        "type": "boolean"
+                      },
+                      "active": {
+                        "type": "boolean"
+                      },
+                      "parent": {
+                        "type": "string"
+                      },
+                      "depth": {
+                        "anyOf": [
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "string",
+                            "enum": ["NaN"]
+                          },
+                          {
+                            "type": "string",
+                            "enum": ["Infinity"]
+                          },
+                          {
+                            "type": "string",
+                            "enum": ["-Infinity"]
+                          },
+                          {
+                            "type": "string",
+                            "enum": ["Infinity", "-Infinity", "NaN"]
+                          }
+                        ]
+                      },
+                      "rootScope": {
+                        "type": "string",
+                        "enum": ["global", "project"]
+                      }
+                    },
+                    "required": ["id", "name", "description", "scope", "builtin", "active", "depth", "rootScope"],
+                    "additionalProperties": false
+                  },
+                  "description": "All available Lenses (built-in + user), with the active one marked"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          }
+        },
+        "description": "List every available Aperture Lens (built-in + user-defined) for the searchable Lens picker.",
+        "summary": "List Lenses",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.aperture.listLenses({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/aperture/lens/select": {
+      "get": {
+        "tags": ["aperture"],
+        "operationId": "aperture.selectLens",
+        "parameters": [
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "lens",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The outcome and the now-active Lens",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": ["ok", "not-found"]
+                    },
+                    "active": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string"
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "legend": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "facet": {
+                                "type": "string"
+                              },
+                              "label": {
+                                "type": "string"
+                              },
+                              "color": {
+                                "type": "string"
+                              }
+                            },
+                            "required": ["facet", "label", "color"],
+                            "additionalProperties": false
+                          }
+                        },
+                        "deterministic": {
+                          "type": "boolean"
+                        },
+                        "search": {
+                          "type": "boolean"
+                        }
+                      },
+                      "required": ["id", "name", "legend"],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": ["status"],
+                  "additionalProperties": false,
+                  "description": "The outcome and the now-active Lens"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Activate an Aperture Lens by id or name; the view re-paints from its cached facets.",
+        "summary": "Select a Lens",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.aperture.selectLens({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/aperture/facet-filter": {
+      "post": {
+        "tags": ["aperture"],
+        "operationId": "aperture.facetFilter",
+        "parameters": [
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The facets now greyed out",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "The facets now greyed out"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Grey out the given facets across every Aperture surface (top bar, tree chips, editor gutter). View-only and never persisted; an empty list clears the filter.",
+        "summary": "Set the legend facet filter",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "facets": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "Facet ids to grey out; empty clears the filter"
+                  }
+                },
+                "required": ["facets"],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.aperture.facetFilter({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/aperture/scope": {
+      "post": {
+        "tags": ["aperture"],
+        "operationId": "aperture.focusScope",
+        "parameters": [
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Scope focus intent published",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "boolean",
+                  "description": "Scope focus intent published"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Publish an intent for the Aperture view (the TUI top bar) to re-root at a directory — the reciprocal of the top bar revealing a directory in the host editor's file tree.",
+        "summary": "Re-root the Aperture view",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "scope": {
+                    "type": "string",
+                    "description": "Repo-relative directory to re-root the view at; empty clears to the repo root"
+                  }
+                },
+                "required": ["scope"],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.aperture.focusScope({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/aperture/interaction": {
+      "post": {
+        "tags": ["aperture"],
+        "operationId": "aperture.interaction",
+        "parameters": [
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Interaction recorded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "boolean",
+                  "description": "Interaction recorded"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Record a top-bar click in the Aperture view to the per-session study log (research logging).",
+        "summary": "Log an Aperture view interaction",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "sessionID": {
+                    "type": "string",
+                    "description": "The viewed session the interaction belongs to"
+                  },
+                  "interaction": {
+                    "type": "string",
+                    "description": "Interaction type id, e.g. lens.cycle / tile.drill / breadcrumb.nav"
+                  },
+                  "scope": {
+                    "type": "string"
+                  },
+                  "drill": {
+                    "type": "string"
+                  },
+                  "lens": {
+                    "type": "string"
+                  },
+                  "detail": {
+                    "type": "string"
+                  }
+                },
+                "required": ["sessionID", "interaction"],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.aperture.interaction({\n  ...\n})"
+          }
+        ]
+      }
+    },
     "/config": {
       "get": {
         "tags": ["config"],
@@ -10384,6 +11813,150 @@
         ]
       }
     },
+    "/tui/open-file": {
+      "post": {
+        "tags": ["tui"],
+        "operationId": "tui.openFile",
+        "parameters": [
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "File open intent published successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "boolean",
+                  "description": "File open intent published successfully"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Publish an intent for the host editor to open/reveal a file.",
+        "summary": "Reveal file in host editor",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string",
+                    "description": "Repo-relative path of the file to reveal"
+                  }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.tui.openFile({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/tui/reveal-directory": {
+      "post": {
+        "tags": ["tui"],
+        "operationId": "tui.revealDirectory",
+        "parameters": [
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Directory reveal intent published successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "boolean",
+                  "description": "Directory reveal intent published successfully"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Publish an intent for the host editor to reveal a directory in its file tree.",
+        "summary": "Reveal directory in host editor",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string",
+                    "description": "Repo-relative path of the directory to reveal; empty string = the workspace root"
+                  }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.tui.revealDirectory({\n  ...\n})"
+          }
+        ]
+      }
+    },
     "/tui/publish": {
       "post": {
         "tags": ["tui"],
@@ -11466,10 +13039,31 @@
             "$ref": "#/components/schemas/Event.tui.session.select"
           },
           {
+            "$ref": "#/components/schemas/EventTuiFileOpen"
+          },
+          {
+            "$ref": "#/components/schemas/EventTuiDirectoryReveal"
+          },
+          {
             "$ref": "#/components/schemas/EventMcpToolsChanged"
           },
           {
             "$ref": "#/components/schemas/EventMcpBrowserOpenFailed"
+          },
+          {
+            "$ref": "#/components/schemas/EventSessionStatus"
+          },
+          {
+            "$ref": "#/components/schemas/EventSessionIdle"
+          },
+          {
+            "$ref": "#/components/schemas/EventApertureInvalidated"
+          },
+          {
+            "$ref": "#/components/schemas/EventApertureScopeFocused"
+          },
+          {
+            "$ref": "#/components/schemas/EventApertureFacetsFiltered"
           },
           {
             "$ref": "#/components/schemas/EventCommandExecuted"
@@ -11488,12 +13082,6 @@
           },
           {
             "$ref": "#/components/schemas/EventQuestionRejected"
-          },
-          {
-            "$ref": "#/components/schemas/EventSessionStatus"
-          },
-          {
-            "$ref": "#/components/schemas/EventSessionIdle"
           },
           {
             "$ref": "#/components/schemas/EventSessionCompacted"
@@ -13203,69 +14791,6 @@
         "required": ["id", "title", "command", "args", "cwd", "status", "pid"],
         "additionalProperties": false
       },
-      "QuestionOption": {
-        "type": "object",
-        "properties": {
-          "label": {
-            "type": "string",
-            "description": "Display text (1-5 words, concise)"
-          },
-          "description": {
-            "type": "string",
-            "description": "Explanation of choice"
-          }
-        },
-        "required": ["label", "description"],
-        "additionalProperties": false
-      },
-      "QuestionInfo": {
-        "type": "object",
-        "properties": {
-          "question": {
-            "type": "string",
-            "description": "Complete question"
-          },
-          "header": {
-            "type": "string",
-            "description": "Very short label (max 30 chars)"
-          },
-          "options": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/QuestionOption"
-            },
-            "description": "Available choices"
-          },
-          "multiple": {
-            "type": "boolean"
-          },
-          "custom": {
-            "type": "boolean"
-          }
-        },
-        "required": ["question", "header", "options"],
-        "additionalProperties": false
-      },
-      "QuestionTool": {
-        "type": "object",
-        "properties": {
-          "messageID": {
-            "type": "string",
-            "pattern": "^msg"
-          },
-          "callID": {
-            "type": "string"
-          }
-        },
-        "required": ["messageID", "callID"],
-        "additionalProperties": false
-      },
-      "QuestionAnswer": {
-        "type": "array",
-        "items": {
-          "type": "string"
-        }
-      },
       "SessionStatus": {
         "anyOf": [
           {
@@ -13338,6 +14863,69 @@
             "additionalProperties": false
           }
         ]
+      },
+      "QuestionOption": {
+        "type": "object",
+        "properties": {
+          "label": {
+            "type": "string",
+            "description": "Display text (1-5 words, concise)"
+          },
+          "description": {
+            "type": "string",
+            "description": "Explanation of choice"
+          }
+        },
+        "required": ["label", "description"],
+        "additionalProperties": false
+      },
+      "QuestionInfo": {
+        "type": "object",
+        "properties": {
+          "question": {
+            "type": "string",
+            "description": "Complete question"
+          },
+          "header": {
+            "type": "string",
+            "description": "Very short label (max 30 chars)"
+          },
+          "options": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QuestionOption"
+            },
+            "description": "Available choices"
+          },
+          "multiple": {
+            "type": "boolean"
+          },
+          "custom": {
+            "type": "boolean"
+          }
+        },
+        "required": ["question", "header", "options"],
+        "additionalProperties": false
+      },
+      "QuestionTool": {
+        "type": "object",
+        "properties": {
+          "messageID": {
+            "type": "string",
+            "pattern": "^msg"
+          },
+          "callID": {
+            "type": "string"
+          }
+        },
+        "required": ["messageID", "callID"],
+        "additionalProperties": false
+      },
+      "QuestionAnswer": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
       },
       "Todo": {
         "type": "object",
@@ -15355,6 +16943,56 @@
                   },
                   "type": {
                     "type": "string",
+                    "enum": ["tui.file.open"]
+                  },
+                  "properties": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string",
+                        "description": "Repo-relative path of the file to reveal"
+                      }
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                  }
+                },
+                "required": ["id", "type", "properties"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": ["tui.directory.reveal"]
+                  },
+                  "properties": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string",
+                        "description": "Repo-relative path of the directory to reveal; empty string = the workspace root"
+                      }
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                  }
+                },
+                "required": ["id", "type", "properties"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "string",
                     "enum": ["mcp.tools.changed"]
                   },
                   "properties": {
@@ -15392,6 +17030,136 @@
                       }
                     },
                     "required": ["mcpName", "url"],
+                    "additionalProperties": false
+                  }
+                },
+                "required": ["id", "type", "properties"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": ["session.status"]
+                  },
+                  "properties": {
+                    "type": "object",
+                    "properties": {
+                      "sessionID": {
+                        "type": "string",
+                        "pattern": "^ses"
+                      },
+                      "status": {
+                        "$ref": "#/components/schemas/SessionStatus"
+                      }
+                    },
+                    "required": ["sessionID", "status"],
+                    "additionalProperties": false
+                  }
+                },
+                "required": ["id", "type", "properties"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": ["session.idle"]
+                  },
+                  "properties": {
+                    "type": "object",
+                    "properties": {
+                      "sessionID": {
+                        "type": "string",
+                        "pattern": "^ses"
+                      }
+                    },
+                    "required": ["sessionID"],
+                    "additionalProperties": false
+                  }
+                },
+                "required": ["id", "type", "properties"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": ["aperture.invalidated"]
+                  },
+                  "properties": {
+                    "type": "object",
+                    "properties": {
+                      "scope": {
+                        "type": "string"
+                      }
+                    },
+                    "required": ["scope"],
+                    "additionalProperties": false
+                  }
+                },
+                "required": ["id", "type", "properties"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": ["aperture.scope.focused"]
+                  },
+                  "properties": {
+                    "type": "object",
+                    "properties": {
+                      "scope": {
+                        "type": "string",
+                        "description": "Repo-relative directory to re-root the Aperture view at; empty string = the repo root"
+                      }
+                    },
+                    "required": ["scope"],
+                    "additionalProperties": false
+                  }
+                },
+                "required": ["id", "type", "properties"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": ["aperture.facets.filtered"]
+                  },
+                  "properties": {
+                    "type": "object",
+                    "properties": {
+                      "facets": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        },
+                        "description": "Facet ids toggled off in the legend; empty means nothing is filtered"
+                      }
+                    },
+                    "required": ["facets"],
                     "additionalProperties": false
                   }
                 },
@@ -15638,59 +17406,6 @@
                       }
                     },
                     "required": ["sessionID", "requestID"],
-                    "additionalProperties": false
-                  }
-                },
-                "required": ["id", "type", "properties"],
-                "additionalProperties": false
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "id": {
-                    "type": "string"
-                  },
-                  "type": {
-                    "type": "string",
-                    "enum": ["session.status"]
-                  },
-                  "properties": {
-                    "type": "object",
-                    "properties": {
-                      "sessionID": {
-                        "type": "string",
-                        "pattern": "^ses"
-                      },
-                      "status": {
-                        "$ref": "#/components/schemas/SessionStatus"
-                      }
-                    },
-                    "required": ["sessionID", "status"],
-                    "additionalProperties": false
-                  }
-                },
-                "required": ["id", "type", "properties"],
-                "additionalProperties": false
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "id": {
-                    "type": "string"
-                  },
-                  "type": {
-                    "type": "string",
-                    "enum": ["session.idle"]
-                  },
-                  "properties": {
-                    "type": "object",
-                    "properties": {
-                      "sessionID": {
-                        "type": "string",
-                        "pattern": "^ses"
-                      }
-                    },
-                    "required": ["sessionID"],
                     "additionalProperties": false
                   }
                 },
@@ -17053,6 +18768,29 @@
                 "items": {
                   "$ref": "#/components/schemas/ConfigV2ExperimentalPolicy"
                 }
+              }
+            },
+            "additionalProperties": false
+          },
+          "aperture": {
+            "type": "object",
+            "properties": {
+              "painter": {
+                "type": "object",
+                "properties": {
+                  "context": {
+                    "type": "string",
+                    "enum": ["minimal", "medium"]
+                  },
+                  "concurrency": {
+                    "type": "integer"
+                  },
+                  "granularity": {
+                    "type": "string",
+                    "enum": ["file", "interest", "declaration"]
+                  }
+                },
+                "additionalProperties": false
               }
             },
             "additionalProperties": false
@@ -24647,6 +26385,56 @@
         "required": ["id", "type", "properties"],
         "additionalProperties": false
       },
+      "EventTuiFileOpen": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["tui.file.open"]
+          },
+          "properties": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "Repo-relative path of the file to reveal"
+              }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "properties"],
+        "additionalProperties": false
+      },
+      "EventTuiDirectoryReveal": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["tui.directory.reveal"]
+          },
+          "properties": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "Repo-relative path of the directory to reveal; empty string = the workspace root"
+              }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "properties"],
+        "additionalProperties": false
+      },
       "EventMcpToolsChanged": {
         "type": "object",
         "properties": {
@@ -24692,6 +26480,136 @@
               }
             },
             "required": ["mcpName", "url"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "properties"],
+        "additionalProperties": false
+      },
+      "EventSessionStatus": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["session.status"]
+          },
+          "properties": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              },
+              "status": {
+                "$ref": "#/components/schemas/SessionStatus"
+              }
+            },
+            "required": ["sessionID", "status"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "properties"],
+        "additionalProperties": false
+      },
+      "EventSessionIdle": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["session.idle"]
+          },
+          "properties": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              }
+            },
+            "required": ["sessionID"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "properties"],
+        "additionalProperties": false
+      },
+      "EventApertureInvalidated": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["aperture.invalidated"]
+          },
+          "properties": {
+            "type": "object",
+            "properties": {
+              "scope": {
+                "type": "string"
+              }
+            },
+            "required": ["scope"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "properties"],
+        "additionalProperties": false
+      },
+      "EventApertureScopeFocused": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["aperture.scope.focused"]
+          },
+          "properties": {
+            "type": "object",
+            "properties": {
+              "scope": {
+                "type": "string",
+                "description": "Repo-relative directory to re-root the Aperture view at; empty string = the repo root"
+              }
+            },
+            "required": ["scope"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "properties"],
+        "additionalProperties": false
+      },
+      "EventApertureFacetsFiltered": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["aperture.facets.filtered"]
+          },
+          "properties": {
+            "type": "object",
+            "properties": {
+              "facets": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Facet ids toggled off in the legend; empty means nothing is filtered"
+              }
+            },
+            "required": ["facets"],
             "additionalProperties": false
           }
         },
@@ -24938,59 +26856,6 @@
               }
             },
             "required": ["sessionID", "requestID"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "properties"],
-        "additionalProperties": false
-      },
-      "EventSessionStatus": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["session.status"]
-          },
-          "properties": {
-            "type": "object",
-            "properties": {
-              "sessionID": {
-                "type": "string",
-                "pattern": "^ses"
-              },
-              "status": {
-                "$ref": "#/components/schemas/SessionStatus"
-              }
-            },
-            "required": ["sessionID", "status"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "properties"],
-        "additionalProperties": false
-      },
-      "EventSessionIdle": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["session.idle"]
-          },
-          "properties": {
-            "type": "object",
-            "properties": {
-              "sessionID": {
-                "type": "string",
-                "pattern": "^ses"
-              }
-            },
-            "required": ["sessionID"],
             "additionalProperties": false
           }
         },
@@ -25278,6 +27143,10 @@
     {
       "name": "event",
       "description": "Instance event stream route."
+    },
+    {
+      "name": "aperture",
+      "description": "Aperture routes."
     },
     {
       "name": "config",

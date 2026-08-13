@@ -75,6 +75,31 @@ export type Target = (typeof TARGETS)[number]
 // for a read or an edit it is usually the path. It costs nothing to carry: every tool
 // result already persists it (session/processor.ts), so the Activity View's hover line is
 // reading text that exists rather than generating any.
+//
+// `additions`/`deletions` are the size of the change this act made, and like `title` they
+// are *read* rather than measured: `edit` already persists a `filediff` with both counts
+// and `apply_patch` a per-file equivalent (tool/edit.ts, tool/apply_patch.ts), so a row can
+// state a magnitude without anything being recomputed or any model being called.
+//
+// `deletions` is absent on a `create`, and deliberately not guessed. The `write` tool
+// persists the content it wrote but nothing about what was there before, so an overwrite's
+// removed lines are genuinely unknown — and "+42" is true of a create and an overwrite
+// alike ("wrote 42 lines"), where any invented deletion count would not be. It costs one
+// honest omission to avoid a number the store cannot support.
+//
+// `changed` is a count of *files* rather than lines, and only ever appears on a `run`: a
+// shell command persists no diff at all, so the nearest true statement about it comes from
+// the snapshot patch that closes its LLM step. It is a fact about the step, not about the
+// command (see the window rule in activity-model.ts), which is why it is a separate field
+// with a separate name rather than more `additions`.
+//
+// `messageID`/`partID` say **where this act is visible in the viewed session's chat**,
+// which is not the same as where the tool call lives. For work the session did itself they
+// are that call's own message and part. For a sub-agent's work they are the *parent's*
+// `task` call, because the child session's parts are absent from this transcript entirely —
+// so the nearest thing the user can actually be shown is the call that spawned it. Naming
+// the field for the destination rather than for the provenance is what keeps that from
+// being a special case in the renderer.
 export interface ActivityEntry {
   readonly path?: string
   readonly action: Action
@@ -85,6 +110,11 @@ export interface ActivityEntry {
   readonly callID: string
   readonly timestamp: number
   readonly title?: string
+  readonly additions?: number
+  readonly deletions?: number
+  readonly changed?: number
+  readonly messageID?: string
+  readonly partID?: string
 }
 
 // How much of a tool's title to carry. Long enough for a real bash description, short
@@ -110,16 +140,7 @@ export interface Turn {
 // needs to see on a timeline of what happened to their codebase. `task` is absent from
 // this list because it is not an entry at all: it *opens a lane* (see Aperture.activity),
 // and its sub-agent's own entries are what get recorded.
-const IGNORED_TOOLS = new Set([
-  "todowrite",
-  "todoread",
-  "question",
-  "plan",
-  "plan_exit",
-  "skill",
-  "invalid",
-  "task",
-])
+const IGNORED_TOOLS = new Set(["todowrite", "todoread", "question", "plan", "plan_exit", "skill", "invalid", "task"])
 
 // Map a tool name to the action it represents, or undefined for tools we deliberately
 // ignore. The `write` tool — which both overwrites whole files and creates new ones —

@@ -1468,6 +1468,92 @@ so there is nothing to expand), and a keyboard path to any of this — the sideb
 mouse-only today (G0), and giving one section focus semantics nothing else has would
 be a bigger change than the rest of this track combined.
 
+### G5 — What changed, and where it happened
+
+G4 left the path saying *"the agent edited something in `<file>.ts`, which is X facet"*.
+That is far less than the message store already holds, and both of the missing halves turn
+out to be **read** rather than built.
+
+- [x] **1. Diffs were already persisted.** `edit` stores a full unified patch *and* a
+  `filediff` with additions/deletions (`tool/edit.ts`); `apply_patch` stores a per-file
+  equivalent. Both land verbatim in the SQLite `part.data` blob and survive compaction — so
+  a row can state a magnitude with nothing recomputed and no model called, exactly the
+  posture G4.5 took for the hover title. A mutation now reads `Edit  activity-model.ts
+  +12 −3`, in the same green and red the transcript uses for that string.
+
+- [x] **2. `write` reports additions only, and this is deliberate.** The tool computes a
+  diff for its permission prompt and discards it (`tool/write.ts:53`), keeping only the
+  content it wrote. So an overwrite's *removed* lines are genuinely unknown. `+42` is true
+  of a create and an overwrite alike ("wrote 42 lines"); an invented deletion count would
+  not be, and inventing one is the single thing this module must not do. Changing the tool
+  to keep its diff was considered and rejected for now: it only helps future sessions and it
+  is not this track's business.
+
+- [x] **3. A shell command reports a fact about its *step*.** `bash` persists no diff, but
+  each LLM step closes with a `PatchPart` naming the files that changed in it. Credited only
+  when the window holds exactly one command, and only for paths no explicit edit already
+  claimed — otherwise nobody is credited. Drawn `Δ3`, muted, and hovered as *"3 files changed
+  in this step"*. The weaker sentence is the true one: the snapshot window covers everything
+  that touched the worktree while the step ran, including the user saving a file. A distinct
+  glyph rather than `+/−` because `PatchPart` carries names only, and `+/−` would imply a
+  line-level knowledge it does not have.
+
+- [x] **4. Clicking a verb reveals the act in the chat.** The transcript already renders
+  each tool call under a findable id and already draws the persisted patch with a native
+  `<diff>`. So the right move was to *point at it* rather than build a second diff surface —
+  36 columns cannot hold a patch, and growing the hover box would undo G4.8. Threading the
+  anchor was the actual work: `PartLike` never declared `id`/`messageID`, and `callID` (which
+  it did carry) was dropped by `freeze` before a row ever saw it.
+
+- [x] **5. The anchor names a destination, not a provenance.** The field says *where this act
+  is visible in the viewed session's chat*. For a sub-agent that is the **parent's `task`
+  call**, because the child session's parts are absent from this transcript entirely — so
+  `mergeChildEntries` *overwrites* each merged entry's anchor, which is also what makes
+  nesting correct (a depth-2 entry is re-pointed at the depth-1 task, then at the depth-0
+  one, the only one on screen). Naming the field for the destination is what keeps this from
+  being a special case in the renderer.
+
+- [x] **6. Two hit zones, decided by what the reader is pointing at.** The verb and its icon
+  reveal; the band or label keeps G4.3/G4.4 exactly. The gesture therefore costs nothing —
+  it spends the eight columns of the verb, which were inert — and neither existing
+  affordance loses any of its target. A `↗` marks it, and its **absence** is meaningful:
+  a sub-agent's step rows have none, so the lane header carries the one icon for the lane.
+  Twelve indented rows revealing the same block would be noise.
+
+- [x] **7. The scroll bridge is a payload-carrying command.** The chat's scrollbox ref is
+  local to the session route and a sidebar plugin cannot reach it, so `session.part.reveal`
+  is registered there and dispatched from the sidebar with `{ messageID, partID }`.
+  Rejected: exporting a host context (`feature-plugins/*` imports nothing from
+  `routes/session`, and adding it creates a cycle through the slot registry), and walking
+  `api.renderer.root` (`scrollChildIntoView` is nearest-edge and no-ops when the target is
+  already visible — wrong for a reveal).
+
+- [x] **8. The fallback is load-bearing, not a formality.** With tool details hidden
+  (`tool_details_visibility`, default on) `shouldHide` removes **every** completed tool part
+  from the render tree, so no `tool-block-*` id exists at all. A reveal then lands on the
+  enclosing user message. A tool part also renders under one of three id prefixes depending
+  on how it is drawn, so all three are tried, and the whole attempt retries once after 50ms —
+  the same settle the existing `toBottom()` uses.
+
+**G4.6 gains a stated exception.** A mutation's band now ends a few columns short of the
+shared right edge, because its tail is content-sized. The rule exists so two *mixes* can be
+compared by eye, and a mutate band has no mix — it is one solid colour carrying a name.
+Holding the edge would mean shrinking every gathering band to the worst case, costing real
+resolution (20 cells resolve a 5% facet; 15 resolve only 6.7%) to protect a reading
+mutations do not participate in. Left edges stay aligned, which is the half the eye follows.
+
+**Free, because a mutate step always weighs exactly 1.** Only survey entries ever join an
+open draft, so every mutation's `×n` was already blank — the sizes reuse a reserved gutter
+rather than taking anything from the band. Guarded by a test now, since the layout depends
+on it.
+
+**Not in scope.** Generated natural-language explanations of a change: `bash` titles are
+already the model's own words and G4.5 already shows them, and for an `edit` the title is
+just the path — the informative delta is the counts, which are free. Also rejected: shipping
+a hunk header (it names only the *first* hunk, so a three-hunk edit is misreported, and
+"where exactly" is what the reveal is for), and a per-file jump for `apply_patch` (the chat
+gives every one of its blocks the same part id, so the call is one target by construction).
+
 ---
 
 ---

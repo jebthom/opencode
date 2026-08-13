@@ -11,7 +11,17 @@ let clock = 0
 
 const entry = (
   action: Action,
-  opts: { path?: string; target?: Target; agent?: string; session?: string; depth?: number; at?: number } = {},
+  opts: {
+    path?: string
+    target?: Target
+    agent?: string
+    session?: string
+    depth?: number
+    at?: number
+    additions?: number
+    deletions?: number
+    changed?: number
+  } = {},
 ): ActivityEntry => ({
   ...(opts.path === undefined ? {} : { path: opts.path }),
   action,
@@ -21,6 +31,9 @@ const entry = (
   depth: opts.depth ?? 0,
   callID: `c_${clock}`,
   timestamp: opts.at ?? clock++,
+  ...(opts.additions === undefined ? {} : { additions: opts.additions }),
+  ...(opts.deletions === undefined ? {} : { deletions: opts.deletions }),
+  ...(opts.changed === undefined ? {} : { changed: opts.changed }),
 })
 
 const turn = (entries: ActivityEntry[]): Turn => ({ promptedAt: 0, agent: "build", entries })
@@ -261,5 +274,90 @@ describe("step contents", () => {
   test("a step whose entries carry no title has none, rather than empty strings", () => {
     const step = stepsForTurn(turn([entry("run")])).lanes[0]!.steps[0]!
     expect(step.titles).toEqual([])
+  })
+})
+
+// The size of a change reaches a row through the step, so the accumulator has to carry it
+// without inventing any of it: a survey step must stay silent, and a mutate step must
+// report exactly what its one entry recorded.
+describe("change size", () => {
+  const only = (t: Turn) => stepsForTurn(t).lanes[0]!.steps[0]!
+
+  test("a mutate step carries its entry's line counts through freeze", () => {
+    const step = only(turn([entry("edit", { path: "a.ts", additions: 12, deletions: 3 })]))
+    expect([step.additions, step.deletions]).toEqual([12, 3])
+  })
+
+  test("a survey step carries no counts at all", () => {
+    // Absent, not zero: the renderer keys off absence to decide whether a row has a
+    // magnitude to state, so three explicit undefineds would read as "changed nothing"
+    // where they should read as "is not a change".
+    const step = only(turn([entry("read", { path: "a.ts" }), entry("read", { path: "b.ts" })]))
+    expect("additions" in step).toBe(false)
+    expect("deletions" in step).toBe(false)
+    expect("changed" in step).toBe(false)
+  })
+
+  test("a write reports additions with no deletions beside them", () => {
+    const step = only(turn([entry("create", { path: "a.ts", additions: 42 })]))
+    expect(step.additions).toBe(42)
+    expect("deletions" in step).toBe(false)
+  })
+
+  test("a run step carries its changed-file count", () => {
+    const step = only(turn([entry("run", { changed: 3 })]))
+    expect(step.changed).toBe(3)
+    expect("additions" in step).toBe(false)
+  })
+
+  test("a mutate step always weighs exactly one", () => {
+    // Not new behaviour — it follows from the step rule, since only survey entries ever
+    // join an open draft. But the row layout spends the `×n` gutter on the diff stats
+    // *because* this holds, so it is worth a guard of its own.
+    for (const step of stepsForTurn(
+      turn([
+        entry("edit", { path: "a.ts" }),
+        entry("edit", { path: "a.ts" }),
+        entry("create", { path: "b.ts" }),
+        entry("run"),
+      ]),
+    ).lanes[0]!.steps) {
+      expect(stepWeight(step)).toBe(1)
+    }
+  })
+})
+
+// A row's destination in the chat. Carried by the step rather than looked up later, because
+// segmentation is where the entries are still available to choose between.
+describe("chat anchor", () => {
+  test("a survey run anchors to its FIRST entry, not its last", () => {
+    // `startedAt` is the first entry's too, so a row's identity and its destination agree —
+    // and a gathering run reads better from its opening than from its close.
+    const step = stepsForTurn(
+      turn([
+        { ...entry("read", { path: "a.ts" }), messageID: "m1", partID: "p1" },
+        { ...entry("read", { path: "b.ts" }), messageID: "m1", partID: "p2" },
+        { ...entry("read", { path: "c.ts" }), messageID: "m1", partID: "p3" },
+      ]),
+    ).lanes[0]!.steps[0]!
+    expect([step.messageID, step.partID]).toEqual(["m1", "p1"])
+  })
+
+  test("each mutation keeps its own anchor", () => {
+    const steps = stepsForTurn(
+      turn([
+        { ...entry("edit", { path: "a.ts" }), messageID: "m1", partID: "p1" },
+        { ...entry("edit", { path: "b.ts" }), messageID: "m1", partID: "p2" },
+      ]),
+    ).lanes[0]!.steps
+    expect(steps.map((s) => s.partID)).toEqual(["p1", "p2"])
+  })
+
+  test("a step whose entries carry no anchor has none", () => {
+    // The renderer reads the absence as "there is nothing to reveal" and draws no icon, so
+    // this must stay absent rather than becoming an empty string.
+    const step = stepsForTurn(turn([entry("read", { path: "a.ts" })])).lanes[0]!.steps[0]!
+    expect("messageID" in step).toBe(false)
+    expect("partID" in step).toBe(false)
   })
 })
