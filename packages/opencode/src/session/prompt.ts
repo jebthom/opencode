@@ -1282,6 +1282,10 @@ export const layer = Layer.effect(
         const slog = elog.with({ sessionID })
         let structured: unknown
         let step = 0
+        // The Aperture state reminder, computed once per user turn (keyed by the turn's user
+        // message). Re-reading it every step would change the prompt mid-turn each time the
+        // agent curates a Lens, which is exactly when the prompt cache matters most.
+        let apertureNote: { readonly turn: string; readonly text: string | undefined } | undefined
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
@@ -1380,6 +1384,18 @@ export const layer = Layer.effect(
             Effect.provideService(FSUtil.Service, fsys),
             Effect.provideService(Session.Service, sessions),
           )
+          if (apertureNote?.turn !== lastUser.id)
+            apertureNote = { turn: lastUser.id, text: yield* sys.apertureState(agent) }
+          const turnMessage = msgs.findLast((m) => m.info.role === "user")
+          if (apertureNote.text && turnMessage)
+            turnMessage.parts.push({
+              id: PartID.ascending(),
+              messageID: turnMessage.info.id,
+              sessionID,
+              type: "text",
+              text: apertureNote.text,
+              synthetic: true,
+            })
 
           const msg: SessionV1.Assistant = {
             id: MessageID.ascending(),

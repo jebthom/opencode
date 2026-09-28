@@ -1,6 +1,6 @@
 import { AperturePayload } from "@/aperture/payload"
-// Side-effect import: registers the aperture.invalidated event in the EventV2
-// registry before api.ts snapshots it into the SDK Event union.
+// Side-effect import: registers the aperture events in the EventV2 registry before api.ts
+// snapshots it into the SDK Event union.
 import "@/aperture/event"
 import { Schema } from "effect"
 import { HttpApi, HttpApiEndpoint, HttpApiGroup, OpenApi } from "effect/unstable/httpapi"
@@ -11,100 +11,112 @@ import { described } from "./metadata"
 
 const root = "/aperture"
 
-// Repo-relative directory the view is rooted at ("" / omitted = repo root).
-// `refresh=true` recomputes that scope from disk instead of serving the cache —
-// used by the TUI refresh control to pick up external edits / clear errors.
-const ApertureQuery = Schema.Struct({
+// One file's line tags under the active Lens — the editor gutter's read.
+const LinesQuery = Schema.Struct({
   ...WorkspaceRoutingQueryFields,
-  scope: Schema.optional(Schema.String),
-  refresh: Schema.optional(Schema.Literals(["true", "false"])),
-  // Drill into a file (A5): a repo-relative file path. When present the payload also
-  // carries `extents` (the file's function-level tiles) and a drill-in paint pass is
-  // scheduled at top priority. Rides the same endpoint so the TUI keeps one fetch path.
-  drill: Schema.optional(Schema.String),
+  path: Schema.String.annotate({ description: "Repo-relative file path" }),
 })
 
-// Step the active Lens one forward/back in the list, wrapping at the
-// ends. Drives the top-bar ◀/▶ arrows; repaint rides the aperture.invalidated
-// event the switch publishes, so this just returns the newly-active Lens.
+// The append-only Lens history (lens-history.ts). `turnID` is the id of the user message that
+// opened a chat turn, so `?turnID=` returns exactly the Lens changes made during that turn.
+const HistoryQuery = Schema.Struct({
+  ...WorkspaceRoutingQueryFields,
+  since: Schema.optional(Schema.NumberFromString).annotate({ description: "Only entries with seq >= this" }),
+  sessionID: Schema.optional(Schema.String),
+  turnID: Schema.optional(Schema.String),
+  lens: Schema.optional(Schema.String),
+  limit: Schema.optional(Schema.NumberFromString).annotate({ description: "Keep only the newest N matches" }),
+})
+
+const HistoryActor = Schema.Struct({
+  kind: Schema.Literals(["user", "agent"]),
+  agent: Schema.optional(Schema.String),
+  sessionID: Schema.optional(Schema.String),
+  turnID: Schema.optional(Schema.String),
+  messageID: Schema.optional(Schema.String),
+  callID: Schema.optional(Schema.String),
+  reason: Schema.optional(Schema.String),
+  consented: Schema.optional(Schema.Boolean),
+})
+
+const HistoryEntry = Schema.Struct({
+  seq: Schema.Int,
+  at: Schema.Number,
+  op: Schema.Literals([
+    "lens.create",
+    "lens.delete",
+    "lens.edit",
+    "lens.select",
+    "facet.add",
+    "facet.remove",
+    "facet.edit",
+    "rule.add",
+    "rule.replace",
+    "rule.remove",
+  ]),
+  actor: HistoryActor,
+  lens: Schema.Struct({ id: Schema.String, name: Schema.String }),
+  facet: Schema.optional(Schema.String),
+  rule: Schema.optional(Schema.String),
+  // Snapshots of what changed: `{ lens }`, `{ facet, rules? }` or `{ rule }`.
+  before: Schema.optional(Schema.Unknown),
+  after: Schema.optional(Schema.Unknown),
+  hits: Schema.optional(
+    Schema.Struct({ lines: Schema.Int, files: Schema.Int, overCap: Schema.optional(Schema.Boolean) }),
+  ),
+})
+
+// Step the active Lens one forward/back in the list, wrapping at the ends. Drives the top-bar
+// ◀/▶ arrows; the repaint rides the aperture.invalidated event the switch publishes.
 const CycleLensQuery = Schema.Struct({
   ...WorkspaceRoutingQueryFields,
   direction: Schema.Literals(["next", "prev"]),
 })
+const CycleLensResult = Schema.Struct({
+  // Absent when there are no Lenses to cycle through.
+  active: Schema.optional(AperturePayload.LensInfo),
+})
 
-// Delete a user-defined Lens by id or name. Drives the top-bar ✕ control
-// and the `/lens-delete` command — both deterministic, never routed through the agent.
-// Built-in Lenses are immutable, so the result reports why a delete was refused.
+// Delete a Lens by id or name. Drives the top-bar ✕ control — deterministic, and always the
+// user's own action.
 const DeleteLensQuery = Schema.Struct({
   ...WorkspaceRoutingQueryFields,
   lens: Schema.String,
 })
 
-// Outcome: "ok" with the now-active Lens (Architecture when the deleted one was
-// active), or a refusal ("not-found" / "builtin").
 const DeleteLensResult = Schema.Struct({
-  status: Schema.Literals(["ok", "not-found", "builtin"]),
+  status: Schema.Literals(["ok", "not-found", "needs-consent"]),
   active: Schema.optional(AperturePayload.LensInfo),
 })
 
-// One row in the Lens picker (A2): enough to list, group, and mark the active Lens.
-// Rows arrive in DFS-forest order — each Lens immediately followed by the drill-downs
-// scoped to it — so the picker renders the hierarchy by indenting on `depth` alone.
+// One row in the Lens picker.
 const LensSummary = Schema.Struct({
   id: Schema.String,
   name: Schema.String,
   description: Schema.String,
-  // "global" = built-in (architecture / git-changed / mtime), "project" = user-defined.
-  scope: Schema.Literals(["global", "project"]),
-  builtin: Schema.Boolean,
+  owner: Schema.Literals(["user", "agent"]),
   active: Schema.Boolean,
-  // Set on a drill-down: the id of the Lens whose facets define its domain.
-  parent: Schema.optional(Schema.String),
-  // Nesting depth (0 = root). Drives the picker's indent.
-  depth: Schema.Number,
-  // The scope of the ROOT ancestor, not this Lens's own. The picker groups on it, so a
-  // project drill-down of a built-in parent stays adjacent to that parent instead of being
-  // torn into the "Project" section and rendered indented under nothing.
-  rootScope: Schema.Literals(["global", "project"]),
+  facets: Schema.Int,
+  rules: Schema.Int,
 })
 
-// Whole-repo file → facet mix under the active Lens (O2). The bulk counterpart to the
-// per-file `drill` the editor gutter uses: the VSCode Explorer decorates every row of the
-// file tree, so it needs one fetch that answers for the whole repo.
-//
-// Each file's *whole* mix ships rather than a pre-reduced dominant facet — a client
-// filtering to one facet needs that facet's share, not the file's plurality winner. `f`
-// indexes into `facets`; `p` is an integer percent of the file's attributed bytes,
-// descending. Files with nothing painted are omitted.
-//
-// `t` is the attributed byte total those percentages divide. Percentages alone cannot be
-// rolled up — a client aggregating a directory from its files would weight every file
-// equally and disagree with the byte-weighted directory treemap — so `t` is what lets the
-// VSCode tree's folder chips reproduce `attributeFileBytes` exactly.
-//
-// `m` is the file's *marks* (S3): a Search rule's hits per facet, as `l` marked lines and
-// `b` marked bytes. Raw counts rather than percentages by the same argument `t` answers, one
-// step further — a count needs no denominator at all, so a folder chip sums its
-// descendants' marks directly and nothing can be rounded away on the way up. Kept beside
-// `w` rather than merged into it because marks are sparse and do not tile, so they must not
-// enter the byte partition `w` reports (see MarkWeight in payload.ts). A file may carry `m`
-// with an empty `w`: a rule can glob a file the extractor never walks.
+// Every marked file in the repo under the active Lens. `m` is the file's marks per facet — `f`
+// indexes `facets`, `l` is marked lines, `b` marked bytes — as raw counts, so a client rolls a
+// directory up by plain summation with nothing rounded away. `line` is the first marked line,
+// where a click should open the file.
+const MarkedFile = Schema.Struct({
+  m: Schema.Array(Schema.Struct({ f: Schema.Int, l: Schema.Int, b: Schema.Int })),
+  line: Schema.Int,
+})
+
 const FacetMapResult = Schema.Struct({
-  lens: AperturePayload.LensInfo,
-  // Facet ids in legend order, with the "Other" facet appended (it is a real stored value
-  // but never a Lens facet, so it needs an index without polluting the legend).
+  // Absent when the project has no Lens yet.
+  lens: Schema.optional(AperturePayload.LensInfo),
+  // Facet ids in legend order.
   facets: Schema.Array(Schema.String),
-  files: Schema.Record(
-    Schema.String,
-    Schema.Struct({
-      t: Schema.Int,
-      w: Schema.Array(Schema.Struct({ f: Schema.Int, p: Schema.Int })),
-      m: Schema.optional(Schema.Array(Schema.Struct({ f: Schema.Int, l: Schema.Int, b: Schema.Int }))),
-    }),
-  ),
-  // Facets currently toggled off in the legend (O4). Carried here as well as on the
-  // aperture.facets.filtered event so a client that reconnects — or connects after the
-  // filter was set — recovers it from an ordinary refresh instead of painting unfiltered.
+  files: Schema.Record(Schema.String, MarkedFile),
+  // Facets currently toggled off in the legend (O4), so a client that reconnects recovers the
+  // filter from an ordinary refresh.
   suppressed: Schema.Array(Schema.String),
 })
 
@@ -114,9 +126,8 @@ const FacetMapResult = Schema.Struct({
 //
 // Derived from the durable message store on every read, never recorded — which is what
 // makes a Lens switch recolour history for free: `turns` comes back byte-identical and only
-// `facets`/`files` move. The facet half is shaped exactly like FacetMapResult (same
-// vocabulary, same `{t, w:[{f,p}]}` weights, same `suppressed`) so the Activity View, the
-// Explorer pip and the directory treemap are three renderings of one attribution.
+// `facets`/`files` move. The facet half is shaped exactly like FacetMapResult, so the Activity
+// View and the top bar can never disagree about a file.
 const ActivityQuery = Schema.Struct({
   ...WorkspaceRoutingQueryFields,
   sessionID: Schema.String,
@@ -169,15 +180,12 @@ const ActivityTurnSchema = Schema.Struct({
 })
 
 const ActivityResult = Schema.Struct({
-  lens: AperturePayload.LensInfo,
+  lens: Schema.optional(AperturePayload.LensInfo),
   facets: Schema.Array(Schema.String),
   turns: Schema.Array(ActivityTurnSchema),
-  // Facet mix per *touched* path only, deduped across turns — the same shape as
+  // Marks per *touched* path only, deduped across turns — the same shape as
   // FacetMapResult.files, scoped to what the turns actually reference.
-  files: Schema.Record(
-    Schema.String,
-    Schema.Struct({ t: Schema.Int, w: Schema.Array(Schema.Struct({ f: Schema.Int, p: Schema.Int })) }),
-  ),
+  files: Schema.Record(Schema.String, MarkedFile),
   suppressed: Schema.Array(Schema.String),
 })
 
@@ -191,16 +199,6 @@ export const FacetFilterInput = Schema.Struct({
   }),
 })
 
-// Re-root the Aperture view at a directory (the reciprocal of tui.directory.reveal). Posted
-// by a host surface — the VSCode extension's file tree, when the user expands a folder — and
-// published as aperture.scope.focused for the TUI's top bar to adopt. Purely a navigation
-// intent: nothing is computed or stored, so an unknown path costs a repaint at most.
-export const ScopeFocusInput = Schema.Struct({
-  scope: Schema.String.annotate({
-    description: "Repo-relative directory to re-root the view at; empty clears to the repo root",
-  }),
-})
-
 // Activate a Lens by id or name (the searchable Lens picker / `/lens-switch`). The
 // repaint rides the aperture.invalidated event the switch publishes; this returns the
 // resolved Lens, or "not-found" when the id/name doesn't match an available Lens.
@@ -209,7 +207,7 @@ const SelectLensQuery = Schema.Struct({
   lens: Schema.String,
 })
 const SelectLensResult = Schema.Struct({
-  status: Schema.Literals(["ok", "not-found"]),
+  status: Schema.Literals(["ok", "not-found", "needs-consent"]),
   active: Schema.optional(AperturePayload.LensInfo),
 })
 
@@ -232,27 +230,39 @@ export const ApertureApi = HttpApi.make("aperture")
   .add(
     HttpApiGroup.make("aperture")
       .add(
-        HttpApiEndpoint.get("get", root, {
-          query: ApertureQuery,
-          success: described(AperturePayload.Payload, "The deterministic Aperture payload"),
+        HttpApiEndpoint.get("lines", `${root}/lines`, {
+          query: LinesQuery,
+          success: described(AperturePayload.Lines, "One file's line tags under the active Lens"),
         }).annotateMerge(
           OpenApi.annotations({
-            identifier: "aperture.get",
-            summary: "Get Aperture view",
-            description: "Retrieve the deterministic Aperture payload for the active instance.",
+            identifier: "aperture.lines",
+            summary: "Get a file's Aperture marks",
+            description: "The marked line ranges of one file under the active Lens, for editor gutter painting.",
+          }),
+        ),
+      )
+      .add(
+        HttpApiEndpoint.get("history", `${root}/history`, {
+          query: HistoryQuery,
+          success: described(Schema.Array(HistoryEntry), "Lens history entries, oldest first"),
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "aperture.history",
+            summary: "Get the Lens history",
+            description:
+              "The append-only history of Lens, facet and rule changes, each tied to the actor, session and chat turn that made it.",
           }),
         ),
       )
       .add(
         HttpApiEndpoint.get("facetMap", `${root}/facets`, {
           query: Schema.Struct({ ...WorkspaceRoutingQueryFields }),
-          success: described(FacetMapResult, "Every painted file in the repo with its facet mix"),
+          success: described(FacetMapResult, "Every marked file in the repo with its marks per facet"),
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "aperture.facetMap",
             summary: "Get the whole-repo facet map",
-            description:
-              "Every painted source file in the repo with its facet mix under the active Lens, for bulk file-tree decoration.",
+            description: "Every file with marked lines under the active Lens, with marked-line counts per facet.",
           }),
         ),
       )
@@ -265,14 +275,14 @@ export const ApertureApi = HttpApi.make("aperture")
             identifier: "aperture.activity",
             summary: "Get a session's Aperture activity",
             description:
-              "Per-turn agent read/edit/write activity for a session, with the facet of each touched file under the active Lens. Derived from the message store on read, so switching Lens recolours history without re-recording it.",
+              "Per-turn agent read/edit/write activity for a session, with the marks of each touched file under the active Lens. Derived from the message store on read, so switching Lens recolours history without re-recording it.",
           }),
         ),
       )
       .add(
         HttpApiEndpoint.get("cycleLens", `${root}/lens/cycle`, {
           query: CycleLensQuery,
-          success: described(AperturePayload.LensInfo, "The newly-active Lens"),
+          success: described(CycleLensResult, "The newly-active Lens"),
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "aperture.cycleLens",
@@ -289,22 +299,19 @@ export const ApertureApi = HttpApi.make("aperture")
           OpenApi.annotations({
             identifier: "aperture.deleteLens",
             summary: "Delete a Lens",
-            description: "Delete a user-defined Aperture Lens by id or name. Built-in Lenses are immutable.",
+            description: "Delete an Aperture Lens by id or name.",
           }),
         ),
       )
       .add(
         HttpApiEndpoint.get("listLenses", `${root}/lens/list`, {
           query: Schema.Struct({ ...WorkspaceRoutingQueryFields }),
-          success: described(
-            Schema.Array(LensSummary),
-            "All available Lenses (built-in + user), with the active one marked",
-          ),
+          success: described(Schema.Array(LensSummary), "Every Lens, with the active one marked"),
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "aperture.listLenses",
             summary: "List Lenses",
-            description: "List every available Aperture Lens (built-in + user-defined) for the searchable Lens picker.",
+            description: "List every Aperture Lens for the searchable Lens picker.",
           }),
         ),
       )
@@ -316,7 +323,7 @@ export const ApertureApi = HttpApi.make("aperture")
           OpenApi.annotations({
             identifier: "aperture.selectLens",
             summary: "Select a Lens",
-            description: "Activate an Aperture Lens by id or name; the view re-paints from its cached facets.",
+            description: "Activate an Aperture Lens by id or name.",
           }),
         ),
       )
@@ -331,20 +338,6 @@ export const ApertureApi = HttpApi.make("aperture")
             summary: "Set the legend facet filter",
             description:
               "Grey out the given facets across every Aperture surface (top bar, tree chips, editor gutter). View-only and never persisted; an empty list clears the filter.",
-          }),
-        ),
-      )
-      .add(
-        HttpApiEndpoint.post("focusScope", `${root}/scope`, {
-          query: Schema.Struct({ ...WorkspaceRoutingQueryFields }),
-          payload: ScopeFocusInput,
-          success: described(Schema.Boolean, "Scope focus intent published"),
-        }).annotateMerge(
-          OpenApi.annotations({
-            identifier: "aperture.focusScope",
-            summary: "Re-root the Aperture view",
-            description:
-              "Publish an intent for the Aperture view (the TUI top bar) to re-root at a directory — the reciprocal of the top bar revealing a directory in the host editor's file tree.",
           }),
         ),
       )

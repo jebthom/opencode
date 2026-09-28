@@ -339,19 +339,13 @@ export function chipKey(segments: ReadonlyArray<Segment>, layout: ChipLayout): s
   return `${layout}:${segments.map((s) => `${s.color}@${round(s.frac)}`).join(",")}`
 }
 
-// The hover text: the full breakdown, which is the detail the chip necessarily rounds off.
-//
-// `marks` (S3) lead, and in *lines* rather than percent. A mark's share is exactly the part
-// the chip rounds up to a whole cell — a guaranteed minimum says nothing about how much was
-// found — so this is the only place the real count can be read, and "3 lines" is the number
-// a probe is asked for anyway.
+// The hover text: marked lines per facet — the exact counts the chip necessarily rounds to whole
+// cells, and the number a user asking "how much of this is here" wants anyway.
 export function chipTooltip(
-  weights: ReadonlyArray<FacetWeight>,
   facets: ReadonlyArray<string>,
   legend: ReadonlyArray<LegendEntry>,
-  marks?: ReadonlyArray<{ f: number; l: number }>,
+  marks: ReadonlyArray<{ f: number; l: number }> | undefined,
 ): string {
   const labelOf = (index: number) => legend.find((e) => e.facet === facets[index])?.label ?? facets[index] ?? "?"
-  const marked = (marks ?? []).map((m) => `${labelOf(m.f)} ${m.l} line${m.l === 1 ? "" : "s"} marked`)
-  return [...marked, ...weights.map((w) => `${labelOf(w.f)} ${w.p}%`)].join(" · ")
+  return (marks ?? []).map((m) => `${labelOf(m.f)} ${m.l} line${m.l === 1 ? "" : "s"}`).join(" · ")
 }

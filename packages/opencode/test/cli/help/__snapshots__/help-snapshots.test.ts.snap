@@ -131,7 +131,6 @@ Commands:
   opencode debug startup          print startup timing
   opencode debug agent <name>     show agent configuration details
   opencode debug v2               debug v2 catalog and built-in plugins
-  opencode debug aperture-cost    summarize Aperture painter token spend
   opencode debug aperture-colors  check Aperture's facet colours survive this terminal
   opencode debug info             show debug information
   opencode debug paths            show global paths (data, config, cache, state)

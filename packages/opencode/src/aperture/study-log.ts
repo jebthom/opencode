@@ -231,11 +231,3 @@ export function record(sessionID: string, rec: Record<string, unknown>): Effect.
     }).catch(() => {})
   }).pipe(Effect.ignore)
 }
-
-// Attribute a painter pass's token spend to the most-recently-active session (the
-// painter runs in a forked fiber not tied to a session). Kept separate from
-// conversation tokens in the summary.
-export function recordPainter(rec: Record<string, unknown>): Effect.Effect<void> {
-  if (!lastActiveSessionID) return Effect.void
-  return record(lastActiveSessionID, { type: "painter", ...rec })
-}

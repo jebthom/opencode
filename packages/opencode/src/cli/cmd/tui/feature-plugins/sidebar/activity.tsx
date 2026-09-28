@@ -58,8 +58,7 @@ const VERB_COLS = 8
 const MIN_NAME_COLS = 10
 // The band fills whatever the tail leaves. A gathering row's tail is the `×n` gutter; a
 // mutation's is its change size, which is content-sized and so varies by row.
-const bandMax = (depth: number, tail: number) =>
-  SIDEBAR_COLS - SPINE_COLS - VERB_COLS - 1 - tail - depth * INDENT_COLS
+const bandMax = (depth: number, tail: number) => SIDEBAR_COLS - SPINE_COLS - VERB_COLS - 1 - tail - depth * INDENT_COLS
 
 // The change a step made, split into the pieces that colour differently. Read straight off
 // the step — every number here was persisted by the tool that made the change, so nothing
@@ -79,7 +78,7 @@ function statsOf(step: Step): Stats | undefined {
   if (step.additions !== undefined) out.added = `+${clampCount(step.additions)}`
   if (step.deletions !== undefined) out.removed = `−${clampCount(step.deletions)}`
   if (step.changed !== undefined) out.changed = `Δ${clampCount(step.changed)}`
-  return out.added ?? out.removed ?? out.changed ? out : undefined
+  return (out.added ?? out.removed ?? out.changed) ? out : undefined
 }
 
 // Columns the stats occupy, each piece drawn with its own leading space.
@@ -117,7 +116,7 @@ type ActivityResult = {
   lens?: { id: string; name: string; legend: readonly { facet: string; label: string; color: string }[] }
   facets: readonly string[]
   turns: readonly Turn[]
-  files: Record<string, { t: number; w: readonly { f: number; p: number }[] }>
+  files: Record<string, { m: readonly { f: number; l: number }[]; line: number }>
   suppressed?: readonly string[]
 }
 
@@ -258,35 +257,28 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     return out
   })
 
-  // Per-facet totals for a step, rolled up across the files it touched.
-  //
-  // `t * p / 100` is the documented client rollup: `p` is a rounded percentage and `t` the
-  // pre-rounding denominator, so this carries a file's real weight even where a sliver was
-  // floored to 1%. Places contribute nothing by design — a survey step is already an
-  // aggregate, and folding a directory's subtree into it would report the mix of code the
-  // agent never opened.
-  // Takes a path list rather than a step so an expanded child row (one file) and the
-  // aggregate it came from (all of them) reduce through exactly the same arithmetic — the
-  // expansion has to agree with the row it opened, or the affordance undermines the reading.
+  // Per-facet marked lines for a step, summed across the files it touched. Places contribute
+  // nothing by design — a survey step is already an aggregate, and folding a directory's subtree
+  // into it would report marks in code the agent never opened.
+  // Takes a path list rather than a step so an expanded child row (one file) and the aggregate it
+  // came from (all of them) reduce through exactly the same arithmetic — the expansion has to
+  // agree with the row it opened, or the affordance undermines the reading.
   const bandsFor = (paths: ReadonlyArray<string>) => {
     const files = data()?.files
     if (!files) return []
     const totals = new Map<string, number>()
     for (const path of paths) {
-      const mix = files[path]
-      if (!mix) continue
-      for (const w of mix.w) {
-        const facet = facets()[w.f]
+      for (const mark of files[path]?.m ?? []) {
+        const facet = facets()[mark.f]
         if (facet === undefined) continue
-        totals.set(facet, (totals.get(facet) ?? 0) + (mix.t * w.p) / 100)
+        totals.set(facet, (totals.get(facet) ?? 0) + mark.l)
       }
     }
     return [...totals].map(([key, value]) => ({ key, value }))
   }
 
-  // The colours of one band, left to right. Falls back to the untagged grey when nothing
-  // here is painted — the honest grey the treemap already draws for un-swept code, rather
-  // than an empty row that reads as a rendering bug.
+  // The colours of one band, left to right. Falls back to the dark grey when nothing here is
+  // marked, rather than an empty row that reads as a rendering bug.
   const bandColors = (paths: ReadonlyArray<string>, width: number): TuiThemeCurrent["text"][] => {
     const bands = bandsFor(paths)
     if (bands.length === 0) return Array.from({ length: width }, () => resolveColor(theme(), UNTAGGED_HUE))
@@ -606,8 +598,7 @@ function StepRow(props: {
   // title is the best of those words by far — for a shell command it is the model-written
   // description the chat renders, so a `Run` row reads "Output the text smoke-three"
   // rather than naming the agent that happened to run it.
-  const beatLabel = () =>
-    props.step.titles[0] ?? (props.step.places.length > 0 ? "looked around" : props.step.agent)
+  const beatLabel = () => props.step.titles[0] ?? (props.step.places.length > 0 ? "looked around" : props.step.agent)
 
   // What the band or label does when clicked — unchanged from G4.3/G4.4.
   const click = () => {

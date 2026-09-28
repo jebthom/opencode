@@ -1,7 +1,7 @@
 {
   "name": "aperture",
   "displayName": "Aperture",
-  "description": "Function-level Aperture facet painting in the editor",
+  "description": "Aperture marks in the editor gutter and a facet-chip file tree",
   "version": "0.0.1",
   "publisher": "sst-dev",
   "repository": {
@@ -213,11 +213,6 @@
           "default": 4096,
           "description": "Port of the running opencode server (the port passed to `opencode --port`)."
         },
-        "aperture.explorerPips": {
-          "type": "boolean",
-          "default": false,
-          "description": "Show a facet pip on each source file in the Explorer, coloured by the active Lens. Off by default since the Aperture tree's chip carries the same information better — a pip can only name one facet, and it also tints the filename, which applies in every tree at once."
-        },
         "aperture.tree.chipLayout": {
           "type": "string",
           "enum": [
@@ -226,7 +221,7 @@
             "mosaic6"
           ],
           "enumDescriptions": [
-            "Equal cells in one row, apportioned to facets by byte share — six, or one per facet where the node carries more. Cells are ~2.7px wide.",
+            "Equal cells in one row, apportioned to facets by byte share \u2014 six, or one per facet where the node carries more. Cells are ~2.7px wide.",
             "One row, with segment widths as the true byte shares and a floor so a small facet stays visible.",
             "Three columns of two, with the right-hand column split vertically into four narrow cells. Cells are ~5.3x7px (~2.7x7px in the split third), so individual facets are far easier to pick out and every facet present is guaranteed one."
           ],
@@ -250,104 +245,16 @@
           "type": "boolean",
           "default": true,
           "description": "Reveal and select the active editor's file in the Aperture tree."
-        },
-        "aperture.tree.focusTopBar": {
-          "type": "boolean",
-          "default": true,
-          "description": "Expanding a folder in the Aperture tree re-roots the opencode top bar at it."
         }
       }
-    },
-    "colors": [
-      {
-        "id": "aperture.c00875F",
-        "description": "Aperture facet colour #00875F",
-        "defaults": {
-          "dark": "#00875F",
-          "light": "#00875F",
-          "highContrast": "#00875F",
-          "highContrastLight": "#00875F"
-        }
-      },
-      {
-        "id": "aperture.c00AFD7",
-        "description": "Aperture facet colour #00AFD7",
-        "defaults": {
-          "dark": "#00AFD7",
-          "light": "#00AFD7",
-          "highContrast": "#00AFD7",
-          "highContrastLight": "#00AFD7"
-        }
-      },
-      {
-        "id": "aperture.c444444",
-        "description": "Aperture facet colour #444444",
-        "defaults": {
-          "dark": "#444444",
-          "light": "#444444",
-          "highContrast": "#444444",
-          "highContrastLight": "#444444"
-        }
-      },
-      {
-        "id": "aperture.c5F5FD7",
-        "description": "Aperture facet colour #5F5FD7",
-        "defaults": {
-          "dark": "#5F5FD7",
-          "light": "#5F5FD7",
-          "highContrast": "#5F5FD7",
-          "highContrastLight": "#5F5FD7"
-        }
-      },
-      {
-        "id": "aperture.c8A8A8A",
-        "description": "Aperture facet colour #8A8A8A",
-        "defaults": {
-          "dark": "#8A8A8A",
-          "light": "#8A8A8A",
-          "highContrast": "#8A8A8A",
-          "highContrastLight": "#8A8A8A"
-        }
-      },
-      {
-        "id": "aperture.cAF5F00",
-        "description": "Aperture facet colour #AF5F00",
-        "defaults": {
-          "dark": "#AF5F00",
-          "light": "#AF5F00",
-          "highContrast": "#AF5F00",
-          "highContrastLight": "#AF5F00"
-        }
-      },
-      {
-        "id": "aperture.cAFAF00",
-        "description": "Aperture facet colour #AFAF00",
-        "defaults": {
-          "dark": "#AFAF00",
-          "light": "#AFAF00",
-          "highContrast": "#AFAF00",
-          "highContrastLight": "#AFAF00"
-        }
-      },
-      {
-        "id": "aperture.cD7005F",
-        "description": "Aperture facet colour #D7005F",
-        "defaults": {
-          "dark": "#D7005F",
-          "light": "#D7005F",
-          "highContrast": "#D7005F",
-          "highContrastLight": "#D7005F"
-        }
-      }
-    ]
+    }
   },
   "scripts": {
     "vscode:prepublish": "bun run package",
     "compile": "bun run check-types && node esbuild.js",
     "watch:esbuild": "node esbuild.js --watch",
     "package": "bun run check-types && node esbuild.js --production",
-    "check-types": "tsc --noEmit",
-    "gen-colors": "bun script/gen-colors.ts"
+    "check-types": "tsc --noEmit"
   },
   "devDependencies": {
     "@types/vscode": "^1.96.0",

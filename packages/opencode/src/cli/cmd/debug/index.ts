@@ -15,7 +15,6 @@ import { SnapshotCommand } from "./snapshot"
 import { AgentCommand } from "./agent"
 import { StartupCommand } from "./startup"
 import { V2Command } from "./v2"
-import { ApertureCostCommand } from "./aperture-cost"
 import { ApertureColorsCommand } from "./aperture-colors"
 
 export const DebugCommand = cmd({
@@ -33,7 +32,6 @@ export const DebugCommand = cmd({
       .command(StartupCommand)
       .command(AgentCommand)
       .command(V2Command)
-      .command(ApertureCostCommand)
       .command(ApertureColorsCommand)
       .command(InfoCommand)
       .command(PathsCommand)

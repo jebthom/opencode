@@ -71,7 +71,6 @@ export type Event =
   | EventSessionStatus
   | EventSessionIdle
   | EventApertureInvalidated
-  | EventApertureScopeFocused
   | EventApertureFacetsFiltered
   | EventCommandExecuted
   | EventProjectDirectoriesUpdated
@@ -1318,6 +1317,7 @@ export type GlobalEvent = {
            * Repo-relative path of the file to reveal
            */
           path: string
+          line?: number
         }
       }
     | {
@@ -1364,16 +1364,6 @@ export type GlobalEvent = {
         id: string
         type: "aperture.invalidated"
         properties: {
-          scope: string
-        }
-      }
-    | {
-        id: string
-        type: "aperture.scope.focused"
-        properties: {
-          /**
-           * Repo-relative directory to re-root the Aperture view at; empty string = the repo root
-           */
           scope: string
         }
       }
@@ -1966,13 +1956,6 @@ export type Config = {
     continue_loop_on_deny?: boolean
     mcp_timeout?: number
     policies?: Array<ConfigV2ExperimentalPolicy>
-  }
-  aperture?: {
-    painter?: {
-      context?: "minimal" | "medium"
-      concurrency?: number
-      granularity?: "file" | "interest" | "declaration"
-    }
   }
 }
 
@@ -4492,6 +4475,7 @@ export type EventTuiFileOpen = {
      * Repo-relative path of the file to reveal
      */
     path: string
+    line?: number
   }
 }
 
@@ -4544,17 +4528,6 @@ export type EventApertureInvalidated = {
   id: string
   type: "aperture.invalidated"
   properties: {
-    scope: string
-  }
-}
-
-export type EventApertureScopeFocused = {
-  id: string
-  type: "aperture.scope.focused"
-  properties: {
-    /**
-     * Repo-relative directory to re-root the Aperture view at; empty string = the repo root
-     */
     scope: string
   }
 }
@@ -5021,73 +4994,34 @@ export type EventSubscribeResponses = {
 
 export type EventSubscribeResponse = EventSubscribeResponses[keyof EventSubscribeResponses]
 
-export type ApertureGetData = {
+export type ApertureLinesData = {
   body?: never
   path?: never
-  query?: {
+  query: {
     directory?: string
     workspace?: string
-    scope?: string
-    refresh?: "true" | "false"
-    drill?: string
+    /**
+     * Repo-relative file path
+     */
+    path: string
   }
-  url: "/aperture"
+  url: "/aperture/lines"
 }
 
-export type ApertureGetErrors = {
+export type ApertureLinesErrors = {
   /**
    * Bad request
    */
   400: BadRequestError
 }
 
-export type ApertureGetError = ApertureGetErrors[keyof ApertureGetErrors]
+export type ApertureLinesError = ApertureLinesErrors[keyof ApertureLinesErrors]
 
-export type ApertureGetResponses = {
+export type ApertureLinesResponses = {
   /**
-   * The deterministic Aperture payload
+   * One file's line tags under the active Lens
    */
   200: {
-    version: number
-    nodes: Array<{
-      id: string
-      path: string
-      kind: "file" | "directory"
-      size: number
-      position: {
-        layer: number
-        index: number
-      }
-    }>
-    edges: Array<{
-      from: string
-      to: string
-      kind: "import"
-    }>
-    boundaries?: Array<{
-      id: string
-      path: string
-      kind: "file" | "directory"
-    }>
-    semantics: {
-      [key: string]: {
-        facets: Array<string>
-        hue?: string
-      }
-    }
-    composition?: {
-      [key: string]: {
-        weights: Array<{
-          facet: string
-          count: number
-          bytes: number
-        }>
-        totalCount: number
-        totalBytes: number
-        subtreeCount: number
-        subtreeBytes: number
-      }
-    }
     lens?: {
       id: string
       name: string
@@ -5096,40 +5030,92 @@ export type ApertureGetResponses = {
         label: string
         color: string
       }>
-      deterministic?: boolean
-      search?: boolean
+      owner: "user" | "agent"
     }
-    extents?: {
-      [key: string]: Array<{
-        name: string
-        startLine: number
-        endLine: number
-        facet?: string
-        hue?: string
-      }>
-    }
-    lineTags?: {
-      [key: string]: Array<{
-        startLine: number
-        endLine: number
-        facet: string
-        hue?: string
-        rule?: string
-        note?: string
-      }>
-    }
-    marks?: {
-      [key: string]: Array<{
-        facet: string
-        lines: number
-        bytes: number
-      }>
-    }
-    suppressed?: Array<string>
+    path: string
+    tags: Array<{
+      startLine: number
+      endLine: number
+      facet: string
+      hue?: string
+      rule?: string
+      note?: string
+    }>
+    suppressed: Array<string>
   }
 }
 
-export type ApertureGetResponse = ApertureGetResponses[keyof ApertureGetResponses]
+export type ApertureLinesResponse = ApertureLinesResponses[keyof ApertureLinesResponses]
+
+export type ApertureHistoryData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+    since?: string
+    sessionID?: string
+    turnID?: string
+    lens?: string
+    limit?: string
+  }
+  url: "/aperture/history"
+}
+
+export type ApertureHistoryErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ApertureHistoryError = ApertureHistoryErrors[keyof ApertureHistoryErrors]
+
+export type ApertureHistoryResponses = {
+  /**
+   * Lens history entries, oldest first
+   */
+  200: Array<{
+    seq: number
+    at: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    op:
+      | "lens.create"
+      | "lens.delete"
+      | "lens.edit"
+      | "lens.select"
+      | "facet.add"
+      | "facet.remove"
+      | "facet.edit"
+      | "rule.add"
+      | "rule.replace"
+      | "rule.remove"
+    actor: {
+      kind: "user" | "agent"
+      agent?: string
+      sessionID?: string
+      turnID?: string
+      messageID?: string
+      callID?: string
+      reason?: string
+      consented?: boolean
+    }
+    lens: {
+      id: string
+      name: string
+    }
+    facet?: string
+    rule?: string
+    before?: unknown
+    after?: unknown
+    hits?: {
+      lines: number
+      files: number
+      overCap?: boolean
+    }
+  }>
+}
+
+export type ApertureHistoryResponse = ApertureHistoryResponses[keyof ApertureHistoryResponses]
 
 export type ApertureFacetMapData = {
   body?: never
@@ -5152,10 +5138,10 @@ export type ApertureFacetMapError = ApertureFacetMapErrors[keyof ApertureFacetMa
 
 export type ApertureFacetMapResponses = {
   /**
-   * Every painted file in the repo with its facet mix
+   * Every marked file in the repo with its marks per facet
    */
   200: {
-    lens: {
+    lens?: {
       id: string
       name: string
       legend: Array<{
@@ -5163,22 +5149,17 @@ export type ApertureFacetMapResponses = {
         label: string
         color: string
       }>
-      deterministic?: boolean
-      search?: boolean
+      owner: "user" | "agent"
     }
     facets: Array<string>
     files: {
       [key: string]: {
-        t: number
-        w: Array<{
-          f: number
-          p: number
-        }>
-        m?: Array<{
+        m: Array<{
           f: number
           l: number
           b: number
         }>
+        line: number
       }
     }
     suppressed: Array<string>
@@ -5213,7 +5194,7 @@ export type ApertureActivityResponses = {
    * The session's recent turns with each touched file's facet mix
    */
   200: {
-    lens: {
+    lens?: {
       id: string
       name: string
       legend: Array<{
@@ -5221,8 +5202,7 @@ export type ApertureActivityResponses = {
         label: string
         color: string
       }>
-      deterministic?: boolean
-      search?: boolean
+      owner: "user" | "agent"
     }
     facets: Array<string>
     turns: Array<{
@@ -5241,15 +5221,18 @@ export type ApertureActivityResponses = {
         additions?: number
         deletions?: number
         changed?: number
+        messageID?: string
+        partID?: string
       }>
     }>
     files: {
       [key: string]: {
-        t: number
-        w: Array<{
+        m: Array<{
           f: number
-          p: number
+          l: number
+          b: number
         }>
+        line: number
       }
     }
     suppressed: Array<string>
@@ -5283,15 +5266,16 @@ export type ApertureCycleLensResponses = {
    * The newly-active Lens
    */
   200: {
-    id: string
-    name: string
-    legend: Array<{
-      facet: string
-      label: string
-      color: string
-    }>
-    deterministic?: boolean
-    search?: boolean
+    active?: {
+      id: string
+      name: string
+      legend: Array<{
+        facet: string
+        label: string
+        color: string
+      }>
+      owner: "user" | "agent"
+    }
   }
 }
 
@@ -5322,7 +5306,7 @@ export type ApertureDeleteLensResponses = {
    * The outcome and the now-active Lens
    */
   200: {
-    status: "ok" | "not-found" | "builtin"
+    status: "ok" | "not-found" | "needs-consent"
     active?: {
       id: string
       name: string
@@ -5331,8 +5315,7 @@ export type ApertureDeleteLensResponses = {
         label: string
         color: string
       }>
-      deterministic?: boolean
-      search?: boolean
+      owner: "user" | "agent"
     }
   }
 }
@@ -5360,18 +5343,16 @@ export type ApertureListLensesError = ApertureListLensesErrors[keyof ApertureLis
 
 export type ApertureListLensesResponses = {
   /**
-   * All available Lenses (built-in + user), with the active one marked
+   * Every Lens, with the active one marked
    */
   200: Array<{
     id: string
     name: string
     description: string
-    scope: "global" | "project"
-    builtin: boolean
+    owner: "user" | "agent"
     active: boolean
-    parent?: string
-    depth: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-    rootScope: "global" | "project"
+    facets: number
+    rules: number
   }>
 }
 
@@ -5402,7 +5383,7 @@ export type ApertureSelectLensResponses = {
    * The outcome and the now-active Lens
    */
   200: {
-    status: "ok" | "not-found"
+    status: "ok" | "not-found" | "needs-consent"
     active?: {
       id: string
       name: string
@@ -5411,8 +5392,7 @@ export type ApertureSelectLensResponses = {
         label: string
         color: string
       }>
-      deterministic?: boolean
-      search?: boolean
+      owner: "user" | "agent"
     }
   }
 }
@@ -5451,39 +5431,6 @@ export type ApertureFacetFilterResponses = {
 }
 
 export type ApertureFacetFilterResponse = ApertureFacetFilterResponses[keyof ApertureFacetFilterResponses]
-
-export type ApertureFocusScopeData = {
-  body?: {
-    /**
-     * Repo-relative directory to re-root the view at; empty clears to the repo root
-     */
-    scope: string
-  }
-  path?: never
-  query?: {
-    directory?: string
-    workspace?: string
-  }
-  url: "/aperture/scope"
-}
-
-export type ApertureFocusScopeErrors = {
-  /**
-   * Bad request
-   */
-  400: BadRequestError
-}
-
-export type ApertureFocusScopeError = ApertureFocusScopeErrors[keyof ApertureFocusScopeErrors]
-
-export type ApertureFocusScopeResponses = {
-  /**
-   * Scope focus intent published
-   */
-  200: boolean
-}
-
-export type ApertureFocusScopeResponse = ApertureFocusScopeResponses[keyof ApertureFocusScopeResponses]
 
 export type ApertureInteractionData = {
   body?: {
@@ -9641,6 +9588,7 @@ export type TuiOpenFileData = {
      * Repo-relative path of the file to reveal
      */
     path: string
+    line?: number
   }
   path?: never
   query?: {

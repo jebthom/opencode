@@ -11,7 +11,6 @@ import { ProviderTransform } from "@/provider/transform"
 import PROMPT_GENERATE from "./generate.txt"
 import PROMPT_COMPACTION from "./prompt/compaction.txt"
 import PROMPT_EXPLORE from "./prompt/explore.txt"
-import PROMPT_LENS from "./prompt/lens.txt"
 import PROMPT_SUMMARY from "./prompt/summary.txt"
 import PROMPT_TITLE from "./prompt/title.txt"
 import { Permission } from "@/permission"
@@ -106,6 +105,9 @@ export const layer = Layer.effect(
         const defaults = Permission.fromConfig({
           "*": "allow",
           doom_loop: "ask",
+          // An agent changing a Lens or facet the user owns (tool/lens-consent.ts). Never covered
+          // by "*": "allow" — the whole point is that the user is asked.
+          lens_consent: "ask",
           external_directory: {
             "*": "ask",
             ...Object.fromEntries(whitelistedDirs.map((dir) => [dir, "allow"])),
@@ -198,42 +200,6 @@ export const layer = Layer.effect(
             prompt: PROMPT_EXPLORE,
             options: {},
             mode: "subagent",
-            native: true,
-          },
-          lens: {
-            name: "lens",
-            description:
-              "Designs Aperture Lenses: explores read-only, proposes a facet schema (name, facets + definitions, palette, prompt), and persists it with the lens tools. Entered via the /lens command.",
-            permission: Permission.merge(
-              defaults,
-              Permission.fromConfig({
-                "*": "deny",
-                grep: "allow",
-                glob: "allow",
-                list: "allow",
-                bash: "allow",
-                read: "allow",
-                webfetch: "allow",
-                websearch: "allow",
-                lens_list: "allow",
-                lens_create: "allow",
-                lens_select: "allow",
-                lens_merge_facets: "allow",
-                lens_edit: "allow",
-                // `prompt/lens.txt` has told this agent to call lens_facet_files since it was
-                // written, but the tool was never on this list — and a "*": "deny" default
-                // *removes* a tool from the request rather than refusing it at call time, so
-                // the instruction referred to something the agent could not see.
-                lens_facet_files: "allow",
-                lens_mark: "allow",
-                lens_unmark: "allow",
-                external_directory: readonlyExternalDirectory,
-              }),
-              user,
-            ),
-            prompt: PROMPT_LENS,
-            options: {},
-            mode: "all",
             native: true,
           },
           compaction: {

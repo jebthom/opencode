@@ -389,16 +389,21 @@ describe("chipSegments — a floored mark (PLAN S3)", () => {
   })
 })
 
-describe("chipTooltip — marks", () => {
-  test("marked lines lead, in lines rather than the percent the chip rounds", () => {
-    expect(chipTooltip([{ f: 0, p: 100 }], FACETS, LEGEND, [{ f: 1, l: 3 }])).toBe("Server 3 lines marked · Parsing 100%")
+describe("chipTooltip", () => {
+  test("lists marked lines per facet, in lines rather than the percent the chip rounds", () => {
+    expect(
+      chipTooltip(FACETS, LEGEND, [
+        { f: 0, l: 12 },
+        { f: 1, l: 3 },
+      ]),
+    ).toBe("Parsing 12 lines · Server 3 lines")
   })
 
   test("one line is singular", () => {
-    expect(chipTooltip([], FACETS, LEGEND, [{ f: 1, l: 1 }])).toBe("Server 1 line marked")
+    expect(chipTooltip(FACETS, LEGEND, [{ f: 1, l: 1 }])).toBe("Server 1 line")
   })
 
-  test("no marks reads exactly as it did before", () => {
-    expect(chipTooltip([{ f: 0, p: 100 }], FACETS, LEGEND)).toBe("Parsing 100%")
+  test("no marks is an empty breakdown", () => {
+    expect(chipTooltip(FACETS, LEGEND, undefined)).toBe("")
   })
 })

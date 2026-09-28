@@ -2,21 +2,27 @@ import { Effect, Schema } from "effect"
 import { Aperture } from "@/aperture/aperture"
 import {
   type Finder,
+  type GitFilter,
   type Lens,
   concernRoster,
   describeFinder,
   finderProblem,
+  whereProblem,
   MAX_FACETS,
-  MAX_RULE_HITS,
 } from "@/aperture/lenses"
+import { ApertureRules } from "@/aperture/rules"
 import * as StudyLog from "@/aperture/study-log"
 import * as Tool from "./tool"
+import { actorOf, withConsent } from "./lens-consent"
 
-// Mark lines in the repo with a named *concern* on an Aperture Lens (S2). The persisted thing
-// is the QUERY, not the lines: a finder is re-evaluated from disk at every payload read, so a
-// deleted usage silently loses its paint and a new one gains it, with no anchoring and no
-// "lost" state. See `aperture/lenses.ts` for the Finder union and `aperture/rules.ts` for the
-// evaluator.
+// Mark lines in the repo with a named *concern* on an Aperture Lens. The persisted thing is the
+// QUERY, not the lines: a finder is re-evaluated from disk at every read, so a deleted usage
+// silently loses its paint and a new one gains it, with no anchoring and no "lost" state. See
+// `aperture/lenses.ts` for the Finder union and `aperture/rules.ts` for the evaluator.
+//
+// This is also the agent's curation tool (v3): the build/plan agent keeps its own Lens of the
+// concerns that best help the user verify the current work, adding and removing facets as the
+// task moves. Every call lands in the Lens history with the turn it came from.
 //
 // Deterministic — no model call, no repaint, no tokens. The return value is the safety
 // mechanism: an agent that writes a loose regex sees the hit count and narrows it instead of
@@ -33,9 +39,9 @@ import * as Tool from "./tool"
 export const Parameters = Schema.Struct({
   lens: Schema.String.annotate({
     description: [
-      "Id or name of the Lens to mark on (see lens_list). A name that doesn't exist creates a",
-      "Search Lens with that name — so give it a descriptive one ('Retry Handling', not 'search'),",
-      "and check lens_list first so you add to an existing Lens instead of making a near-duplicate.",
+      "Id or name of the Lens to mark on (see lens_list). A name that doesn't exist creates a Lens",
+      "with that name — give it a descriptive one ('Retry Handling', not 'search'), and check",
+      "lens_list first so you add to an existing Lens instead of making a near-duplicate.",
     ].join(" "),
   }),
   facet: Schema.String.annotate({
@@ -46,15 +52,15 @@ export const Parameters = Schema.Struct({
       "what the user reads in the legend, so it has to say what the lines have in common.",
     ].join(" "),
   }),
-  kind: Schema.Literals(["pattern", "symbol", "structural"]).annotate({
+  kind: Schema.Literals(["pattern", "symbol", "diff", "structural"]).annotate({
     description: [
       "How to find the lines. 'pattern' is a ripgrep regex, painting each matched LINE:",
-      "language-agnostic (config, YAML, markup) but it also matches comments and strings.",
-      "'symbol' names a top-level declaration and paints its whole extent: coarser, but",
-      "idiom-blind — it finds a const-arrow, a generator and a function declaration alike, which",
-      "matters in a codebase where most callables are not `function` declarations.",
-      "'structural' is an ast-grep pattern (precise, exact ranges) but its backend is not",
-      "installed yet, so it will be refused; prefer 'pattern' or 'symbol'.",
+      "language-agnostic but it also matches comments and strings.",
+      "'symbol' names a top-level declaration and paints its whole extent: coarser, but idiom-blind",
+      "— it finds a const-arrow, a generator and a function declaration alike.",
+      "'diff' marks the lines git reports as changed against `ref` (default HEAD = uncommitted",
+      "changes; 'main' = changed since main; 'HEAD~1..HEAD' = the last commit).",
+      "'structural' is an ast-grep pattern but its backend is not installed yet, so it is refused.",
     ].join(" "),
   }),
   pattern: Schema.optional(Schema.String).annotate({
@@ -69,6 +75,9 @@ export const Parameters = Schema.Struct({
   language: Schema.optional(Schema.String).annotate({
     description: "Required for kind 'structural', e.g. 'ts', 'tsx', 'js', 'py'.",
   }),
+  ref: Schema.optional(Schema.String).annotate({
+    description: "kind 'diff' only: the git ref or 'A..B' range to compare against. Defaults to HEAD.",
+  }),
   glob: Schema.optional(Schema.Array(Schema.String)).annotate({
     description: [
       "Repo-relative globs restricting the search, e.g. ['packages/*/src/**/*.ts'].",
@@ -78,11 +87,24 @@ export const Parameters = Schema.Struct({
   caseSensitive: Schema.optional(Schema.Boolean).annotate({
     description: "kind 'pattern' only. Matching is case-sensitive unless you pass false.",
   }),
+  changed: Schema.optional(Schema.String).annotate({
+    description: [
+      "Keep only hits on lines git reports as changed against this ref or range — e.g. 'HEAD'",
+      "(uncommitted), 'main', or 'HEAD~1..HEAD' (the last commit). Combine with a pattern to mark",
+      "'every call to x() that this change touched'.",
+    ].join(" "),
+  }),
+  author: Schema.optional(Schema.String).annotate({
+    description:
+      "Keep only hits on lines last changed by this author (case-insensitive substring of git blame's name or email).",
+  }),
+  since: Schema.optional(Schema.String).annotate({
+    description: "Keep only hits on lines last changed after this date ('2 weeks ago', '2026-09-01'), per git blame.",
+  }),
   note: Schema.optional(Schema.String).annotate({
     description: [
-      "One line on WHY these lines matter, shown to the user on hover. This is where your",
-      "judgement lives — the finder can only match text, so 'this is the retry path' has to be",
-      "said here rather than encoded in the query.",
+      "One line on WHY these lines matter, shown to the user on hover. This is where your judgement",
+      "lives — the finder can only match text, so 'this is the retry path' has to be said here.",
     ].join(" "),
   }),
   definition: Schema.optional(Schema.String).annotate({
@@ -91,11 +113,23 @@ export const Parameters = Schema.Struct({
   about: Schema.optional(Schema.String).annotate({
     description: "One line describing the Lens. Used only when this call creates it.",
   }),
+  reason: Schema.optional(Schema.String).annotate({
+    description: [
+      "Why you are making this change now, recorded in the Lens history the user can review.",
+      "Always give one when curating on your own initiative.",
+    ].join(" "),
+  }),
+  requestedByUser: Schema.optional(Schema.Boolean).annotate({
+    description: [
+      "True ONLY when the user explicitly asked for this mark in this conversation. The concern is",
+      "then theirs, and you must not later change or remove it without asking. Leave it unset when",
+      "you are curating the view on your own initiative.",
+    ].join(" "),
+  }),
   activate: Schema.optional(Schema.Boolean).annotate({
     description: [
-      "Switch the user's view to this Lens. Defaults to false, and marks are invisible until the",
-      "Lens is active — so the right move is to tell the user it exists and offer lens_select,",
-      "not to switch the view they are looking at out from under them.",
+      "Switch the user's view to this Lens. You may do this freely when the active Lens is one you",
+      "curate (or there is none); switching away from a user's Lens asks them first.",
     ].join(" "),
   }),
 })
@@ -109,7 +143,8 @@ export const LensMarkTool = Tool.define(
       description: [
         "Mark lines in the repo with a named concern on an Aperture Lens, so 'where do we handle X?'",
         "leaves a persistent, paintable answer behind instead of scrolling out of the conversation.",
-        "What is stored is the QUERY (a regex, or a declaration name), not the line numbers — it is",
+        "What is stored is the QUERY (a regex, a declaration name, or a git diff, optionally narrowed",
+        "by git history — changed in a ref, by an author, since a date), not the line numbers — it is",
         "re-run against the files on every read, so the paint follows the code as it changes.",
         "Free and instant: no model call, no repainting. Returns the hit count, a sample of matched",
         "lines and the concern's colour. Check the count AND read the samples — the count catches a",
@@ -141,30 +176,53 @@ export const LensMarkTool = Tool.define(
             ...(params.name !== undefined ? { name: params.name } : {}),
             ...(params.path !== undefined ? { path: params.path } : {}),
             ...(params.language !== undefined ? { language: params.language } : {}),
+            ...(params.ref !== undefined ? { ref: params.ref } : {}),
             ...(params.glob !== undefined ? { glob: params.glob } : {}),
             ...(params.caseSensitive !== undefined ? { caseSensitive: params.caseSensitive } : {}),
           }
-          const problem = finderProblem(find)
+          const where = {
+            ...(params.changed ? { changed: params.changed } : {}),
+            ...(params.author ? { author: params.author } : {}),
+            ...(params.since ? { since: params.since } : {}),
+          }
+          const problem = finderProblem(find) ?? whereProblem(where)
           if (problem)
             return {
               title: "Invalid finder",
               metadata,
               output: `Nothing was marked: ${problem}.`,
             }
-          // Narrowed by the check above, which is the whole point of validating here rather than
+          // Narrowed by the checks above, which is the whole point of validating here rather than
           // letting a Schema.Union reject it upstream of this function.
           const finder = find as Finder
+          const filter: GitFilter | undefined = Object.keys(where).length ? where : undefined
 
-          const result = yield* aperture.markLens({
+          const input = {
             lens: params.lens,
             facet: params.facet,
             ...(params.definition ? { definition: params.definition } : {}),
             ...(params.about ? { about: params.about } : {}),
             find: finder,
+            ...(filter ? { where: filter } : {}),
             ...(params.note ? { note: params.note } : {}),
-            ...(ctx.agent ? { agent: ctx.agent } : {}),
             ...(params.activate !== undefined ? { activate: params.activate } : {}),
-          })
+          }
+          const actor = actorOf(ctx, params)
+          const first = yield* aperture.markLens(input, actor)
+          // An agent curating on its own initiative may change only its own Lenses. Touching the
+          // user's asks them first; a rejection fails this call, which is what the agent should see.
+          const result =
+            first.status === "needs-consent"
+              ? yield* aperture.markLens(
+                  input,
+                  yield* withConsent(
+                    ctx,
+                    actor,
+                    first.lens,
+                    `mark "${params.facet}" on "${first.lens.name}": ${describeFinder(finder, filter)}`,
+                  ),
+                )
+              : first
 
           // Rule content + hit count at creation, and the authoring agent. The tool is the only
           // place that has both — ctx.agent/ctx.sessionID don't reach the service — and the
@@ -177,6 +235,7 @@ export const LensMarkTool = Tool.define(
               lens: params.lens,
               facet: params.facet,
               find,
+              ...(filter ? { where: filter } : {}),
               ...extra,
             })
 
@@ -198,17 +257,17 @@ export const LensMarkTool = Tool.define(
                   "Either the query is wrong or the code isn't there — check with grep before marking again.",
                 ].join("\n"),
               }
-            case "builtin":
-              return {
-                title: "Built-in Lens",
-                metadata,
-                output: `"${params.lens}" is a built-in Lens and can't carry rules. Name a user Lens, or a new name to create a Search Lens.`,
-              }
             case "not-found":
               return {
                 title: "Unknown Lens",
                 metadata,
                 output: `No Lens matches "${params.lens}" and it could not be created. Run lens_list to see the options.`,
+              }
+            case "needs-consent":
+              return {
+                title: "Not changed",
+                metadata,
+                output: `"${result.lens.name}" belongs to the user, and the change was not approved.`,
               }
             case "facet-cap":
               yield* log("rejected-cap")
@@ -247,7 +306,7 @@ export const LensMarkTool = Tool.define(
 
               const head = diagnostic.overCap
                 ? [
-                    `NOT PAINTED: that finder matched ${diagnostic.hits} lines across ${diagnostic.files} files, past the ${MAX_RULE_HITS}-line cap.`,
+                    `NOT PAINTED: that finder matched ${diagnostic.hits} lines across ${diagnostic.files} files, past the ${ApertureRules.capOf(finder)}-line cap.`,
                     `The rule is stored on "${lens.name}" as "${facet.label}" but paints nowhere.`,
                     "Narrow it — add a glob, anchor the regex, or use kind 'symbol' — and call lens_mark again",
                     `with the same facet; or drop it with lens_unmark rule ${rule.id}.`,
@@ -282,7 +341,7 @@ export const LensMarkTool = Tool.define(
                       ]),
                   "",
                   `rule:   ${rule.id}`,
-                  `finder: ${describeFinder(finder)}`,
+                  `finder: ${describeFinder(finder, filter)}`,
                   ...(result.samples.length
                     ? [
                         "samples:",
@@ -296,7 +355,7 @@ export const LensMarkTool = Tool.define(
                   `Concerns on "${lens.name}":`,
                   ...rosterLines(lens),
                   "",
-                  ...visibility(result.activated, result.isActive, lens.name),
+                  ...visibility(result.activation, lens.name),
                 ].join("\n"),
               }
             }
@@ -310,19 +369,25 @@ export const LensMarkTool = Tool.define(
 // `concernRoster` for why.
 export function rosterLines(lens: Pick<Lens, "facets" | "rules">): string[] {
   const roster = concernRoster(lens)
-  if (roster.length === 0) return ["  (none yet — nothing is marked, so the whole repo reads as unmarked grey)"]
+  if (roster.length === 0) return ["  (none yet — nothing is marked)"]
   return roster.map(
     (c) =>
       `  - ${c.label} [${c.facet}] ${c.color} ${c.colorName} — ${c.rules} rule${c.rules === 1 ? "" : "s"}` +
-      (c.ruleOnly ? "" : " (painter-owned)"),
+      (c.owner === "user" ? " (the user's — ask before changing)" : " (yours)"),
   )
 }
 
-function visibility(activated: boolean, isActive: boolean, name: string): string[] {
-  if (activated) return [`Switched the view to "${name}", so the marks are visible now.`]
-  if (isActive) return ["That Lens is active, so the marks are visible in the view and the editor gutter now."]
+function visibility(activation: "switched" | "already-active" | "not-requested" | "needs-consent", name: string) {
+  if (activation === "switched") return [`Switched the view to "${name}", so the marks are visible now.`]
+  if (activation === "already-active")
+    return ["That Lens is active, so the marks are visible in the view and the editor gutter now."]
+  if (activation === "needs-consent")
+    return [
+      `"${name}" is not active and the user's own Lens is, so the view was not switched.`,
+      `Tell them it exists and ask before switching (lens_select "${name}").`,
+    ]
   return [
     `"${name}" is not the active Lens, so the user cannot see these marks yet.`,
-    `Tell them it exists and ask before switching (lens_select "${name}").`,
+    `Tell them it exists, or switch to it with lens_select if the active Lens is one you curate.`,
   ]
 }

@@ -1,261 +1,26 @@
 {
-  "agent-architecture-f43eb025": {
-    "id": "agent-architecture-f43eb025",
-    "name": "Agent Architecture",
-    "description": "Maps where agents are defined, configured, managed, and tested across the codebase.",
-    "palette": "categorical",
-    "prompt": "Classify each file by its role in the agent system: configuration files that define agents, service implementations that manage them, CLI commands for user interaction, integration points with sessions/plugins, or tests covering agent functionality.",
-    "facets": [
-      {
-        "id": "configuration",
-        "label": "Configuration",
-        "description": "Agent definition files in .opencode/agent/ and config loaders that parse agent markdown files",
-        "color": "#D7005F"
-      },
-      {
-        "id": "service-layer",
-        "label": "Service & Layer",
-        "description": "Agent service implementations, Effect layers, and core business logic for managing agent state",
-        "color": "#AF5F00"
-      },
-      {
-        "id": "cli-commands",
-        "label": "CLI & Commands",
-        "description": "Agent command handling and CLI interface for creating, listing, and managing agents",
-        "color": "#AFAF00"
-      },
-      {
-        "id": "integration",
-        "label": "Integration",
-        "description": "Agent integration with plugins, sessions, events, and message types",
-        "color": "#00875F"
-      },
-      {
-        "id": "testing",
-        "label": "Testing",
-        "description": "Agent tests, test fixtures, test utilities, and test coverage",
-        "color": "#00AFD7"
-      }
-    ],
-    "scope": "project",
-    "directories": [
-      "packages/opencode/src/agent",
-      "packages/core/src/agent.ts",
-      ".opencode/agent"
-    ]
-  },
-  "tui-features-architecture-1146ff62": {
-    "id": "tui-features-architecture-1146ff62",
-    "name": "TUI Features & Architecture",
-    "description": "Maps TUI features across architectural layers—from core app to context providers, UI components, feature plugins, and utilities.",
-    "palette": "categorical",
-    "prompt": "Classify each file by its layer in the TUI architecture: the main app and routing layer, state management contexts, reusable UI components and dialogs, full-page routes, modular feature plugins, or utilities and configuration helpers.",
-    "facets": [
-      {
-        "id": "app-routing",
-        "label": "App & Routing",
-        "description": "Main app entry point, global routing, keymaps, and app lifecycle (app.tsx, routes setup)",
-        "color": "#D7005F"
-      },
-      {
-        "id": "contexts-providers",
-        "label": "Contexts & Providers",
-        "description": "State management providers for project, editor, theme, sync, SDK, dialog, and other global state",
-        "color": "#AF5F00"
-      },
-      {
-        "id": "ui-components-dialogs",
-        "label": "UI Components & Dialogs",
-        "description": "Reusable UI widgets, dialog components, spinners, toasts, and form components",
-        "color": "#AFAF00"
-      },
-      {
-        "id": "routes-pages",
-        "label": "Routes & Pages",
-        "description": "Full-page views and route implementations like home and session screens",
-        "color": "#00875F"
-      },
-      {
-        "id": "feature-plugins",
-        "label": "Feature Plugins",
-        "description": "Modular feature implementations (session, sidebar, home, system) that extend the app",
-        "color": "#00AFD7"
-      },
-      {
-        "id": "utilities-config",
-        "label": "Utilities & Config",
-        "description": "Helper functions, configuration, editor integration, audio, clipboard, and keybindings",
-        "color": "#5F5FD7"
-      }
-    ],
-    "scope": "project",
-    "directories": [
-      "packages/opencode/src/cli/cmd/tui"
-    ]
-  },
-  "attack-surface-pii-656fc57d": {
-    "id": "attack-surface-pii-656fc57d",
-    "name": "Attack Surface & PII",
-    "description": "Maps code handling secrets, authentication, authorization, external IO boundaries, and cryptographic operations across the codebase.",
-    "palette": "categorical",
-    "prompt": "Classify files by their role in the attack surface: Secrets & PII (stores or handles sensitive credentials, tokens, API keys, redacts secrets), Auth & Authz (authentication, authorization, permissions, OAuth), External IO (HTTP endpoints, clients, API boundaries, webhooks), or Cryptographic Ops (hashing, encryption, signing, key derivation). Everything else falls into the automatic \"Other\" bucket.",
-    "facets": [
-      {
-        "id": "secrets-pii",
-        "label": "Secrets & PII",
-        "description": "Stores, transmits, redacts, or manages sensitive credentials (API keys, tokens, passwords, OAuth tokens, private keys)",
-        "color": "#D7005F"
-      },
-      {
-        "id": "auth-authz",
-        "label": "Auth & Authz",
-        "description": "Authentication middleware, permission rules, OAuth flows, credential validation, and access control",
-        "color": "#AF5F00"
-      },
-      {
-        "id": "external-io",
-        "label": "External IO",
-        "description": "HTTP clients, servers, API endpoints, webhooks, and boundaries with external systems",
-        "color": "#AFAF00"
-      },
-      {
-        "id": "cryptographic-ops",
-        "label": "Cryptographic Ops",
-        "description": "Hashing, encoding, signing, encryption, or cryptographic utilities",
-        "color": "#00875F"
-      }
-    ],
-    "scope": "project"
-  },
-  "top-bar-rendering-a9d443de": {
-    "id": "top-bar-rendering-a9d443de",
-    "name": "Top Bar Rendering",
-    "description": "Maps TUI code by likelihood of being the source of top bar rendering issues.",
-    "palette": "ordinal",
-    "prompt": "Classify TUI files by how directly they affect the top bar's rendering. Likely files directly paint the aperture visualization. Possible files manage its container, layout, or dimensions. Adjacent files provide data or styling but don't directly render the bar.",
-    "facets": [
-      {
-        "id": "likely",
-        "label": "Likely",
-        "description": "Core aperture rendering logic: the aperture plugin, treemap layout, cell rendering, and direct display of the visualization grid/tiles",
-        "color": "#5F5FD7"
-      },
-      {
-        "id": "possible",
-        "label": "Possible",
-        "description": "Container and layout management: session layout, flex constraints, viewport sizing, scrollbox configuration, and height/width calculations that might cause aperture to be clipped or misaligned",
-        "color": "#00AFD7"
-      },
-      {
-        "id": "adjacent",
-        "label": "Adjacent",
-        "description": "Related but indirect: aperture data fetching, lens picker, activity tracking, theme/styling, and event handlers that feed the aperture but don't directly render it",
-        "color": "#00875F"
-      }
-    ],
-    "scope": "project"
-  },
-  "textbox-input-debug-5622a8b3": {
-    "id": "textbox-input-debug-5622a8b3",
-    "name": "Textbox & Input Debug",
-    "description": "Maps TUI code by its role in textbox functionality—from core input rendering and event handling to state management and integrations.",
-    "palette": "categorical",
-    "prompt": "Classify TUI files by their role in textbox functionality: core input mechanics, event handling and keyboard, text state management, autocomplete/suggestions, rendering and display, or features that use text input.",
-    "facets": [
-      {
-        "id": "core-input",
-        "label": "Core Input",
-        "description": "The main prompt component, textarea rendering, and low-level input mechanics (prompt/index.tsx, TextareaRenderable, @opentui integration)",
-        "color": "#D7005F"
-      },
-      {
-        "id": "events",
-        "label": "Events",
-        "description": "Keyboard event capture, key bindings, clipboard handling, and input event dispatch (event.ts, keymap, clipboard.ts)",
-        "color": "#AF5F00"
-      },
-      {
-        "id": "state",
-        "label": "State",
-        "description": "Text state management, undo/redo, history, stash, and prompt value mutation (prompt/history.tsx, prompt/part.ts, prompt/stash.tsx, store operations)",
-        "color": "#AFAF00"
-      },
-      {
-        "id": "completion",
-        "label": "Completion",
-        "description": "Autocomplete, suggestions, traits detection, and contextual features (prompt/autocomplete.tsx, prompt/traits.ts, prompt/cwd.ts)",
-        "color": "#00875F"
-      },
-      {
-        "id": "rendering",
-        "label": "Rendering",
-        "description": "Visual rendering, styling, cursor position, selection, and terminal dimension handling (border components, spinner, theme context)",
-        "color": "#00AFD7"
-      },
-      {
-        "id": "features",
-        "label": "Features",
-        "description": "Feature plugins and dialogs that embed text input (feature-plugins/*, dialogs that use prompt or text input)",
-        "color": "#5F5FD7"
-      }
-    ],
-    "scope": "project",
-    "directories": [
-      "packages/opencode/src/cli/cmd/tui"
-    ]
-  },
-  "terminal-bottlenecks-f4f273b4": {
-    "id": "terminal-bottlenecks-f4f273b4",
-    "name": "Terminal Bottlenecks",
-    "description": "Identifies likely locations of critical performance bottlenecks—database operations, external I/O, and data processing.",
-    "palette": "categorical",
-    "prompt": "Classify each file by the type of terminal bottleneck it's most likely to contain. Categorize as Database & Persistence if it handles SQL queries, ORM operations, schema definitions, or migrations. Categorize as External I/O if it makes HTTP requests, calls LLM providers, or integrates with external services. Categorize as Data Processing if it performs serialization, parsing, searching, fuzzy matching, or algorithmic data transformations. A file may touch multiple areas; choose the bottleneck that would be most critical if that file became slow.",
-    "facets": [
-      {
-        "id": "database-persistence",
-        "label": "Database & Persistence",
-        "description": "SQL queries, ORM operations, schema definitions, migrations, and direct database access. Files dealing with data persistence and query execution.",
-        "color": "#D7005F"
-      },
-      {
-        "id": "external-i-o",
-        "label": "External I/O",
-        "description": "API requests, HTTP calls, LLM provider integrations, and external service communications. Files that make blocking network or third-party calls.",
-        "color": "#AF5F00"
-      },
-      {
-        "id": "data-processing",
-        "label": "Data Processing",
-        "description": "Serialization, parsing (JSON, imports, Git data), searching, fuzzy matching, and compute-heavy transformations. Files with algorithmic work on data.",
-        "color": "#AFAF00"
-      }
-    ],
-    "scope": "project"
-  },
   "failure-modes-129059e4": {
     "id": "failure-modes-129059e4",
     "name": "Failure Modes",
     "description": "Search Lens: Failure Modes.",
     "palette": "categorical",
-    "prompt": "",
     "facets": [
       {
         "id": "failures",
         "label": "failures",
         "description": "Effect.orDie calls that crash the program on error",
-        "ruleOnly": true,
+        "owner": "user",
         "color": "#D7005F"
       },
       {
         "id": "error-throws",
         "label": "error-throws",
         "description": "Effect.die calls that explicitly throw errors or abort execution",
-        "ruleOnly": true,
+        "owner": "user",
         "color": "#AF5F00"
       }
     ],
-    "scope": "project",
-    "search": true,
+    "owner": "user",
     "rules": [
       {
         "id": "failures-d61f5fd1",
@@ -281,6 +46,207 @@
           ]
         },
         "note": "Deliberate error throwing, often for testing or validation",
+        "createdBy": "build"
+      }
+    ]
+  },
+  "aperture-features-81c9b4ef": {
+    "id": "aperture-features-81c9b4ef",
+    "name": "Aperture Features",
+    "description": "Core features and concepts of Aperture lens system",
+    "palette": "categorical",
+    "facets": [
+      {
+        "id": "lens-management",
+        "label": "lens-management",
+        "description": "Where Lenses are created, stored, or switched",
+        "owner": "agent",
+        "createdBy": "build",
+        "color": "#D7005F"
+      },
+      {
+        "id": "concerns-facets",
+        "label": "concerns-facets",
+        "description": "Concerns (facets) that group and color related marks",
+        "owner": "agent",
+        "createdBy": "build",
+        "color": "#AF5F00"
+      },
+      {
+        "id": "marking-rules",
+        "label": "marking-rules",
+        "description": "The four kinds of rules: pattern, symbol, diff, structural",
+        "owner": "agent",
+        "createdBy": "build",
+        "color": "#AFAF00"
+      },
+      {
+        "id": "live-queries",
+        "label": "live-queries",
+        "description": "Query re-execution that makes marks follow code changes",
+        "owner": "agent",
+        "createdBy": "build",
+        "color": "#00875F"
+      },
+      {
+        "id": "visualization",
+        "label": "visualization",
+        "description": "Grouping files by concerns and painting marks in the gutter",
+        "owner": "agent",
+        "createdBy": "build",
+        "color": "#00AFD7"
+      }
+    ],
+    "owner": "agent",
+    "rules": [
+      {
+        "id": "lens-management-78cc2f0d",
+        "facet": "lens-management",
+        "find": {
+          "kind": "symbol",
+          "name": "Lens"
+        },
+        "createdBy": "build"
+      },
+      {
+        "id": "concerns-facets-980874f3",
+        "facet": "concerns-facets",
+        "find": {
+          "kind": "pattern",
+          "pattern": "Facet|facet",
+          "glob": [
+            "packages/opencode/src/aperture/**"
+          ]
+        },
+        "createdBy": "build"
+      },
+      {
+        "id": "marking-rules-a3d5aa3c",
+        "facet": "marking-rules",
+        "find": {
+          "kind": "symbol",
+          "name": "Rule",
+          "path": "packages/opencode/src/aperture/lenses.ts"
+        },
+        "createdBy": "build"
+      },
+      {
+        "id": "live-queries-e4e3b46a",
+        "facet": "live-queries",
+        "find": {
+          "kind": "symbol",
+          "name": "RuleResult",
+          "path": "packages/opencode/src/aperture/rules.ts"
+        },
+        "createdBy": "build"
+      },
+      {
+        "id": "visualization-edc77b44",
+        "facet": "visualization",
+        "find": {
+          "kind": "symbol",
+          "name": "MarkedFile",
+          "path": "packages/opencode/src/aperture/facet-grid.ts"
+        },
+        "createdBy": "build"
+      }
+    ]
+  },
+  "v3changes-impact-5baca2d6": {
+    "id": "v3changes-impact-5baca2d6",
+    "name": "v3changes Impact",
+    "description": "Changes in v3changes branch affecting lens-management and the Lens class",
+    "palette": "categorical",
+    "facets": [
+      {
+        "id": "lens-class-changes",
+        "label": "lens-class-changes",
+        "description": "Changes to the Lens interface/class definition",
+        "owner": "agent",
+        "createdBy": "build",
+        "color": "#D7005F"
+      },
+      {
+        "id": "lens-store-changes",
+        "label": "lens-store-changes",
+        "description": "Changes to lens-store (CRUD operations for lenses)",
+        "owner": "agent",
+        "createdBy": "build",
+        "color": "#AF5F00"
+      },
+      {
+        "id": "aperture-api-changes",
+        "label": "aperture-api-changes",
+        "description": "Changes to the main Aperture API (markLens, unmarkLens, etc)",
+        "owner": "agent",
+        "createdBy": "build",
+        "color": "#AFAF00"
+      },
+      {
+        "id": "rule-execution-changes",
+        "label": "rule-execution-changes",
+        "description": "Changes to rule execution and query logic",
+        "owner": "agent",
+        "createdBy": "build",
+        "color": "#00875F"
+      }
+    ],
+    "owner": "agent",
+    "rules": [
+      {
+        "id": "lens-class-changes-0fec150a",
+        "facet": "lens-class-changes",
+        "find": {
+          "kind": "diff",
+          "glob": [
+            "packages/opencode/src/aperture/lenses.ts"
+          ]
+        },
+        "where": {
+          "changed": "dev"
+        },
+        "createdBy": "build"
+      },
+      {
+        "id": "lens-store-changes-ee592777",
+        "facet": "lens-store-changes",
+        "find": {
+          "kind": "diff",
+          "glob": [
+            "packages/opencode/src/aperture/lens-store.ts"
+          ]
+        },
+        "where": {
+          "changed": "dev"
+        },
+        "createdBy": "build"
+      },
+      {
+        "id": "aperture-api-changes-6fe79033",
+        "facet": "aperture-api-changes",
+        "find": {
+          "kind": "diff",
+          "glob": [
+            "packages/opencode/src/aperture/aperture.ts"
+          ]
+        },
+        "where": {
+          "changed": "dev"
+        },
+        "createdBy": "build"
+      },
+      {
+        "id": "rule-execution-changes-bd616876",
+        "facet": "rule-execution-changes",
+        "find": {
+          "kind": "diff",
+          "glob": [
+            "packages/opencode/src/aperture/rules.ts"
+          ]
+        },
+        "where": {
+          "changed": "dev"
+        },
         "createdBy": "build"
       }
     ]

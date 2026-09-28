@@ -181,26 +181,6 @@ export const Info = Schema.Struct({
       }),
     }),
   ),
-  aperture: Schema.optional(
-    Schema.Struct({
-      painter: Schema.optional(
-        Schema.Struct({
-          context: Schema.optional(Schema.Literals(["minimal", "medium"])).annotate({
-            description:
-              "Global override for how much per-file context the Aperture semantic painter sends the model, forcing one mode across ALL Lenses (normally each Lens chooses via its own 'context'). 'minimal' uses path + imports + leading comment; 'medium' adds a structural skeleton (exported names, file line count, and each top-level declaration's signature + length). Leave unset to let each Lens decide (default minimal).",
-          }),
-          concurrency: Schema.optional(Schema.Int).annotate({
-            description:
-              "Max concurrent model calls the Aperture painter runs per pass (dir-coherent bins, default 64, clamped 1-128). Lower it on small API tiers to avoid rate-limit bounceback.",
-          }),
-          granularity: Schema.optional(Schema.Literals(["file", "interest", "declaration"])).annotate({
-            description:
-              "How finely the Aperture painter cuts files. Every file is always painted at least once as a whole ('file'), which costs the same as the pre-O3 file-level pass. 'interest' (the default) additionally re-cuts per top-level declaration any file you look at, edit, or have uncommitted changes in. 'declaration' promotes the whole repository, which measured roughly 5.8x the cost and 2x the wall time of whole-file painting. A file is never coarsened back once it has been cut finely.",
-          }),
-        }),
-      ),
-    }),
-  ).annotate({ description: "Aperture visualization configuration." }),
 }).annotate({ identifier: "Config" })
 
 export type Info = DeepMutable<Schema.Schema.Type<typeof Info>>

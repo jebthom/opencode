@@ -58,6 +58,7 @@ export const TuiEvent = {
     type: "tui.file.open",
     schema: {
       path: Schema.String.annotate({ description: "Repo-relative path of the file to reveal" }),
+      line: Schema.optional(Schema.Int).annotate({ description: "1-based line to scroll to, if any" }),
     },
   }),
   // The directory counterpart of FileOpen: "show this directory in the host editor's file

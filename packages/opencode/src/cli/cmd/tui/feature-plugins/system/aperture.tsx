@@ -3,195 +3,67 @@ import type { MouseEvent, ScrollBoxRenderable } from "@opentui/core"
 import { useTerminalDimensions } from "@opentui/solid"
 import type { InternalTuiPlugin } from "../../plugin/internal"
 import { createEffect, createMemo, createResource, createSignal, For, onCleanup, Show } from "solid-js"
-import { DIRECTORY_HUE } from "@/aperture/semantics"
-import { NONE_FACET, NONE_HUE, NONE_LABEL, UNTAGGED_HUE, UNTAGGED_LABEL, BUILTIN_LENS_IDS } from "@/aperture/lenses"
-import { allocateCells, buildGrid, coalesce } from "@/aperture/treemap"
-import { facetColors, resolveColor, themeColor, GREY_CELL } from "./aperture-colors"
-import { openLensPicker, fetchLenses, drillDownsOf } from "./aperture-lens-picker"
+import { allocateCells } from "@/aperture/treemap"
+import {
+  basename,
+  groupByCombination,
+  packColumns,
+  SEGMENT_BORDER_ROWS,
+  type Group,
+  type MarkedFile,
+  type Segment,
+} from "@/aperture/facet-grid"
+import { facetColors } from "./aperture-colors"
+import { openLensPicker } from "./aperture-lens-picker"
 
 const id = "internal:aperture"
 
-// The Aperture top bar (PLAN.md): a persistent strip that draws the deterministic
-// Aperture view as *directory composition blocks* and lets the user walk the tree.
+// The Aperture top bar (v3): every marked file in the repo, grouped by the exact combination of
+// facets it carries — for facets a, b, c the groups run abc, ab, ac, bc, a, b, c — so the user's
+// attention is scoped to precisely the files at issue. Directory structure survives only as a
+// containment border around the tiles in a group that share a parent directory; the bar is flat
+// and repo-wide on purpose, because a slice through the code ("everything with facet a") should
+// cut across directories rather than be organised by them. File browsing belongs to the editor.
 //
-// The bar is rooted at a `scope` (a repo-relative directory, "" = repo root) and shows
-// the scope's direct child directories as bordered treemap blocks. Clicking a block
-// re-roots the view at it *and* reveals that directory in the editor's file tree
-// (`tui.directory.reveal`); a root button, an up button, and a clickable breadcrumb
-// walk back out without touching the editor. The link runs both ways — opening a directory
-// in the editor's tree re-roots the bar at it (`aperture.scope.focused`), so the two
-// surfaces stay on the same directory whichever one the user navigated in. Data is
-// fetched per scope from
-// api.client.aperture.get({ scope }); when the server reports a file change inside the
-// viewed scope (aperture.invalidated) we refetch just that scope, so the visible view
-// stays live without recomputing graphs nobody is looking at.
-//
-// O1 removed the second tier: there is no per-directory child list, so a directory's
-// contents are legible only through its block's composition. What the bar still draws
-// per-file is the scope's *own* files, as a packed grid of one-line tiles (see
-// `fileColumns`) — each the filename over a band of that file's facet mix. That band is
-// the finest-grained facet reading anywhere in the product: finer than the directory
-// treemap, which averages a file into its parent, and finer than the VSCode Explorer pip,
-// which carries one colour and so can only ever report a file's dominant facet.
+// One read serves it: the whole-repo facet map (`aperture.facetMap`), refetched whenever the
+// server says the marks may have moved (aperture.invalidated) or a turn ends.
 
-type GraphNode = {
-  id: string
-  path: string
-  kind: "file" | "directory"
-  size: number
-  position: { layer: number; index: number }
+type FacetMap = {
+  lens?: {
+    id: string
+    name: string
+    owner: "user" | "agent"
+    legend: readonly { facet: string; label: string; color: string }[]
+  }
+  facets: readonly string[]
+  files: Record<string, { m: readonly { f: number; l: number; b: number }[]; line: number }>
+  suppressed: readonly string[]
 }
 
-type GraphEdge = { from: string; to: string; kind: string }
-
-// Per-node composition (server-merged, see payload.ts): a directory's recursive subtree
-// mix, or a file's own mix as a subtree of one. The treemap paints a block from these
-// weights and a file tile paints its band from them; `count` and `bytes` are both carried
-// so TREEMAP_METRIC can switch which one drives cell area.
-type FacetWeight = { facet: string; count: number; bytes: number }
-// `total*` cover only the painted files in `weights`; `subtree*` cover every descendant
-// file. A fully-unpainted directory has zero `total*` but non-zero `subtree*`, so its
-// grey block can still be sized by real size (see TreemapBlock's grey branch).
-type Composition = {
-  weights: readonly FacetWeight[]
-  totalCount: number
-  totalBytes: number
-  subtreeCount: number
-  subtreeBytes: number
-}
-
-// Per-node mark aggregate (S3): how much of a node's subtree carries each Search-rule
-// facet. A *separate* record from `composition` because marks are sparse and do not tile —
-// folding them into the byte partition would stop it summing (see MarkWeight in payload.ts)
-// — so `compositionBands` merges the two instead, and only there.
-type MarkWeight = { facet: string; lines: number; bytes: number }
-
-// An out-of-window one-hop import target (step 6). No position/size — it isn't
-// placed in the layer grid; the renderer draws it as a boundary tile under the
-// importing node. An edge's `to` may reference a boundary id.
-type GraphBoundary = { id: string; path: string; kind: "file" | "directory" }
-
-type Graph = {
-  version: number
-  nodes: GraphNode[]
-  edges: GraphEdge[]
-  boundaries?: GraphBoundary[]
-  semantics: Record<string, { facets: readonly string[]; hue?: string }>
-  composition?: Record<string, Composition>
-  // Search-rule marks per node (S3). Absent unless the active Lens carries rules.
-  marks?: Record<string, readonly MarkWeight[]>
-  // The active Lens + legend (facet → label + colour), merged in server-side.
-  lens?: { id: string; name: string; legend: readonly { facet: string; label: string; color: string }[] }
-  // Facets already toggled off server-side when this payload was built (O4) — the filter
-  // the VSCode picker set before the bar opened. Colours above stay true regardless; this
-  // only says which of them to paint grey.
-  suppressed?: readonly string[]
-}
-
-// --- block dimensions ------------------------------------------------------
-// A block is a grid of CELL_W-wide cells, `COLUMN_ROWS` tall, whose *area* is the
-// directory's size against its biggest sibling. Width is not a separate quantity: it is
-// however many columns those cells occupy (`buildGrid` fills column by column, each one
-// bottom-up, so a block is a bottom-aligned rectangle). That identity is the point — a block
-// is never wider than the colour inside it, so there is no blank right-hand margin.
-const COLUMN_COLS_MIN = 2 // → 6 terminal cols outer
-const COLUMN_COLS_MAX = 6 // → 14 terminal cols outer
-const COLUMN_ROWS = 6
-// TREEMAP_METRIC picks whether file count or byte size drives cell area — both are carried
-// in the payload, so flipping this is a one-line change. CELL_W is how many terminal columns
-// one cell spans (2 reads as a roughly square block).
-const TREEMAP_METRIC: "bytes" | "count" = "bytes"
-const CELL_W = 2
-// The cell budget a full-size block gets. Absolute rather than derived from a per-block
-// column count, which is what breaks the circularity: cells are chosen first, and the
-// column count falls out of them.
-const BLOCK_CELL_CAP = COLUMN_COLS_MAX * COLUMN_ROWS
-// Cells for a directory of `size` against the biggest sibling. sqrt so small directories
-// stay visible (area, not length, carries the comparison) and floored at 1 so anything with
-// bytes at all paints something.
-function scaleCells(size: number, max: number, cap: number) {
-  return max <= 0 || size <= 0 ? 0 : Math.max(1, Math.min(cap, Math.round(cap * Math.sqrt(size / max))))
-}
-// Border-inclusive footprint of a `cols`-cell-wide block.
-const columnOuterW = (cols: number) => cols * CELL_W + 2
-
-// --- file grid -------------------------------------------------------------
-// The scope's own files, drawn as a packed grid of one-line tiles rather than aggregated
-// into a single block. A tile is a border around one row: the filename written over a band
-// of the file's *facet mix*, so a facet holding a minority of the file still shows — which
-// the VSCode Explorer pip structurally cannot do, since a FileDecoration carries one colour
-// and therefore only ever reports the dominant facet.
-//
-// Height is the whole reason this is a grid: laid out in a single row (as the old file tier
-// was) the tiles left most of the strip empty, because ordering was preserved at all costs.
-// Grouping the files together frees us to wrap them, so the grid fills the height a
-// directory block already occupies and the strip gets shorter instead of longer.
-const FILE_TILE_H = 3 // top border + one content row + bottom border
-// Inner width is FILE_TILE_W − 2 = 12 characters. The single knob to turn if filenames read
-// as too clipped or the grid as too sparse.
-const FILE_TILE_W = 14
-// A directory block's total height: its label row, its border, and its treemap. The file
-// grid is sized to match so the two kinds of column are the same height and the bar's
-// budget doesn't depend on which one the scope happens to contain.
-const BLOCK_H = 1 + 2 + COLUMN_ROWS
-// Tiles per grid column — derived, so raising COLUMN_ROWS keeps the two aligned instead of
-// silently overflowing the strip. At COLUMN_ROWS = 6 this is exactly 3.
-const FILE_GRID_ROWS = Math.max(1, Math.floor(BLOCK_H / FILE_TILE_H))
-
-// The bar's base height, and the budget every other vertical constant is cut from: the
-// three header rows (title / nav / legend), one block (a label row over a COLUMN_ROWS-tall
-// treemap wrapped in a 2-row border), and the bar's own bottom border.
-// One row is added on top *only while the horizontal scrollbar is actually showing* (see
-// scrollbarVisible) — the block fills the whole height, so the scrollbar would otherwise
-// paint over its bottom border, but when the strip fits, that row goes back to the
-// conversation. Dropping the file tier (O1) took this from 20 to 14, and dropping the
-// agent-action glyph row (G1) from 14 to 13; if you want to spend the space back, spend it
-// on COLUMN_ROWS. NB: `routes/session/index.tsx` hides the bar outright on short terminals
-// using its own literal — move that with this.
-const TOP_BAR_HEIGHT = 3 + BLOCK_H + 1
-// Inter-column gap in the scroll strip (the scrollbox's contentOptions gap) and the bar's
-// own horizontal padding — both feed the content-width vs viewport-width test that decides
-// whether the horizontal scrollbar shows. Keep in sync with the JSX that uses them.
-//
-// Zero: blocks pack against each other exactly as the file tiles do, so the strip has one
-// density rather than two. Adjacent borders sharing a column is what makes a row of small
-// directories read as a row rather than as scattered boxes. Block labels are trimmed one
-// column short (see the render) so neighbouring names still can't collide.
-const SCROLL_GAP = 0
+// --- dimensions ------------------------------------------------------------
+// A tile is one row: the filename over a band of its facets. A column of tiles is framed by its
+// directory's border, so a column is TILE_W wide including that border.
+const TILE_W = 22
+const NAME_W = TILE_W - 2
+// Rows the grid has under each group's header row. Columns of bordered runs are packed into this.
+const GRID_ROWS = 9
+// Title row + legend row + group header + grid + the bar's bottom border. NB:
+// `routes/session/index.tsx` hides the bar outright on short terminals using its own literal —
+// move that with this.
+const TOP_BAR_HEIGHT = 2 + 1 + GRID_ROWS + 1
+const GROUP_GAP = 1
 const BAR_PADDING_X = 2
-// Inter-item gap in the one-row legend strip. Named (not the literal 2) because the fit
-// test below has to reproduce the row's exact width to know when to trim — keep the JSX
-// gap prop and this constant the same.
 const LEGEND_GAP = 2
-// Even-trim floor for legend facet labels. The legend is a fixed single row that must
-// neither wrap (vertical space is scarce) nor clip; when the swatches + labels overflow
-// the bar width, every facet label is capped to a shared length — as large as still fits —
-// but never shorter than this: below it a label stops being recognisable. A trimmed label
-// renders LEGEND_LABEL_MIN columns (LEGEND_LABEL_MIN-1 chars + "…"). The lens name and the
-// fixed "Other"/"Non-code" labels are never trimmed; the hover line still shows a swatch's
-// full label, so trimming hides characters but loses no information.
+// Even-trim floor for legend facet labels: the legend is one row that must neither wrap nor clip.
 const LEGEND_LABEL_MIN = 6
-// A couple of columns held back from the fit test so ambiguous-width legend glyphs
-// (■ ◀ ▶ ⌄) a terminal may render two cells wide can't nudge the row past the edge.
+// Columns held back from the fit test for ambiguous-width glyphs (■ ◀ ▶ ⌄).
 const LEGEND_SAFETY_PAD = 2
-// The "clear the legend filter" control (O4), rendered at the tail of the legend row only
-// while at least one facet is greyed. Named because the fit test has to charge for it —
-// it appears and disappears under the user, and a row that only overflows once something
-// is filtered would be a bug that shows up exactly when the feature is in use.
 const LEGEND_RESET = "↺"
-// Cells moved per wheel notch when we redirect a vertical wheel into horizontal
-// scroll. Blocks are ~10 cols wide, so 1 cell/notch (the raw terminal delta) feels
-// sluggish; a small multiplier makes the bar pan at a comfortable speed.
 const HSCROLL_STEP = 3
-// How often (ms) to poll-refresh the view for changes nothing tells us about — files
-// created/deleted in the user's IDE outside opencode emit no event the bar can see, so
-// they'd otherwise only surface on navigation or a manual ⟳. Recompute is a cheap scoped
-// walk, so a low-frequency poll keeps the view honest without meaningful cost.
+// Catch-all for changes nothing tells us about (manual IDE edits outside opencode). The facet map
+// is memoized server-side, so a poll costs a map lookup unless something actually changed.
 const REFRESH_POLL_MS = 5000
 
-// Directory blocks and file tiles share one corner set. Kind used to be encoded by corner
-// shape (files rounded), which is redundant now that the two are different shapes in
-// different parts of the strip.
 const SQUARE_CORNERS = {
   topLeft: "┌",
   topRight: "┐",
@@ -208,67 +80,26 @@ const SQUARE_CORNERS = {
 
 function View(props: { api: TuiPluginApi; session_id: string }) {
   const theme = () => props.api.theme.current
-  // Reactive terminal size: column mode reclaims the reserved scrollbar row when the strip
-  // fits the viewport (see scrollbarVisible / barHeight below).
   const dimensions = useTerminalDimensions()
-  const [scope, setScope] = createSignal("")
-  // Foundation A hover-info line: what a node tile / link shows when pointed at.
-  // Cleared on mouse-out so the header falls back to the summary. Set as a plain
-  // string so any feature (node detail, edge target, …) can drive it uniformly.
+  // What the pointer is over, shown in the title row; cleared on mouse-out.
   const [hovered, setHovered] = createSignal<string | undefined>()
-  // Facets toggled off in the legend (O4): clicking a swatch greys that facet everywhere
-  // instead of hiding it, so the remaining facets pop while the layout holds still.
-  //
-  // Held here *and* on the server. Locally so a click repaints on the next frame rather
-  // than after a round trip; on the server so the VSCode extension greys the same facets in
-  // the same gesture. The POST is what tells the server, and its echoed event is what tells
-  // any other surface — see the subscription below.
+  // Facets toggled off in the legend (O4). Held here so a click re-slices on the next frame, and
+  // on the server so the VSCode extension follows in the same gesture.
   const [suppressed, setSuppressed] = createSignal<ReadonlySet<string>>(new Set())
 
-  // Recompute on display (refresh=true): every scope we show — on navigation, on
-  // the manual refresh button, and on a live invalidation event — is recomputed
-  // from disk rather than served from the server cache. The 2-level scoped walk
-  // is cheap, and this keeps a drilled-into view consistent with its parent (a
-  // child that changed/vanished is reflected the moment you open it). The server
-  // cache + invalidation still spare recompute for scopes nobody is viewing.
-  //
-  // No `drill` is sent any more (O1): the bar doesn't draw files, so it has no file to
-  // ask for function-level extents about. Nothing is lost — the VSCode extension drills
-  // every visible/open editor to paint its gutter, which is what schedules the fine paint
-  // now, and O3's interest set already covers open tabs.
-  const [graph, { refetch }] = createResource(
-    () => ({ directory: props.api.state.path.directory, scope: scope() }),
-    async (key) => {
-      const result = await props.api.client.aperture.get({ scope: key.scope, refresh: "true" }, { throwOnError: true })
-      return result.data as Graph
+  const [map, { refetch }] = createResource(
+    () => props.api.state.path.directory,
+    async () => {
+      const result = await props.api.client.aperture.facetMap({}, { throwOnError: true })
+      return result.data as FacetMap
     },
   )
 
-  // Step the active Lens one forward/back, wrapping at the ends. The
-  // server flips the active Lens and publishes aperture.invalidated for the
-  // viewed scope, which the subscription below turns into a refetch — so the repaint
-  // rides the same path a `/lens`-driven switch already uses.
-  const cycleLens = (direction: "next" | "prev") => {
-    logInteraction("lens.cycle", direction)
-    // Fire-and-forget: the repaint arrives via aperture.invalidated, so we don't
-    // throwOnError (an unhandled rejection on a click) — a failed switch just
-    // leaves the current Lens painted.
-    void props.api.client.aperture.cycleLens({ direction })
-  }
+  const offInvalidated = props.api.event.on("aperture.invalidated", () => refetch())
+  onCleanup(() => offInvalidated())
 
-  // Live update: refetch only when the change is inside the scope we're showing.
-  const off = props.api.event.on("aperture.invalidated", (event) => {
-    if (event.properties.scope === scope()) refetch()
-  })
-  onCleanup(() => off())
-
-  // The legend filter changed somewhere else (O4) — the VSCode picker, or the server
-  // clearing it on a Lens switch. Adopt it wholesale: the event carries the entire set, and
-  // the server is the authority for it. No refetch — the filter only changes how the
-  // colours we already hold are painted.
-  //
-  // Our own clicks come back through here too, already applied optimistically — bail on an
-  // unchanged set so the echo costs nothing rather than repainting the strip a second time.
+  // The legend filter changed elsewhere (the VSCode picker, or the server clearing it on a Lens
+  // switch). The event carries the whole set; our own clicks echo back already applied.
   const offFilter = props.api.event.on("aperture.facets.filtered", (event) => {
     const next = event.properties.facets
     const current = suppressed()
@@ -277,43 +108,8 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   })
   onCleanup(() => offFilter())
 
-  // The other half of the link to the editor (the reciprocal of revealDirectory below): a
-  // host surface — the VSCode extension's file tree — says the user opened a directory
-  // there, and the bar re-roots at it. So expanding `packages/` in the tree and clicking the
-  // `packages/` block in the bar leave both surfaces showing the same place, whichever one
-  // the user touched.
-  //
-  // Bail on an unchanged scope: the reveal *we* asked for makes the tree expand, which comes
-  // straight back through here, and re-setting the signal would refetch the scope we are
-  // already showing. (The extension drops the echo too — this is the belt to its braces, and
-  // covers a host that doesn't.)
-  const offScope = props.api.event.on("aperture.scope.focused", (event) => {
-    const next = event.properties.scope
-    if (next === scope()) return
-    // Logged like a click, because it is one — just performed in the editor rather than in
-    // the bar. Keeping it in the study log is what makes a navigation traceable to the
-    // surface it came from instead of appearing as an unexplained scope change.
-    logInteraction("tree.navigate", next)
-    setScope(next)
-  })
-  onCleanup(() => offScope())
-
-  // Shell commands (rm, mv, git, scaffolding, …) mutate the tree without firing
-  // file.edited, so nothing else invalidates the view. Recompute is cheap, so we
-  // just refetch the current scope whenever this session's agent finishes a shell
-  // command. (session.next.* rides the experimental event system; when it's off
-  // this is simply inert and the manual ⟳ / navigation refresh still cover it.)
-  const offShell = props.api.event.on("session.next.shell.ended", (event) => {
-    if (event.properties.sessionID === props.session_id) refetch()
-  })
-  onCleanup(() => offShell())
-
-  // A turn boundary — the shown session, or a sub-agent (build/plan) it spawned, going
-  // idle — is when shell-driven tree mutations that emit no file.edited (most notably
-  // `rm`) have settled, so we recompute then. session.status is a core event (unlike the
-  // experimental session.next.* family), so this fires even with the experimental event
-  // system off, and a fresh user prompt flips the session busy→idle again, covering the
-  // "user's turn begins" case too. Recompute is cheap, so an unconditional refetch is fine.
+  // A turn boundary — this session or a sub-agent it spawned going idle — is when shell-driven
+  // changes that emit no file event have settled.
   const offIdle = props.api.event.on("session.status", (event) => {
     if (event.properties.status.type !== "idle") return
     const sid = event.properties.sessionID
@@ -321,100 +117,71 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   })
   onCleanup(() => offIdle())
 
-  // Catch-all for changes nothing tells us about (manual IDE edits, external tools): a
-  // low-frequency poll. Skipped while a fetch is already in flight so a slow walk can't
-  // stack up refetches.
   const poll = setInterval(() => {
-    if (!graph.loading) refetch()
+    if (!map.loading) refetch()
   }, REFRESH_POLL_MS)
   onCleanup(() => clearInterval(poll))
 
-  // Guarded reads — never call the resource accessor in its error state (the
-  // documented render→catch→re-render leak, PLAN.md). The frame stays mounted.
-  const nodes = () => (graph.error ? [] : (graph()?.nodes ?? []))
-  const summary = () => {
-    if (graph.error) return "fetch error"
-    const g = graph()
-    return g ? `${g.nodes.length} nodes · ${g.edges.length} edges` : "loading…"
-  }
-  const hueOf = (nodeID: string) => (graph.error ? undefined : graph()?.semantics[nodeID]?.hue)
-  // The active Lens's legend (facet → label + colour) drives the swatch row and the
-  // facet → colour map used to paint nodes/composition — no hard-coded vocabulary.
-  const legendEntries = () => (graph.error ? [] : (graph()?.lens?.legend ?? []))
-  const activeName = () => (graph.error ? "" : (graph()?.lens?.name ?? ""))
-  const activeId = () => (graph.error ? "" : (graph()?.lens?.id ?? ""))
-  // Built-in Lenses (the protected group, e.g. Architecture) are immutable — no
-  // delete affordance for them. Gated on the group so new built-ins are covered too.
-  const canDeleteActive = () => activeId() !== "" && !BUILTIN_LENS_IDS.has(activeId())
+  // Guarded reads — never call the resource accessor in its error state (the documented
+  // render→catch→re-render leak, PLAN.md). The frame stays mounted.
+  const data = () => (map.error ? undefined : map())
+  const lens = () => data()?.lens
+  const legendEntries = () => lens()?.legend ?? []
+  const activeId = () => lens()?.id ?? ""
+  const facetIds = () => data()?.facets ?? []
 
-  // Aperture research/study logging: record a top-bar interaction (a click in the
-  // view) to the per-session study log, interleaved with the agent's prompts/tool
-  // calls. `interaction` is the type id (e.g. "lens.cycle", "dir.reveal"); `detail`
-  // is an optional target (e.g. the path navigated to). Fire-and-forget — a logging
-  // failure must never break a click. (`drill` is no longer sent: with the file tier
-  // gone there is no drilled file, and tile.drill/tile.undrill have left the log with it.)
+  const files = createMemo((): MarkedFile[] =>
+    Object.entries(data()?.files ?? {}).map(([path, file]) => ({ path, marks: file.m, line: file.line })),
+  )
+  const groups = createMemo(() => {
+    const ids = facetIds()
+    const off = new Set(ids.flatMap((facet, i) => (suppressed().has(facet) ? [i] : [])))
+    return groupByCombination(files(), off).map((group) => ({ group, columns: packColumns(group.runs, GRID_ROWS) }))
+  })
+
+  const summary = () => {
+    if (map.error) return "fetch error"
+    if (!data()) return "loading…"
+    if (!lens()) return "no Lens yet"
+    const n = files().length
+    return `${n} marked file${n === 1 ? "" : "s"} · ${groups().length} group${groups().length === 1 ? "" : "s"}`
+  }
+
+  // Study logging: a click in the view, interleaved with the agent's prompts and tool calls.
   const logInteraction = (interaction: string, detail?: string) => {
     void props.api.client.aperture.interaction({
       sessionID: props.session_id,
       interaction,
-      scope: scope(),
       lens: activeId(),
       ...(detail !== undefined ? { detail } : {}),
     })
   }
-  // Navigate the directory tree — logs the navigation then re-roots. Used on its own by
-  // the breadcrumb / ⌂ / ◀ controls, which deliberately do *not* disturb the editor.
-  const navigateScope = (path: string) => {
-    logInteraction("tile.navigate", path)
-    setScope(path)
-  }
-  // Reveal a directory in the editor's file tree. This is the link the file tier used to
-  // provide: the bar no longer lists files, so the way to get from "this part of the repo
-  // looks interesting" to the files themselves is to open it where files belong. The host
-  // (the Aperture VSCode extension) listens for `tui.directory.reveal` and runs
-  // revealInExplorer, which expands the parent chain, scrolls the folder into view and
-  // focuses it — focus moving to the Explorer is intended, since you asked to go there.
-  // Fire-and-forget: no editor attached, or a failed publish, must not break the click.
-  const revealDirectory = (path: string) => {
-    logInteraction("dir.reveal", path)
-    void props.api.client.tui.revealDirectory({ path })
-  }
-  // Clicking a directory block does both: re-root the bar *and* reveal it in the editor.
-  const openDirectory = (path: string) => {
-    navigateScope(path)
-    revealDirectory(path)
-  }
-  // Clicking a file tile opens it in the editor. The bar has no file view of its own to
-  // drill into any more — the tile already shows the whole file's facet band — so the only
-  // thing left to want from a click is the file itself.
-  const openFile = (path: string) => {
-    logInteraction("file.open", path)
-    void props.api.client.tui.openFile({ path })
+
+  const cycleLens = (direction: "next" | "prev") => {
+    logInteraction("lens.cycle", direction)
+    void props.api.client.aperture.cycleLens({ direction })
   }
 
-  // Adopt a filter that was already set when this view mounted — the extension's picker set
-  // one before the TUI opened, or this panel was remounted. Once only: past the first
-  // payload the event subscription is the live channel, and re-reading every poll would let
-  // a fetch that raced ahead of our own POST un-grey a facet the user just clicked.
+  // Open the file in the editor, at its first marked line.
+  const openFile = (file: MarkedFile) => {
+    logInteraction("file.open", file.path)
+    void props.api.client.tui.openFile({ path: file.path, line: file.line })
+  }
+
+  // Adopt a filter that was already set when this view mounted. Once only: past the first
+  // payload the event is the live channel, and re-reading every poll could un-grey a facet the
+  // user just clicked if the fetch raced ahead of our own POST.
   let seededFilter = false
   createEffect(() => {
-    if (seededFilter || graph.error || graph.loading) return
-    const g = graph()
-    if (!g) return
+    const d = data()
+    if (seededFilter || !d) return
     seededFilter = true
-    if (g.suppressed?.length) setSuppressed(new Set(g.suppressed))
+    if (d.suppressed.length) setSuppressed(new Set(d.suppressed))
   })
 
-  // Push the filter to the server, which holds it for every surface and echoes it back as
-  // aperture.facets.filtered so the VSCode extension greys in the same gesture (O4).
-  // Fire-and-forget, like the other click actions: a failed publish must leave the local
-  // paint alone rather than un-grey what the user just clicked.
   const publishFilter = (next: ReadonlySet<string>) => {
     void props.api.client.aperture.facetFilter({ facets: [...next] })
   }
-  // Click a legend swatch (glyph or label) to grey its facet; click again to restore.
-  // Multi-select — each click is independent, so "show me only the parsing code" is a
-  // matter of turning the others off.
   const toggleFacet = (facet: string) => {
     const next = new Set(suppressed())
     if (!next.delete(facet)) next.add(facet)
@@ -422,340 +189,98 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     setSuppressed(next)
     publishFilter(next)
   }
-  // The way back from any filter, however many clicks built it. Only rendered while
-  // something is actually suppressed, so it costs no room in the common case.
   const clearFilter = () => {
     logInteraction("legend.reset")
     setSuppressed(new Set<string>())
     publishFilter(new Set<string>())
   }
 
-  // Delete the active Lens via the ✕ control. Two-step: the first click arms a
-  // "confirm?" state, the second performs the delete. Fire-and-forget — the repaint
-  // (and the fall-back to Architecture) rides aperture.invalidated like a cycle.
+  // Delete the active Lens: the first click arms, the second deletes.
   const [confirmingDelete, setConfirmingDelete] = createSignal(false)
-  // Deleting a Lens also deletes every drill-down scoped to it (their domains are its
-  // facets — without it they can't paint at all). That's painted work the user can't see
-  // from here, so the confirm has to count it rather than destroy it silently.
-  const [cascade, setCascade] = createSignal(0)
   const deleteActiveLens = () => {
-    if (!canDeleteActive()) return
-    if (!confirmingDelete()) {
-      setConfirmingDelete(true)
-      void fetchLenses(props.api)
-        .then((all) => setCascade(drillDownsOf(all, activeId()).length))
-        .catch(() => setCascade(0))
-      return
-    }
+    if (!activeId()) return
+    if (!confirmingDelete()) return setConfirmingDelete(true)
     setConfirmingDelete(false)
     logInteraction("lens.delete", activeId())
     void props.api.client.aperture.deleteLens({ lens: activeId() })
   }
-  const deleteLabel = () => {
-    if (!confirmingDelete()) return "✕"
-    const n = cascade()
-    return n > 0 ? `✕ confirm? (+${n} drill-down${n > 1 ? "s" : ""})` : "✕ confirm?"
-  }
-  // Disarm the confirm if the active Lens changes out from under us.
+  const deleteLabel = () => (confirmingDelete() ? "✕ confirm?" : "✕")
   createEffect(() => {
     activeId()
     setConfirmingDelete(false)
-    setCascade(0)
   })
-  // Columns the leading lens-name cluster occupies (◀ name ▶ ⌄ [delete], inner gap 1), or
-  // 0 when there's no active Lens. Mirrors the JSX at the head of the legend row so the
-  // trim budget below matches what actually renders.
+
+  // The lens cluster's rendered width (◀ name ▶ ⌄ ✕ with gap 1), so the legend trim below
+  // charges exactly what renders.
+  const lensLabel = () => (lens() ? lens()!.name + (lens()!.owner === "agent" ? " (agent)" : "") : "")
   const lensClusterWidth = () => {
-    if (!activeName()) return 0
-    const items = [1, activeName().length, 1, 1] // ◀  name  ▶  ⌄
-    if (canDeleteActive()) items.push(deleteLabel().length) // ✕ / ✕ confirm? (+N …)
-    return items.reduce((a, b) => a + b, 0) + (items.length - 1) // + inner gap-1s
+    if (!lens()) return 0
+    const items = [1, lensLabel().length, 1, 1, deleteLabel().length]
+    return items.reduce((a, b) => a + b, 0) + (items.length - 1)
   }
-  // Path-B legend fit: reproduce the one-row legend's rendered width and, when it overflows
-  // the bar, even-trim the facet labels to a shared cap (as large as fits, floored at
-  // LEGEND_LABEL_MIN) so the row neither wraps nor clips. Labels at or under the cap are left
-  // whole; longer ones are ellipsised. Only the facet labels are trimmable — the lens cluster
-  // and the fixed Other/Non-code swatches are counted as fixed overhead. Returns the legend
-  // entries with (possibly) shortened labels.
+  // Fit the one-row legend: when it would overflow, even-trim the facet labels to the largest
+  // shared cap that fits (never below LEGEND_LABEL_MIN). The hover line shows the full label.
   const trimmedLegend = createMemo(() => {
     const entries = legendEntries()
-    // The reset control is only in the row while a filter is on, so it's only charged for
-    // then — otherwise every unfiltered legend would pay for a control it isn't showing.
     const reset = suppressed().size > 0 ? 1 : 0
-    // Top-level children of the legend row: optional lens cluster + one per entry + the two
-    // fixed swatches + the optional reset control. Gaps sit between them.
-    const children = (activeName() ? 1 : 0) + entries.length + 2 + reset
+    const children = (lens() ? 1 : 0) + entries.length + reset
     const fixed =
       lensClusterWidth() +
-      entries.length * 2 + // ■ + leading space on each entry (the label is the trimmable rest)
-      (2 + NONE_LABEL.length) + // "Other" swatch + label
-      (2 + UNTAGGED_LABEL.length) + // "Non-code" swatch + label
+      entries.length * 2 +
       reset * LEGEND_RESET.length +
       Math.max(0, children - 1) * LEGEND_GAP +
       LEGEND_SAFETY_PAD
     const budget = dimensions().width - BAR_PADDING_X * 2 - fixed
     const maxLen = entries.reduce((m, e) => Math.max(m, e.label.length), 0)
-    // Largest shared cap whose trimmed-label total still fits the budget; never below the
-    // floor. sum(min(len, n)) is monotonic in n, so grow from the floor and stop when it
-    // no longer fits. A negative/tiny budget leaves cap at the floor (best effort).
     let cap = LEGEND_LABEL_MIN
     for (let n = LEGEND_LABEL_MIN; n <= maxLen; n++) {
-      const used = entries.reduce((s, e) => s + Math.min(e.label.length, n), 0)
-      if (used <= budget) cap = n
+      if (entries.reduce((s, e) => s + Math.min(e.label.length, n), 0) <= budget) cap = n
       else break
     }
-    // Carry the untrimmed text as `full` so a swatch can reveal it on hover (below) —
-    // trimming then hides characters without losing information.
-    if (cap >= maxLen) return entries.map((e) => ({ ...e, full: e.label }))
     return entries.map((e) => ({
       ...e,
       full: e.label,
       label: e.label.length > cap ? e.label.slice(0, cap - 1) + "…" : e.label,
     }))
   })
-  // Facet → colour, including the O4 legend filter. Shared with the sidebar Activity View
-  // through aperture-colors.ts rather than resolved here: two copies of this mapping is
-  // precisely how one facet ends up greying to two different colours across two surfaces.
+
   const colors = createMemo(() => facetColors(legendEntries(), suppressed(), theme()))
-  const facetColor = (key: string): TuiThemeCurrent["text"] => colors().facetColor(key)
-  const colorFor = (key: string | null): TuiThemeCurrent["text"] => colors().colorFor(key)
-  const boundaries = () => (graph.error ? [] : (graph()?.boundaries ?? []))
-  const edgeList = () => (graph.error ? [] : (graph()?.edges ?? []))
-  const compositionOf = (nodeID: string) => (graph.error ? undefined : graph()?.composition?.[nodeID])
-  const marksOf = (nodeID: string) => (graph.error ? undefined : graph()?.marks?.[nodeID])
-  // The band vocabulary, in the order blocks lay their colours down: the Lens's own facets as
-  // the legend prints them, then NONE_FACET, which the legend never carries. Identical to the
-  // `facets` array the VSCode chip indexes into, so a directory's block and its tree chip
-  // sequence alike — and it is what keeps "Other" grey at the far end rather than at the
-  // front, where a Search Lens would otherwise put it (see compositionBands).
-  const facetOrder = createMemo(() => [...legendEntries().map((e) => e.facet), NONE_FACET])
+  const facetColor = (facet: string) => colors().facetColor(facet)
+  const labelOf = (index: number) => {
+    const facet = facetIds()[index]
+    return legendEntries().find((e) => e.facet === facet)?.label ?? facet ?? "?"
+  }
 
-  // The blocks in the strip: the scope's direct child *directories*, in payload order.
-  // Layer-1 is no longer read at all — the bar shows one level, and what's below it is
-  // legible through each block's composition rather than through a child list (O1).
-  const dirNodes = createMemo(() =>
-    nodes()
-      .filter((n) => n.position.layer === 0 && n.kind === "directory")
-      .toSorted((a, b) => a.position.index - b.position.index),
-  )
-
-  // The scope's own files, as grid columns of FILE_GRID_ROWS tiles each.
-  //
-  // Sorted alphabetically and filled *column-major*, so reading order is down a column then
-  // right — the direction the strip scrolls. Alphabetical rather than payload order because
-  // grouping the files together is what buys the wrapping in the first place: once they are
-  // no longer interleaved with directories there is nothing left for payload order to mean,
-  // and alphabetical is what makes a name findable by eye.
-  const fileColumns = createMemo(() => {
-    const files = nodes()
-      .filter((n) => n.position.layer === 0 && n.kind === "file")
-      .toSorted((a, b) => basename(a.path).localeCompare(basename(b.path)))
-    const columns: GraphNode[][] = []
-    for (let i = 0; i < files.length; i += FILE_GRID_ROWS) columns.push(files.slice(i, i + FILE_GRID_ROWS))
-    return columns
-  })
-
-  // Per-character background colours for a node's one-row band: its composition spread
-  // across `width` columns, each facet taking its byte-proportion and the not-yet-painted /
-  // non-code remainder filling the rest in grey. Used by the file tiles, which is why a
-  // file now needs a `composition` entry of its own (see computeComposition) — painting from
-  // `semantics[id].hue` would flatten it back to the single dominant facet the Explorer pip
-  // is already stuck with, and losing that distinction is the reason the grid exists.
-  const bandColors = (id: string, width: number): (TuiThemeCurrent["text"] | undefined)[] => {
-    const comp = compositionOf(id)
-    const bands = comp ? compositionBands(comp, marksOf(id), facetOrder()) : []
-    if (bands.length === 0) return Array.from({ length: width }, () => resolveColor(theme(), UNTAGGED_HUE))
-    const alloc = allocateCells(bands, width)
-    const flat: TuiThemeCurrent["text"][] = []
-    for (const a of alloc) for (let i = 0; i < a.n; i++) flat.push(colorFor(a.key))
-    while (flat.length < width) flat.push(theme().backgroundPanel)
+  // A tile's band: its group's facets, each taking a share of the width proportional to its marked
+  // lines, and every one of them at least one cell — a single marked line still shows.
+  const bandColors = (file: MarkedFile, group: Group): TuiThemeCurrent["text"][] => {
+    const lines = new Map(file.marks.map((m) => [m.f, m.l]))
+    const bands = group.key.map((f) => ({ key: String(f), value: lines.get(f) ?? 0 }))
+    const alloc = allocateCells(bands, NAME_W)
+    const flat = alloc.flatMap((a) => Array.from({ length: a.n }, () => facetColor(facetIds()[Number(a.key)] ?? "")))
+    while (flat.length < NAME_W) flat.push(theme().backgroundPanel)
     return flat
   }
 
-  // A block's treemap scales its cell count against the biggest sibling (by *whole-subtree*
-  // size, tagged or not), so the largest block fills its grid and the rest read at their
-  // true proportion — a few tagged files never inflate a directory to full size.
-  // Directories only: the file grid is a fixed-size layout, so it neither scales against
-  // this denominator nor belongs in it.
-  const maxDirSubtree0 = createMemo(() => {
-    let max = 0
-    for (const n of nodes()) {
-      if (n.kind !== "directory" || n.position.layer !== 0) continue
-      const c = compositionOf(n.id)
-      if (c) max = Math.max(max, metricSubtree(c))
-    }
-    return max
-  })
-
-  // Blocks carry their name in a label row; it brightens on hover.
-  const dirLabelFg = (node: GraphNode) => (hoveredId() === node.id ? theme().accent : theme().textMuted)
-
-  // Which node tile the mouse is over, for the in-window import highlight. Kept
-  // separate from the `hovered` info-line string so the highlight survives when a
-  // boundary tile (not a node) drives the info line.
-  const [hoveredId, setHoveredId] = createSignal<string>()
-
-  // id → boundary, for the out-of-window targets an edge can point at.
-  const boundaryById = createMemo(() => new Map(boundaries().map((b) => [b.id, b] as const)))
-
-  // Per node: its out-of-window import targets (edges from the node to a boundary).
-  // Drives the boundary-tile strip and the hover line's "→ targets" list.
-  const boundariesFor = createMemo(() => {
-    const byId = boundaryById()
-    const m = new Map<string, GraphBoundary[]>()
-    for (const e of edgeList()) {
-      const b = byId.get(e.to)
-      if (!b) continue
-      const arr = m.get(e.from) ?? []
-      arr.push(b)
-      m.set(e.from, arr)
-    }
-    return m
-  })
-
-  // In-window adjacency (both directions) so hovering a node lights up everything
-  // it imports and everything that imports it. Boundary edges are excluded — those
-  // are surfaced as tiles, not highlights.
-  const adjacency = createMemo(() => {
-    const byId = boundaryById()
-    const m = new Map<string, Set<string>>()
-    const link = (a: string, b: string) => (m.get(a) ?? m.set(a, new Set()).get(a)!).add(b)
-    for (const e of edgeList()) {
-      if (byId.has(e.to)) continue
-      link(e.from, e.to)
-      link(e.to, e.from)
-    }
-    return m
-  })
-
-  // Border color for a node tile under the current hover: the hovered node itself
-  // gets the bright foreground; its in-window neighbors are tinted by *their own*
-  // layer hue (the dependency's semantics); everything else stays the plain border.
-  const borderColorFor = (node: GraphNode) => {
-    const hid = hoveredId()
-    if (!hid) return theme().border
-    if (node.id === hid) return theme().text
-    if (adjacency().get(hid)?.has(node.id)) return hueColor(theme(), hueOf(node.id), node.kind)
-    return theme().border
-  }
-  const enterNode = (node: GraphNode) => {
-    setHovered(hoverNode(node))
-    setHoveredId(node.id)
-  }
-  const leaveNode = () => {
-    setHovered(undefined)
-    setHoveredId(undefined)
+  const describeFile = (file: MarkedFile, group: Group) => {
+    const lines = new Map(file.marks.map((m) => [m.f, m.l]))
+    return [
+      file.path,
+      ...group.key.map((f) => `${labelOf(f)} ${lines.get(f) ?? 0} line${lines.get(f) === 1 ? "" : "s"}`),
+    ].join(" · ")
   }
 
-  // A file's facet mix as text — the band spelled out, since a 14-column strip of colour
-  // can show that a file is mixed without saying what it is mixed *of*. Same reading the
-  // VSCode Explorer pip puts in its tooltip.
-  const facetLabel = (facet: string) =>
-    facet === NONE_FACET ? NONE_LABEL : (legendEntries().find((e) => e.facet === facet)?.label ?? facet)
-
-  // What a node's Search rules found below it, in *lines* rather than percent (S3). A mark's
-  // share is the part the block necessarily rounds up to a whole cell, so the hover is the
-  // only place that can say what was actually found — and "3 lines" is the reading a probe is
-  // asked for anyway.
-  const describeMarks = (id: string) =>
-    (marksOf(id) ?? []).map((m) => `${facetLabel(m.facet)} ${m.lines} line${m.lines === 1 ? "" : "s"}`).join(" · ")
-
-  const describeMix = (id: string) => {
-    const comp = compositionOf(id)
-    if (!comp) return undefined
-    const marked = describeMarks(id)
-    const total = metricSubtree(comp)
-    if (total <= 0 || comp.weights.length === 0) return marked || undefined
-    const parts = comp.weights.map((w) => `${facetLabel(w.facet)} ${Math.round((metricValue(w) / total) * 100)}%`)
-    const untagged = total - metricTotal(comp)
-    if (untagged > 0) parts.push(`${UNTAGGED_LABEL} ${Math.round((untagged / total) * 100)}%`)
-    return [...(marked ? [marked] : []), ...parts].join(" · ")
-  }
-
-  // Hover text for a node: its path/size and — for a file — its facet mix spelled out.
-  const hoverNode = (node: GraphNode) => {
-    // A directory still doesn't spell out its mix — that is what its treemap is for — but it
-    // does report what is *marked* below it, since a probe's whole question is "how much of
-    // this is in here" and one or two cells cannot answer it.
-    const mix =
-      node.kind === "file"
-        ? describeMix(node.id)
-        : (marksOf(node.id) ?? []).length
-          ? describeMarks(node.id)
-          : undefined
-    const base = mix ? `${describeNode(node)} · ${mix}` : describeNode(node)
-    // List out-of-window import targets so a dependency that left the window is
-    // still legible even though it can't be drawn as an in-window highlight.
-    const outs = boundariesFor().get(node.id) ?? []
-    return outs.length ? `${base} · →${outs.map((b) => basename(b.path)).join(" ")}` : base
-  }
-
-  // How many cells a directory's treemap paints. Everything about a block's size derives
-  // from this one number — the grid it draws and the width of the box around it — so the
-  // box cannot end up wider than its contents. Previously width was scaled separately from
-  // cell count, and a "there's horizontal room, so draw everything full-size" rule sat on
-  // top of it; between them a small directory got a big empty box.
-  const blockCells = (id: string) => {
-    const comp = compositionOf(id)
-    const bands = comp ? compositionBands(comp, marksOf(id), facetOrder()) : []
-    // Nothing under it the painter sees as code: one grey cell, so the box still reads as a
-    // real-but-uninhabited directory rather than vanishing.
-    if (!comp || bands.length === 0) return 1
-    // Floor at the band count so every facet actually present gets at least one cell — a
-    // real facet is never an invisible sliver. This is also what keeps `allocateCells`'s
-    // steal loop inside its `cells >= parts.length` guard now that a mark can add a band
-    // the composition doesn't carry (S3): a single marked line in a huge directory has no
-    // area to speak of and reaches the block only through that guarantee.
-    return Math.min(
-      BLOCK_CELL_CAP,
-      Math.max(scaleCells(metricSubtree(comp), maxDirSubtree0(), BLOCK_CELL_CAP), bands.length),
-    )
-  }
-  // ...and the columns those cells occupy, which is the block's width. `buildGrid` lays the
-  // same count into ceil(cells / rows) columns, so this matches what actually gets drawn;
-  // the clamp only bites at the very bottom, where a sub-one-column directory is widened to
-  // the COLUMN_COLS_MIN floor so it stays a legible box.
-  const blockCols = (id: string) =>
-    Math.max(COLUMN_COLS_MIN, Math.min(COLUMN_COLS_MAX, Math.ceil(blockCells(id) / COLUMN_ROWS)))
-  const blockWidth = (id: string) => columnOuterW(blockCols(id))
-
-  // Whether the strip overflows the viewport horizontally — i.e. whether OpenTUI will draw
-  // the horizontal scrollbar on the scrollbox's bottom row. Computed from data + terminal
-  // width rather than read off the renderable (no per-frame polling, no layout-timing race):
-  // the strip's width is the sum of the block footprints plus the inter-block gaps, and the
-  // viewport is the full-width bar less its own horizontal padding.
-  // The file grid is one strip child however many columns it holds, so it contributes its
-  // whole packed width but only one gap.
+  const groupWidth = (entry: { group: Group; columns: Segment[][] }) =>
+    Math.max(entry.columns.length * TILE_W, headerText(entry.group).length + entry.group.key.length * 2)
   const contentWidth = createMemo(() => {
-    const widths = dirNodes().map((n) => blockWidth(n.id))
-    const columns = fileColumns().length
-    if (columns > 0) widths.push(columns * FILE_TILE_W)
-    if (widths.length === 0) return 0
-    return widths.reduce((a, b) => a + b, 0) + SCROLL_GAP * (widths.length - 1)
+    const widths = groups().map(groupWidth)
+    return widths.reduce((a, b) => a + b, 0) + GROUP_GAP * Math.max(0, widths.length - 1)
   })
   const scrollbarVisible = createMemo(() => contentWidth() > dimensions().width - BAR_PADDING_X * 2)
-  // Bar height: the base budget, plus the one reserved scrollbar row only while the scrollbar
-  // is actually showing — so a strip that fits gives the row back to the conversation below.
   const barHeight = () => TOP_BAR_HEIGHT + (scrollbarVisible() ? 1 : 0)
 
-  const crumbs = () => {
-    const s = scope()
-    if (s === "") return []
-    const segs = s.split("/")
-    return segs.map((seg, i) => ({ label: seg, path: segs.slice(0, i + 1).join("/") }))
-  }
-  const upTarget = () => {
-    const s = scope()
-    const i = s.lastIndexOf("/")
-    return i === -1 ? "" : s.slice(0, i)
-  }
-
-  // The bar lays its tiles out in a single horizontal strip that overflows the
-  // viewport, so it scrolls sideways only. A native left/right wheel is handled by
-  // the scrollbox itself; here we redirect a vertical (up/down) wheel into the same
-  // horizontal motion so either gesture pans the strip. Shift+wheel is left alone —
-  // the scrollbox already remaps that to horizontal, and double-handling it would
-  // scroll twice as far.
+  // Redirect a vertical wheel into horizontal scroll so either gesture pans the strip. Shift+wheel
+  // is left alone — the scrollbox already remaps it.
   let scroll: ScrollBoxRenderable | undefined
   const onWheel = (event: MouseEvent) => {
     const dir = event.scroll?.direction
@@ -764,27 +289,12 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     scroll.scrollLeft += dir === "up" ? -cells : cells
   }
 
-  // Re-root the view by typing/pasting a repo-relative path. This is the reliable way to
-  // point the bar at something the agent mentioned: file/dir references in the chat aren't
-  // clickable (an inline text run carries no mouse events), so instead of hunting for a
-  // tile you copy the path from anywhere and drop it here. Opened from the ⌖ button;
-  // prefilled with the current scope, blank input means the repo root. Opens on mouse-up
-  // (a dialog opened on mouse-down is dismissed by the backdrop seeing the release).
-  const openGoto = () => {
-    const DialogPrompt = props.api.ui.DialogPrompt
-    props.api.ui.dialog.replace(() => (
-      <DialogPrompt
-        title="Go to path"
-        value={scope()}
-        placeholder="repo-relative path (blank = repo root)"
-        onConfirm={(value: string) => {
-          logInteraction("goto", scopeFromInput(value))
-          setScope(scopeFromInput(value))
-          props.api.ui.dialog.clear()
-        }}
-        onCancel={() => props.api.ui.dialog.clear()}
-      />
-    ))
+  const emptyMessage = () => {
+    if (map.error) return "Could not load the Aperture view."
+    if (!data()) return ""
+    if (!lens()) return "No Lens yet — ask the agent to mark something, or it will curate one as it works."
+    if (files().length === 0) return `Nothing marked under "${lens()!.name}" yet.`
+    return "Every facet is filtered out — click one in the legend, or ↺ to reset."
   }
 
   return (
@@ -799,121 +309,53 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
       borderColor={theme().border}
     >
       <box flexDirection="row" justifyContent="space-between">
-        <text fg={theme().text}>
-          <b>Aperture</b>
-        </text>
-        {/* Hover-info line (Foundation A): a node's path/size while pointed at,
-            otherwise the node/edge count. Shared by all overlay features. */}
+        <box flexDirection="row" gap={1} flexShrink={0}>
+          <text fg={theme().text}>
+            <b>Aperture</b>
+          </text>
+          <text
+            fg={theme().accent}
+            onMouseDown={() => {
+              logInteraction("refresh")
+              refetch()
+            }}
+          >
+            ⟳
+          </text>
+        </box>
         <text fg={hovered() ? theme().text : theme().textMuted} wrapMode="none">
           {hovered() ?? summary()}
         </text>
       </box>
 
-      {/* Navigation row: refresh + go-to + root + up + breadcrumb. Always present so the
-          graph area below doesn't jump as the user drills in and out. Crumbs are clickable
-          for quick navigation; the ⌖ button opens a "go to path" prompt (type/paste a path)
-          for jumping somewhere arbitrary — e.g. a path the agent mentioned in chat. */}
-      <box flexDirection="row" gap={1} height={1} flexShrink={0}>
-        <text
-          fg={theme().accent}
-          onMouseDown={() => {
-            logInteraction("refresh")
-            refetch()
-          }}
-        >
-          ⟳
-        </text>
-        <text
-          fg={theme().accent}
-          onMouseUp={() => openGoto()}
-          onMouseOver={() => setHovered("go to a path (type or paste)")}
-          onMouseOut={() => setHovered(undefined)}
-        >
-          ⌖
-        </text>
-        <Show when={scope() !== ""} fallback={<text fg={theme().textMuted}>/</text>}>
-          <text
-            fg={theme().accent}
-            onMouseDown={() => {
-              logInteraction("nav.root")
-              setScope("")
-            }}
-          >
-            ⌂
-          </text>
-          <text
-            fg={theme().accent}
-            onMouseDown={() => {
-              logInteraction("nav.up", upTarget())
-              setScope(upTarget())
-            }}
-          >
-            ◀
-          </text>
-          <For each={crumbs()}>
-            {(crumb, i) => (
-              <text
-                fg={i() === crumbs().length - 1 ? theme().text : theme().textMuted}
-                onMouseDown={() => {
-                  logInteraction("breadcrumb.nav", crumb.path)
-                  setScope(crumb.path)
-                }}
-              >
-                {(i() === 0 ? "" : "/ ") + crumb.label}
-              </text>
-            )}
-          </For>
-        </Show>
-      </box>
-
-      {/* Legend: the fixed architectural-layer vocabulary the async painter paints
-          with. Stable row so the swatches don't move as nodes get (re)tagged. */}
       <box flexDirection="row" gap={LEGEND_GAP} height={1} flexShrink={0}>
-        {/* Active Lens name flanked by ◀/▶ arrows that step (and loop)
-            through the available Lenses, the click-driven sibling of /lens. */}
-        <Show when={activeName()}>
+        <Show when={lens()}>
           <box flexDirection="row" gap={1} flexShrink={0}>
             <text fg={theme().accent} onMouseDown={() => cycleLens("prev")} wrapMode="none">
               ◀
             </text>
-            {/* Clicking the name advances like ▶, giving the forward step a bigger hit area. */}
             <text fg={theme().accent} onMouseDown={() => cycleLens("next")} wrapMode="none">
-              {activeName()}
+              {lensLabel()}
             </text>
             <text fg={theme().accent} onMouseDown={() => cycleLens("next")} wrapMode="none">
               ▶
             </text>
-            {/* Open the searchable Lens picker (A2) — the scalable alternative to
-                cycling once there are many Lenses. Opened on mouse *up*, not down:
-                the dialog backdrop dismisses itself on the mouse-up it sees outside
-                its inner box, so opening on mouse-down means the same gesture's
-                release closes the popup immediately (see ui/dialog.tsx). */}
+            {/* Opened on mouse *up*: the dialog backdrop dismisses itself on the mouse-up it sees
+                outside its box, so opening on mouse-down would close it immediately. */}
             <text fg={theme().textMuted} onMouseUp={() => openLensPicker(props.api, props.session_id)} wrapMode="none">
               ⌄
             </text>
-            {/* Delete the active (user) collection: click to arm, click again to
-                confirm. Hidden for the immutable built-in Architecture collection. */}
-            <Show when={canDeleteActive()}>
-              <text
-                fg={confirmingDelete() ? theme().error : theme().textMuted}
-                onMouseDown={() => deleteActiveLens()}
-                wrapMode="none"
-              >
-                {deleteLabel()}
-              </text>
-            </Show>
+            <text
+              fg={confirmingDelete() ? theme().error : theme().textMuted}
+              onMouseDown={() => deleteActiveLens()}
+              wrapMode="none"
+            >
+              {deleteLabel()}
+            </text>
           </box>
         </Show>
         <For each={trimmedLegend()}>
           {(entry) => (
-            // Hovering a swatch surfaces the untrimmed facet name in the hover line, so an
-            // ellipsised label still tells you what it stands for.
-            //
-            // Clicking anywhere in this box — glyph or label — toggles the facet off and on
-            // (O4). The handler sits on the wrapper rather than on the ■ so the whole entry
-            // is the hit area: the label is the wider half and the easier thing to aim at.
-            // onMouseDown, not up: the mouse-up convention above is only for controls that
-            // open a dialog whose backdrop would eat the release.
             <box
               flexDirection="row"
               flexShrink={0}
@@ -921,8 +363,6 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
               onMouseOver={() => setHovered(entry.full)}
               onMouseOut={() => setHovered(undefined)}
             >
-              {/* Painted through facetColor, not entry.color, so the swatch greys with
-                  everything else it stands for — the legend shows its own off-state. */}
               <text fg={facetColor(entry.facet)} wrapMode="none">
                 ■
               </text>
@@ -932,29 +372,6 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
             </box>
           )}
         </For>
-        {/* "Other": code the painter judged unrelated to this Lens (NONE_FACET). */}
-        <box flexDirection="row" flexShrink={0}>
-          <text fg={resolveColor(theme(), NONE_HUE)} wrapMode="none">
-            ■
-          </text>
-          <text fg={theme().textMuted} wrapMode="none">
-            {" " + NONE_LABEL}
-          </text>
-        </box>
-        {/* The dimmer grey: a subtree with nothing the painter sees as code (specs,
-            fixtures, assets, …) or not yet swept. */}
-        <box flexDirection="row" flexShrink={0}>
-          <text fg={resolveColor(theme(), UNTAGGED_HUE)} wrapMode="none">
-            ■
-          </text>
-          <text fg={theme().textMuted} wrapMode="none">
-            {" " + UNTAGGED_LABEL}
-          </text>
-        </box>
-        {/* Un-grey everything in one click. Shown only while a filter is on — it is the
-            exit from a state, not a permanent control, and the legend row has no columns to
-            spare for one. Its width is in the trim budget (see trimmedLegend) so the labels
-            give up the space it takes rather than the row overflowing when it appears. */}
         <Show when={suppressed().size > 0}>
           <text fg={theme().accent} onMouseDown={() => clearFilter()} wrapMode="none">
             {LEGEND_RESET}
@@ -962,239 +379,102 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
         </Show>
       </box>
 
-      {/* Sideways-scrolling graph strip. The tiles lay out in a row that overflows
-          the viewport and pans horizontally; a thin themed scrollbar marks the
-          position and vertical-wheel panning is wired through onWheel above.
-
-          NB: the scrollbox's `scrollX`/`scrollY` are *constructor-only* options, but
-          the solid renderer builds every element with just `{ id }` and applies the
-          rest as property assignments — which those two lack setters for, so passing
-          them as props is silently inert. We instead configure the content box
-          directly (it's what `scrollX`/`scrollY` ultimately size): clear its maxWidth
-          so it can grow past the viewport (horizontal overflow → scroll), and pin
-          maxHeight to 100% so the band can't scroll vertically. */}
-      <scrollbox
-        ref={(r: ScrollBoxRenderable) => (scroll = r)}
-        flexGrow={1}
-        onMouseScroll={onWheel}
-        contentOptions={{ flexDirection: "row", gap: SCROLL_GAP, maxWidth: undefined, maxHeight: "100%" }}
-        verticalScrollbarOptions={{ visible: false }}
-        horizontalScrollbarOptions={{
-          showArrows: false,
-          trackOptions: { foregroundColor: theme().textMuted, backgroundColor: theme().backgroundPanel },
-        }}
+      <Show
+        when={groups().length > 0}
+        fallback={
+          <text fg={theme().textMuted} wrapMode="none">
+            {emptyMessage()}
+          </text>
+        }
       >
-        {/* One block per child directory, then the loose-files aggregate. There is no
-            second tier: a directory's files are already summed into its treemap, so the
-            child list the bar used to draw beneath each block was showing the same bytes
-            twice at the cost of six rows of height (O1). */}
-        <For each={dirNodes()}>
-          {(node) => (
-            <DirBlock
-              // One column short of the block, so that with SCROLL_GAP at 0 two neighbouring
-              // labels always have a space between them instead of running together.
-              label={truncate(basename(node.path), blockWidth(node.id) - 1)}
-              labelFg={() => dirLabelFg(node)}
-              rows={COLUMN_ROWS}
-              cells={blockCells(node.id)}
-              width={blockWidth(node.id)}
-              borderColor={() => borderColorFor(node)}
-              composition={() => compositionOf(node.id)}
-              marks={() => marksOf(node.id)}
-              order={facetOrder}
-              colorFor={colorFor}
-              theme={theme}
-              onDrill={() => openDirectory(node.path)}
-              onEnter={() => enterNode(node)}
-              onLeave={() => leaveNode()}
-            />
-          )}
-        </For>
-        {/* The scope's own files, packed into a grid rather than aggregated into one block.
-            Each tile is the filename over a band of that file's facet mix, so a minority
-            facet stays visible — the thing a single aggregate block averages away and the
-            Explorer pip cannot show at all (one colour per FileDecoration ⇒ dominant only).
-            The whole grid is a single strip child, so its tiles pack tight against each
-            other while the strip's gap still separates it from the directory blocks. */}
-        <Show when={fileColumns().length > 0}>
-          <box flexDirection="row" flexShrink={0}>
-            <For each={fileColumns()}>
-              {(column) => (
-                <box flexDirection="column" flexShrink={0}>
-                  <For each={column}>
-                    {(node) => (
-                      <FileTile
-                        label={basename(node.path)}
-                        width={FILE_TILE_W}
-                        colors={(w) => bandColors(node.id, w)}
-                        borderColor={() => borderColorFor(node)}
-                        theme={theme}
-                        onOpen={() => openFile(node.path)}
-                        onEnter={() => enterNode(node)}
-                        onLeave={() => leaveNode()}
-                      />
+        {/* NB: the scrollbox's `scrollX`/`scrollY` are constructor-only and inert as props, so
+            the content box is configured directly: no maxWidth (horizontal overflow scrolls),
+            maxHeight pinned (no vertical scroll). */}
+        <scrollbox
+          ref={(r: ScrollBoxRenderable) => (scroll = r)}
+          flexGrow={1}
+          onMouseScroll={onWheel}
+          contentOptions={{ flexDirection: "row", gap: GROUP_GAP, maxWidth: undefined, maxHeight: "100%" }}
+          verticalScrollbarOptions={{ visible: false }}
+          horizontalScrollbarOptions={{
+            showArrows: false,
+            trackOptions: { foregroundColor: theme().textMuted, backgroundColor: theme().backgroundPanel },
+          }}
+        >
+          <For each={groups()}>
+            {(entry) => (
+              <box flexDirection="column" flexShrink={0} width={groupWidth(entry)}>
+                <box
+                  flexDirection="row"
+                  height={1}
+                  flexShrink={0}
+                  onMouseOver={() => setHovered(entry.group.key.map(labelOf).join(" + "))}
+                  onMouseOut={() => setHovered(undefined)}
+                >
+                  <For each={entry.group.key}>
+                    {(f) => (
+                      <text fg={facetColor(facetIds()[f] ?? "")} wrapMode="none">
+                        {"■ "}
+                      </text>
+                    )}
+                  </For>
+                  <text fg={theme().textMuted} wrapMode="none">
+                    {headerText(entry.group)}
+                  </text>
+                </box>
+                <box flexDirection="row" flexShrink={0}>
+                  <For each={entry.columns}>
+                    {(column) => (
+                      <box flexDirection="column" flexShrink={0}>
+                        <For each={column}>
+                          {(segment) => (
+                            <box
+                              border
+                              customBorderChars={SQUARE_CORNERS}
+                              borderColor={theme().border}
+                              title={segmentTitle(segment)}
+                              titleAlignment="left"
+                              width={TILE_W}
+                              height={segment.files.length + SEGMENT_BORDER_ROWS}
+                              flexShrink={0}
+                              flexDirection="column"
+                            >
+                              <For each={segment.files}>
+                                {(file) => (
+                                  <box
+                                    onMouseDown={() => openFile(file)}
+                                    onMouseOver={() => setHovered(describeFile(file, entry.group))}
+                                    onMouseOut={() => setHovered(undefined)}
+                                  >
+                                    <NameRow
+                                      name={truncate(basename(file.path), NAME_W)}
+                                      width={NAME_W}
+                                      colors={() => bandColors(file, entry.group)}
+                                      textColor={() => theme().background}
+                                      theme={theme}
+                                    />
+                                  </box>
+                                )}
+                              </For>
+                            </box>
+                          )}
+                        </For>
+                      </box>
                     )}
                   </For>
                 </box>
-              )}
-            </For>
-          </box>
-        </Show>
-      </scrollbox>
-    </box>
-  )
-}
-
-// --- treemap layer ---------------------------------------------------------
-
-// A directory rendered as its subtree's composition: a clickable label over a
-// *bordered* grid of layer-colored cells. The border frames the block so it reads as a
-// real directory even when empty (an empty/untagged subtree paints solid grey rather
-// than vanishing into the panel). The whole block is the click target.
-//
-// `cells` and `width` are computed together by the caller from one number, so the box is
-// exactly as wide as the cells it holds — see `blockCells`/`blockCols`.
-function DirBlock(props: {
-  label: string
-  labelFg: () => TuiThemeCurrent["text"]
-  rows: number
-  cells: number
-  width?: number
-  borderColor: () => TuiThemeCurrent["text"]
-  composition: () => Composition | undefined
-  marks: () => readonly MarkWeight[] | undefined
-  order: () => readonly string[]
-  colorFor: (key: string | null) => TuiThemeCurrent["text"]
-  theme: () => TuiThemeCurrent
-  onDrill: () => void
-  onEnter: () => void
-  onLeave: () => void
-}) {
-  return (
-    <box
-      flexDirection="column"
-      flexShrink={0}
-      onMouseDown={() => props.onDrill()}
-      onMouseOver={() => props.onEnter()}
-      onMouseOut={() => props.onLeave()}
-    >
-      <text fg={props.labelFg()} wrapMode="none">
-        {props.label}
-      </text>
-      <box
-        border
-        customBorderChars={SQUARE_CORNERS}
-        borderColor={props.borderColor()}
-        width={props.width}
-        flexShrink={0}
-      >
-        <TreemapBlock
-          composition={props.composition}
-          marks={props.marks}
-          order={props.order}
-          colorFor={props.colorFor}
-          rows={props.rows}
-          cells={props.cells}
-          theme={props.theme}
-        />
-      </box>
-    </box>
-  )
-}
-
-// The colored grid itself, painted *inside* the directory's border. `cells` — the block's
-// area, decided by the caller so the surrounding box can be sized to match — is split
-// across the tag bands plus a trailing grey band for the not-yet-tagged / non-code
-// remainder, by largest-remainder rounding, laid out in fixed-order bands column-major and
-// bottom-aligned (each column fills bottom-up before the next one starts, so the footing
-// stays full and a band reads as columns rather than as stripes) — the same order the VSCode
-// tree chip's mosaic uses, so the two renderings of one directory can be read the same way.
-// So a directory reads at its true size, starts all grey, and each tag only occupies its
-// real byte-proportion as the sweep fills in — rather than a handful of tagged files
-// painting the whole block.
-function TreemapBlock(props: {
-  composition: () => Composition | undefined
-  marks: () => readonly MarkWeight[] | undefined
-  order: () => readonly string[]
-  colorFor: (key: string | null) => TuiThemeCurrent["text"]
-  rows: number
-  cells: number
-  theme: () => TuiThemeCurrent
-}) {
-  const grid = createMemo(() => {
-    const comp = props.composition()
-    const bands = comp ? compositionBands(comp, props.marks(), props.order()) : []
-    // No descendant source files: keep the bordered box non-empty with one grey cell.
-    if (bands.length === 0) return buildGrid([GREY_CELL], props.rows)
-    const alloc = allocateCells(bands, props.cells)
-    const flat: string[] = []
-    for (const a of alloc) for (let i = 0; i < a.n; i++) flat.push(a.key)
-    // Degenerate (e.g. only zero-byte files): keep the bordered box non-empty.
-    if (flat.length === 0) return buildGrid([GREY_CELL], props.rows)
-    return buildGrid(flat, props.rows)
-  })
-  return (
-    <box flexDirection="column" flexShrink={0}>
-      <For each={grid()}>
-        {(row) => (
-          <box flexDirection="row" height={1} flexShrink={0}>
-            <For each={coalesce(row)}>
-              {(run) => (
-                <box width={run.len * CELL_W} height={1} flexShrink={0} backgroundColor={props.colorFor(run.value)} />
-              )}
-            </For>
-          </box>
-        )}
-      </For>
-    </box>
-  )
-}
-
-// A file tile: one bordered row, the filename in dark text over a band of the file's own
-// facet mix. The band is the point — it is the finest-grained facet reading in the product,
-// finer than the directory treemap (which averages the file into its parent) and finer than
-// the VSCode Explorer pip (one colour, so dominant-only). Clicking opens the file.
-function FileTile(props: {
-  label: string
-  width: number
-  colors: (width: number) => (TuiThemeCurrent["text"] | undefined)[]
-  borderColor: () => TuiThemeCurrent["text"]
-  theme: () => TuiThemeCurrent
-  onOpen: () => void
-  onEnter: () => void
-  onLeave: () => void
-}) {
-  // The tile's inner cols (width − border), all of them the name's: the band keeps its
-  // full width behind the name and nothing is held back to its right.
-  const nameWidth = () => Math.max(0, props.width - 2)
-  return (
-    <box
-      border
-      customBorderChars={SQUARE_CORNERS}
-      borderColor={props.borderColor()}
-      width={props.width}
-      flexShrink={0}
-      onMouseDown={() => props.onOpen()}
-      onMouseOver={() => props.onEnter()}
-      onMouseOut={() => props.onLeave()}
-    >
-      <NameRow
-        name={truncate(props.label, nameWidth())}
-        width={nameWidth()}
-        colors={() => props.colors(nameWidth())}
-        // Dark text over the band, the same treatment the directory bars used: every band
-        // colour (facet hues and the untagged grey alike) is a light fill, so the label
-        // reads against all of them without having to know which facet it landed on.
-        textColor={() => props.theme().background}
-        theme={props.theme}
-      />
+              </box>
+            )}
+          </For>
+        </scrollbox>
+      </Show>
     </box>
   )
 }
 
 // One inner row of `width` character cells: each shows the name's character (or a space) in
-// `textColor` over the per-column background from `colors` (undefined → panel). The
-// per-character split is what lets dark text sit over a multi-colour composition band.
+// `textColor` over the per-column background from `colors`. The per-character split is what
+// lets dark text sit over a multi-colour band.
 function NameRow(props: {
   name: string
   width: number
@@ -1222,120 +502,21 @@ function NameRow(props: {
   )
 }
 
-// Hover-info text for a node: its full repo-relative path (plus size for files).
-function describeNode(node: GraphNode) {
-  if (node.kind === "directory") return node.path + "/"
-  return `${node.path} · ${formatBytes(node.size)}`
+function headerText(group: Group) {
+  return `${group.files.length} file${group.files.length === 1 ? "" : "s"}`
 }
 
-function formatBytes(n: number) {
-  if (n < 1024) return `${n} B`
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
-  return `${(n / (1024 * 1024)).toFixed(1)} MB`
-}
-
-// --- helpers ---------------------------------------------------------------
-
-function basename(p: string) {
-  return p.split("/").pop() ?? p
-}
-
-// Turn typed/pasted text into a directory scope: trim surrounding slashes/space, and if it
-// points at a file (a basename with an extension — a dot past the first char) root at its
-// parent directory, so pasting a file path from chat lands on the file's 2-level window.
-// Dotfiles (".github") keep their own name, as the dot is leading.
-function scopeFromInput(input: string): string {
-  const trimmed = input.trim().replace(/^\/+|\/+$/g, "")
-  if (trimmed === "") return ""
-  const segs = trimmed.split("/")
-  if ((segs[segs.length - 1] ?? "").lastIndexOf(".") > 0) segs.pop()
-  return segs.join("/")
+// A run's border title: its directory, trimmed from the left so the most specific part survives.
+function segmentTitle(segment: Segment) {
+  const dir = segment.dir === "" ? "(root)" : segment.dir
+  const label = (segment.continued ? "↳ " : "") + dir
+  const max = TILE_W - 4
+  return label.length > max ? "…" + label.slice(label.length - max + 1) : label
 }
 
 function truncate(s: string, max: number) {
   return s.length > max ? s.slice(0, max - 1) + "…" : s
 }
-
-// --- treemap math ----------------------------------------------------------
-
-// The metric (bytes or count) a composition is weighed by. Both are carried so the
-// switch is a single constant; `metricTotal` is the directory's total, `metricValue`
-// one layer's share.
-function metricTotal(c: Composition) {
-  return TREEMAP_METRIC === "bytes" ? c.totalBytes : c.totalCount
-}
-function metricValue(w: FacetWeight) {
-  return TREEMAP_METRIC === "bytes" ? w.bytes : w.count
-}
-// The whole-subtree size (all descendant files, tagged or not), used as the denominator
-// so a directory is always sized and split against its real size.
-function metricSubtree(c: Composition) {
-  return TREEMAP_METRIC === "bytes" ? c.subtreeBytes : c.subtreeCount
-}
-
-// Allocation bands for a directory: one per tag (its byte/count share) plus a trailing
-// grey band (GREY_CELL) for the not-yet-tagged / non-code remainder (whole subtree minus
-// the tagged total). Because the bands sum to the whole subtree, a freshly-created
-// collection starts fully grey and each tag only ever grows to its true proportion as
-// the background sweep fills in — instead of a few tagged files painting a whole
-// directory. Returns [] only when the directory has no descendant source files at all.
-//
-// `marks` (S3) overlays the Search-rule hits below the node onto that partition. The rule is
-// **`max` per facet, never additive**: on an Overview Lens the marked lines' bytes are
-// already counted under whatever facet their extent had, so adding would count them twice; a
-// mark says "at least this much of this facet is here", which is also exactly right on a
-// Search Lens, where the composition is entirely NONE and every mark band is new. The grey
-// remainder absorbs whatever the overlay adds, so the bands still sum to the subtree and a
-// block's size is unaffected by what is marked inside it.
-//
-// This function does not floor anything. A single marked line in a large directory comes out
-// with a real but minuscule value, and it is `allocateCells`'s "every band with weight > 0
-// keeps a cell" guarantee — kept reachable by `blockCells` flooring the budget at the band
-// count — that turns it into a visible cell. That is deliberate: the floor belongs where the
-// cell budget is known, not here, or the two would have to agree about a number neither owns.
-// `order` is the Lens's facet ids with NONE_FACET appended — the same vocabulary the VSCode
-// chip indexes its `f` into, and the reason bands are laid down in *facet* order rather than
-// in the order the two inputs happened to supply them. Merging two maps by insertion put
-// NONE first on every Search Lens, because the composition contributes nothing else and each
-// concern arrived behind it: the one facet the user is not looking for took the whole left
-// edge of every block. Sorting by `order` fixes it at the root — NONE is last in the
-// vocabulary, so it is last in the block, before the grey remainder.
-function compositionBands(
-  c: Composition,
-  marks?: readonly MarkWeight[],
-  order?: readonly string[],
-): { key: string; value: number }[] {
-  const byFacet = new Map(c.weights.map((w) => [w.facet, metricValue(w)] as const))
-  for (const m of marks ?? []) {
-    const value = TREEMAP_METRIC === "bytes" ? m.bytes : m.lines
-    if (value > 0) byFacet.set(m.facet, Math.max(byFacet.get(m.facet) ?? 0, value))
-  }
-  // NONE is ranked last explicitly rather than by its position in `order`, so the rule holds
-  // even before the legend arrives (an empty `order` is just `[NONE_FACET]`, which would
-  // otherwise rank it first — the exact failure this fixes). A facet the legend has not caught
-  // up with sorts after the known ones but still ahead of NONE: it is a real colour, and
-  // burying it under the grey would be the same mistake one step removed.
-  const rank = (facet: string) => {
-    if (facet === NONE_FACET) return (order?.length ?? 0) + 1
-    const i = order?.indexOf(facet) ?? -1
-    return i === -1 ? (order?.length ?? 0) : i
-  }
-  const bands = [...byFacet].map(([key, value]) => ({ key, value })).sort((a, b) => rank(a.key) - rank(b.key))
-  const remainder = metricSubtree(c) - bands.reduce((sum, b) => sum + b.value, 0)
-  if (remainder > 0) bands.push({ key: GREY_CELL, value: remainder })
-  return bands
-}
-
-// --- hue mapping -----------------------------------------------------------
-
-// Agent-inferred hues are named theme colors. Until the semantic layer exists
-// (step 4) every node falls back to a structural color (directories accented,
-// files muted), so the bar is useful immediately.
-function hueColor(theme: TuiThemeCurrent, hue: string | undefined, kind: GraphNode["kind"]) {
-  if (hue) return resolveColor(theme, hue)
-  return kind === "directory" ? themeColor(theme, DIRECTORY_HUE) : theme.textMuted
-}
-
 
 const tui: TuiPlugin = async (api) => {
   api.slots.register({
@@ -1346,8 +527,8 @@ const tui: TuiPlugin = async (api) => {
       },
     },
   })
-  // A2: searchable Lens picker, reachable from the command palette / `/lens-switch`
-  // (and from a click on the active-Lens name in the legend, see View).
+  // Searchable Lens picker, reachable from the command palette / `/lens-switch` (and from the ⌄
+  // next to the active Lens name).
   api.keymap.registerLayer({
     commands: [
       {

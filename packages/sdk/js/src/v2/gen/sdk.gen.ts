@@ -14,12 +14,12 @@ import type {
   ApertureFacetFilterResponses,
   ApertureFacetMapErrors,
   ApertureFacetMapResponses,
-  ApertureFocusScopeErrors,
-  ApertureFocusScopeResponses,
-  ApertureGetErrors,
-  ApertureGetResponses,
+  ApertureHistoryErrors,
+  ApertureHistoryResponses,
   ApertureInteractionErrors,
   ApertureInteractionResponses,
+  ApertureLinesErrors,
+  ApertureLinesResponses,
   ApertureListLensesErrors,
   ApertureListLensesResponses,
   ApertureSelectLensErrors,
@@ -679,17 +679,15 @@ export class Event extends HeyApiClient {
 
 export class Aperture extends HeyApiClient {
   /**
-   * Get Aperture view
+   * Get a file's Aperture marks
    *
-   * Retrieve the deterministic Aperture payload for the active instance.
+   * The marked line ranges of one file under the active Lens, for editor gutter painting.
    */
-  public get<ThrowOnError extends boolean = false>(
-    parameters?: {
+  public lines<ThrowOnError extends boolean = false>(
+    parameters: {
       directory?: string
       workspace?: string
-      scope?: string
-      refresh?: "true" | "false"
-      drill?: string
+      path: string
     },
     options?: Options<never, ThrowOnError>,
   ) {
@@ -700,15 +698,53 @@ export class Aperture extends HeyApiClient {
           args: [
             { in: "query", key: "directory" },
             { in: "query", key: "workspace" },
-            { in: "query", key: "scope" },
-            { in: "query", key: "refresh" },
-            { in: "query", key: "drill" },
+            { in: "query", key: "path" },
           ],
         },
       ],
     )
-    return (options?.client ?? this.client).get<ApertureGetResponses, ApertureGetErrors, ThrowOnError>({
-      url: "/aperture",
+    return (options?.client ?? this.client).get<ApertureLinesResponses, ApertureLinesErrors, ThrowOnError>({
+      url: "/aperture/lines",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Get the Lens history
+   *
+   * The append-only history of Lens, facet and rule changes, each tied to the actor, session and chat turn that made it.
+   */
+  public history<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      since?: string
+      sessionID?: string
+      turnID?: string
+      lens?: string
+      limit?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "query", key: "since" },
+            { in: "query", key: "sessionID" },
+            { in: "query", key: "turnID" },
+            { in: "query", key: "lens" },
+            { in: "query", key: "limit" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<ApertureHistoryResponses, ApertureHistoryErrors, ThrowOnError>({
+      url: "/aperture/history",
       ...options,
       ...params,
     })
@@ -717,7 +753,7 @@ export class Aperture extends HeyApiClient {
   /**
    * Get the whole-repo facet map
    *
-   * Every painted source file in the repo with its facet mix under the active Lens, for bulk file-tree decoration.
+   * Every file with marked lines under the active Lens, with marked-line counts per facet.
    */
   public facetMap<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -747,7 +783,7 @@ export class Aperture extends HeyApiClient {
   /**
    * Get a session's Aperture activity
    *
-   * Per-turn agent read/edit/write activity for a session, with the facet of each touched file under the active Lens. Derived from the message store on read, so switching Lens recolours history without re-recording it.
+   * Per-turn agent read/edit/write activity for a session, with the marks of each touched file under the active Lens. Derived from the message store on read, so switching Lens recolours history without re-recording it.
    */
   public activity<ThrowOnError extends boolean = false>(
     parameters: {
@@ -813,7 +849,7 @@ export class Aperture extends HeyApiClient {
   /**
    * Delete a Lens
    *
-   * Delete a user-defined Aperture Lens by id or name. Built-in Lenses are immutable.
+   * Delete an Aperture Lens by id or name.
    */
   public deleteLens<ThrowOnError extends boolean = false>(
     parameters: {
@@ -845,7 +881,7 @@ export class Aperture extends HeyApiClient {
   /**
    * List Lenses
    *
-   * List every available Aperture Lens (built-in + user-defined) for the searchable Lens picker.
+   * List every Aperture Lens for the searchable Lens picker.
    */
   public listLenses<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -875,7 +911,7 @@ export class Aperture extends HeyApiClient {
   /**
    * Select a Lens
    *
-   * Activate an Aperture Lens by id or name; the view re-paints from its cached facets.
+   * Activate an Aperture Lens by id or name.
    */
   public selectLens<ThrowOnError extends boolean = false>(
     parameters: {
@@ -941,43 +977,6 @@ export class Aperture extends HeyApiClient {
         },
       },
     )
-  }
-
-  /**
-   * Re-root the Aperture view
-   *
-   * Publish an intent for the Aperture view (the TUI top bar) to re-root at a directory — the reciprocal of the top bar revealing a directory in the host editor's file tree.
-   */
-  public focusScope<ThrowOnError extends boolean = false>(
-    parameters?: {
-      directory?: string
-      workspace?: string
-      scope?: string
-    },
-    options?: Options<never, ThrowOnError>,
-  ) {
-    const params = buildClientParams(
-      [parameters],
-      [
-        {
-          args: [
-            { in: "query", key: "directory" },
-            { in: "query", key: "workspace" },
-            { in: "body", key: "scope" },
-          ],
-        },
-      ],
-    )
-    return (options?.client ?? this.client).post<ApertureFocusScopeResponses, ApertureFocusScopeErrors, ThrowOnError>({
-      url: "/aperture/scope",
-      ...options,
-      ...params,
-      headers: {
-        "Content-Type": "application/json",
-        ...options?.headers,
-        ...params.headers,
-      },
-    })
   }
 
   /**
@@ -5771,6 +5770,7 @@ export class Tui extends HeyApiClient {
       directory?: string
       workspace?: string
       path?: string
+      line?: number
     },
     options?: Options<never, ThrowOnError>,
   ) {
@@ -5782,6 +5782,7 @@ export class Tui extends HeyApiClient {
             { in: "query", key: "directory" },
             { in: "query", key: "workspace" },
             { in: "body", key: "path" },
+            { in: "body", key: "line" },
           ],
         },
       ],

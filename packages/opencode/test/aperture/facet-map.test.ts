@@ -1,277 +1,155 @@
 import { describe, expect, test } from "bun:test"
-import { computeComposition, computeFacetMapFiles, computeMarks } from "@/aperture/aperture"
-import { NONE_FACET, type Lens } from "@/aperture/lenses"
+import { computeFacetMapFiles } from "@/aperture/aperture"
+import { groupByCombination, packColumns, type MarkedFile } from "@/aperture/facet-grid"
 
-// The facet map is what paints the VSCode Explorer's per-file pips (O2). Its contract is
-// agreement: a file's pip and the treemap band it contributes to its parent directory are
-// two views of ONE attribution, so anything that makes them disagree is the class of bug
-// O3's single-classification model exists to prevent.
+const hit = (facet: string, ranges: Array<readonly [number, number]>, lines: number) => ({
+  rule: `${facet}-rule`,
+  facet,
+  ranges,
+  lines,
+  bytes: lines * 10,
+})
 
-const facet = (id: string, label: string, color: string) => ({ id, label, description: label, color })
+describe("computeFacetMapFiles", () => {
+  const FACETS = ["a", "b", "c"]
 
-const LENS: Lens = {
-  id: "perf",
-  name: "Terminal Performance Bottlenecks",
-  description: "",
-  prompt: "",
-  facets: [facet("likely", "Likely", "#f00"), facet("hot", "Hot path", "#0f0"), facet("cold", "Cold", "#00f")],
-  scope: "project",
-}
-
-// The vocabulary the emitted `f` indexes into, built the way the service builds it.
-const FACETS = [...LENS.facets.map((t) => t.id), NONE_FACET]
-
-const DIR = { id: "d_1", path: "src", kind: "directory" as const, size: 0, position: { layer: 0, index: 0 } }
-const file = { id: "n_a", path: "src/a.ts", size: 100 }
-
-describe("computeFacetMapFiles (Explorer pip weights)", () => {
-  test("an un-mixed file is one weight at 100%", () => {
-    const files = computeFacetMapFiles([file], { n_a: { facet: "likely", hash: "h" } }, {}, FACETS)
-    expect(files["src/a.ts"]).toEqual({ t: 100, w: [{ f: 0, p: 100 }] })
-  })
-
-  test("a function-painted file reports its mix, descending, summing to 100", () => {
-    // 100 bytes: a 60-byte "hot" function, the 40-byte remainder falling to the file facet.
-    const mixes = {
-      "src/a.ts": {
-        weights: [{ facet: "hot", count: 1, bytes: 60 }],
-        totalCount: 1,
-        totalBytes: 60,
-        subtreeCount: 2,
-        subtreeBytes: 100,
-      },
-    }
-    const entry = computeFacetMapFiles([file], { n_a: { facet: "likely", hash: "h" } }, mixes, FACETS)["src/a.ts"]!
-    expect(entry.w).toEqual([
-      { f: 1, p: 60 },
-      { f: 0, p: 40 },
-    ])
-    expect(entry.w.reduce((sum, w) => sum + w.p, 0)).toBe(100)
-    expect(entry.t).toBe(100)
-  })
-
-  test("the head weight is the facet the directory treemap counts the file toward", () => {
-    // The pip's colour and the file's `count` band in its parent must name the same facet.
-    const mixes = {
-      "src/a.ts": {
-        weights: [{ facet: "cold", count: 1, bytes: 90 }],
-        totalCount: 1,
-        totalBytes: 90,
-        subtreeCount: 2,
-        subtreeBytes: 100,
-      },
-    }
-    const store = { n_a: { facet: "likely", hash: "h" } }
-    const head = computeFacetMapFiles([file], store, mixes, FACETS)["src/a.ts"]!.w[0]!
-    const counted = computeComposition([DIR], [file], store, mixes, LENS)[DIR.id]!.weights.find((w) => w.count === 1)!
-    expect(FACETS[head.f]).toBe(counted.facet)
-  })
-
-  test("an unpainted file is absent entirely, not present-and-empty", () => {
-    expect(computeFacetMapFiles([file], {}, {}, FACETS)).toEqual({})
-  })
-
-  test('a file bucketed "Other" maps to the appended index', () => {
-    const files = computeFacetMapFiles([file], { n_a: { facet: NONE_FACET, hash: "h" } }, {}, FACETS)
-    expect(files["src/a.ts"]).toEqual({ t: 100, w: [{ f: FACETS.length - 1, p: 100 }] })
-  })
-
-  test("a sliver that rounds to 0% is floored to 1%, never dropped", () => {
-    // 1000 bytes: a 3-byte "hot" function (0.3%) and the rest on the file facet.
-    const mixes = {
-      "src/big.ts": {
-        weights: [{ facet: "hot", count: 1, bytes: 3 }],
-        totalCount: 1,
-        totalBytes: 3,
-        subtreeCount: 2,
-        subtreeBytes: 1000,
-      },
-    }
-    const big = { id: "n_b", path: "src/big.ts", size: 1000 }
-    // Both surfaces that consume this guarantee a facet present at least one cell (the TUI's
-    // `allocateCells`, the VSCode chip's `apportion`), and neither can honour that for a
-    // facet dropped here. Overstating 0.3% as 1% is the smaller lie than reading as pure.
-    expect(computeFacetMapFiles([big], { n_b: { facet: "likely", hash: "h" } }, mixes, FACETS)["src/big.ts"]).toEqual({
-      // `t` is the pre-rounding total, so the floored sliver's real bytes are still what a
-      // client's rollup carries — the 1% is a display floor, not a re-weighting.
-      t: 1000,
-      w: [
-        { f: 0, p: 100 },
-        { f: 1, p: 1 },
+  test("reports marked lines per facet, ascending by index, with the first marked line", () => {
+    const files = computeFacetMapFiles(
+      new Map([
+        [
+          "src/x.ts",
+          [
+            hit("c", [[40, 41]], 2),
+            hit(
+              "a",
+              [
+                [12, 12],
+                [3, 5],
+              ],
+              4,
+            ),
+          ],
+        ],
+      ]),
+      FACETS,
+    )
+    expect(files["src/x.ts"]).toEqual({
+      m: [
+        { f: 0, l: 4, b: 40 },
+        { f: 2, l: 2, b: 20 },
       ],
+      line: 3,
     })
   })
 
-  test("a zero-byte file contributes nothing", () => {
-    const empty = { id: "n_c", path: "src/empty.ts", size: 0 }
-    expect(computeFacetMapFiles([empty], { n_c: { facet: "likely", hash: "h" } }, {}, FACETS)).toEqual({})
+  test("sums two rules on the same facet", () => {
+    const files = computeFacetMapFiles(new Map([["x.ts", [hit("b", [[1, 1]], 1), hit("b", [[9, 10]], 2)]]]), FACETS)
+    expect(files["x.ts"]!.m).toEqual([{ f: 1, l: 3, b: 30 }])
   })
 
-  // This is what `t` is for. The VSCode tree paints a folder chip by rolling its subtree's
-  // files up client-side; that rollup and the directory treemap over the same folder are
-  // one attribution, so they have to land on the same bytes per facet. Percentages alone
-  // can't do it — the two files below differ 9:1 in size, so an equal-weighted rollup
-  // would call the directory "hot" when the treemap calls it "likely".
-  test("t * p / 100 rolls a directory up to the same bytes the treemap counts", () => {
-    const big = { id: "n_b", path: "src/big.ts", size: 900 }
-    const small = { id: "n_s", path: "src/small.ts", size: 100 }
-    const store = { n_b: { facet: "likely", hash: "h" }, n_s: { facet: "hot", hash: "h" } }
-    const files = computeFacetMapFiles([big, small], store, {}, FACETS)
-
-    const rolled: Record<string, number> = {}
-    for (const entry of Object.values(files))
-      for (const w of entry.w) rolled[FACETS[w.f]!] = (rolled[FACETS[w.f]!] ?? 0) + (entry.t * w.p) / 100
-
-    const comp = computeComposition([DIR], [big, small], store, {}, LENS)[DIR.id]!
-    for (const w of comp.weights) expect(rolled[w.facet]).toBe(w.bytes)
-    expect(Object.keys(rolled).sort()).toEqual(comp.weights.map((w) => w.facet).sort())
+  test("skips hits on a facet outside the vocabulary, and omits a file left with nothing", () => {
+    expect(computeFacetMapFiles(new Map([["x.ts", [hit("gone", [[1, 1]], 1)]]]), FACETS)).toEqual({})
   })
 })
 
-// The TUI paints a file *tile* as a band of its own facet mix (O1's file grid), which it
-// reads from the same `composition` map the directory treemaps come from. Same contract as
-// above, one level down: the band, the pip and the parent's treemap are one attribution.
-describe("computeComposition (per-file entries)", () => {
-  const FILE_NODE = { id: "n_a", path: "src/a.ts", kind: "file" as const, size: 100, position: { layer: 0, index: 0 } }
-  // 100 bytes: a 60-byte "hot" function, the 40-byte remainder falling to the file facet.
-  const MIXES = {
-    "src/a.ts": {
-      weights: [{ facet: "hot", count: 1, bytes: 60 }],
-      totalCount: 1,
-      totalBytes: 60,
-      subtreeCount: 2,
-      subtreeBytes: 100,
-    },
-  }
-  const STORE = { n_a: { facet: "likely", hash: "h" } }
-
-  test("a file node gets its own mix as a subtree of one", () => {
-    const comp = computeComposition([FILE_NODE], [file], STORE, MIXES, LENS)[FILE_NODE.id]!
-    // Lens facet order (likely, hot, cold, none), not attributeFileBytes's facet-id order.
-    expect(comp.weights.map((w) => w.facet)).toEqual(["likely", "hot"])
-    expect(comp.weights.find((w) => w.facet === "hot")!.bytes).toBe(60)
-    expect(comp.subtreeCount).toBe(1)
-    expect(comp.subtreeBytes).toBe(100)
-    // Counts "files", not functions: the file counts once, toward its dominant facet.
-    expect(comp.totalCount).toBe(1)
-    expect(comp.weights.filter((w) => w.count === 1)).toHaveLength(1)
+describe("groupByCombination", () => {
+  const file = (path: string, facets: number[], line = 1): MarkedFile => ({
+    path,
+    marks: facets.map((f) => ({ f, l: 1 })),
+    line,
   })
 
-  test("the file's band and its Explorer pip name the same dominant facet", () => {
-    const head = computeFacetMapFiles([file], STORE, MIXES, FACETS)["src/a.ts"]!.w[0]!
-    const comp = computeComposition([FILE_NODE], [file], STORE, MIXES, LENS)[FILE_NODE.id]!
-    expect(FACETS[head.f]).toBe(comp.weights.find((w) => w.count === 1)!.facet)
+  test("orders groups most-specific first, then lexicographically: abc, ab, ac, bc, a, b, c", () => {
+    const groups = groupByCombination(
+      [
+        file("c.ts", [2]),
+        file("ab.ts", [0, 1]),
+        file("a.ts", [0]),
+        file("bc.ts", [1, 2]),
+        file("abc.ts", [2, 1, 0]),
+        file("b.ts", [1]),
+        file("ac.ts", [0, 2]),
+      ],
+      new Set(),
+    )
+    expect(groups.map((g) => g.key.join(""))).toEqual(["012", "01", "02", "12", "0", "1", "2"])
   })
 
-  test("an unpainted file still reports its size, so the band greys rather than vanishing", () => {
-    const comp = computeComposition([FILE_NODE], [file], {}, {}, LENS)[FILE_NODE.id]!
-    expect(comp.weights).toEqual([])
-    expect(comp.totalBytes).toBe(0)
-    // compositionBands derives the grey remainder from subtreeBytes − totalBytes.
-    expect(comp.subtreeBytes).toBe(100)
+  test("places each file in exactly one group, the one for its exact facet set", () => {
+    const groups = groupByCombination([file("x.ts", [0, 1]), file("y.ts", [0]), file("z.ts", [0, 1])], new Set())
+    expect(groups.map((g) => g.files.map((f) => f.path))).toEqual([["x.ts", "z.ts"], ["y.ts"]])
   })
 
-  test("file entries survive a window with no directories — the leaf case they exist for", () => {
-    const result = computeComposition([FILE_NODE], [file], STORE, MIXES, LENS)
-    expect(Object.keys(result)).toEqual([FILE_NODE.id])
+  test("a suppressed facet leaves every key, re-slicing the files by what remains", () => {
+    const groups = groupByCombination([file("x.ts", [0, 1]), file("y.ts", [0]), file("z.ts", [1])], new Set([1]))
+    expect(groups.map((g) => [g.key, g.files.map((f) => f.path)])).toEqual([[[0], ["x.ts", "y.ts"]]])
+  })
+
+  test("a facet with zero marked lines does not count toward the key", () => {
+    const groups = groupByCombination(
+      [
+        {
+          path: "x.ts",
+          marks: [
+            { f: 0, l: 3 },
+            { f: 1, l: 0 },
+          ],
+          line: 1,
+        },
+      ],
+      new Set(),
+    )
+    expect(groups[0]!.key).toEqual([0])
+  })
+
+  test("files sharing a parent directory form one run, even when a sibling directory sorts between them", () => {
+    const groups = groupByCombination(
+      [file("a/c.ts", [0]), file("a/b/x.ts", [0]), file("a/b.ts", [0]), file("root.ts", [0])],
+      new Set(),
+    )
+    expect(groups[0]!.runs.map((r) => [r.dir, r.files.map((f) => f.path)])).toEqual([
+      ["", ["root.ts"]],
+      ["a", ["a/b.ts", "a/c.ts"]],
+      ["a/b", ["a/b/x.ts"]],
+    ])
   })
 })
 
-// S3: the aggregate reading of a Search rule's hits. The contract that matters is that a
-// single marked line in a huge file survives every reduction between the evaluator and the
-// renderer — a Search Lens routinely marks one usage in a thousand-line file, and any step
-// that expresses it as a rounded share loses it.
-describe("computeMarks", () => {
-  const FILE_NODE = { id: "n_a", path: "src/a.ts", kind: "file" as const, size: 100_000, position: { layer: 0, index: 0 } }
-  const DEEP = { id: "n_d", path: "src/deep/b.ts", kind: "file" as const, size: 500, position: { layer: 1, index: 0 } }
-  const SUBDIR = { id: "d_2", path: "src/deep", kind: "directory" as const, size: 0, position: { layer: 0, index: 1 } }
-  const hit = (facet: string, lines: number, bytes: number) => ({ rule: "r1", facet, ranges: [], lines, bytes })
-
-  test("a one-line hit in a huge file reaches the file and every ancestor", () => {
-    const marks = computeMarks(
-      [DIR, FILE_NODE],
-      new Map([["src/a.ts", [hit("hot", 1, 20)]]]),
-      LENS,
-    )
-    expect(marks[FILE_NODE.id]).toEqual([{ facet: "hot", lines: 1, bytes: 20 }])
-    expect(marks[DIR.id]).toEqual([{ facet: "hot", lines: 1, bytes: 20 }])
+describe("packColumns", () => {
+  const run = (dir: string, n: number) => ({
+    dir,
+    files: Array.from({ length: n }, (_, i) => ({ path: `${dir}/f${i}.ts`, marks: [{ f: 0, l: 1 }], line: 1 })),
   })
 
-  test("a directory sums its whole subtree, at every level", () => {
-    const marks = computeMarks(
-      [DIR, SUBDIR, DEEP],
-      new Map([
-        ["src/a.ts", [hit("hot", 3, 60)]],
-        ["src/deep/b.ts", [hit("hot", 4, 80)]],
-      ]),
-      LENS,
-    )
-    expect(marks[SUBDIR.id]).toEqual([{ facet: "hot", lines: 4, bytes: 80 }])
-    expect(marks[DIR.id]).toEqual([{ facet: "hot", lines: 7, bytes: 140 }])
+  test("stacks runs in a column while they fit, counting two border rows each", () => {
+    // 9 rows: a run of 3 (5 rows) and a run of 2 (4 rows) share one column.
+    const columns = packColumns([run("a", 3), run("b", 2)], 9)
+    expect(columns.map((c) => c.map((s) => [s.dir, s.files.length]))).toEqual([
+      [
+        ["a", 3],
+        ["b", 2],
+      ],
+    ])
   })
 
-  // The reason marks are attributed from the hit paths rather than from the subtree file set:
-  // a rule can glob a file the extractor never walks, which has no node and never will.
-  test("a hit in a file with no node still colours its ancestors", () => {
-    const marks = computeMarks([DIR], new Map([["src/config.yaml", [hit("cold", 2, 40)]]]), LENS)
-    expect(marks[DIR.id]).toEqual([{ facet: "cold", lines: 2, bytes: 40 }])
+  test("splits a run too tall for the space left, continuing it in the next column", () => {
+    const columns = packColumns([run("a", 2), run("b", 8)], 9)
+    expect(columns.map((c) => c.map((s) => [s.dir, s.files.length, s.continued]))).toEqual([
+      [
+        ["a", 2, false],
+        ["b", 3, false],
+      ],
+      [["b", 5, true]],
+    ])
   })
 
-  test("weights come out in Lens facet order, matching computeComposition", () => {
-    const marks = computeMarks(
-      [DIR],
-      new Map([["src/a.ts", [hit("cold", 1, 10), hit("likely", 1, 10), hit("hot", 1, 10)]]]),
-      LENS,
-    )
-    expect(marks[DIR.id]!.map((w) => w.facet)).toEqual(["likely", "hot", "cold"])
+  test("never loses or duplicates a file", () => {
+    const runs = [run("a", 13), run("b", 1), run("c", 7)]
+    const packed = packColumns(runs, 9).flatMap((c) => c.flatMap((s) => s.files.map((f) => f.path)))
+    expect(packed).toEqual(runs.flatMap((r) => r.files.map((f) => f.path)))
   })
 
-  // A zero-line band would be handed a cell by the renderers' "every present facet keeps
-  // one" rule — a colour for something that isn't there.
-  test("a zero-line hit produces no band at all", () => {
-    expect(computeMarks([DIR], new Map([["src/a.ts", [hit("hot", 0, 0)]]]), LENS)).toEqual({})
-  })
-
-  test("marks never enter the composition partition", () => {
-    const hits = new Map([["src/a.ts", [hit("hot", 1, 20)]]])
-    const withHits = computeComposition([DIR, FILE_NODE], [{ ...FILE_NODE }], {}, {}, LENS)
-    expect(computeMarks([DIR, FILE_NODE], hits, LENS)[DIR.id]).toBeDefined()
-    // Same call, no marks argument anywhere: composition cannot see them by construction.
-    expect(withHits[DIR.id]!.weights).toEqual([])
-    expect(withHits[DIR.id]!.totalBytes).toBe(0)
-  })
-})
-
-describe("computeFacetMapFiles (marks)", () => {
-  const hit = (facet: string, lines: number, bytes: number) => ({ rule: "r1", facet, ranges: [], lines, bytes })
-
-  test("marks ride as raw counts beside the percentage mix", () => {
-    const entry = computeFacetMapFiles(
-      [file],
-      { n_a: { facet: "likely", hash: "h" } },
-      {},
-      FACETS,
-      new Map([["src/a.ts", [hit("hot", 2, 30)]]]),
-    )["src/a.ts"]!
-    expect(entry.w).toEqual([{ f: 0, p: 100 }])
-    expect(entry.m).toEqual([{ f: 1, l: 2, b: 30 }])
-  })
-
-  // "Files with nothing painted are omitted" is the older rule; a mark outranks it, or the
-  // tree would drop a concern the editor gutter is painting.
-  test("a marked file with nothing painted still gets an entry", () => {
-    const empty = { id: "n_c", path: "src/empty.ts", size: 0 }
-    const files = computeFacetMapFiles([empty], {}, {}, FACETS, new Map([["src/empty.ts", [hit("hot", 1, 12)]]]))
-    expect(files["src/empty.ts"]).toEqual({ t: 0, w: [], m: [{ f: 1, l: 1, b: 12 }] })
-  })
-
-  test("a marked file the extractor never walked gets an entry of its own", () => {
-    const files = computeFacetMapFiles([file], {}, {}, FACETS, new Map([["src/config.yaml", [hit("cold", 3, 45)]]]))
-    expect(files["src/config.yaml"]).toEqual({ t: 0, w: [], m: [{ f: 2, l: 3, b: 45 }] })
-  })
-
-  test("hits on a facet outside the Lens vocabulary are dropped, not indexed as -1", () => {
-    const files = computeFacetMapFiles([file], {}, {}, FACETS, new Map([["src/a.ts", [hit("gone", 3, 45)]]]))
-    expect(files["src/a.ts"]).toBeUndefined()
+  test("terminates even when the height could not hold a bordered file", () => {
+    expect(packColumns([run("a", 2)], 1).flat().length).toBe(2)
   })
 })

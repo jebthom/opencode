@@ -1,17 +1,17 @@
 import { describe, expect, test } from "bun:test"
 import { buildModel, type FacetFiles } from "../src/model"
 
-// The tree's contract with the server: a folder's chip is the byte-weighted rollup of its
-// subtree, so it names the same dominant facet the TUI's directory treemap does over the
-// same folder. That is what `t` is on the wire for — see the matching assertion in
-// packages/opencode/test/aperture/facet-map.test.ts.
+// The tree's model: a path trie over the workspace's files, and a rollup of marked lines per
+// facet up every folder — so a folder's chip is sized by how much of each concern lives below it.
+
+const mark = (f: number, l: number) => ({ f, l, b: l * 10 })
 
 const PATHS = ["src/aperture/chip.ts", "src/aperture/model.ts", "src/server/http.ts", "README.md"]
 
 const FILES: FacetFiles = {
-  "src/aperture/chip.ts": { t: 1000, w: [{ f: 0, p: 100 }] },
-  "src/aperture/model.ts": { t: 500, w: [{ f: 1, p: 100 }] },
-  "src/server/http.ts": { t: 200, w: [{ f: 1, p: 100 }] },
+  "src/aperture/chip.ts": { m: [mark(0, 20)], line: 1 },
+  "src/aperture/model.ts": { m: [mark(1, 10)], line: 4 },
+  "src/server/http.ts": { m: [mark(1, 4)], line: 2 },
 }
 const FACET_COUNT = 3
 
@@ -33,15 +33,12 @@ describe("buildModel — structure", () => {
     expect(model.children("src").filter((e) => e.name === "aperture")).toHaveLength(1)
   })
 
-  test("an unpainted file is still in the tree — it just has no chip", () => {
+  test("an unmarked file is still in the tree — it just has no chip", () => {
     expect(model.has("README.md")).toBe(true)
     expect(model.weights("README.md", false)).toBeUndefined()
   })
 
   test("a path with an empty segment is dropped, not turned into a self-child root", () => {
-    // An empty segment is the root, so `child("", {rel: "", …})` would make the root its own
-    // child and getChildren would descend forever. A URI outside the workspace folder is how
-    // asRelativePath could hand us one.
     const model = buildModel(["/abs/x.ts", "a//b.ts", "ok.ts", ""], {}, FACET_COUNT)
     expect(model.children("").map((e) => e.rel)).toEqual(["ok.ts"])
   })
@@ -49,13 +46,10 @@ describe("buildModel — structure", () => {
   test("isDir is tracked, not inferred from having children", () => {
     expect(model.isDir("src/aperture")).toBe(true)
     expect(model.isDir("README.md")).toBe(false)
-    // The root is always a directory even before anything has been enumerated.
     expect(buildModel([], {}, 0).isDir("")).toBe(true)
   })
 
   test("a newly created empty directory appears, and knows it is one", () => {
-    // Directories are derived from file paths, so a folder with nothing in it can only get
-    // into the tree by being named — otherwise "New Folder" creates something invisible.
     const model = buildModel(PATHS, FILES, FACET_COUNT, ["src/aperture/fixtures"])
     expect(model.children("src/aperture").map((e) => e.name)).toEqual(["fixtures", "chip.ts", "model.ts"])
     expect(model.isDir("src/aperture/fixtures")).toBe(true)
@@ -65,17 +59,15 @@ describe("buildModel — structure", () => {
   test("an extra dir that already exists as a real one is not duplicated", () => {
     const model = buildModel(PATHS, FILES, FACET_COUNT, ["src/server"])
     expect(model.children("src").filter((e) => e.name === "server")).toHaveLength(1)
-    // ...and it keeps the file it actually contains.
     expect(model.children("src/server").map((e) => e.name)).toEqual(["http.ts"])
   })
 })
 
-describe("buildModel — byte rollup", () => {
+describe("buildModel — marked-line rollup", () => {
   const model = buildModel(PATHS, FILES, FACET_COUNT)
 
-  test("a folder's mix is byte-weighted, not file-count-weighted", () => {
-    // src/aperture holds one 1000-byte facet-0 file and one 500-byte facet-1 file.
-    // Byte-weighted that is 67/33 toward facet 0; counted by files it would be a 50/50 tie.
+  test("a folder's mix is weighted by marked lines", () => {
+    // src/aperture: 20 lines of facet 0, 10 of facet 1.
     expect(model.weights("src/aperture", true)).toEqual([
       { f: 0, p: 67 },
       { f: 1, p: 33 },
@@ -83,128 +75,58 @@ describe("buildModel — byte rollup", () => {
   })
 
   test("the rollup reaches every ancestor, including the root", () => {
-    // 1000 bytes facet 0, 700 bytes facet 1 across the whole tree.
+    // 20 lines facet 0, 14 lines facet 1 across the whole tree.
     expect(model.weights("", true)).toEqual([
       { f: 0, p: 59 },
       { f: 1, p: 41 },
     ])
-    expect(model.weights("src", true)).toEqual([
-      { f: 0, p: 59 },
-      { f: 1, p: 41 },
-    ])
+    expect(model.weights("src", true)).toEqual(model.weights("", true))
   })
 
-  test("a leaf directory reports its one file's mix", () => {
-    expect(model.weights("src/server", true)).toEqual([{ f: 1, p: 100 }])
-  })
-
-  test("a directory with nothing painted below it gets no chip", () => {
+  test("a directory with nothing marked below it gets no chip", () => {
     const model = buildModel(["docs/notes.md"], {}, FACET_COUNT)
     expect(model.weights("docs", true)).toBeUndefined()
   })
 
-  test("a mixed file contributes to each of its facets separately", () => {
-    const model = buildModel(
-      ["a/one.ts"],
-      {
-        "a/one.ts": {
-          t: 100,
-          w: [
-            { f: 0, p: 60 },
-            { f: 1, p: 40 },
-          ],
-        },
-      },
-      FACET_COUNT,
-    )
-    expect(model.weights("a", true)).toEqual([
+  test("a file marked with several facets contributes to each", () => {
+    const model = buildModel(["a/one.ts"], { "a/one.ts": { m: [mark(0, 6), mark(1, 4)], line: 1 } }, FACET_COUNT)
+    expect(model.weights("a/one.ts", false)).toEqual([
       { f: 0, p: 60 },
       { f: 1, p: 40 },
     ])
+    expect(model.weights("a", true)).toEqual(model.weights("a/one.ts", false))
   })
 
-  test("a painted file VSCode is hiding does not inflate its ancestors", () => {
-    // node_modules is in files.exclude, so findFiles never returned it — but the server,
-    // which walks the repo itself, may still have painted something under it.
-    const files: FacetFiles = { ...FILES, "node_modules/pkg/index.js": { t: 999999, w: [{ f: 2, p: 100 }] } }
+  test("a single marked line deep in the tree keeps a cell at every level, however small", () => {
+    const model = buildModel(
+      ["src/deep/big.ts", "src/other.ts"],
+      { "src/deep/big.ts": { m: [mark(1, 1)], line: 9 }, "src/other.ts": { m: [mark(0, 5000)], line: 1 } },
+      FACET_COUNT,
+    )
+    // 1 line against 5000 rounds to 0% — floored to 1% rather than dropped, which is what lets
+    // `apportion` give it a slot.
+    for (const dir of ["", "src"]) expect(model.weights(dir, true)).toContainEqual({ f: 1, p: 1 })
+    expect(model.weights("src/deep", true)).toEqual([{ f: 1, p: 100 }])
+  })
+
+  test("a marked file VSCode is hiding does not inflate its ancestors", () => {
+    const files: FacetFiles = { ...FILES, "node_modules/pkg/index.js": { m: [mark(2, 999)], line: 1 } }
     const model = buildModel(PATHS, files, FACET_COUNT)
     expect(model.weights("", true)!.some((w) => w.f === 2)).toBe(false)
   })
 
   test("a facet index beyond the vocabulary is ignored rather than thrown on", () => {
     // A facet map fetched under one Lens can race a legend from the next one.
-    const model = buildModel(["a/one.ts"], { "a/one.ts": { t: 100, w: [{ f: 99, p: 100 }] } }, FACET_COUNT)
+    const model = buildModel(["a/one.ts"], { "a/one.ts": { m: [mark(99, 3)], line: 1 } }, FACET_COUNT)
     expect(model.weights("a", true)).toBeUndefined()
-  })
-})
-
-// S3. A Search rule marks a handful of lines and the tree has to show that facet's colour on
-// the file and on every folder above it, whatever the proportions say. The rollup is by plain
-// summation of raw counts — the reason the wire carries `l`/`b` rather than percentages.
-describe("buildModel — marks", () => {
-  test("a one-line mark in a huge file survives to the file's own chip", () => {
-    const model = buildModel(
-      ["src/big.ts"],
-      { "src/big.ts": { t: 100_000, w: [{ f: 0, p: 100 }], m: [{ f: 1, l: 1, b: 30 }] } },
-      FACET_COUNT,
-    )
-    // 30 bytes against 100,000 is 0.03% — floored to 1% rather than rounded away, which is
-    // what lets `apportion` give it a slot.
-    expect(model.weights("src/big.ts", false)).toEqual([
-      { f: 0, p: 100 },
-      { f: 1, p: 1 },
-    ])
-  })
-
-  test("...and to every folder above it", () => {
-    const model = buildModel(
-      ["src/deep/big.ts"],
-      { "src/deep/big.ts": { t: 100_000, w: [{ f: 0, p: 100 }], m: [{ f: 1, l: 1, b: 30 }] } },
-      FACET_COUNT,
-    )
-    for (const dir of ["", "src", "src/deep"]) {
-      expect(model.weights(dir, true)!.some((w) => w.f === 1)).toBe(true)
-    }
-  })
-
-  test("marks merge by max, never additively", () => {
-    // The whole file is facet 1 AND 40 of its bytes are marked facet 1. Adding would report
-    // 140 bytes of a 100-byte file; max reports the truth, which is 100.
-    const model = buildModel(
-      ["a/one.ts"],
-      { "a/one.ts": { t: 100, w: [{ f: 1, p: 100 }], m: [{ f: 1, l: 2, b: 40 }] } },
-      FACET_COUNT,
-    )
-    expect(model.weights("a", true)).toEqual([{ f: 1, p: 100 }])
-  })
-
-  test("a file with marks and nothing painted still gets a chip", () => {
-    const model = buildModel(
-      ["config.yaml"],
-      { "config.yaml": { t: 0, w: [], m: [{ f: 2, l: 3, b: 60 }] } },
-      FACET_COUNT,
-    )
-    expect(model.weights("config.yaml", false)).toEqual([{ f: 2, p: 100 }])
-    expect(model.weights("", true)).toEqual([{ f: 2, p: 100 }])
   })
 
   test("marked lines roll up as exact counts, for the tooltip the chip cannot carry", () => {
-    const model = buildModel(
-      ["src/a.ts", "src/b.ts"],
-      {
-        "src/a.ts": { t: 100, w: [{ f: 0, p: 100 }], m: [{ f: 1, l: 3, b: 30 }] },
-        "src/b.ts": { t: 100, w: [{ f: 0, p: 100 }], m: [{ f: 1, l: 4, b: 40 }] },
-      },
-      FACET_COUNT,
-    )
-    expect(model.marks("src", true)).toEqual([{ f: 1, l: 7 }])
-    expect(model.marks("src/a.ts", false)).toEqual([{ f: 1, l: 3 }])
-    expect(model.marks("src/b.ts", false)).toEqual([{ f: 1, l: 4 }])
-  })
-
-  test("an unmarked node reports no marks", () => {
-    const model = buildModel(PATHS, FILES, FACET_COUNT)
-    expect(model.marks("src", true)).toBeUndefined()
-    expect(model.marks("src/aperture/chip.ts", false)).toBeUndefined()
+    expect(model.marks("src", true)).toEqual([
+      { f: 0, l: 20 },
+      { f: 1, l: 14 },
+    ])
+    expect(model.marks("src/server/http.ts", false)).toEqual([{ f: 1, l: 4 }])
+    expect(model.marks("README.md", false)).toBeUndefined()
   })
 })

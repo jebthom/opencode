@@ -97,9 +97,9 @@ export const ApertureColorsCommand = effectCmd({
     console.log(`  truecolor advertised: ${truecolor ? "yes" : "no (the TUI will emit indexed colour)"}`)
 
     const lens = yield* ApertureLensStore.getActive(directory)
-    console.log(`\nactive Lens: ${lens.name} (${lens.id})${lens.palette ? `, palette "${lens.palette}"` : ""}`)
+    console.log(lens ? `\nactive Lens: ${lens.name} (${lens.id}), palette "${lens.palette}"` : "\nno Lens yet")
 
-    const facetRows = lens.facets.map((f: Facet) => ({ label: f.label, hex: f.color }))
+    const facetRows = (lens?.facets ?? []).map((f: Facet) => ({ label: f.label, hex: f.color }))
     report("facets — truecolor swatch, then the swatch after 256-colour quantisation", [
       ...facetRows,
       { label: NONE_LABEL, hex: NONE_HUE },

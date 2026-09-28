@@ -6,30 +6,21 @@ import { buildModel, type FacetFile, type FacetFiles, type TreeModel } from "./m
 import { ApertureOpenEditors } from "./open-editors"
 import { ApertureTree, type Node } from "./tree"
 
-// Aperture — a slim client for the opencode server. It renders function-level Facet
-// painting in the editor gutter, a facet-composition file tree, and reveals files the TUI
-// drills into.
+// Aperture — a slim client for the opencode server. Every mark is a deterministic rule hit on
+// the server (v3: there is no painter), and this extension shows them in two places:
 //
-//  - Gutter (extension → server): GET /aperture?drill=<relPath> returns the focused
-//    file's `extents` ({name,startLine,endLine,facet?,hue?}); we paint each as a colored
-//    left-border strip + overview-ruler mark.
-//  - Explorer pips (extension → server): GET /aperture/facets returns every painted file's
-//    facet mix in one shot; we decorate each file row with a coloured shade glyph.
-//  - Aperture tree (same fetch): our own TreeView in the activity bar, where each row's
-//    icon is a generated SVG of the file's whole facet mix — the thing a FileDecoration's
-//    one-colour budget cannot express — and folders roll their subtree up. See tree.ts.
+//  - Gutter (extension → server): GET /aperture/lines?path=<relPath> returns the file's marked
+//    line ranges under the active Lens; we paint each line as a coloured strip + overview-ruler
+//    mark.
+//  - Aperture tree (extension → server): GET /aperture/facets returns every marked file's lines
+//    per facet in one shot; our own TreeView in the activity bar draws each row's icon as a chip
+//    of its facets, and folders roll their subtree's marked lines up. See tree.ts / model.ts.
 //  - Open-in-editor (TUI → server → extension): we listen on the /event SSE stream for
-//    `tui.file.open` (open a file) and `tui.directory.reveal` (show a directory in the
-//    Explorer). The latter is what connects the TUI's top bar — which since PLAN O1 shows
-//    only aggregated directory blocks, no files — to the files themselves.
-//  - Re-root the top bar (extension → server → TUI): the reciprocal of the above. Expanding
-//    a folder in our tree POSTs /aperture/scope, which the server publishes as
-//    `aperture.scope.focused` for the top bar to adopt — so a directory opened in either
-//    surface is the directory both of them show.
+//    `tui.file.open` and open the file, at its first marked line when the TUI sends one.
 //
 // Connection is manual: the user runs `opencode --port <N>` and points us at it via the
-// `aperture.port` / `aperture.host` settings. Everything is an inert no-op when there's
-// no workspace folder or the server is unreachable.
+// `aperture.port` / `aperture.host` settings. Everything is an inert no-op when there's no
+// workspace folder or the server is unreachable.
 
 const REPAINT_DEBOUNCE_MS = 150
 const RECONNECT_DELAY_MS = 2000
@@ -42,46 +33,22 @@ const REFRESH_POLL_MS = 5000
 // between that strip and the line's text (so the strip never sits under the leading chars).
 const STRIP_WIDTH_PX = 4
 const TEXT_GAP_PX = 4
-// The Explorer's facet map is a whole-repo fetch, so it debounces longer than the gutter's
-// single-file drill — a burst of invalidations during a paint sweep should cost one refetch.
+// The tree's facet map is a whole-repo fetch, so it debounces longer than the gutter's single
+// file — a burst of invalidations should cost one refetch.
 const FACET_MAP_DEBOUNCE_MS = 400
-// ...and it self-heals on a slower cadence than the gutter's REFRESH_POLL_MS. Repaints
-// arrive pushed over SSE; this poll only covers a dropped event, and each tick costs the
-// server a whole-repo attribution pass (~150KB response on a 2000-file repo), so paying
-// that every 5s to almost always find nothing changed is a bad trade.
+// ...and it self-heals on a slower cadence than the gutter's REFRESH_POLL_MS: repaints arrive
+// pushed over SSE, and this poll only covers a dropped event.
 const FACET_MAP_POLL_MS = 20000
 // The tree's file set changes far less often than its colours, and a create/delete storm
 // (a branch switch, an install) should cost one re-enumeration rather than hundreds.
 const FILE_SET_DEBOUNCE_MS = 500
-// How long to wait before telling the TUI's top bar that a folder was opened here. One
-// gesture can expand several levels (a reveal, or a click on a folder inside a collapsed
-// chain) and only the deepest is worth sending, so this is long enough to collect a burst
-// and short enough that the bar still moves in the same beat as the click.
-const SCOPE_FOCUS_DEBOUNCE_MS = 120
-// How long the echo guard outlives a TUI-driven reveal. `TreeView.reveal` resolves once the
-// expansions are done, but the events for them can land a tick later — holding the guard a
-// moment longer is cheaper than racing that.
-const SCOPE_ECHO_GUARD_MS = 300
 // Hard ceiling on the enumerated file set. The excludes should keep a normal workspace two
 // orders of magnitude below this; the cap exists so a workspace that somehow isn't degrades
 // to a truncated tree instead of exhausting the extension host.
 const MAX_TREE_FILES = 50000
 
-// Since O3 every file is extent-painted, so a file routinely spans several facets. A
-// FileDecoration gives exactly one ThemeColor and a <=2-char badge rendered in that colour,
-// so a multi-coloured pip row isn't available: instead the colour says *which* facet and the
-// glyph says *how much* of the file it is. A single-facet file reads as a solid pip; a
-// grab-bag file reads as a faint one, at identical width.
-const SHADES: ReadonlyArray<{ min: number; glyph: string }> = [
-  { min: 85, glyph: "█" },
-  { min: 60, glyph: "▓" },
-  { min: 35, glyph: "▒" },
-  { min: 0, glyph: "░" },
-]
-
 // The hue a facet takes while it is filtered out of the legend (PLAN O4). The same value
-// chip.ts falls back to, so the tree chip, the Explorer pip and the gutter stripe all grey
-// to one colour — and the one the TUI also reads as "off" rather than as a facet of its own.
+// chip.ts falls back to, so the tree chip and the gutter stripe grey to one colour — and the one the TUI also reads as "off" rather than as a facet of its own.
 // This is NONE_HUE from the server's lenses.ts, duplicated as a literal because the
 // extension bundle deliberately has no dependency on the server package.
 const SUPPRESSED_HUE = "#8A8A8A"
@@ -109,7 +76,6 @@ let pollTimer: ReturnType<typeof setInterval> | undefined
 let facetMapTimer: ReturnType<typeof setTimeout> | undefined
 let facetMapPollTimer: ReturnType<typeof setInterval> | undefined
 let fileSetTimer: ReturnType<typeof setTimeout> | undefined
-let scopeTimer: ReturnType<typeof setTimeout> | undefined
 // True while a repaint's fetch is outstanding, so the poll skips a tick rather than
 // stacking refetches behind a slow server walk.
 let repainting = false
@@ -156,95 +122,50 @@ export function activate(context: vscode.ExtensionContext) {
     return deco
   }
 
-  type Extent = { name: string; startLine: number; endLine: number; facet?: string; hue?: string }
-  // A sparse line-level facet (PLAN S1). Unlike an Extent these do not tile the file — they
-  // mark only the lines that answer a query (or, for git-changed, that actually changed).
+  // A marked line range. `hue` is the server's resolution of `facet` against the legend.
   type LineTag = { startLine: number; endLine: number; facet?: string; hue?: string; note?: string }
-  type GraphNode = { id: string; path: string; kind: string }
 
-  // The colour a function's stripe paints, honouring the legend filter (PLAN O4).
-  //
-  // `ex.hue` is the server's own resolution of `ex.facet`, made before it knew about the
-  // filter, so a suppressed facet would still arrive in its Lens colour. Preferring the
-  // filtered legend — which is the same table with suppressed facets swapped to the muted
-  // role — is what greys the gutter alongside the chips. `ex.hue` remains the fallback for
-  // an extent whose facet isn't in the legend (notably "Other").
-  // Takes anything carrying a facet/hue pair, so line tags resolve through the same filtered
-  // legend as extents — the two layers must not disagree about what a facet looks like.
-  function hueForExtent(ex: { facet?: string; hue?: string }): string | undefined {
-    if (ex.facet === undefined) return ex.hue
-    return facetLegend.find((e) => e.facet === ex.facet)?.color ?? ex.hue
+  // The colour a tag's stripe paints, honouring the legend filter (PLAN O4): the filtered legend
+  // swaps a suppressed facet to the muted hue, and `hue` is the fallback for a facet the legend
+  // doesn't carry.
+  function hueForTag(tag: { facet?: string; hue?: string }): string | undefined {
+    if (tag.facet === undefined) return tag.hue
+    return facetLegend.find((e) => e.facet === tag.facet)?.color ?? tag.hue
   }
 
-  async function fetchExtents(relPath: string): Promise<{ extents: Extent[]; lineTags: LineTag[] }> {
-    const none = { extents: [], lineTags: [] }
+  async function fetchLineTags(relPath: string): Promise<LineTag[]> {
     const dir = directory()
-    if (!dir) return none
-    // Scope the window at the file's parent dir so the file's node is in-window and the
-    // server attaches its extents (a root-scoped window omits deep files).
-    const scope = relPath.split("/").slice(0, -1).join("/")
-    const url = `${baseUrl()}/aperture?drill=${encodeURIComponent(relPath)}&scope=${encodeURIComponent(scope)}`
-    const res = await fetch(url, { headers: { "x-opencode-directory": dir } })
-    if (!res.ok) return none
-    const data = (await res.json()) as {
-      nodes?: GraphNode[]
-      extents?: Record<string, Extent[]>
-      lineTags?: Record<string, LineTag[]>
-      lens?: { id: string; deterministic?: boolean }
-    }
-    // `extents`/`lineTags` are keyed by file node id and carry EVERY drilled file still in
-    // the window — not just the one we asked for. Select by this file's node id; taking the
-    // first entry would paint a sibling's ranges onto the current file.
-    const node = data.nodes?.find((n) => n.kind === "file" && n.path === relPath)
-    if (!node) return none
-    const lineTags = data.lineTags?.[node.id] ?? []
-    // Deterministic built-in Lenses don't paint *extents* in the gutter: Edit recency and
-    // Bus factor are file-level, and git-changed's declaration-wide strips buried the
-    // added/removed markers of VSCode's own diff gutter — a whole function striped because
-    // three lines changed.
-    //
-    // Their sparse LINE TAGS are a different matter, and are the reason this is no longer a
-    // blanket skip. git-changed already knows exactly which lines changed (it widens diff
-    // hunks up to declarations to build its tiles), so marking just those lines adds the
-    // magnitude *heat* VSCode's own gutter has no notion of without burying anything.
-    if (data.lens?.deterministic) return { extents: [], lineTags }
-    return { extents: data.extents?.[node.id] ?? [], lineTags }
+    if (!dir) return []
+    const res = await fetch(`${baseUrl()}/aperture/lines?path=${encodeURIComponent(relPath)}`, {
+      headers: { "x-opencode-directory": dir },
+    })
+    if (!res.ok) return []
+    const data = (await res.json()) as { tags?: LineTag[] }
+    return data.tags ?? []
   }
 
-  // Fetch one editor's file extents and (re)apply its gutter. The fetch also drills the
-  // file server-side, so painting a visible editor is what schedules its server paint.
+  // Fetch one editor's marked lines and (re)apply its gutter.
   async function repaintEditor(editor: vscode.TextEditor) {
     if (editor.document.uri.scheme !== "file") return
     const relPath = vscode.workspace.asRelativePath(editor.document.uri, false).replace(/\\/g, "/")
 
-    let extents: Extent[] = []
     let lineTags: LineTag[] = []
     try {
-      ;({ extents, lineTags } = await fetchExtents(relPath))
+      lineTags = await fetchLineTags(relPath)
     } catch (e) {
       log(`fetch FAILED for ${relPath}: ${String(e)} (baseUrl=${baseUrl()} dir=${directory()})`)
       return
     }
-    const painted = extents.filter((e) => {
-      const hue = hueForExtent(e)
-      return hue !== undefined && resolveHue(hue) !== undefined
-    }).length
-    log(`drill ${relPath}: ${extents.length} extents, ${painted} painted, ${lineTags.length} line tags`)
+    log(`lines ${relPath}: ${lineTags.length} tags`)
 
-    // Resolve a hue per LINE rather than accumulating ranges per hue, because the two layers
-    // overlap: extents tile the file, line tags mark a few lines inside them, and a line
-    // covered by both must paint one colour. Writing tags after extents into a line→hue map
-    // gives the precedence rule ("line tags win the lines they cover") for free, and dedupes
-    // overlapping ranges on the way — two decorations on one line would double-draw the strip.
+    // Resolve a hue per LINE: two rules can mark the same line, and two decorations on one line
+    // would double-draw the strip. Later tags win, which is the rules' own last-writer-wins order.
     const hueByLine = new Map<number, string>()
-    const put = (startLine: number, endLine: number, hue: string | undefined) => {
-      if (!hue || resolveHue(hue) === undefined) return
-      for (let line = startLine - 1; line <= endLine - 1; line++) {
-        if (line >= 0) hueByLine.set(line, hue)
-      }
+    for (const tag of lineTags) {
+      const hue = hueForTag(tag)
+      if (!hue || resolveHue(hue) === undefined) continue
+      for (let line = tag.startLine - 1; line <= tag.endLine - 1; line++) if (line >= 0) hueByLine.set(line, hue)
     }
-    for (const ex of extents) put(ex.startLine, ex.endLine, hueForExtent(ex))
-    for (const tag of lineTags) put(tag.startLine, tag.endLine, hueForExtent(tag))
 
     // One range per line: the `before` strip only renders at a range's start, so a multi-line
     // range would leave every line but the first un-striped.
@@ -261,12 +182,8 @@ export function activate(context: vscode.ExtensionContext) {
     }
   }
 
-  // Repaint every *visible* editor, not just the focused one. A file you're reading in a
-  // split pane — or while focus sits in the TUI/terminal — is visible but is not
-  // `activeTextEditor`; painting only the active editor is why such a file stayed grey
-  // until you clicked into it (the click made it active, firing the first drill). Driving
-  // off `visibleTextEditors` makes the invariant "visible ⇒ drilled-and-painted", so the
-  // click stops mattering. `repainting` gates the poll so it skips rather than stacking.
+  // Repaint every *visible* editor, not just the focused one: a file in a split pane — or while
+  // focus sits in the TUI/terminal — is visible but not `activeTextEditor`. `repainting` gates the poll so it skips rather than stacking.
   async function repaintVisible() {
     repainting = true
     try {
@@ -281,45 +198,10 @@ export function activate(context: vscode.ExtensionContext) {
     repaintTimer = setTimeout(() => void repaintVisible(), REPAINT_DEBOUNCE_MS)
   }
 
-  // Pre-warm the server's function paint for open-but-hidden tabs. `repaintVisible` already
-  // drills + paints every visible editor; warming covers the tabs you have open but aren't
-  // looking at, so the server has already function-painted them and switching to one shows
-  // colours immediately instead of the drill → wait → watch-the-colours-appear beat. Same
-  // drill GET the gutter uses, result discarded (a hidden tab has no editor to decorate; the
-  // fetch's side effect — scheduling the server-side paint — is the whole point). Deduped via
-  // `warmed`: once per file per connection, since real edits repaint server-side and the
-  // SSE/poll refresh the gutter.
-  const warmed = new Set<string>()
-  async function warmOpenTabs() {
-    // Visible tabs are handled by repaintVisible; warm only the hidden ones.
-    const visible = new Set(
-      vscode.window.visibleTextEditors
-        .filter((e) => e.document.uri.scheme === "file")
-        .map((e) => vscode.workspace.asRelativePath(e.document.uri, false).replace(/\\/g, "/")),
-    )
-    for (const group of vscode.window.tabGroups.all) {
-      for (const tab of group.tabs) {
-        const input = tab.input
-        if (!(input instanceof vscode.TabInputText) || input.uri.scheme !== "file") continue
-        const rel = vscode.workspace.asRelativePath(input.uri, false).replace(/\\/g, "/")
-        if (visible.has(rel) || warmed.has(rel)) continue
-        warmed.add(rel)
-        try {
-          await fetchExtents(rel)
-        } catch {
-          warmed.delete(rel) // transient failure — allow a retry on the next tab change
-        }
-      }
-    }
-  }
+  // ---- facet map -----------------------------------------------------------
 
-  // ---- Explorer pips -------------------------------------------------------
-
-  // Whole-repo file → facet mix, refetched in one request rather than per file: the Explorer
-  // asks us to decorate every visible row, and a fetch per row would be thousands of calls.
-  // Each entry is `{t, w}` — the file's attributed byte total and its mix as percentages of
-  // it. The pips only need `w`; `t` is what lets the tree roll a directory up by bytes
-  // rather than by file count, so its folder chips agree with the TUI's treemap.
+  // Whole-repo file → marks, refetched in one request rather than per file: the tree draws a
+  // chip for every visible row, and a fetch per row would be thousands of calls.
   let facetMap = new Map<string, FacetFile>()
   // The legend exactly as the server sent it, and the legend everything actually paints
   // from. They differ only by the filter: `facetLegend` is `facetLegendRaw` with every
@@ -327,17 +209,13 @@ export function activate(context: vscode.ExtensionContext) {
   //
   // One derivation, rather than a `suppressed` set threaded through every paint site: a
   // facet becomes a colour in exactly one place, so filtering is a property of the palette
-  // and each surface — chips, pips, gutter — greys without knowing the filter exists. Raw is
+  // and each surface — chips, gutter — greys without knowing the filter exists. Raw is
   // kept because un-filtering has to restore the true hue without a refetch.
   let facetLegendRaw: LegendEntry[] = []
   let facetLegend: LegendEntry[] = []
   let facetIds: string[] = []
-  // The active Lens's id. Only the pips consult it (to stand down for git-changed); the
-  // tree paints every Lens.
-  let lensId: string | undefined
   // Facets the user has toggled off (PLAN O4). One set drives every surface: the tree greys
-  // those cells in place, the Explorer pips fall through to each file's largest surviving
-  // facet, and the gutter greys their extents.
+  // those cells in place and the gutter greys their lines.
   //
   // The server owns it — the TUI's legend and the aperture.filterFacets command both POST to
   // it, and it comes back to us over SSE and on the facet map. This is a local mirror of that
@@ -354,13 +232,6 @@ export function activate(context: vscode.ExtensionContext) {
   // unchanged repo re-serializes byte-identically and this comparison is exact — which is
   // what lets the self-heal poll run without touching the UI. See the flicker note below.
   let facetMapRaw: string | undefined
-
-  // Firing `undefined` means "every decoration changed": VSCode drops its whole cache and
-  // re-queries the provider for every visible row, and the rows paint bare for the round
-  // trip — a visible full-tree flicker. So we fire a URI list whenever we can, and reserve
-  // `undefined` for the cases where every row really did change meaning (a new Lens, a
-  // filter change, pips switched off).
-  const decorationsChanged = new vscode.EventEmitter<vscode.Uri[] | undefined>()
 
   async function fetchFacetMap() {
     const dir = directory()
@@ -381,16 +252,9 @@ export function activate(context: vscode.ExtensionContext) {
         files?: Record<string, FacetFile>
         suppressed?: string[]
       }
-      const next = new Map(Object.entries(data.files ?? {}))
-      // A different Lens (or vocabulary) re-colours every row at once, so a targeted list
-      // would be wrong as well as pointless — that is a genuine full invalidation.
-      const relit = JSON.stringify(facetIds) !== JSON.stringify(data.facets ?? [])
-      const changed = relit ? undefined : changedUris(facetMap, next)
-      const previous = facetMap
-      facetMap = next
+      facetMap = new Map(Object.entries(data.files ?? {}))
       facetLegendRaw = data.lens?.legend ?? []
       facetIds = data.facets ?? []
-      lensId = data.lens?.id
       // Adopt the server's filter. This is the self-heal path: the SSE event is what makes a
       // click feel instant, but a reconnect (or an extension that started after the filter
       // was set) missed it, and this fetch is where that gets put right. The server clears
@@ -404,12 +268,8 @@ export function activate(context: vscode.ExtensionContext) {
         for (const facet of data.suppressed ?? []) suppressedFacets.add(facet)
         refreshLegend()
       }
-      // The tree colours from the same fetch, and unlike the pips it has no reason to skip
-      // any Lens — so it is rebuilt before the early-out below.
       rebuildModel()
-      if (changed && changed.length === 0) return
-      log(`facet map: ${next.size} files (was ${previous.size}), ${changed ? `${changed.length} rows` : "all rows"}`)
-      decorationsChanged.fire(changed)
+      log(`facet map: ${facetMap.size} marked files`)
     } catch (e) {
       log(`facet map fetch FAILED: ${String(e)} (baseUrl=${baseUrl()} dir=${dir})`)
     } finally {
@@ -417,52 +277,9 @@ export function activate(context: vscode.ExtensionContext) {
     }
   }
 
-  // The files whose pip actually differs between two maps — added, removed, or re-weighted.
-  // Only these rows need re-querying, so a paint sweep touching a handful of files repaints
-  // a handful of rows instead of blanking the tree.
-  function changedUris(before: Map<string, FacetFile>, after: Map<string, FacetFile>) {
-    const folder = workspaceFolder()
-    if (!folder) return undefined
-    const key = (entry: FacetFile | undefined) => (entry ? JSON.stringify(entry.w) : "")
-    const paths = new Set([...before.keys(), ...after.keys()])
-    return [...paths]
-      .filter((p) => key(before.get(p)) !== key(after.get(p)))
-      .map((p) => vscode.Uri.joinPath(folder.uri, p))
-  }
-
   function scheduleFacetMap() {
     if (facetMapTimer) clearTimeout(facetMapTimer)
     facetMapTimer = setTimeout(() => void fetchFacetMap(), FACET_MAP_DEBOUNCE_MS)
-  }
-
-  const decorationProvider: vscode.FileDecorationProvider = {
-    onDidChangeFileDecorations: decorationsChanged.event,
-    provideFileDecoration(uri) {
-      if (uri.scheme !== "file") return undefined
-      // Off by default. A FileDecoration is not scopable to a view — it applies to every
-      // TreeItem carrying this resourceUri, ours included — and it tints the filename as
-      // well as adding the badge. Once the tree's chip is showing the whole mix, that is a
-      // second, coarser answer to the same question competing with it in the same row.
-      if (!config().get<boolean>("explorerPips", false)) return undefined
-      // "Changed since last commit" is the one Lens the pips suppress: VSCode already
-      // decorates modified files from its own SCM provider, and ours would compete with that
-      // badge for the same slot to say the same thing. The other deterministic built-ins
-      // (edit recency, bus factor) are file-level by nature and are exactly what a file tree
-      // wants to show, so — unlike the gutter — we do NOT skip all deterministic Lenses.
-      // Note this is a *pips* rule, not a data rule: the Aperture tree paints git-changed
-      // happily, because its rows have their own icon slot and contend with nothing.
-      if (lensId === "git-changed") return undefined
-      // Files only. A folder decoration would need its own subtree rollup and would contend
-      // with git's folder badges; folder aggregation is the Aperture tree's job (and the
-      // TUI top bar's), where there is room to show a composition rather than one colour.
-      const entry = facetMap.get(vscode.workspace.asRelativePath(uri, false).replace(/\\/g, "/"))
-      // No entry = unpainted, non-source, or the map hasn't loaded yet. Returning undefined
-      // leaves the row plain; the refresh event makes VSCode ask again once it has.
-      if (!entry?.w.length) return undefined
-      const deco = decorationFrom(entry.w, facetLegend, facetIds, suppressedFacets)
-      if (!deco) return undefined
-      return new vscode.FileDecoration(deco.badge, deco.tooltip, deco.color)
-    },
   }
 
   // ---- Aperture tree -------------------------------------------------------
@@ -631,8 +448,7 @@ export function activate(context: vscode.ExtensionContext) {
   // is already on screen.
   //
   // `expand` is the thing the built-in Explorer could not do at all: `TreeView.reveal` takes
-  // it directly, whereas ExplorerView.selectResource stops *at* the target and leaves it
-  // shut. That whole workaround is now gone (see revealDirectory).
+  // it directly, whereas ExplorerView.selectResource stops *at* the target and leaves it shut.
   async function revealInTree(rel: string, opts: { expand?: boolean; show?: boolean } = {}) {
     if (!treeView.visible && !opts.show) return
     const node = tree.find(rel)
@@ -656,55 +472,6 @@ export function activate(context: vscode.ExtensionContext) {
     const uri = vscode.window.activeTextEditor?.document.uri
     if (!uri || uri.scheme !== "file") return
     void revealInTree(vscode.workspace.asRelativePath(uri, false).replace(/\\/g, "/"))
-  }
-
-  // ---- tree → top bar ------------------------------------------------------
-
-  // The reciprocal of the `tui.directory.reveal` handling below: opening a folder here
-  // re-roots the TUI's top bar at it, so the bar shows that directory's composition while
-  // the tree shows its files. Between the two, a directory the user navigates to in either
-  // surface is the directory both of them are looking at.
-  //
-  // Set while a TUI-driven reveal is expanding the tree. Every ancestor of the revealed
-  // folder fires an expand event, and posting those would walk the bar *back up* the chain
-  // it just asked us to open. This is the only echo guard here on purpose: tracking "where
-  // the bar is" would go stale the moment the user walked it out with the breadcrumb (which
-  // deliberately publishes nothing), and a redundant POST is free — the bar ignores a scope
-  // it is already showing.
-  let adoptingBarScope = false
-  let pendingScope: string | undefined
-
-  // Only the last expansion in the window is posted: expanding a collapsed chain (from a
-  // reveal, or from a click on a folder whose parents were shut) fires an event per level,
-  // and the deepest one is the directory the user is actually looking at.
-  function focusScope(rel: string) {
-    if (!config().get<boolean>("tree.focusTopBar", true)) return
-    pendingScope = rel
-    if (scopeTimer) clearTimeout(scopeTimer)
-    scopeTimer = setTimeout(() => {
-      scopeTimer = undefined
-      const scope = pendingScope
-      pendingScope = undefined
-      if (scope === undefined || adoptingBarScope) return
-      void postScope(scope)
-    }, SCOPE_FOCUS_DEBOUNCE_MS)
-  }
-
-  async function postScope(scope: string) {
-    const dir = directory()
-    if (!dir) return
-    try {
-      await fetch(`${baseUrl()}/aperture/scope`, {
-        method: "POST",
-        headers: { "x-opencode-directory": dir, "Content-Type": "application/json" },
-        body: JSON.stringify({ scope }),
-      })
-      log(`focus scope ${scope === "" ? "<root>" : scope}`)
-    } catch (e) {
-      // No TUI attached, or the server is down. The tree is unaffected — the bar simply
-      // stays where it was, exactly as it does when nothing is listening.
-      log(`focus scope POST FAILED: ${String(e)}`)
-    }
   }
 
   // ---- facet filter (PLAN O4) ----------------------------------------------
@@ -779,8 +546,6 @@ export function activate(context: vscode.ExtensionContext) {
     refreshLegend()
     tree.refresh()
     openEditors.refresh()
-    // A genuine full invalidation: every row's answer changed at once.
-    decorationsChanged.fire(undefined)
     // The gutter reads the legend too, and unlike the tree it isn't driven by an event —
     // repaint the editors the user can actually see. Straight through, not debounced: this
     // is a click, not a paint sweep.
@@ -789,58 +554,25 @@ export function activate(context: vscode.ExtensionContext) {
 
   // ---- open-in-editor via SSE ----------------------------------------------
 
-  async function revealFile(relPath: string) {
+  async function revealFile(relPath: string, line?: number) {
     const folder = workspaceFolder()
     if (!folder) return
     const uri = vscode.Uri.joinPath(folder.uri, relPath)
+    const at = line !== undefined && line > 0 ? new vscode.Position(line - 1, 0) : undefined
     try {
-      await vscode.window.showTextDocument(uri, { preview: false })
+      await vscode.window.showTextDocument(uri, {
+        preview: false,
+        ...(at ? { selection: new vscode.Range(at, at) } : {}),
+      })
     } catch {
       // file may have moved/been deleted — ignore.
     }
     void revealInTree(relPath, { show: true })
   }
 
-  // Open a directory in the Aperture tree, so it shows what the TUI's top bar has navigated
-  // into. This is the bar's link into the editor now that it no longer lists files (PLAN
-  // O1): the bar aggregates, the tree enumerates.
-  //
-  // This used to target the built-in Explorer and was three times this length, because
-  // `revealInExplorer` cannot open the folder you give it. ExplorerView.selectResource walks
-  // *down* from the root with `while (item.resource !== resource) await tree.expand(item)`,
-  // so it expands every ancestor and stops the moment it reaches the target — revealing
-  // `src` selected it and left it shut. The workaround was to reveal an arbitrary *child*
-  // (so `src` became an ancestor and the same loop opened it), which in turn needed a
-  // readDirectory and a hand-rolled `files.exclude` matcher to pick a child the Explorer was
-  // not hiding. `TreeView.reveal` takes `expand` as a parameter, so all of that is gone.
-  async function revealDirectory(relPath: string) {
-    if (!workspaceFolder()) return
-    // The bar has moved itself, and the expansions we are about to perform are its doing —
-    // ignore what they fire, or we would post its own navigation back to it one ancestor at
-    // a time (see focusScope).
-    adoptingBarScope = true
-    try {
-      // The TUI's root scope is the empty string. There is no node for the root — it *is* the
-      // tree — so the useful response is to bring the view forward and leave it at that.
-      if (relPath === "") {
-        await vscode.commands.executeCommand("workbench.view.extension.aperture")
-        log("reveal <root>")
-        return
-      }
-      await revealInTree(relPath, { expand: true, show: true })
-      log(`reveal ${relPath}`)
-    } finally {
-      setTimeout(() => {
-        adoptingBarScope = false
-      }, SCOPE_ECHO_GUARD_MS)
-    }
-  }
-
   function handleEvent(evt: { type?: string; properties?: any }) {
     if (evt.type === "tui.file.open" && typeof evt.properties?.path === "string") {
-      void revealFile(evt.properties.path)
-    } else if (evt.type === "tui.directory.reveal" && typeof evt.properties?.path === "string") {
-      void revealDirectory(evt.properties.path)
+      void revealFile(evt.properties.path, typeof evt.properties.line === "number" ? evt.properties.line : undefined)
     } else if (evt.type === "aperture.invalidated") {
       scheduleRepaint()
       scheduleFacetMap()
@@ -882,12 +614,6 @@ export function activate(context: vscode.ExtensionContext) {
             await delay(RECONNECT_DELAY_MS)
             continue
           }
-          // Fresh connection (first connect, or a reconnect after a server restart — which
-          // drops the server's in-memory drilled-file set that drives extent attachment).
-          // Re-warm every open tab so their function paint is re-established under the active
-          // Lens without needing a focus, keeping the "open ⇒ painted-or-in-flight" invariant.
-          warmed.clear()
-          void warmOpenTabs()
           const reader = res.body.getReader()
           const decoder = new TextDecoder()
           let buffer = ""
@@ -938,7 +664,6 @@ export function activate(context: vscode.ExtensionContext) {
   const fileWatcher = vscode.workspace.createFileSystemWatcher("**/*")
 
   context.subscriptions.push(
-    decorationsChanged,
     tree,
     treeView,
     fileWatcher,
@@ -948,7 +673,6 @@ export function activate(context: vscode.ExtensionContext) {
     fileWatcher.onDidDelete((uri) => {
       if (watchedPath(uri)) scheduleFileSet()
     }),
-    vscode.window.registerFileDecorationProvider(decorationProvider),
     vscode.commands.registerCommand("aperture.repaint", () => scheduleRepaint()),
     vscode.commands.registerCommand("aperture.filterFacets", () => void pickFacetFilter()),
     vscode.commands.registerCommand("aperture.clearFacetFilter", () => {
@@ -1007,25 +731,16 @@ export function activate(context: vscode.ExtensionContext) {
     treeView.onDidChangeVisibility((e) => {
       if (e.visible) revealActiveFile()
     }),
-    // Opening a folder here re-roots the TUI's top bar at it. Only folders can be expanded,
-    // so the `dir` test is belt-and-braces against a future non-file row.
-    treeView.onDidExpandElement((e) => {
-      if (e.element.dir) focusScope(e.element.rel)
-    }),
     vscode.window.onDidChangeActiveTextEditor(() => {
       scheduleRepaint()
       revealActiveFile()
     }),
-    // A newly split/opened editor becomes visible without necessarily becoming active —
-    // repaint so it drills + fills without needing a focus.
+    // A newly split/opened editor becomes visible without necessarily becoming active.
     vscode.window.onDidChangeVisibleTextEditors(() => scheduleRepaint()),
     // Warm open-but-hidden tabs so their function paint is ready before they're focused.
     // The Open Editors view is a projection of this same state, so it refreshes here too —
     // including on a dirty/clean flip, which is a tab change rather than a group change.
-    vscode.window.tabGroups.onDidChangeTabs(() => {
-      void warmOpenTabs()
-      openEditors.refresh()
-    }),
+    vscode.window.tabGroups.onDidChangeTabs(() => openEditors.refresh()),
     vscode.workspace.onDidSaveTextDocument((doc) => {
       if (vscode.window.visibleTextEditors.some((e) => e.document === doc)) scheduleRepaint()
     }),
@@ -1038,13 +753,8 @@ export function activate(context: vscode.ExtensionContext) {
         tree.refresh()
         openEditors.refresh()
       }
-      // The pips setting is read inside provideFileDecoration, so toggling it changes every
-      // row's answer at once — a genuine full invalidation, and the only way the already
-      // painted pips get dropped.
-      if (e.affectsConfiguration("aperture.explorerPips")) decorationsChanged.fire(undefined)
       if (!e.affectsConfiguration("aperture.host") && !e.affectsConfiguration("aperture.port")) return
-      // Reconnect against the new host/port and repaint. The fresh connection re-warms every
-      // open tab on connect (see connectEvents), so no explicit re-warm is needed here.
+      // Reconnect against the new host/port and repaint.
       sse?.abort()
       sse = connectEvents()
       scheduleRepaint()
@@ -1063,8 +773,7 @@ export function activate(context: vscode.ExtensionContext) {
     if (!fetchingFacetMap) scheduleFacetMap()
   }, FACET_MAP_POLL_MS)
 
-  // Paint the visible files. Open-but-hidden tabs are warmed on SSE connect (see
-  // connectEvents), so switching to one is instant (no click-to-drill).
+  // Paint the visible files.
   scheduleRepaint()
   scheduleFacetMap()
   // The tree needs both inputs; this is the one that doesn't depend on the server, so it
@@ -1078,7 +787,6 @@ export function deactivate() {
   if (facetMapTimer) clearTimeout(facetMapTimer)
   if (facetMapPollTimer) clearInterval(facetMapPollTimer)
   if (fileSetTimer) clearTimeout(fileSetTimer)
-  if (scopeTimer) clearTimeout(scopeTimer)
   sse?.abort()
   sse = undefined
   for (const deco of decorationByColor.values()) deco.dispose()
@@ -1089,55 +797,4 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-// ---- Explorer pip encoding (pure) ------------------------------------------
-
-export type FacetWeight = { f: number; p: number }
 export type LegendEntry = { facet: string; label: string; color: string }
-
-// A facet's colour as a ThemeColor. FileDecoration.color accepts only a colour *id* — there
-// is no runtime API to hand VSCode a hex — so every hex Aperture can emit is contributed as
-// an id in package.json (`#D7005F` → `aperture.cD7005F`, see script/gen-colors.ts). That's
-// what keeps the Explorer pip the Lens's *actual* legend hue rather than an approximation.
-// Since C1 that covers the whole colour universe, greys included; a non-hex hue is version
-// skew with an older server and goes unpainted rather than being guessed at.
-export function themeColorFor(hue: string): vscode.ThemeColor | undefined {
-  if (!hue.startsWith("#")) return undefined
-  return new vscode.ThemeColor(`aperture.c${hue.slice(1).toUpperCase()}`)
-}
-
-// Reduce a file's facet mix to the one colour + one glyph a FileDecoration can carry.
-//
-// `suppressed` is a parameter rather than this picking a baked-in "dominant" on purpose:
-// legend filtering (PLAN O4/S4) is the same question asked over a smaller vocabulary, so
-// that feature changes only what is passed here and never this encoding.
-//
-// With nothing suppressed we show the file's plurality facet, which matches the server's
-// `attributeFileBytes(...).dominant` and therefore the TUI tile and the directory treemap.
-// With facets suppressed we show the file's largest *surviving* facet, and a file made
-// entirely of suppressed facets gets no decoration at all — so filtering visually subtracts
-// the unrelated files from the tree.
-//
-// Note the divergence from the Aperture tree, which greys a suppressed facet in place
-// rather than dropping it. That is not an inconsistency: the tree has a whole chip to spend
-// and can afford to preserve area, while a one-colour pip has to choose a facet, so the
-// only filtering it can express is subtraction.
-export function decorationFrom(
-  weights: ReadonlyArray<FacetWeight>,
-  legend: ReadonlyArray<LegendEntry>,
-  facets: ReadonlyArray<string>,
-  suppressed: ReadonlySet<string>,
-): { badge: string; color: vscode.ThemeColor | undefined; tooltip: string } | undefined {
-  // Weights arrive sorted descending, so the first survivor is the largest one.
-  const chosen = suppressed.size === 0 ? weights[0] : weights.find((w) => !suppressed.has(facets[w.f] ?? ""))
-  if (!chosen) return undefined
-  const labelOf = (index: number) => legend.find((e) => e.facet === facets[index])?.label ?? facets[index] ?? "?"
-  const hue = legend.find((e) => e.facet === facets[chosen.f])?.color
-  return {
-    badge: SHADES.find((s) => chosen.p >= s.min)!.glyph,
-    // "Other" (and anything else outside the legend) has no legend colour; fall back to the
-    // grey the TUI paints it with rather than leaving it uncoloured and indistinguishable
-    // from an unpainted file.
-    color: themeColorFor(hue ?? SUPPRESSED_HUE),
-    tooltip: weights.map((w) => `${labelOf(w.f)} ${w.p}%`).join(" · "),
-  }
-}

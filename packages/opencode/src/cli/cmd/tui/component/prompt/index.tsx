@@ -19,7 +19,7 @@ import { tint, useTheme } from "@tui/context/theme"
 import { EmptyBorder, SplitBorder } from "@tui/component/border"
 import { Spinner } from "@tui/component/spinner"
 import { useSDK } from "@tui/context/sdk"
-import { fetchLenses, drillDownsOf } from "@tui/feature-plugins/system/aperture-lens-picker"
+import { fetchLenses } from "@tui/feature-plugins/system/aperture-lens-picker"
 import { useRoute } from "@tui/context/route"
 import { useProject } from "@tui/context/project"
 import { useSync } from "@tui/context/sync"
@@ -639,8 +639,7 @@ export function Prompt(props: PromptProps) {
         },
       },
       {
-        // Deterministic, agent-free delete of the active Aperture Lens.
-        // Mirrors the top-bar ✕; the server refuses built-ins (status "builtin").
+        // Deterministic, agent-free delete of the active Aperture Lens. Mirrors the top-bar ✕.
         title: "Delete Lens",
         desc: "Delete the active Aperture Lens",
         name: "aperture.lens.delete",
@@ -648,30 +647,21 @@ export function Prompt(props: PromptProps) {
         slashName: "lens-delete",
         slashAliases: ["unlens"],
         run: async () => {
-          const active = await sdk.client.aperture
-            .get({})
-            .then((r) => r.data?.lens)
+          const active = await fetchLenses(sdk)
+            .then((all) => all.find((l) => l.active))
             .catch(() => undefined)
           if (!active) {
             toast.show({
               title: "No Lens",
-              message: "Open Aperture and pick a Lens first.",
+              message: "There is no active Lens to delete.",
               variant: "error",
             })
             return
           }
-          // Deleting a Lens cascades to the drill-downs scoped to it — their domain is its
-          // facets, so they can't survive it. Name them: they're painted work the user has
-          // no other way to see from this prompt.
-          const drillDowns = await fetchLenses(sdk)
-            .then((all) => drillDownsOf(all, active.id))
-            .catch(() => [])
           const ok = await DialogConfirm.show(
             dialog,
             "Delete Lens",
-            drillDowns.length
-              ? `Delete "${active.name}"? This also deletes the ${drillDowns.length} drill-down Lens(es) scoped to it (${drillDowns.map((l) => l.name).join(", ")}), and all their facets.`
-              : `Delete "${active.name}"? This removes the Lens and its facets.`,
+            `Delete "${active.name}"? This removes the Lens, its concerns and their rules.`,
           )
           if (!ok) return
           const result = await sdk.client.aperture
@@ -681,14 +671,10 @@ export function Prompt(props: PromptProps) {
           if (result?.status === "ok") {
             toast.show({
               title: "Deleted Lens",
-              message: `Removed "${active.name}"; now showing "${result.active?.name ?? "Architecture"}".`,
+              message: result.active
+                ? `Removed "${active.name}"; now showing "${result.active.name}".`
+                : `Removed "${active.name}".`,
               variant: "success",
-            })
-          } else if (result?.status === "builtin") {
-            toast.show({
-              title: "Built-in Lens",
-              message: `"${active.name}" is built-in and can't be deleted.`,
-              variant: "error",
             })
           } else {
             toast.show({ title: "Delete failed", message: `Couldn't delete "${active.name}".`, variant: "error" })

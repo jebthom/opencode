@@ -1,26 +1,28 @@
 import { Aperture } from "@/aperture/aperture"
 import { ApertureEvent } from "@/aperture/event"
-import { legend, orderForest } from "@/aperture/lenses"
+import { USER } from "@/aperture/lens-history"
 import * as StudyLog from "@/aperture/study-log"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Effect } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
-import type { FacetFilterInput, InteractionInput, ScopeFocusInput } from "../groups/aperture"
+import type { FacetFilterInput, InteractionInput } from "../groups/aperture"
 
+// Every mutation arriving over HTTP is the user's own action (a click in the top bar or the
+// VSCode extension), so it is recorded in the Lens history as `USER`.
 export const apertureHandlers = HttpApiBuilder.group(InstanceHttpApi, "aperture", (handlers) =>
   Effect.gen(function* () {
     const aperture = yield* Aperture.Service
     const events = yield* EventV2Bridge.Service
 
-    const get = Effect.fn("ApertureHttpApi.get")(function* (ctx: {
-      query: { scope?: string; refresh?: "true" | "false"; drill?: string }
+    const lines = Effect.fn("ApertureHttpApi.lines")(function* (ctx: { query: { path: string } }) {
+      return yield* aperture.lines(ctx.query.path)
+    })
+
+    const history = Effect.fn("ApertureHttpApi.history")(function* (ctx: {
+      query: { since?: number; sessionID?: string; turnID?: string; lens?: string; limit?: number }
     }) {
-      // Drilling supersedes refresh/get: the drilled file's content is re-read each
-      // call, so its extents are always fresh while the window structure is reused.
-      if (ctx.query.drill) return yield* aperture.drill(ctx.query.drill, ctx.query.scope)
-      if (ctx.query.refresh === "true") return yield* aperture.refresh(ctx.query.scope)
-      return yield* aperture.get(ctx.query.scope)
+      return yield* aperture.history(ctx.query)
     })
 
     const facetMap = Effect.fn("ApertureHttpApi.facetMap")(function* () {
@@ -36,63 +38,46 @@ export const apertureHandlers = HttpApiBuilder.group(InstanceHttpApi, "aperture"
     const cycleLens = Effect.fn("ApertureHttpApi.cycleLens")(function* (ctx: {
       query: { direction: "next" | "prev" }
     }) {
-      return yield* aperture.cycleLens(ctx.query.direction)
+      const active = yield* aperture.cycleLens(ctx.query.direction, USER)
+      return active ? { active } : {}
     })
 
-    const deleteLens = Effect.fn("ApertureHttpApi.deleteLens")(function* (ctx: {
-      query: { lens: string }
-    }) {
-      const result = yield* aperture.deleteLens(ctx.query.lens)
-      return result.status === "ok" ? { status: "ok" as const, active: result.active } : { status: result.status }
+    const deleteLens = Effect.fn("ApertureHttpApi.deleteLens")(function* (ctx: { query: { lens: string } }) {
+      const result = yield* aperture.deleteLens(ctx.query.lens, USER)
+      if (result.status !== "ok") return { status: result.status }
+      return { status: "ok" as const, ...(result.active ? { active: result.active } : {}) }
     })
 
     const listLenses = Effect.fn("ApertureHttpApi.listLenses")(function* () {
       const all = yield* aperture.lenses()
       const active = yield* aperture.activeLens()
-      // `all` is already in DFS-forest order; orderForest re-derives each Lens's depth and
-      // the scope of its root ancestor, which is what the picker indents and groups on.
-      return orderForest(all).map(({ lens, depth, rootScope }) => ({
+      return all.map((lens) => ({
         id: lens.id,
         name: lens.name,
         description: lens.description,
-        scope: lens.scope,
-        builtin: lens.scope === "global",
-        active: lens.id === active.id,
-        ...(lens.parent ? { parent: lens.parent.lens } : {}),
-        depth,
-        rootScope,
+        owner: lens.owner,
+        active: lens.id === active?.id,
+        facets: lens.facets.length,
+        rules: lens.rules?.length ?? 0,
       }))
     })
 
     const selectLens = Effect.fn("ApertureHttpApi.selectLens")(function* (ctx: { query: { lens: string } }) {
-      const found = yield* aperture.selectLens(ctx.query.lens)
-      if (!found) return { status: "not-found" as const }
-      return { status: "ok" as const, active: { id: found.id, name: found.name, legend: legend(found) } }
+      const result = yield* aperture.selectLens(ctx.query.lens, USER)
+      if (result.status !== "ok") return { status: result.status }
+      return { status: "ok" as const, active: Aperture.lensInfo(result.lens) }
     })
 
-    // Replace the legend filter and tell the other surfaces (O4). The publish happens
-    // *inside the request* on purpose: that's what has EventV2Bridge stamp the event's
-    // `location` from the ambient instance, and without it the /event SSE filter drops the
-    // event and the VSCode extension silently never greys (the same trap as
-    // aperture.invalidated — see painter.ts publishInvalidated).
+    // Replace the legend filter and tell the other surfaces (O4). The publish happens *inside the
+    // request* on purpose: that is what has EventV2Bridge stamp the event's `location` from the
+    // ambient instance, and without it the /event SSE filter drops the event and the VSCode
+    // extension silently never greys.
     const facetFilter = Effect.fn("ApertureHttpApi.facetFilter")(function* (ctx: {
       payload: typeof FacetFilterInput.Type
     }) {
       const facets = yield* aperture.setFacetFilter(ctx.payload.facets)
       yield* events.publish(ApertureEvent.Event.FacetsFiltered, { facets })
       return facets
-    })
-
-    // Re-root the view somewhere else, on behalf of a host surface. Publishes and nothing
-    // more: the bar refetches because its scope changed, which is the same path a click on a
-    // directory block takes. Published inside the request for the same reason facetFilter is
-    // — that is what stamps the event's `location`, without which the /event SSE filter drops
-    // it before any other surface sees it.
-    const focusScope = Effect.fn("ApertureHttpApi.focusScope")(function* (ctx: {
-      payload: typeof ScopeFocusInput.Type
-    }) {
-      yield* events.publish(ApertureEvent.Event.ScopeFocused, { scope: ctx.payload.scope })
-      return true
     })
 
     const interaction = Effect.fn("ApertureHttpApi.interaction")(function* (ctx: {
@@ -111,7 +96,8 @@ export const apertureHandlers = HttpApiBuilder.group(InstanceHttpApi, "aperture"
     })
 
     return handlers
-      .handle("get", get)
+      .handle("lines", lines)
+      .handle("history", history)
       .handle("facetMap", facetMap)
       .handle("activity", activity)
       .handle("cycleLens", cycleLens)
@@ -119,7 +105,6 @@ export const apertureHandlers = HttpApiBuilder.group(InstanceHttpApi, "aperture"
       .handle("listLenses", listLenses)
       .handle("selectLens", selectLens)
       .handle("facetFilter", facetFilter)
-      .handle("focusScope", focusScope)
       .handle("interaction", interaction)
   }),
 )

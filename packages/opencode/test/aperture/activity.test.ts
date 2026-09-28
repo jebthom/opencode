@@ -1,7 +1,12 @@
 import { describe, expect, test } from "bun:test"
-import { deriveTurns, mergeChildEntries, toRepoRelative, toRepoScope, type MessageLike } from "@/aperture/activity-model"
+import {
+  deriveTurns,
+  mergeChildEntries,
+  toRepoRelative,
+  toRepoScope,
+  type MessageLike,
+} from "@/aperture/activity-model"
 import { computeFacetMapFiles } from "@/aperture/aperture"
-import { NONE_FACET } from "@/aperture/lenses"
 
 // Activity is *derived*, not recorded (PLAN.md G1): every tool call already lives in the
 // durable message store, so the log is a view of it rather than a second source of truth.
@@ -197,7 +202,11 @@ describe("deriveTurns", () => {
     // absence of these fields rather than off the mode, so this has to stay absent.
     const turns = derive([
       user("go"),
-      assistant([tool("read", { filePath: "src/a.ts" }), tool("grep", { pattern: "x" }), tool("bash", { command: "ls" })]),
+      assistant([
+        tool("read", { filePath: "src/a.ts" }),
+        tool("grep", { pattern: "x" }),
+        tool("bash", { command: "ls" }),
+      ]),
     ])
     for (const entry of turns[0]!.entries) {
       expect(entry.additions).toBeUndefined()
@@ -267,9 +276,7 @@ describe("deriveTurns", () => {
   test("a task call yields its child session rather than an entry", () => {
     const turns = derive([
       user("go"),
-      assistant([
-        tool("task", { subagent_type: "explore", prompt: "look" }, { metadata: { sessionId: "ses_child" } }),
-      ]),
+      assistant([tool("task", { subagent_type: "explore", prompt: "look" }, { metadata: { sessionId: "ses_child" } })]),
     ])
     expect(turns[0]!.entries).toHaveLength(0)
     // The task call's own ids ride along: they are the anchor every entry the child produces
@@ -286,10 +293,7 @@ describe("deriveTurns", () => {
   })
 
   test("a child session's entries fold into the parent turn at depth 1, in timeline order", () => {
-    const parent = derive([
-      user("go", { at: 100 }),
-      assistant([tool("read", { filePath: "src/a.ts" }, { at: 300 })]),
-    ])
+    const parent = derive([user("go", { at: 100 }), assistant([tool("read", { filePath: "src/a.ts" }, { at: 300 })])])
     const child = derive(
       [user("look"), assistant([tool("read", { filePath: "src/z.ts" }, { at: 200 })], { agent: "explore" })],
       "ses_child",
@@ -517,29 +521,26 @@ describe("toRepoScope", () => {
 
 describe("facet agreement", () => {
   // The activity response's `files` is `computeFacetMapFiles` over the *touched* subset —
-  // filtered at the input, not in the reduction — so an Activity View block, an Explorer pip
-  // and a treemap band for the same file are three renderings of one attribution.
-  const FACETS = ["likely", "hot", NONE_FACET]
-  const SUBTREE = [
-    { id: "n_a", path: "src/a.ts", size: 100 },
-    { id: "n_b", path: "src/b.ts", size: 200 },
-    { id: "n_c", path: "src/c.ts", size: 300 },
-  ]
-  const STORE = {
-    n_a: { facet: "likely", hash: "h" },
-    n_b: { facet: "hot", hash: "h" },
-    n_c: { facet: "hot", hash: "h" },
-  }
+  // filtered at the input, not in the reduction — so an Activity View block and a top-bar tile
+  // for the same file are two renderings of one set of marks.
+  const FACETS = ["likely", "hot"]
+  const hit = (facet: string, start: number, lines: number) => ({
+    rule: `${facet}-rule`,
+    facet,
+    ranges: [[start, start + lines - 1] as const],
+    lines,
+    bytes: lines * 10,
+  })
+  const HITS = new Map([
+    ["src/a.ts", [hit("likely", 3, 2)]],
+    ["src/b.ts", [hit("hot", 1, 1)]],
+    ["src/c.ts", [hit("hot", 7, 4), hit("likely", 2, 1)]],
+  ])
 
   test("the touched subset equals the whole-repo map restricted to those paths", () => {
     const touched = new Set(["src/a.ts", "src/c.ts"])
-    const all = computeFacetMapFiles(SUBTREE, STORE, {}, FACETS)
-    const scoped = computeFacetMapFiles(
-      SUBTREE.filter((f) => touched.has(f.path)),
-      STORE,
-      {},
-      FACETS,
-    )
+    const all = computeFacetMapFiles(HITS, FACETS)
+    const scoped = computeFacetMapFiles(new Map([...HITS].filter(([path]) => touched.has(path))), FACETS)
     expect(Object.keys(scoped).sort()).toEqual(["src/a.ts", "src/c.ts"])
     for (const path of touched) expect(scoped[path]).toEqual(all[path]!)
   })

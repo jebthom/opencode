@@ -154,6 +154,137 @@ exports[`tool parameters JSON Schema (wire shape) invalid 1`] = `
 }
 `;
 
+exports[`tool parameters JSON Schema (wire shape) lens_mark 1`] = `
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "about": {
+      "description": "One line describing the Lens. Used only when this call creates it.",
+      "type": "string",
+    },
+    "activate": {
+      "description": "Switch the user's view to this Lens. You may do this freely when the active Lens is one you curate (or there is none); switching away from a user's Lens asks them first.",
+      "type": "boolean",
+    },
+    "author": {
+      "description": "Keep only hits on lines last changed by this author (case-insensitive substring of git blame's name or email).",
+      "type": "string",
+    },
+    "caseSensitive": {
+      "description": "kind 'pattern' only. Matching is case-sensitive unless you pass false.",
+      "type": "boolean",
+    },
+    "changed": {
+      "description": "Keep only hits on lines git reports as changed against this ref or range — e.g. 'HEAD' (uncommitted), 'main', or 'HEAD~1..HEAD' (the last commit). Combine with a pattern to mark 'every call to x() that this change touched'.",
+      "type": "string",
+    },
+    "definition": {
+      "description": "One-line definition of the concern for the legend. Used only when minting a new concern.",
+      "type": "string",
+    },
+    "facet": {
+      "description": "The concern these lines belong to, kebab-case: 'retry-path', 'any-casts', 'feature-flag-reads'. An existing facet id or label adds another rule to that concern; a new name mints one (up to 6 per Lens). NEVER a generic name like 'hit', 'match' or 'result' — this is what the user reads in the legend, so it has to say what the lines have in common.",
+      "type": "string",
+    },
+    "glob": {
+      "description": "Repo-relative globs restricting the search, e.g. ['packages/*/src/**/*.ts']. The cheapest way to narrow a rule that matched too much.",
+      "items": {
+        "type": "string",
+      },
+      "type": "array",
+    },
+    "kind": {
+      "description": "How to find the lines. 'pattern' is a ripgrep regex, painting each matched LINE: language-agnostic but it also matches comments and strings. 'symbol' names a top-level declaration and paints its whole extent: coarser, but idiom-blind — it finds a const-arrow, a generator and a function declaration alike. 'diff' marks the lines git reports as changed against \`ref\` (default HEAD = uncommitted changes; 'main' = changed since main; 'HEAD~1..HEAD' = the last commit). 'structural' is an ast-grep pattern but its backend is not installed yet, so it is refused.",
+      "enum": [
+        "pattern",
+        "symbol",
+        "diff",
+        "structural",
+      ],
+      "type": "string",
+    },
+    "language": {
+      "description": "Required for kind 'structural', e.g. 'ts', 'tsx', 'js', 'py'.",
+      "type": "string",
+    },
+    "lens": {
+      "description": "Id or name of the Lens to mark on (see lens_list). A name that doesn't exist creates a Lens with that name — give it a descriptive one ('Retry Handling', not 'search'), and check lens_list first so you add to an existing Lens instead of making a near-duplicate.",
+      "type": "string",
+    },
+    "name": {
+      "description": "Required for kind 'symbol': the exact top-level declaration name, e.g. 'retryWithBackoff'.",
+      "type": "string",
+    },
+    "note": {
+      "description": "One line on WHY these lines matter, shown to the user on hover. This is where your judgement lives — the finder can only match text, so 'this is the retry path' has to be said here.",
+      "type": "string",
+    },
+    "path": {
+      "description": "kind 'symbol' only: restrict to this repo-relative file or directory prefix.",
+      "type": "string",
+    },
+    "pattern": {
+      "description": "Required for kind 'pattern' (a rust-regex, as ripgrep takes it) and kind 'structural'.",
+      "type": "string",
+    },
+    "reason": {
+      "description": "Why you are making this change now, recorded in the Lens history the user can review. Always give one when curating on your own initiative.",
+      "type": "string",
+    },
+    "ref": {
+      "description": "kind 'diff' only: the git ref or 'A..B' range to compare against. Defaults to HEAD.",
+      "type": "string",
+    },
+    "requestedByUser": {
+      "description": "True ONLY when the user explicitly asked for this mark in this conversation. The concern is then theirs, and you must not later change or remove it without asking. Leave it unset when you are curating the view on your own initiative.",
+      "type": "boolean",
+    },
+    "since": {
+      "description": "Keep only hits on lines last changed after this date ('2 weeks ago', '2026-09-01'), per git blame.",
+      "type": "string",
+    },
+  },
+  "required": [
+    "lens",
+    "facet",
+    "kind",
+  ],
+  "type": "object",
+}
+`;
+
+exports[`tool parameters JSON Schema (wire shape) lens_unmark 1`] = `
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "facet": {
+      "description": "Concern to remove ENTIRELY, with every rule pointing at it (id or label). Use this to free a slot when the Lens is at the 6-concern cap.",
+      "type": "string",
+    },
+    "lens": {
+      "description": "Id or name of the Lens to remove from (see lens_list).",
+      "type": "string",
+    },
+    "reason": {
+      "description": "Why you are removing it, recorded in the Lens history the user can review.",
+      "type": "string",
+    },
+    "requestedByUser": {
+      "description": "True ONLY when the user explicitly asked for this removal in this conversation.",
+      "type": "boolean",
+    },
+    "rule": {
+      "description": "Rule id to remove — lens_mark returns it, and lens_list shows a Lens's rules.",
+      "type": "string",
+    },
+  },
+  "required": [
+    "lens",
+  ],
+  "type": "object",
+}
+`;
+
 exports[`tool parameters JSON Schema (wire shape) lsp 1`] = `
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -478,104 +609,6 @@ exports[`tool parameters JSON Schema (wire shape) write 1`] = `
   "required": [
     "content",
     "filePath",
-  ],
-  "type": "object",
-}
-`;
-
-exports[`tool parameters JSON Schema (wire shape) lens_mark 1`] = `
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "properties": {
-    "about": {
-      "description": "One line describing the Lens. Used only when this call creates it.",
-      "type": "string",
-    },
-    "activate": {
-      "description": "Switch the user's view to this Lens. Defaults to false, and marks are invisible until the Lens is active — so the right move is to tell the user it exists and offer lens_select, not to switch the view they are looking at out from under them.",
-      "type": "boolean",
-    },
-    "caseSensitive": {
-      "description": "kind 'pattern' only. Matching is case-sensitive unless you pass false.",
-      "type": "boolean",
-    },
-    "definition": {
-      "description": "One-line definition of the concern for the legend. Used only when minting a new concern.",
-      "type": "string",
-    },
-    "facet": {
-      "description": "The concern these lines belong to, kebab-case: 'retry-path', 'any-casts', 'feature-flag-reads'. An existing facet id or label adds another rule to that concern; a new name mints one (up to 6 per Lens). NEVER a generic name like 'hit', 'match' or 'result' — this is what the user reads in the legend, so it has to say what the lines have in common.",
-      "type": "string",
-    },
-    "glob": {
-      "description": "Repo-relative globs restricting the search, e.g. ['packages/*/src/**/*.ts']. The cheapest way to narrow a rule that matched too much.",
-      "items": {
-        "type": "string",
-      },
-      "type": "array",
-    },
-    "kind": {
-      "description": "How to find the lines. 'pattern' is a ripgrep regex, painting each matched LINE: language-agnostic (config, YAML, markup) but it also matches comments and strings. 'symbol' names a top-level declaration and paints its whole extent: coarser, but idiom-blind — it finds a const-arrow, a generator and a function declaration alike, which matters in a codebase where most callables are not \`function\` declarations. 'structural' is an ast-grep pattern (precise, exact ranges) but its backend is not installed yet, so it will be refused; prefer 'pattern' or 'symbol'.",
-      "enum": [
-        "pattern",
-        "symbol",
-        "structural",
-      ],
-      "type": "string",
-    },
-    "language": {
-      "description": "Required for kind 'structural', e.g. 'ts', 'tsx', 'js', 'py'.",
-      "type": "string",
-    },
-    "lens": {
-      "description": "Id or name of the Lens to mark on (see lens_list). A name that doesn't exist creates a Search Lens with that name — so give it a descriptive one ('Retry Handling', not 'search'), and check lens_list first so you add to an existing Lens instead of making a near-duplicate.",
-      "type": "string",
-    },
-    "name": {
-      "description": "Required for kind 'symbol': the exact top-level declaration name, e.g. 'retryWithBackoff'.",
-      "type": "string",
-    },
-    "note": {
-      "description": "One line on WHY these lines matter, shown to the user on hover. This is where your judgement lives — the finder can only match text, so 'this is the retry path' has to be said here rather than encoded in the query.",
-      "type": "string",
-    },
-    "path": {
-      "description": "kind 'symbol' only: restrict to this repo-relative file or directory prefix.",
-      "type": "string",
-    },
-    "pattern": {
-      "description": "Required for kind 'pattern' (a rust-regex, as ripgrep takes it) and kind 'structural'.",
-      "type": "string",
-    },
-  },
-  "required": [
-    "lens",
-    "facet",
-    "kind",
-  ],
-  "type": "object",
-}
-`;
-
-exports[`tool parameters JSON Schema (wire shape) lens_unmark 1`] = `
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "properties": {
-    "facet": {
-      "description": "Concern to remove ENTIRELY, with every rule pointing at it (id or label). Use this to free a slot when the Lens is at the 6-concern cap.",
-      "type": "string",
-    },
-    "lens": {
-      "description": "Id or name of the Lens to remove from (see lens_list).",
-      "type": "string",
-    },
-    "rule": {
-      "description": "Rule id to remove — lens_mark returns it, and lens_list shows a Lens's rules.",
-      "type": "string",
-    },
-  },
-  "required": [
-    "lens",
   ],
   "type": "object",
 }

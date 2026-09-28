@@ -5,7 +5,7 @@ import path from "path"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Ripgrep } from "@opencode-ai/core/filesystem/ripgrep"
 import { ApertureExtents } from "./extents"
-import { MAX_RULE_HITS, type Finder, type Rule } from "./lenses"
+import { MAX_DIFF_HITS, MAX_RULE_HITS, type Finder, type GitFilter, type Rule } from "./lenses"
 
 // Evaluation of a Lens's search rules (S1) into sparse line ranges.
 //
@@ -16,29 +16,23 @@ import { MAX_RULE_HITS, type Finder, type Rule } from "./lenses"
 // it is why there is no anchor, no "lost" state and no durable line-tag store anywhere in
 // the codebase.
 //
-// **Every finder is a pure function of one file's content.** Nothing here resolves an
-// import, follows a re-export or consults a symbol table. That is a real coverage limit
-// (see the `references` gap in PLAN.md S1) but it is also the property that makes the
-// caller's per-file memo *correct* rather than merely convenient: re-evaluating one changed
-// file can never invalidate another file's result, so an edit costs one file's work instead
-// of a whole-repo pass.
+// **Every content finder is a pure function of one file's content.** Nothing here resolves an
+// import, follows a re-export or consults a symbol table. That is a real coverage limit (see the
+// `references` gap in PLAN.md S1) but it is also the property that makes the caller's per-file
+// memo *correct*: re-evaluating one changed file can never invalidate another file's result.
 //
-// The output feeds `lineTags` and `marks` in the payload and NOTHING else. Line tags are
-// sparse and do not tile a file, so they must never enter `attributeFileBytes` /
-// `computeComposition` — the byte contract the treemap, the directory bands and the Explorer
-// pip all depend on would stop summing (see the note on LineTag in payload.ts). `marks` (S3)
-// is the aggregate reading of the same hits and is a separate overlay for the same reason.
+// The exception is anything git-shaped — the `diff` finder and every `where` filter — whose
+// answer also depends on HEAD. Git access comes in through `GitLookup` rather than a Git service
+// import, so this module stays pure and testable, and the caller keys its memo on HEAD for any
+// rule `isGitRule` reports.
 
 // One rule's hits inside one file. `ranges` are 1-based inclusive line ranges, already
 // clamped to the file and merged, so a range is one visual gutter strip and the hit count
 // is not inflated by adjacency.
 //
-// `lines`/`bytes` are the magnitude the aggregate surfaces need (S3), measured over those
-// same merged ranges so a line counts exactly once. Both are carried for the same reason
-// `FacetWeight` carries `count` and `bytes`: `lines` is what a human reads ("14 lines
-// marked") and what a client can roll up by plain summation, while `bytes` is the unit the
-// composition bands are already drawn in, so a mark band is commensurate with them without
-// the renderer having to mix units.
+// `lines`/`bytes` are the magnitude the aggregate surfaces need, measured over those same
+// merged ranges so a line counts exactly once. `lines` is what a human reads ("14 lines
+// marked") and what a client rolls up by plain summation.
 export interface RuleHit {
   readonly rule: string
   readonly facet: string
@@ -79,23 +73,54 @@ export const EMPTY: RuleResult = { byFile: new Map(), diagnostics: [] }
 // they are carried through to the payload but never evaluated.
 export function rulesHash(rules: ReadonlyArray<Rule>): string {
   const material = rules
-    .map((r) => JSON.stringify({ id: r.id, facet: r.facet, find: r.find }))
+    .map((r) => JSON.stringify({ id: r.id, facet: r.facet, find: r.find, where: r.where }))
     .sort()
     .join("\n")
   return createHash("sha256").update(material).digest("hex").slice(0, 16)
 }
 
-// Evaluate `rules` over a repo. `files`, when given, restricts evaluation to those
-// repo-relative paths — the incremental path taken when a handful of files changed. Omit it
-// for the whole-repo pass.
+// What the caller knows about git, for the `diff` finder and `where` filters. Paths are
+// directory-relative, like every path here.
+export interface GitLookup {
+  // Changed line ranges (in each file's CURRENT content) against `ref` — a ref compares the
+  // working tree to it, an "A..B" range compares two commits. "all" marks a file that is wholly
+  // new (untracked). Files absent from the map did not change.
+  readonly changes: (
+    ref: string,
+  ) => Effect.Effect<ReadonlyMap<string, ReadonlyArray<readonly [number, number]> | "all">, Error>
+  // Per-line blame of the file's current contents (index = line - 1), or undefined when git has
+  // nothing to say (untracked, binary, not a repo). With `since`, lines last changed before it
+  // come back `recent: false`.
+  readonly blame: (file: string, since?: string) => Effect.Effect<ReadonlyArray<BlameLine> | undefined>
+}
+
+export interface BlameLine {
+  readonly author: string
+  readonly mail: string
+  readonly recent: boolean
+}
+
+// Blaming is one git process per file, so a filter that would blame the whole repo is refused
+// with a message telling the agent to narrow it (a glob, or a `changed` filter, which is applied
+// first and is one git call for the whole repo).
+export const MAX_BLAME_FILES = 200
+// A `where` filter is often what makes a broad finder narrow ("every call to x() — but only the
+// changed ones"), so such a rule may match past MAX_RULE_HITS before filtering. It still has a
+// ceiling, so the pre-filter pass cannot become a whole-repo read.
+const MAX_PREFILTER_LINES = 20_000
+
+// Evaluate `rules` over a repo. `files`, when given, restricts evaluation to those repo-relative
+// paths — the incremental path taken when a handful of files changed. Omit it for the whole-repo
+// pass. `git` is required only by git-shaped rules; without it they report an error.
 //
-// Never fails: a finder that throws is caught into that rule's diagnostic and the remaining
-// rules still evaluate. One bad regex must not blank the payload, and during an unattended
-// participant session a crashed read boundary is a lost session rather than a bug report.
+// Never fails: a finder that throws is caught into that rule's diagnostic and the remaining rules
+// still evaluate. One bad regex must not blank the view, and during an unattended participant
+// session a crashed read is a lost session rather than a bug report.
 export const evaluate = (
   directory: string,
   rules: ReadonlyArray<Rule>,
   files?: ReadonlyArray<string>,
+  git?: GitLookup,
 ): Effect.Effect<RuleResult> =>
   Effect.gen(function* () {
     if (rules.length === 0 || (files && files.length === 0)) return EMPTY
@@ -103,17 +128,17 @@ export const evaluate = (
     const diagnostics: RuleDiagnostic[] = []
 
     for (const rule of rules) {
-      const outcome = yield* evaluateOne(directory, rule, files).pipe(
+      const outcome = yield* evaluateOne(directory, rule, files, git).pipe(
         Effect.catchCause(
           (cause): Effect.Effect<Outcome> => Effect.succeed({ perFile: new Map(), error: messageOf(cause) }),
         ),
       )
       let hits = 0
       for (const measured of outcome.perFile.values()) hits += measured.ranges.length
-      // An over-cap rule is stored but never painted, so its hits are dropped here rather
-      // than at the emit site: that keeps "too broad ⇒ invisible" in one place and lets a
-      // caller hand `byFile` straight to the payload.
-      const over = outcome.overCap !== undefined || hits > MAX_RULE_HITS
+      // An over-cap rule is stored but never painted, so its hits are dropped here rather than at
+      // the emit site: that keeps "too broad ⇒ invisible" in one place and lets a caller hand
+      // `byFile` straight to the payload.
+      const over = outcome.overCap !== undefined || hits > capOf(rule.find)
       if (!over) {
         for (const [file, measured] of outcome.perFile) {
           if (measured.ranges.length === 0) continue
@@ -134,9 +159,11 @@ export const evaluate = (
     return { byFile, diagnostics }
   })
 
-// One file's hits for one rule, normalised and measured — the shape both finders hand back
-// and the shape `RuleHit` spreads. Distinct from the raw `[start, end]` lists the finders
-// accumulate, which are neither clamped nor merged and so cannot be measured yet.
+export function capOf(find: Finder): number {
+  return find.kind === "diff" ? MAX_DIFF_HITS : MAX_RULE_HITS
+}
+
+// One file's hits for one rule, normalised and measured — the shape `RuleHit` spreads.
 interface Measured {
   readonly ranges: ReadonlyArray<readonly [number, number]>
   readonly lines: number
@@ -146,9 +173,19 @@ interface Measured {
 interface Outcome {
   readonly perFile: Map<string, Measured>
   readonly error?: string
-  // Raw match totals, set ONLY when a backend bailed out early because the rule was already
-  // past MAX_RULE_HITS. `perFile` is then empty — not because nothing matched, but because
-  // far too much did — so the caller must report these counts rather than zero.
+  // Raw match totals, set ONLY when a backend bailed out early because the rule was already past
+  // its cap. `perFile` is then empty — not because nothing matched, but because far too much did
+  // — so the caller must report these counts rather than zero.
+  readonly overCap?: { readonly hits: number; readonly files: number }
+}
+
+// What a finder hands back before filtering and measurement: raw 1-based inclusive ranges per
+// file, neither clamped nor merged.
+type Raw = Map<string, Array<readonly [number, number]>>
+
+interface Found {
+  readonly raw: Raw
+  readonly error?: string
   readonly overCap?: { readonly hits: number; readonly files: number }
 }
 
@@ -158,23 +195,56 @@ function messageOf(cause: unknown): string {
   return text.length > 300 ? text.slice(0, 300) + "…" : text
 }
 
-// The failure type stays declared rather than swallowed here: `evaluate` above is the single
-// place that turns a failure into a diagnostic, so it has to be visible all the way up to it.
+// Find → filter → measure. The failure type stays declared rather than swallowed here: `evaluate`
+// above is the single place that turns a failure into a diagnostic.
 const evaluateOne = (
   directory: string,
   rule: Rule,
   files: ReadonlyArray<string> | undefined,
-): Effect.Effect<Outcome, PlatformError | Error> => {
-  switch (rule.find.kind) {
-    case "pattern":
-      return patternHits(directory, rule.find, files)
-    case "symbol":
-      return symbolHits(directory, rule.find, files)
-    case "structural":
-      // S1b. Reported rather than thrown so the rule survives on the Lens and the agent gets
-      // an actionable message the moment the backend lands.
-      return Effect.succeed({
+  git: GitLookup | undefined,
+): Effect.Effect<Outcome, PlatformError | Error> =>
+  Effect.gen(function* () {
+    const filtered = hasFilter(rule.where)
+    if ((filtered || rule.find.kind === "diff") && !git)
+      return { perFile: new Map(), error: "this rule needs git history, but the project is not a git repository" }
+    const found = yield* find(directory, rule.find, files, git!, filtered ? MAX_PREFILTER_LINES : capOf(rule.find))
+    if (found.overCap || (found.error && found.raw.size === 0))
+      return {
         perFile: new Map(),
+        ...(found.error ? { error: found.error } : {}),
+        ...(found.overCap ? { overCap: found.overCap } : {}),
+      }
+    const narrowed = filtered ? yield* applyWhere(rule.where!, found.raw, git!) : { raw: found.raw }
+    if (narrowed.error) return { perFile: new Map(), error: narrowed.error }
+    return {
+      perFile: yield* clampAll(directory, narrowed.raw),
+      ...(found.error ? { error: found.error } : {}),
+    }
+  })
+
+function hasFilter(where: GitFilter | undefined): where is GitFilter {
+  return !!where && !!(where.changed || where.author || where.since)
+}
+
+const find = (
+  directory: string,
+  finder: Finder,
+  files: ReadonlyArray<string> | undefined,
+  git: GitLookup,
+  cap: number,
+): Effect.Effect<Found, PlatformError | Error> => {
+  switch (finder.kind) {
+    case "pattern":
+      return patternHits(directory, finder, files, cap)
+    case "symbol":
+      return symbolHits(directory, finder, files)
+    case "diff":
+      return diffHits(finder, files, git, cap)
+    case "structural":
+      // S1b. Reported rather than thrown so the rule survives on the Lens and the agent gets an
+      // actionable message the moment the backend lands.
+      return Effect.succeed({
+        raw: new Map(),
         error: "structural rules need the ast-grep backend, which is not installed yet (PLAN.md S1b)",
       })
   }
@@ -197,7 +267,8 @@ const patternHits = (
   directory: string,
   find: Extract<Finder, { kind: "pattern" }>,
   files: ReadonlyArray<string> | undefined,
-) =>
+  cap: number,
+): Effect.Effect<Found, PlatformError | Error> =>
   Effect.gen(function* () {
     const rg = yield* Ripgrep.Service
     const result = yield* rg.search({
@@ -229,7 +300,7 @@ const patternHits = (
       return {
         // Normally empty (exit 2 comes back with no items at all), but a partial read that
         // still produced matches keeps them rather than discarding work the user can see.
-        perFile: yield* clampAll(directory, perFile),
+        raw: perFile,
         error: `ripgrep rejected this pattern or could not read some files (exit 2) — check the regex syntax`,
       }
     // Bail before touching the disk when the rule is already too broad. `clampAll` reads
@@ -238,8 +309,8 @@ const patternHits = (
     // unpainted. The count reported is raw matched lines rather than merged ranges, which is
     // also the more faithful reading of a cap whose job is to catch "this paints a third of
     // the repo" — merging only ever shrinks it.
-    if (raw > MAX_RULE_HITS) return { perFile: new Map(), overCap: { hits: raw, files: perFile.size } }
-    return { perFile: yield* clampAll(directory, perFile) }
+    if (raw > cap) return { raw: new Map(), overCap: { hits: raw, files: perFile.size } }
+    return { raw: perFile }
   }).pipe(Effect.provide(Ripgrep.defaultLayer))
 
 // --- symbol ----------------------------------------------------------------
@@ -265,7 +336,7 @@ const symbolHits = (
   directory: string,
   find: Extract<Finder, { kind: "symbol" }>,
   files: ReadonlyArray<string> | undefined,
-) =>
+): Effect.Effect<Found, PlatformError | Error> =>
   Effect.gen(function* () {
     const under = find.path ? normalize(find.path).replace(/\/+$/, "") : undefined
     const inScope = (rel: string) => !under || rel === under || rel.startsWith(under + "/")
@@ -282,7 +353,7 @@ const symbolHits = (
     }
 
     const fs = yield* FSUtil.Service
-    const perFile = new Map<string, Measured>()
+    const raw: Raw = new Map()
     for (const rel of candidates) {
       const content = yield* fs
         .readFileStringSafe(path.join(directory, rel))
@@ -296,12 +367,111 @@ const symbolHits = (
         if (extent.name !== find.name && !extent.name.startsWith(find.name + "~")) continue
         ranges.push([extent.startLine, extent.endLine])
       }
-      if (ranges.length === 0) continue
-      const measured = measure(ranges, content)
-      if (measured) perFile.set(rel, measured)
+      if (ranges.length) raw.set(rel, ranges)
     }
-    return { perFile }
+    return { raw }
   }).pipe(Effect.provide(Ripgrep.defaultLayer), Effect.provide(FSUtil.defaultLayer))
+
+// --- diff ------------------------------------------------------------------
+
+// The lines git reports as changed against `ref`: what the retired "Changed since last commit"
+// built-in showed, now as a rule, so it can be one concern among several on any Lens. A wholly
+// new (untracked) file is marked end to end; `clampAll` trims the open range to its real length.
+const diffHits = (
+  find: Extract<Finder, { kind: "diff" }>,
+  files: ReadonlyArray<string> | undefined,
+  git: GitLookup,
+  cap: number,
+): Effect.Effect<Found, Error> =>
+  Effect.gen(function* () {
+    const changes = yield* git.changes(find.ref ?? "HEAD")
+    const only = files ? new Set(files.map(normalize)) : undefined
+    const globs = find.glob?.map((g) => new Bun.Glob(g))
+    const raw: Raw = new Map()
+    let lines = 0
+    for (const [file, ranges] of changes) {
+      if (only && !only.has(file)) continue
+      if (globs && !globs.some((g) => g.match(file))) continue
+      const list = ranges === "all" ? [[1, Number.MAX_SAFE_INTEGER] as const] : [...ranges]
+      raw.set(file, list)
+      // An untracked file's size is unknown until it is read, so it counts as one line here; the
+      // cap in `evaluate` is applied again to the measured result.
+      lines += ranges === "all" ? 1 : ranges.reduce((sum, [a, b]) => sum + b - a + 1, 0)
+    }
+    if (lines > cap) return { raw: new Map(), overCap: { hits: lines, files: raw.size } }
+    return { raw }
+  })
+
+// --- where -----------------------------------------------------------------
+
+// Narrow raw hits to the lines that also pass the rule's git filter. `changed` goes first because
+// it is one git call for the whole repo and usually removes most files, which is what keeps the
+// per-file blame behind `author`/`since` affordable.
+const applyWhere = (where: GitFilter, raw: Raw, git: GitLookup): Effect.Effect<{ raw: Raw; error?: string }, Error> =>
+  Effect.gen(function* () {
+    const changes = where.changed ? yield* git.changes(where.changed) : undefined
+    const afterChanged: Raw = new Map()
+    for (const [file, ranges] of raw) {
+      const changed = changes ? changes.get(file) : "all"
+      if (!changed) continue
+      const kept = changed === "all" ? ranges : intersect(ranges, changed)
+      if (kept.length) afterChanged.set(file, kept)
+    }
+    if (!where.author && !where.since) return { raw: afterChanged }
+    if (afterChanged.size > MAX_BLAME_FILES)
+      return {
+        raw: new Map(),
+        error: `the author/since filter would blame ${afterChanged.size} files (limit ${MAX_BLAME_FILES}) — narrow the finder with a glob or add a "changed" filter`,
+      }
+    const author = where.author?.toLowerCase()
+    const out: Raw = new Map()
+    for (const [file, ranges] of afterChanged) {
+      const blame = yield* git.blame(file, where.since)
+      // No blame means git has never seen the file: every line is the user's own uncommitted
+      // work. That is recent by definition, and attributable to no named author.
+      const keep = (line: number) => {
+        const entry = blame?.[line - 1]
+        if (
+          author &&
+          !(entry && (entry.author.toLowerCase().includes(author) || entry.mail.toLowerCase().includes(author)))
+        )
+          return false
+        return !where.since || !entry || entry.recent
+      }
+      const kept = ranges.flatMap(([start, end]) => runsOf(start, Math.min(end, blame?.length ?? end), keep))
+      if (kept.length) out.set(file, kept)
+    }
+    return { raw: out }
+  })
+
+// Intersect two range lists (1-based inclusive). Neither needs to be sorted or merged.
+function intersect(
+  a: ReadonlyArray<readonly [number, number]>,
+  b: ReadonlyArray<readonly [number, number]>,
+): Array<readonly [number, number]> {
+  return a.flatMap(([s1, e1]) =>
+    b.flatMap(([s2, e2]): Array<readonly [number, number]> => {
+      const start = Math.max(s1, s2)
+      const end = Math.min(e1, e2)
+      return start <= end ? [[start, end]] : []
+    }),
+  )
+}
+
+// The maximal runs of lines in [start, end] for which `keep` holds.
+function runsOf(start: number, end: number, keep: (line: number) => boolean): Array<readonly [number, number]> {
+  const runs: Array<readonly [number, number]> = []
+  let open: number | undefined
+  for (let line = start; line <= end; line++) {
+    if (keep(line)) open ??= line
+    else if (open !== undefined) {
+      runs.push([open, line - 1])
+      open = undefined
+    }
+  }
+  if (open !== undefined) runs.push([open, end])
+  return runs
+}
 
 // --- shared ----------------------------------------------------------------
 
@@ -309,7 +479,7 @@ const symbolHits = (
 // end of the file (ripgrep and this read can disagree if a write lands between them, which
 // would otherwise decorate a line the buffer doesn't have) and merges adjacent ones, so two
 // hits on consecutive lines are one strip and count once rather than twice.
-const clampAll = (directory: string, perFile: Map<string, Array<readonly [number, number]>>) =>
+const clampAll = (directory: string, perFile: Raw) =>
   Effect.gen(function* () {
     const fs = yield* FSUtil.Service
     const out = new Map<string, Measured>()
@@ -324,14 +494,10 @@ const clampAll = (directory: string, perFile: Map<string, Array<readonly [number
     return out
   }).pipe(Effect.provide(FSUtil.defaultLayer))
 
-// Clamp + merge one file's ranges and measure what they cover. Separate from `clampAll` so
-// `symbolHits`, which already holds the content it cut extents from, measures without a
-// second read — and so the measurement has one definition rather than one per finder.
+// Clamp + merge one file's ranges and measure what they cover.
 //
-// Bytes are counted per line *including* its terminator, exactly as `fileComposition` counts
-// an extent's (extents.ts): a mark's bytes and an extent's bytes have to be the same unit or
-// the aggregates cannot put them on one scale. Returns undefined when nothing survives the
-// clamp, which is the caller's signal to omit the file entirely.
+// Bytes are counted per line *including* its terminator. Returns undefined when nothing survives
+// the clamp, which is the caller's signal to omit the file entirely.
 function measure(ranges: ReadonlyArray<readonly [number, number]>, content: string): Measured | undefined {
   const clamped = ApertureExtents.clampRanges(ranges, content)
   if (clamped.length === 0) return undefined

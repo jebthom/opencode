@@ -14,9 +14,7 @@ import { WriteTool } from "./write"
 import { InvalidTool } from "./invalid"
 import { SkillTool } from "./skill"
 import { LensListTool } from "./lens-list"
-import { LensCreateTool } from "./lens-create"
 import { LensSelectTool } from "./lens-select"
-import { LensMergeFacetsTool } from "./lens-merge-facets"
 import { LensEditTool } from "./lens-edit"
 import { LensFacetFilesTool } from "./lens-facet-files"
 import { LensMarkTool } from "./lens-mark"
@@ -142,9 +140,7 @@ export const layer: Layer.Layer<
     const patchtool = yield* ApplyPatchTool
     const skilltool = yield* SkillTool
     const lensList = yield* LensListTool
-    const lensCreate = yield* LensCreateTool
     const lensSelect = yield* LensSelectTool
-    const lensMergeFacets = yield* LensMergeFacetsTool
     const lensEdit = yield* LensEditTool
     const lensFacetFiles = yield* LensFacetFilesTool
     const lensMark = yield* LensMarkTool
@@ -257,9 +253,7 @@ export const layer: Layer.Layer<
           lsp: Tool.init(lsptool),
           plan: Tool.init(plan),
           lensList: Tool.init(lensList),
-          lensCreate: Tool.init(lensCreate),
           lensSelect: Tool.init(lensSelect),
-          lensMergeFacets: Tool.init(lensMergeFacets),
           lensEdit: Tool.init(lensEdit),
           lensFacetFiles: Tool.init(lensFacetFiles),
           lensMark: Tool.init(lensMark),
@@ -284,9 +278,7 @@ export const layer: Layer.Layer<
             tool.skill,
             tool.patch,
             tool.lensList,
-            tool.lensCreate,
             tool.lensSelect,
-            tool.lensMergeFacets,
             tool.lensEdit,
             tool.lensFacetFiles,
             tool.lensMark,

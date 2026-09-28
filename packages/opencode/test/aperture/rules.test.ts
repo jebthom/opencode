@@ -114,7 +114,9 @@ describe("aperture rules — evaluation", () => {
     expect(hit.lines).toBe(3)
     // Bytes include each line's terminator, exactly as extents are measured, so a mark and an
     // extent covering the same lines report the same number.
-    expect(hit.bytes).toBe("const one = needle\n".length + "const two = needle\n".length + "const four = needle\n".length)
+    expect(hit.bytes).toBe(
+      "const one = needle\n".length + "const two = needle\n".length + "const four = needle\n".length,
+    )
   })
 
   test("a symbol hit measures the whole declaration it paints", async () => {
