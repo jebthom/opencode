@@ -1954,6 +1954,7 @@ export type Config = {
     openTelemetry?: boolean
     primary_tools?: Array<string>
     continue_loop_on_deny?: boolean
+    aperture_check?: boolean
     mcp_timeout?: number
     policies?: Array<ConfigV2ExperimentalPolicy>
   }

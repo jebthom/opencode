@@ -46,6 +46,7 @@ import { Shell } from "../../src/shell/shell"
 import { Snapshot } from "../../src/snapshot"
 import { ToolRegistry } from "@/tool/registry"
 import { Aperture } from "@/aperture/aperture"
+import { ApertureLensHistory } from "@/aperture/lens-history"
 import { Truncate } from "@/tool/truncate"
 import * as Log from "@opencode-ai/core/util/log"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
@@ -254,6 +255,8 @@ const unixNoLLMServer = process.platform !== "win32" ? noLLMServer.instance : no
 // Config that registers a custom "test" provider with a "test-model" model
 // so provider model lookup succeeds inside the loop.
 const cfg = {
+  // The end-of-turn Aperture check adds an LLM call to build turns; only its own tests enable it.
+  experimental: { aperture_check: false },
   provider: {
     test: {
       name: "Test",
@@ -2352,4 +2355,103 @@ noLLMServer.instance(
       }
     }),
   30_000,
+)
+
+// The end-of-turn Aperture check (SystemPrompt.apertureCheck): a build/plan turn that leaves no
+// Lens change, or no active Lens, gets exactly one curation step before the loop returns.
+const apertureCfg = (url: string) => ({ ...providerCfg(url), experimental: { aperture_check: true } })
+
+const buildTurn = Effect.fn("test.buildTurn")(function* (text: string, parentID?: SessionID) {
+  const prompt = yield* SessionPrompt.Service
+  const sessions = yield* Session.Service
+  const session = yield* sessions.create({
+    title: "Aperture check",
+    parentID,
+    permission: [{ permission: "*", pattern: "*", action: "allow" }],
+  })
+  const msg = yield* prompt.prompt({
+    sessionID: session.id,
+    agent: "build",
+    noReply: true,
+    parts: [{ type: "text", text }],
+  })
+  return { session, turn: msg.info.id }
+})
+
+const markProbe = {
+  lens: "Probe",
+  facet: "probe-lines",
+  kind: "pattern",
+  pattern: "probe",
+  activate: true,
+  reason: "show the probe",
+}
+
+it.instance("aperture check runs one curation step after a turn with no Lens change", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(apertureCfg)
+    const prompt = yield* SessionPrompt.Service
+    const { session } = yield* buildTurn("tell me about the probe")
+    yield* llm.text("the probe does things")
+    yield* llm.text("View unchanged: nothing to mark")
+
+    const result = yield* prompt.loop({ sessionID: session.id })
+    expect(yield* llm.calls).toBe(2)
+    const inputs = (yield* llm.inputs).map((input) => JSON.stringify(input))
+    expect(inputs[0]).not.toContain("APERTURE CHECK")
+    expect(inputs[1]).toContain("APERTURE CHECK")
+    expect(inputs[1]).toContain("<aperture-state>")
+    expect(result.parts.some((part) => part.type === "text" && part.text.startsWith("View unchanged"))).toBe(true)
+
+    // The curation reminder is transient: nothing extra is persisted as a user message.
+    const msgs = yield* MessageV2.filterCompactedEffect(session.id)
+    expect(msgs.filter((m) => m.info.role === "user")).toHaveLength(1)
+  }),
+)
+
+it.instance("aperture check is skipped when the turn curated the view", () =>
+  Effect.gen(function* () {
+    const { dir, llm } = yield* useServerConfig(apertureCfg)
+    const prompt = yield* SessionPrompt.Service
+    yield* writeText(path.join(dir, "probe.ts"), "export const probe = 1\n")
+    const { session, turn } = yield* buildTurn("where is the probe?")
+    yield* llm.tool("lens_mark", markProbe)
+    yield* llm.text("it is in probe.ts, in the probe-lines concern")
+
+    yield* prompt.loop({ sessionID: session.id })
+    expect(yield* llm.calls).toBe(2)
+    expect((yield* ApertureLensHistory.read(dir, { turnID: turn })).length).toBeGreaterThan(0)
+  }),
+)
+
+it.instance("aperture check curation records its Lens changes under the same turn", () =>
+  Effect.gen(function* () {
+    const { dir, llm } = yield* useServerConfig(apertureCfg)
+    const prompt = yield* SessionPrompt.Service
+    yield* writeText(path.join(dir, "probe.ts"), "export const probe = 1\n")
+    const { session, turn } = yield* buildTurn("where is the probe?")
+    yield* llm.text("it is in probe.ts")
+    yield* llm.tool("lens_mark", markProbe)
+    yield* llm.text("Marked probe-lines")
+
+    yield* prompt.loop({ sessionID: session.id })
+    expect(yield* llm.calls).toBe(3)
+    const entries = yield* ApertureLensHistory.read(dir, { turnID: turn })
+    expect(entries.length).toBeGreaterThan(0)
+    expect(entries.every((e) => e.actor.turnID === turn)).toBe(true)
+  }),
+)
+
+it.instance("aperture check skips subagent sessions", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(apertureCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const parent = yield* sessions.create({ title: "Parent" })
+    const { session } = yield* buildTurn("tell me about the probe", parent.id)
+    yield* llm.text("the probe does things")
+
+    yield* prompt.loop({ sessionID: session.id })
+    expect(yield* llm.calls).toBe(1)
+  }),
 )

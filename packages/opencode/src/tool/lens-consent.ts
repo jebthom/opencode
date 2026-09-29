@@ -8,13 +8,16 @@ import type { Context } from "./tool"
 
 // The history actor for a tool call. `turnID` is the user message that opened the turn — the
 // assistant message's `parentID` — which is what maps a Lens change one-to-one onto a chat turn.
+// The fallback skips all-synthetic user messages: the end-of-turn Aperture check splices one in
+// (prompt.ts), and its curation belongs to the turn the user opened.
 // `requestedByUser` is the agent's own statement that the user explicitly asked for this change;
 // the change is then the user's, and needs no further consent.
 export function actorOf(ctx: Context, params: { readonly requestedByUser?: boolean; readonly reason?: string }): Actor {
   const own = ctx.messages.find((m) => m.info.id === ctx.messageID)?.info
   const turnID =
     (own?.role === "assistant" ? own.parentID : undefined) ??
-    ctx.messages.findLast((m) => m.info.role === "user")?.info.id
+    ctx.messages.findLast((m) => m.info.role === "user" && !m.parts.every((p) => p.type === "text" && p.synthetic))
+      ?.info.id
   return {
     kind: params.requestedByUser ? "user" : "agent",
     agent: ctx.agent,

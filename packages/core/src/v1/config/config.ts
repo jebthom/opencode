@@ -173,6 +173,10 @@ export const Info = Schema.Struct({
       continue_loop_on_deny: Schema.optional(Schema.Boolean).annotate({
         description: "Continue the agent loop when a tool call is denied",
       }),
+      aperture_check: Schema.optional(Schema.Boolean).annotate({
+        description:
+          "Run an extra curation step at the end of a build/plan turn that left no Lens change or no active Lens (default true)",
+      }),
       mcp_timeout: Schema.optional(PositiveInt).annotate({
         description: "Timeout in milliseconds for model context protocol (MCP) requests",
       }),

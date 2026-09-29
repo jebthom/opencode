@@ -1276,6 +1276,21 @@ export const layer = Layer.effect(
       throw new Error("Impossible")
     })
 
+    // Whether the turn that just ended owes the user a curation step, and the reminder that drives it.
+    // Only top-level, conversational turns that ended cleanly are checked; the Lens condition itself
+    // lives in SystemPrompt.apertureCheck.
+    const checkAperture = Effect.fn("SessionPrompt.checkAperture")(function* (
+      session: Session.Info,
+      user: SessionV1.User,
+      assistant: SessionV1.Assistant,
+    ) {
+      if (session.parentID || user.format?.type === "json_schema" || assistant.error || assistant.summary) return
+      if ((yield* config.get()).experimental?.aperture_check === false) return
+      const agent = yield* agents.get(user.agent)
+      if (!agent) return
+      return yield* sys.apertureCheck(agent, user.id)
+    })
+
     const runLoop: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
       function* (sessionID: SessionID) {
         const ctx = yield* InstanceState.context
@@ -1286,6 +1301,13 @@ export const layer = Layer.effect(
         // message). Re-reading it every step would change the prompt mid-turn each time the
         // agent curates a Lens, which is exactly when the prompt cache matters most.
         let apertureNote: { readonly turn: string; readonly text: string | undefined } | undefined
+        // The end-of-turn Aperture check (SystemPrompt.apertureCheck): at most one curation step per
+        // user turn, driven by a reminder spliced in after the assistant message that ended the turn.
+        // The reminder is never persisted, so the curation's messages keep the turn's user message as
+        // their parent and its Lens changes land under the same turnID.
+        let apertureCheck:
+          | { readonly turn: string; readonly after: string; readonly id: MessageID; readonly text: string }
+          | undefined
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
@@ -1327,8 +1349,18 @@ export const layer = Layer.effect(
                 callID: orphan.callID,
               })
             }
-            yield* slog.info("exiting loop")
-            break
+            // Only a turn this run actually executed is checked (step > 0): a loop entered on an
+            // already-finished turn, e.g. a concurrent caller, must exit without a model call.
+            const check =
+              step === 0 || apertureCheck?.turn === lastUser.id
+                ? undefined
+                : yield* checkAperture(session, lastUser, lastAssistant)
+            if (!check) {
+              yield* slog.info("exiting loop")
+              break
+            }
+            yield* slog.info("aperture check", { turn: lastUser.id })
+            apertureCheck = { turn: lastUser.id, after: lastAssistant.id, id: MessageID.ascending(), text: check }
           }
 
           step++
@@ -1396,6 +1428,31 @@ export const layer = Layer.effect(
               text: apertureNote.text,
               synthetic: true,
             })
+          if (apertureCheck?.turn === lastUser.id) {
+            const check = apertureCheck
+            const at = msgs.findIndex((m) => m.info.id === check.after)
+            if (at !== -1)
+              msgs.splice(at + 1, 0, {
+                info: {
+                  id: check.id,
+                  sessionID,
+                  role: "user",
+                  time: { created: Date.now() },
+                  agent: agent.name,
+                  model: lastUser.model,
+                },
+                parts: [
+                  {
+                    id: PartID.ascending(),
+                    messageID: check.id,
+                    sessionID,
+                    type: "text",
+                    text: check.text,
+                    synthetic: true,
+                  },
+                ],
+              })
+          }
 
           const msg: SessionV1.Assistant = {
             id: MessageID.ascending(),
