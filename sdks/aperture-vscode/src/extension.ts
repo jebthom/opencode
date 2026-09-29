@@ -29,10 +29,8 @@ const RECONNECT_DELAY_MS = 2000
 // (or a paint that lands between two editor changes) would otherwise leave stale
 // colours on screen; the poll re-fetches the active file so the view stays honest.
 const REFRESH_POLL_MS = 5000
-// Width of the colored strip painted at the left of each function's lines, and the gap
-// between that strip and the line's text (so the strip never sits under the leading chars).
+// Width of the colored strip painted in the glyph margin beside each marked line.
 const STRIP_WIDTH_PX = 4
-const TEXT_GAP_PX = 4
 // The tree's facet map is a whole-repo fetch, so it debounces longer than the gutter's single
 // file — a burst of invalidations should cost one refetch.
 const FACET_MAP_DEBOUNCE_MS = 400
@@ -103,17 +101,15 @@ export function activate(context: vscode.ExtensionContext) {
     let deco = decorationByColor.get(hue)
     if (!deco) {
       const color = resolveHue(hue)
-      // A colored block rendered *before* each line's text rather than a left border:
-      // the block reserves its own width + a right-margin gap, so the text is pushed
-      // clear of it instead of sitting underneath (as a border does).
+      // A bar drawn as a gutter icon in the glyph margin, not inline `before` content: an inline
+      // block pushes that line's text (and its indent guides) right, which only looked aligned
+      // back when extents tiled every line. Line tags mark a few lines, so those lines jutted out.
+      // The SVG fills an 18x18 cell (the glyph margin's width) and "cover" stretches it to the
+      // line height, keeping the bar full-height and centred.
+      const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 18 18"><rect x="${(18 - STRIP_WIDTH_PX) / 2}" width="${STRIP_WIDTH_PX}" height="18" fill="${color}"/></svg>`
       deco = vscode.window.createTextEditorDecorationType({
-        before: {
-          contentText: "",
-          backgroundColor: color,
-          width: `${STRIP_WIDTH_PX}px`,
-          height: "100%",
-          margin: `0 ${TEXT_GAP_PX}px 0 0`,
-        },
+        gutterIconPath: vscode.Uri.parse(`data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`),
+        gutterIconSize: "cover",
         overviewRulerColor: color,
         // Not Left: git's quick-diff marks live there at 60% alpha and composite over ours,
         // so a facet under a changed hunk showed a blended colour in the scrollbar.
@@ -169,8 +165,7 @@ export function activate(context: vscode.ExtensionContext) {
       for (let line = tag.startLine - 1; line <= tag.endLine - 1; line++) if (line >= 0) hueByLine.set(line, hue)
     }
 
-    // One range per line: the `before` strip only renders at a range's start, so a multi-line
-    // range would leave every line but the first un-striped.
+    // One range per line, so each line carries exactly one bar in its resolved hue.
     const rangesByColor = new Map<string, vscode.Range[]>()
     for (const [line, hue] of hueByLine) {
       const list = rangesByColor.get(hue) ?? []
