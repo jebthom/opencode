@@ -115,7 +115,9 @@ export function activate(context: vscode.ExtensionContext) {
           margin: `0 ${TEXT_GAP_PX}px 0 0`,
         },
         overviewRulerColor: color,
-        overviewRulerLane: vscode.OverviewRulerLane.Left,
+        // Not Left: git's quick-diff marks live there at 60% alpha and composite over ours,
+        // so a facet under a changed hunk showed a blended colour in the scrollbar.
+        overviewRulerLane: vscode.OverviewRulerLane.Center,
       })
       decorationByColor.set(hue, deco)
     }
