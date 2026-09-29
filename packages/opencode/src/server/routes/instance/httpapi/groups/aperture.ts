@@ -53,12 +53,16 @@ const HistoryEntry = Schema.Struct({
     "rule.add",
     "rule.replace",
     "rule.remove",
+    "milestone",
   ]),
   actor: HistoryActor,
   lens: Schema.Struct({ id: Schema.String, name: Schema.String }),
   facet: Schema.optional(Schema.String),
   rule: Schema.optional(Schema.String),
-  // Snapshots of what changed: `{ lens }`, `{ facet, rules? }` or `{ rule }`.
+  // Set on "milestone" entries: the completed todo and its position in the todo list.
+  milestone: Schema.optional(Schema.Struct({ todo: Schema.String, index: Schema.Int })),
+  // Snapshots of what changed: `{ lens }`, `{ facet, rules? }`, `{ rule }`, or on a milestone
+  // `{ view }` (the whole active Lens).
   before: Schema.optional(Schema.Unknown),
   after: Schema.optional(Schema.Unknown),
   hits: Schema.optional(

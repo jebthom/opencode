@@ -70,6 +70,17 @@ at milestones, preferring marks that verify the change (`diff`, `changed:"HEAD"`
 `reason`. The live state — Lenses, concerns, owners, the latest history — arrives once per user
 turn as an `<aperture-state>` reminder on the turn's user message.
 
+**Multi-part tasks (milestones).** A multi-part task keeps ONE agent Lens that evolves part by
+part, rather than a Lens per part. The per-part trace for review is derived from history instead:
+when `todowrite` marks a todo `completed`, a `milestone` entry snapshots the active Lens
+(`after: { view }`). Nothing extra is asked of the agent. Curation cadence follows the agent's own
+plan, and no monitor model is involved. The steps after a milestone get an `APERTURE MILESTONE`
+reminder (`SystemPrompt.apertureNudge`) naming the completed todo, the files edited since the last
+Lens change, and the next todo. With no todos, edits to 3 distinct files with no Lens change get a
+one-off nudge instead. Nudges are spliced in mid-turn, are never persisted, and are re-spliced in
+place so the prompt prefix stays stable. The end-of-turn check now also fires when a todo was
+completed after the turn's last Lens change.
+
 ## Verification status
 
 - Unit: `test/aperture` (lens-store ownership/migration/history, facet-grid grouping and packing,
@@ -85,7 +96,8 @@ turn as an `<aperture-state>` reminder on the turn's user message.
 | --- | --- | --- |
 | 1 | Whether the per-turn `<aperture-state>` reminder should also carry hit counts | Needs the Aperture service in `SystemPrompt`; today it carries rule counts only. |
 | 2 | Whether an agent may add its own concern to a user's Lens without consent | Currently no: any change to a user-owned Lens asks. Revisit if it proves noisy. |
-| 3 | History UI in the sidebar / explorer | Data and route exist (`/aperture/history`); no surface renders it yet. |
+| 3 | History UI in the sidebar / explorer | Data and route exist (`/aperture/history`); no surface renders it yet. `milestone` entries carry a full Lens snapshot, so a "step through the task's parts" review view is a pure replay. |
+| 7 | Milestone nudge tuning | The nudge threshold (3 files) and whether a nudge should also fire on `in_progress` transitions (to mark the *next* part up front) have not been checked in a live multi-part session. |
 | 4 | `since` semantics | Uses `git blame --since` (commit-date boundary). Author date may be what users expect. |
 | 5 | S1b — the ast-grep structural backend | Unchanged from sprint 2: stored, reported as unsupported. |
 | 6 | Grid density | 22-column tiles, 9 grid rows; tune after the live check. |

@@ -44,7 +44,18 @@ export interface Interface {
   // stays byte-stable (and cacheable) while the agent curates.
   readonly apertureState: (agent: Agent.Info) => Effect.Effect<string | undefined>
   readonly apertureCheck: (agent: Agent.Info, turnID: string) => Effect.Effect<string | undefined>
+  readonly apertureNudge: (
+    agent: Agent.Info,
+    input: {
+      readonly turnID: string
+      readonly todos: ReadonlyArray<{ readonly content: string; readonly status: string }>
+      readonly edits: ReadonlyArray<{ readonly file: string; readonly at: number }>
+    },
+  ) => Effect.Effect<{ readonly key: string; readonly text: string } | undefined>
 }
+
+// Distinct files edited without a Lens change before a todo-less turn is nudged.
+const NUDGE_FILES = 3
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SystemPrompt") {}
 
@@ -108,13 +119,21 @@ export const layer = Layer.effect(
     const apertureCheck = Effect.fn("SystemPrompt.apertureCheck")(function* (agent: Agent.Info, turnID: string) {
       if (agent.name !== "build" && agent.name !== "plan") return
       const ctx = yield* InstanceState.context
-      const changed = (yield* ApertureLensHistory.read(ctx.directory, { turnID, limit: 1 })).length > 0
+      const entries = yield* ApertureLensHistory.read(ctx.directory, { turnID })
+      const change = entries.findLast((e) => e.op !== "milestone")
+      // A turn that curated early and then finished more todos still owes the view an update.
+      const stale = entries.findLast((e) => e.op === "milestone" && e.seq > (change?.seq ?? -1))
       const active = yield* ApertureLensStore.getActive(ctx.directory)
-      if (changed && active) return
+      if (change && !stale && active) return
+      const why = !change
+        ? "without any change to the Lens view"
+        : stale
+          ? `without a Lens change since you completed "${stale.milestone?.todo}"`
+          : "with no Lens active"
       return [
         (yield* apertureState(agent)) ?? "",
         "<system-reminder>",
-        `APERTURE CHECK: this turn ended ${changed ? "with no Lens active" : "without any change to the Lens view"}.`,
+        `APERTURE CHECK: this turn ended ${why}.`,
         "Before the user replies, bring the view in line with the reply you just gave:",
         "- If it discussed code in this repo, mark the 2-4 concerns it walked through on a Lens of your",
         "  own (create one named after the task if needed) and activate it — unless the user's own Lens",
@@ -125,6 +144,58 @@ export const layer = Layer.effect(
         "End with ONE line for the user: what changed in the view, or `View unchanged: <why>`.",
         "</system-reminder>",
       ].join("\n")
+    })
+
+    // The mid-turn nudge at a task boundary. A long build turn can cover several parts of a task,
+    // and the end-of-turn check alone lets the view go stale in between. The boundary is the
+    // agent's own todo completing (a "milestone" history entry, written by todowrite); with no
+    // todos, it is edits to NUDGE_FILES distinct files since the last Lens change. The nudge is
+    // concrete — the todo, the files, the next todo — so the agent makes a small local decision
+    // instead of recalling a general rule. `key` lets the caller send each nudge once.
+    const apertureNudge = Effect.fn("SystemPrompt.apertureNudge")(function* (
+      agent: Agent.Info,
+      input: {
+        readonly turnID: string
+        readonly todos: ReadonlyArray<{ readonly content: string; readonly status: string }>
+        readonly edits: ReadonlyArray<{ readonly file: string; readonly at: number }>
+      },
+    ) {
+      if (agent.name !== "build" && agent.name !== "plan") return
+      const ctx = yield* InstanceState.context
+      const entries = yield* ApertureLensHistory.read(ctx.directory, { turnID: input.turnID })
+      const change = entries.findLast((e) => e.op !== "milestone")
+      const since = change?.at ?? 0
+      const files = [...new Set(input.edits.filter((e) => e.at >= since).map((e) => e.file))]
+      const reached = entries.filter((e) => e.op === "milestone" && e.seq > (change?.seq ?? -1))
+      const next = input.todos.find((t) => t.status === "in_progress" || t.status === "pending")
+      const edited = files.length ? `Files you edited since the last Lens change: ${files.join(", ")}.` : undefined
+      if (reached.length)
+        return {
+          key: `milestone:${reached[reached.length - 1].seq}`,
+          text: [
+            "<system-reminder>",
+            `APERTURE MILESTONE: you completed ${reached.map((e) => `"${e.milestone?.todo}"`).join(", ")}.`,
+            ...(edited ? [edited] : []),
+            next ? `Next todo: "${next.content}".` : "No todos remain.",
+            "Before continuing, bring your Lens in line with the task in one or two Lens calls:",
+            '- mark the part you finished so the user can verify it (kind "diff", globbed to its files),',
+            "- lens_unmark your concerns that only served the finished part (the history keeps them),",
+            ...(next ? ["- mark what the next todo will touch, if you already know."] : []),
+            "Keep one Lens for the task; don't start a new Lens per todo. Then continue the task.",
+            "</system-reminder>",
+          ].join("\n"),
+        }
+      if (input.todos.length || files.length < NUDGE_FILES) return
+      return {
+        key: `edits:${change?.seq ?? -1}`,
+        text: [
+          "<system-reminder>",
+          `APERTURE: you have edited ${files.length} files without updating the Lens: ${files.join(", ")}.`,
+          'If they belong to the task, mark them (kind "diff", globbed to these files) under a concern',
+          "that says what the change is, then continue the task.",
+          "</system-reminder>",
+        ].join("\n"),
+      }
     })
 
     return Service.of({
@@ -193,6 +264,8 @@ export const layer = Layer.effect(
           "  affects, and the tests that cover it.",
           "- At milestones — a todo completed, a feature landed, a plan finalised — update it: mark what",
           "  became relevant, and lens_unmark your concerns that no longer help. A stale concern is noise.",
+          "  A multi-part task keeps ONE Lens that evolves part by part, not a Lens per part: completing",
+          "  a todo checkpoints the Lens in its history, so pruning a finished part's concerns loses nothing.",
           "- When the task changes, the view changes too: start a new Lens for the new task rather than",
           "  leaving the old one active.",
           '- After changing code, prefer marks that let the user VERIFY the change: kind "diff" (every line',
@@ -240,6 +313,7 @@ export const layer = Layer.effect(
 
       apertureState,
       apertureCheck,
+      apertureNudge,
     })
   }),
 )

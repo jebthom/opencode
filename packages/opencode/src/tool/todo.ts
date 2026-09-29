@@ -2,6 +2,9 @@ import { Effect, Schema } from "effect"
 import * as Tool from "./tool"
 import DESCRIPTION_WRITE from "./todowrite.txt"
 import { Todo } from "../session/todo"
+import { InstanceState } from "@/effect/instance-state"
+import { ApertureLensStore } from "@/aperture/lens-store"
+import { actorOf } from "./lens-consent"
 
 // Todo.Info is still a zod schema (session/todo.ts). Inline the field shape
 // here rather than referencing its `.shape` — the LLM-visible JSON Schema is
@@ -39,10 +42,25 @@ export const TodoWriteTool = Tool.define<typeof Parameters, Metadata, Todo.Servi
             metadata: {},
           })
 
+          const before = yield* todo.get(ctx.sessionID)
           yield* todo.update({
             sessionID: ctx.sessionID,
             todos: params.todos,
           })
+
+          // A todo that became completed is a milestone of the build/plan agent's task: checkpoint
+          // the Lens in its history so review can replay the view part by part. The prompt loop
+          // reads these entries to nudge the agent to curate at the boundary.
+          const done = new Set(before.filter((x) => x.status === "completed").map((x) => x.content))
+          const completed = params.todos.flatMap((x, index) =>
+            x.status === "completed" && !done.has(x.content) ? [{ todo: x.content, index }] : [],
+          )
+          if (completed.length && (ctx.agent === "build" || ctx.agent === "plan"))
+            yield* ApertureLensStore.milestone(
+              (yield* InstanceState.context).directory,
+              completed,
+              actorOf(ctx, { reason: "todo completed" }),
+            )
 
           return {
             title: `${params.todos.filter((x) => x.status !== "completed").length} todos`,

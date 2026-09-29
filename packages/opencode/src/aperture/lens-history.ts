@@ -47,6 +47,9 @@ export type Op =
   | "rule.add"
   | "rule.replace"
   | "rule.remove"
+  // Not a change: a checkpoint written when the agent completes a todo, snapshotting the active
+  // Lens so review can replay "the view as it stood at the end of each part" of a multi-part task.
+  | "milestone"
 
 export interface Entry {
   readonly seq: number
@@ -62,10 +65,14 @@ export interface Entry {
   readonly after?: Snapshot
   // Hit count at creation — the measure of what a rule actually meant when it was installed.
   readonly hits?: { readonly lines: number; readonly files: number; readonly overCap?: boolean }
+  // Set on "milestone" entries only: the todo that was completed and its position in the list.
+  readonly milestone?: { readonly todo: string; readonly index: number }
 }
 
 export type Snapshot =
   | { readonly lens: Pick<Lens, "name" | "description" | "owner"> }
+  // A "milestone" entry's `after`: the whole active Lens at that moment.
+  | { readonly view: Lens }
   | { readonly facet: Facet; readonly rules?: ReadonlyArray<Rule> }
   | { readonly rule: Rule }
 

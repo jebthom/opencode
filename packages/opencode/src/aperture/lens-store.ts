@@ -241,6 +241,32 @@ export const setActive = (directory: string, lens: Lens | undefined, actor: Acto
     }),
   )
 
+// Checkpoint the active Lens for each completed todo. Taken inside the mutex so the snapshot and
+// its `seq` agree with the changes around it. With no Lens active, the entry still marks the
+// boundary (an empty lens ref) so a later "no change since the milestone" check sees it.
+export const milestone = (
+  directory: string,
+  todos: ReadonlyArray<{ readonly todo: string; readonly index: number }>,
+  actor: Actor,
+): Effect.Effect<void> =>
+  withDoc(
+    directory,
+    Effect.gen(function* () {
+      if (todos.length === 0) return
+      const active = yield* getActive(directory)
+      yield* ApertureLensHistory.append(
+        directory,
+        todos.map((m) => ({
+          op: "milestone",
+          actor,
+          lens: active ? ref(active) : { id: "", name: "" },
+          milestone: m,
+          ...(active ? { after: { view: active } } : {}),
+        })),
+      )
+    }),
+  )
+
 // Mint a unique Lens id: name slug + a short hash so two Lenses with the same name never collide
 // and ids stay legible in a committed lenses.json.
 function mintId(name: string): string {

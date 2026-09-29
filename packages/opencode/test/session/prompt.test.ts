@@ -2455,3 +2455,77 @@ it.instance("aperture check skips subagent sessions", () =>
     expect(yield* llm.calls).toBe(1)
   }),
 )
+
+// Mid-turn Aperture nudges (SystemPrompt.apertureNudge): a completed todo checkpoints the Lens and
+// the next step is told to curate; with no todos, edits to several files do the same.
+const todos = (first: string) => ({
+  todos: [
+    { content: "part one", status: first, priority: "high" },
+    { content: "part two", status: "pending", priority: "high" },
+  ],
+})
+
+const count = (text: string, needle: string) => text.split(needle).length - 1
+
+it.instance("completing a todo checkpoints the Lens and nudges the next step once", () =>
+  Effect.gen(function* () {
+    const { dir, llm } = yield* useServerConfig(apertureCfg)
+    const prompt = yield* SessionPrompt.Service
+    yield* writeText(path.join(dir, "probe.ts"), "export const probe = 1\n")
+    const { session, turn } = yield* buildTurn("do the two-part task")
+    yield* llm.tool("todowrite", todos("completed"))
+    yield* llm.tool("lens_mark", markProbe)
+    yield* llm.text("part one is done")
+
+    yield* prompt.loop({ sessionID: session.id })
+    // The Lens change after the milestone satisfies the end-of-turn check: no fourth call.
+    expect(yield* llm.calls).toBe(3)
+    const inputs = (yield* llm.inputs).map((input) => JSON.stringify(input))
+    expect(inputs[0]).not.toContain("APERTURE MILESTONE")
+    expect(inputs[1]).toContain('APERTURE MILESTONE: you completed \\"part one\\"')
+    expect(inputs[1]).toContain('Next todo: \\"part two\\"')
+    // Re-spliced in place on later steps, never duplicated.
+    expect(count(inputs[2], "APERTURE MILESTONE")).toBe(1)
+
+    const milestones = (yield* ApertureLensHistory.read(dir, { turnID: turn })).filter((e) => e.op === "milestone")
+    expect(milestones.map((e) => e.milestone)).toEqual([{ todo: "part one", index: 0 }])
+  }),
+)
+
+it.instance("a todo completed after the last Lens change triggers the end-of-turn check", () =>
+  Effect.gen(function* () {
+    const { dir, llm } = yield* useServerConfig(apertureCfg)
+    const prompt = yield* SessionPrompt.Service
+    yield* writeText(path.join(dir, "probe.ts"), "export const probe = 1\n")
+    const { session } = yield* buildTurn("do the two-part task")
+    yield* llm.tool("lens_mark", markProbe)
+    yield* llm.tool("todowrite", todos("completed"))
+    yield* llm.text("part one is done")
+    yield* llm.text("View unchanged: already shown")
+
+    yield* prompt.loop({ sessionID: session.id })
+    expect(yield* llm.calls).toBe(4)
+    const inputs = (yield* llm.inputs).map((input) => JSON.stringify(input))
+    expect(inputs[2]).toContain("APERTURE MILESTONE")
+    expect(inputs[3]).toContain('without a Lens change since you completed \\"part one\\"')
+  }),
+)
+
+it.instance("edits to several files with no todos and no Lens change nudge once", () =>
+  Effect.gen(function* () {
+    const { dir, llm } = yield* useServerConfig(apertureCfg)
+    const prompt = yield* SessionPrompt.Service
+    const { session } = yield* buildTurn("make the change")
+    yield* llm.tool("write", { filePath: path.join(dir, "a.ts"), content: "export const a = 1\n" })
+    yield* llm.tool("write", { filePath: path.join(dir, "b.ts"), content: "export const b = 1\n" })
+    yield* llm.tool("write", { filePath: path.join(dir, "c.ts"), content: "export const c = 1\n" })
+    yield* llm.text("done")
+    yield* llm.text("View unchanged: nothing to mark")
+
+    yield* prompt.loop({ sessionID: session.id })
+    const inputs = (yield* llm.inputs).map((input) => JSON.stringify(input))
+    expect(inputs[2]).not.toContain("without updating the Lens")
+    expect(inputs[3]).toContain("APERTURE: you have edited 3 files without updating the Lens: a.ts, b.ts, c.ts")
+    expect(count(inputs[4], "without updating the Lens")).toBe(1)
+  }),
+)

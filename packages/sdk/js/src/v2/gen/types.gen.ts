@@ -5090,6 +5090,7 @@ export type ApertureHistoryResponses = {
       | "rule.add"
       | "rule.replace"
       | "rule.remove"
+      | "milestone"
     actor: {
       kind: "user" | "agent"
       agent?: string
@@ -5106,6 +5107,10 @@ export type ApertureHistoryResponses = {
     }
     facet?: string
     rule?: string
+    milestone?: {
+      todo: string
+      index: number
+    }
     before?: unknown
     after?: unknown
     hits?: {

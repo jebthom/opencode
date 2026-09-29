@@ -1308,6 +1308,17 @@ export const layer = Layer.effect(
         let apertureCheck:
           | { readonly turn: string; readonly after: string; readonly id: MessageID; readonly text: string }
           | undefined
+        // Mid-turn Aperture nudges (SystemPrompt.apertureNudge): at a todo boundary, or after several
+        // edits with no Lens change, one reminder spliced after the assistant message that crossed
+        // it. Like the check, never persisted; unlike it, re-spliced at the same place on every later
+        // step of the turn, so the prompt prefix (and its cache) stays stable.
+        const apertureNudges: {
+          readonly key: string
+          readonly turn: string
+          readonly after: string
+          readonly id: MessageID
+          readonly text: string
+        }[] = []
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
@@ -1428,31 +1439,73 @@ export const layer = Layer.effect(
               text: apertureNote.text,
               synthetic: true,
             })
-          if (apertureCheck?.turn === lastUser.id) {
-            const check = apertureCheck
-            const at = msgs.findIndex((m) => m.info.id === check.after)
-            if (at !== -1)
-              msgs.splice(at + 1, 0, {
-                info: {
-                  id: check.id,
-                  sessionID,
-                  role: "user",
-                  time: { created: Date.now() },
-                  agent: agent.name,
-                  model: lastUser.model,
-                },
-                parts: [
-                  {
-                    id: PartID.ascending(),
-                    messageID: check.id,
-                    sessionID,
-                    type: "text",
-                    text: check.text,
-                    synthetic: true,
-                  },
-                ],
-              })
+          if (
+            step > 1 &&
+            lastAssistant &&
+            apertureCheck?.turn !== lastUser.id &&
+            !session.parentID &&
+            (yield* config.get()).experimental?.aperture_check !== false
+          ) {
+            const done = msgs.flatMap((m) => {
+              const info = m.info
+              if (info.role !== "assistant") return []
+              return m.parts.flatMap((p) =>
+                p.type === "tool" && p.state.status === "completed"
+                  ? [{ tool: p.tool, state: p.state, turn: info.parentID }]
+                  : [],
+              )
+            })
+            const edits = done
+              .filter((d) => d.turn === lastUser.id)
+              .flatMap((d) =>
+                (d.tool === "apply_patch"
+                  ? ((d.state.metadata.files ?? []) as { filePath: string; movePath?: string }[]).map(
+                      (f) => f.movePath ?? f.filePath,
+                    )
+                  : d.tool === "edit" || d.tool === "write"
+                    ? [String(d.state.input.filePath)]
+                    : []
+                ).map((file) => ({
+                  file: path.relative(ctx.directory, path.resolve(ctx.directory, file)).replaceAll("\\", "/"),
+                  at: d.state.time.start,
+                })),
+              )
+            const nudge = yield* sys.apertureNudge(agent, {
+              turnID: lastUser.id,
+              todos: done.findLast((d) => d.tool === "todowrite")?.state.metadata.todos ?? [],
+              edits,
+            })
+            if (nudge && !apertureNudges.some((n) => n.key === nudge.key)) {
+              yield* slog.info("aperture nudge", { turn: lastUser.id, key: nudge.key })
+              apertureNudges.push({ ...nudge, turn: lastUser.id, after: lastAssistant.id, id: MessageID.ascending() })
+            }
           }
+          const splice = (reminder: { readonly after: string; readonly id: MessageID; readonly text: string }) => {
+            const at = msgs.findIndex((m) => m.info.id === reminder.after)
+            if (at === -1) return
+            msgs.splice(at + 1, 0, {
+              info: {
+                id: reminder.id,
+                sessionID,
+                role: "user",
+                time: { created: Date.now() },
+                agent: agent.name,
+                model: lastUser.model,
+              },
+              parts: [
+                {
+                  id: PartID.ascending(),
+                  messageID: reminder.id,
+                  sessionID,
+                  type: "text",
+                  text: reminder.text,
+                  synthetic: true,
+                },
+              ],
+            })
+          }
+          apertureNudges.filter((n) => n.turn === lastUser.id).forEach(splice)
+          if (apertureCheck?.turn === lastUser.id) splice(apertureCheck)
 
           const msg: SessionV1.Assistant = {
             id: MessageID.ascending(),
