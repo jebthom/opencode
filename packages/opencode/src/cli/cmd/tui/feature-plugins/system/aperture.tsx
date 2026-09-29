@@ -4,8 +4,10 @@ import { useTerminalDimensions } from "@opentui/solid"
 import type { InternalTuiPlugin } from "../../plugin/internal"
 import { createEffect, createMemo, createResource, createSignal, For, onCleanup, Show } from "solid-js"
 import { allocateCells } from "@/aperture/treemap"
+import { changedFiles, type Turn } from "@/aperture/activity"
 import {
   basename,
+  capColumns,
   groupByCombination,
   packColumns,
   SEGMENT_BORDER_ROWS,
@@ -25,8 +27,13 @@ const id = "internal:aperture"
 // and repo-wide on purpose, because a slice through the code ("everything with facet a") should
 // cut across directories rather than be organised by them. File browsing belongs to the editor.
 //
-// One read serves it: the whole-repo facet map (`aperture.facetMap`), refetched whenever the
-// server says the marks may have moved (aperture.invalidated) or a turn ends.
+// One read serves the grid: the whole-repo facet map (`aperture.facetMap`), refetched whenever the
+// server says the marks may have moved (aperture.invalidated) or a turn ends. Two more say what
+// changed: the session's activity (the same derivation the sidebar draws) for what the *agent*
+// changed, and `vcs.status` for everything uncommitted in the working tree — which is how shell
+// commands and manual edits show up. Change is orthogonal to the facets, so it never forms a group
+// of its own (a file would appear twice): changed files lead their group with a mark, and a toggle
+// narrows the grid to the agent's changes, then to the whole working tree.
 
 type FacetMap = {
   lens?: {
@@ -63,6 +70,15 @@ const HSCROLL_STEP = 3
 // Catch-all for changes nothing tells us about (manual IDE edits outside opencode). The facet map
 // is memoized server-side, so a poll costs a map lookup unless something actually changed.
 const REFRESH_POLL_MS = 5000
+// How many turns of activity to scan for changed files: the server's ceiling, so "this session"
+// is as close to literal as the endpoint allows.
+const CHANGED_TURNS = 100
+const AGENT_MARK = "✎"
+const TREE_MARK = "±"
+// Columns a group shows before the rest fold behind a "+N more" column, so one huge group can't
+// push every other group off the strip. Expanding a group affects that group alone.
+const MAX_GROUP_COLUMNS = 3
+const MORE_W = 8
 
 const SQUARE_CORNERS = {
   topLeft: "┌",
@@ -95,7 +111,31 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     },
   )
 
-  const offInvalidated = props.api.event.on("aperture.invalidated", () => refetch())
+  // Not polled: it reads the message store, and every agent edit already fires one of the two
+  // events below.
+  const [activity, { refetch: refetchActivity }] = createResource(
+    () => ({ directory: props.api.state.path.directory, sessionID: props.session_id }),
+    async (key) => {
+      const result = await props.api.client.aperture.activity(
+        { sessionID: key.sessionID, turns: String(CHANGED_TURNS) },
+        { throwOnError: true },
+      )
+      return result.data as { turns: readonly Turn[] }
+    },
+  )
+
+  // The working tree's uncommitted changes against HEAD, untracked files included. Not polled
+  // either: it runs git, and the file watcher's events arrive as aperture.invalidated.
+  const [tree, { refetch: refetchTree }] = createResource(
+    () => props.api.state.path.directory,
+    async () => (await props.api.client.vcs.status({}, { throwOnError: true })).data ?? [],
+  )
+
+  const offInvalidated = props.api.event.on("aperture.invalidated", () => {
+    refetch()
+    refetchActivity()
+    refetchTree()
+  })
   onCleanup(() => offInvalidated())
 
   // The legend filter changed elsewhere (the VSCode picker, or the server clearing it on a Lens
@@ -113,7 +153,10 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   const offIdle = props.api.event.on("session.status", (event) => {
     if (event.properties.status.type !== "idle") return
     const sid = event.properties.sessionID
-    if (sid === props.session_id || props.api.state.session.get(sid)?.parentID === props.session_id) refetch()
+    if (sid !== props.session_id && props.api.state.session.get(sid)?.parentID !== props.session_id) return
+    refetch()
+    refetchActivity()
+    refetchTree()
   })
   onCleanup(() => offIdle())
 
@@ -130,13 +173,89 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   const activeId = () => lens()?.id ?? ""
   const facetIds = () => data()?.facets ?? []
 
-  const files = createMemo((): MarkedFile[] =>
-    Object.entries(data()?.files ?? {}).map(([path, file]) => ({ path, marks: file.m, line: file.line })),
+  // Guarded like `data()`: a failure here only costs the change marks, never the grid.
+  //
+  // git reports paths from the repo root, Aperture from the project directory, which may sit
+  // below it — so the directory's offset inside the worktree is stripped. A deletion leaves
+  // nothing to open, so deleted paths are dropped, from the agent's changes too (the activity
+  // log records an apply_patch delete as an edit).
+  const treeStatus = createMemo(() => {
+    const prefix = relativePrefix(props.api.state.path.worktree, props.api.state.path.directory)
+    return (tree.error ? [] : (tree() ?? [])).flatMap((item) =>
+      item.file.startsWith(prefix) ? [{ ...item, file: item.file.slice(prefix.length) }] : [],
+    )
+  })
+  const deleted = createMemo(
+    () => new Set(treeStatus().flatMap((item) => (item.status === "deleted" ? [item.file] : []))),
   )
+  const treeChanged = createMemo(
+    () =>
+      new Map(
+        treeStatus().flatMap((item) =>
+          item.status === "deleted"
+            ? []
+            : [[item.file, { additions: item.additions, deletions: item.deletions }] as const],
+        ),
+      ),
+  )
+  const agentChanged = createMemo(
+    () =>
+      new Map(
+        [...changedFiles(activity.error ? [] : (activity()?.turns ?? []))].filter(([path]) => !deleted().has(path)),
+      ),
+  )
+  const changeOf = (path: string) => {
+    if (agentChanged().has(path)) return "agent" as const
+    if (treeChanged().has(path)) return "tree" as const
+    return undefined
+  }
+
+  // Which changes the grid is narrowed to, if any. Local to this view: it scopes one session's
+  // attention, unlike the legend filter, which every surface shares. `agent` is a subset of
+  // `tree` in the common case, so the cycle widens: all → agent → tree → all.
+  const [scope, setScope] = createSignal<"all" | "agent" | "tree">("all")
+  const scoped = () => (scope() === "agent" ? agentChanged() : scope() === "tree" ? treeChanged() : undefined)
+
+  const files = createMemo((): MarkedFile[] => {
+    const marked = Object.entries(data()?.files ?? {}).map(([path, file]) => ({
+      path,
+      marks: file.m,
+      line: file.line,
+      changed: changeOf(path),
+    }))
+    const only = scoped()
+    if (!only) return marked
+    // Changed files with no marks at all join too, so nothing in scope is hidden.
+    const unmarked = [...only.keys()]
+      .filter((path) => !data()?.files[path])
+      .map((path) => ({ path, marks: [], line: 1, changed: changeOf(path) }))
+    return [...marked.filter((file) => only.has(file.path)), ...unmarked]
+  })
+
+  // Groups showing every column, by key. Cleared on a Lens switch, whose keys mean other facets.
+  const [expanded, setExpanded] = createSignal<ReadonlySet<string>>(new Set())
+  createEffect(() => {
+    activeId()
+    setExpanded(new Set<string>())
+  })
+  const toggleExpanded = (group: Group) => {
+    const id = group.key.join(",")
+    const next = new Set(expanded())
+    if (!next.delete(id)) next.add(id)
+    logInteraction(next.has(id) ? "group.expand" : "group.collapse", id)
+    setExpanded(next)
+  }
+
   const groups = createMemo(() => {
     const ids = facetIds()
     const off = new Set(ids.flatMap((facet, i) => (suppressed().has(facet) ? [i] : [])))
-    return groupByCombination(files(), off).map((group) => ({ group, columns: packColumns(group.runs, GRID_ROWS) }))
+    return groupByCombination(files(), off, { keepUnmarked: scope() !== "all" }).map((group) => {
+      const all = packColumns(group.runs, GRID_ROWS)
+      const open = expanded().has(group.key.join(","))
+      const capped = capColumns(all, open ? all.length : MAX_GROUP_COLUMNS)
+      // `toggle` exists whenever the group is too wide to show whole: "+N more" or "◂ less".
+      return { group, columns: capped.columns, hidden: capped.hidden, toggle: all.length > MAX_GROUP_COLUMNS }
+    })
   })
 
   const summary = () => {
@@ -144,7 +263,10 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     if (!data()) return "loading…"
     if (!lens()) return "no Lens yet"
     const n = files().length
-    return `${n} marked file${n === 1 ? "" : "s"} · ${groups().length} group${groups().length === 1 ? "" : "s"}`
+    const g = `${groups().length} group${groups().length === 1 ? "" : "s"}`
+    if (scope() === "agent") return `${n} file${n === 1 ? "" : "s"} changed by the agent · ${g}`
+    if (scope() === "tree") return `${n} uncommitted file${n === 1 ? "" : "s"} · ${g}`
+    return `${n} marked file${n === 1 ? "" : "s"} · ${g}`
   }
 
   // Study logging: a click in the view, interleaved with the agent's prompts and tool calls.
@@ -189,6 +311,28 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     setSuppressed(next)
     publishFilter(next)
   }
+  // The scope a click moves to, skipping one with nothing in it.
+  const nextScope = () => {
+    if (scope() === "all" && agentChanged().size > 0) return "agent"
+    if (scope() !== "tree" && treeChanged().size > 0) return "tree"
+    return "all"
+  }
+  const cycleScope = () => {
+    const next = nextScope()
+    logInteraction("changed.scope", next)
+    setScope(next)
+  }
+  // Worded as the action a click takes, since it starts off (unlike the facet chips, which start
+  // on and are clicked to grey out); the summary line names the scope in force. Kept while a
+  // scope is on, even at zero, so it can always be undone.
+  const changedLabel = () => {
+    const next = nextScope()
+    if (next === "agent") return `${AGENT_MARK} show agent changes (${agentChanged().size})`
+    if (next === "tree") return `${TREE_MARK} show uncommitted (${treeChanged().size})`
+    return "show all"
+  }
+  const showChangedToggle = () => scope() !== "all" || nextScope() !== "all"
+
   const clearFilter = () => {
     logInteraction("legend.reset")
     setSuppressed(new Set<string>())
@@ -223,11 +367,13 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   const trimmedLegend = createMemo(() => {
     const entries = legendEntries()
     const reset = suppressed().size > 0 ? 1 : 0
-    const children = (lens() ? 1 : 0) + entries.length + reset
+    const toggle = showChangedToggle() ? 1 : 0
+    const children = (lens() ? 1 : 0) + entries.length + reset + toggle
     const fixed =
       lensClusterWidth() +
       entries.length * 2 +
       reset * LEGEND_RESET.length +
+      toggle * changedLabel().length +
       Math.max(0, children - 1) * LEGEND_GAP +
       LEGEND_SAFETY_PAD
     const budget = dimensions().width - BAR_PADDING_X * 2 - fixed
@@ -264,14 +410,22 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
 
   const describeFile = (file: MarkedFile, group: Group) => {
     const lines = new Map(file.marks.map((m) => [m.f, m.l]))
+    const agent = agentChanged().get(file.path)
+    const uncommitted = treeChanged().get(file.path)
     return [
       file.path,
       ...group.key.map((f) => `${labelOf(f)} ${lines.get(f) ?? 0} line${lines.get(f) === 1 ? "" : "s"}`),
+      ...(agent ? [`changed by agent +${agent.additions} −${agent.deletions}`] : []),
+      ...(uncommitted ? [`uncommitted +${uncommitted.additions} −${uncommitted.deletions}`] : []),
     ].join(" · ")
   }
 
-  const groupWidth = (entry: { group: Group; columns: Segment[][] }) =>
-    Math.max(entry.columns.length * TILE_W, headerText(entry.group).length + entry.group.key.length * 2)
+  const groupWidth = (entry: { group: Group; columns: Segment[][]; toggle: boolean }) =>
+    Math.max(
+      entry.columns.length * TILE_W + (entry.toggle ? MORE_W : 0),
+      // Two cells per facet square; the unmarked group draws one placeholder square.
+      headerText(entry.group).length + Math.max(entry.group.key.length, 1) * 2,
+    )
   const contentWidth = createMemo(() => {
     const widths = groups().map(groupWidth)
     return widths.reduce((a, b) => a + b, 0) + GROUP_GAP * Math.max(0, widths.length - 1)
@@ -293,6 +447,8 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     if (map.error) return "Could not load the Aperture view."
     if (!data()) return ""
     if (!lens()) return "No Lens yet — ask the agent to mark something, or it will curate one as it works."
+    if (scope() === "agent" && agentChanged().size === 0) return "The agent hasn't changed any files this session."
+    if (scope() === "tree" && treeChanged().size === 0) return "Nothing uncommitted in the working tree."
     if (files().length === 0) return `Nothing marked under "${lens()!.name}" yet.`
     return "Every facet is filtered out — click one in the legend, or ↺ to reset."
   }
@@ -377,6 +533,15 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
             {LEGEND_RESET}
           </text>
         </Show>
+        <Show when={showChangedToggle()}>
+          <text
+            fg={scope() !== "all" ? theme().accent : theme().textMuted}
+            onMouseDown={() => cycleScope()}
+            wrapMode="none"
+          >
+            {changedLabel()}
+          </text>
+        </Show>
       </box>
 
       <Show
@@ -408,9 +573,21 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                   flexDirection="row"
                   height={1}
                   flexShrink={0}
-                  onMouseOver={() => setHovered(entry.group.key.map(labelOf).join(" + "))}
+                  onMouseDown={() => entry.toggle && toggleExpanded(entry.group)}
+                  onMouseOver={() =>
+                    setHovered(
+                      entry.group.key.length === 0
+                        ? "changed files that carry no facet"
+                        : entry.group.key.map(labelOf).join(" + "),
+                    )
+                  }
                   onMouseOut={() => setHovered(undefined)}
                 >
+                  <Show when={entry.group.key.length === 0}>
+                    <text fg={theme().textMuted} wrapMode="none">
+                      {"□ "}
+                    </text>
+                  </Show>
                   <For each={entry.group.key}>
                     {(f) => (
                       <text fg={facetColor(facetIds()[f] ?? "")} wrapMode="none">
@@ -447,10 +624,13 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                                     onMouseOut={() => setHovered(undefined)}
                                   >
                                     <NameRow
-                                      name={truncate(basename(file.path), NAME_W)}
+                                      name={truncate(changeMark(file) + basename(file.path), NAME_W)}
                                       width={NAME_W}
                                       colors={() => bandColors(file, entry.group)}
-                                      textColor={() => theme().background}
+                                      // No band behind an unmarked file, so its name needs the ordinary text colour.
+                                      textColor={() =>
+                                        entry.group.key.length === 0 ? theme().text : theme().background
+                                      }
                                       theme={theme}
                                     />
                                   </box>
@@ -462,6 +642,31 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                       </box>
                     )}
                   </For>
+                  <Show when={entry.toggle}>
+                    <box
+                      width={MORE_W}
+                      flexShrink={0}
+                      flexDirection="column"
+                      paddingLeft={1}
+                      onMouseDown={() => toggleExpanded(entry.group)}
+                    >
+                      <Show
+                        when={entry.hidden > 0}
+                        fallback={
+                          <text fg={theme().accent} wrapMode="none">
+                            ◂ less
+                          </text>
+                        }
+                      >
+                        <text fg={theme().accent} wrapMode="none">
+                          {`+${entry.hidden}`}
+                        </text>
+                        <text fg={theme().accent} wrapMode="none">
+                          more ▸
+                        </text>
+                      </Show>
+                    </box>
+                  </Show>
                 </box>
               </box>
             )}
@@ -503,7 +708,27 @@ function NameRow(props: {
 }
 
 function headerText(group: Group) {
-  return `${group.files.length} file${group.files.length === 1 ? "" : "s"}`
+  const n = group.files.length
+  const agent = group.files.filter((file) => file.changed === "agent").length
+  const tree = group.files.filter((file) => file.changed === "tree").length
+  const label = group.key.length === 0 ? "unmarked · " : ""
+  return [
+    `${label}${n} file${n === 1 ? "" : "s"}`,
+    ...(agent > 0 ? [`${AGENT_MARK}${agent}`] : []),
+    ...(tree > 0 ? [`${TREE_MARK}${tree}`] : []),
+  ].join(" · ")
+}
+
+function changeMark(file: MarkedFile) {
+  if (file.changed === "agent") return AGENT_MARK
+  if (file.changed === "tree") return TREE_MARK
+  return ""
+}
+
+// The project directory's path inside the worktree, as a prefix to strip from git's paths.
+function relativePrefix(worktree: string, directory: string) {
+  if (directory === worktree || !directory.startsWith(worktree + "/")) return ""
+  return directory.slice(worktree.length + 1) + "/"
 }
 
 // A run's border title: its directory, trimmed from the left so the most specific part survives.

@@ -180,4 +180,20 @@ export function actionFromTool(tool: string): Action | undefined {
   }
 }
 
+// The files the agent changed across `turns`, with the summed size of those changes. Only
+// the tools that name what they changed count: a shell command's snapshot window also holds
+// whatever else touched the worktree meanwhile, so it cannot say the *agent* changed a file.
+export function changedFiles(turns: ReadonlyArray<Turn>): Map<string, { additions: number; deletions: number }> {
+  const out = new Map<string, { additions: number; deletions: number }>()
+  for (const entry of turns.flatMap((turn) => turn.entries)) {
+    if (entry.target !== "file" || !entry.path || (entry.action !== "edit" && entry.action !== "create")) continue
+    const prev = out.get(entry.path) ?? { additions: 0, deletions: 0 }
+    out.set(entry.path, {
+      additions: prev.additions + (entry.additions ?? 0),
+      deletions: prev.deletions + (entry.deletions ?? 0),
+    })
+  }
+  return out
+}
+
 export * as ApertureActivity from "./activity"

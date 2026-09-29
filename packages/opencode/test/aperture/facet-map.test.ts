@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { computeFacetMapFiles } from "@/aperture/aperture"
-import { groupByCombination, packColumns, type MarkedFile } from "@/aperture/facet-grid"
+import { capColumns, groupByCombination, packColumns, type MarkedFile } from "@/aperture/facet-grid"
 
 const hit = (facet: string, ranges: Array<readonly [number, number]>, lines: number) => ({
   rule: `${facet}-rule`,
@@ -113,6 +113,32 @@ describe("groupByCombination", () => {
       ["a/b", ["a/b/x.ts"]],
     ])
   })
+
+  test("changed files come first in their group, agent changes before other working-tree ones", () => {
+    const groups = groupByCombination(
+      [
+        file("a/x.ts", [0]),
+        { ...file("m/t.ts", [0]), changed: "tree" },
+        { ...file("z/y.ts", [0]), changed: "agent" },
+        file("a/w.ts", [0, 1]),
+      ],
+      new Set(),
+    )
+    expect(groups.map((g) => g.files.map((f) => f.path))).toEqual([["a/w.ts"], ["z/y.ts", "m/t.ts", "a/x.ts"]])
+  })
+
+  test("keepUnmarked puts files with no marks in a trailing empty-key group", () => {
+    const groups = groupByCombination([file("u.ts", []), file("x.ts", [0])], new Set(), { keepUnmarked: true })
+    expect(groups.map((g) => [g.key, g.files.map((f) => f.path)])).toEqual([
+      [[0], ["x.ts"]],
+      [[], ["u.ts"]],
+    ])
+    expect(groupByCombination([file("u.ts", [])], new Set())).toEqual([])
+  })
+
+  test("keepUnmarked still drops a file whose every facet is suppressed", () => {
+    expect(groupByCombination([file("x.ts", [0])], new Set([0]), { keepUnmarked: true })).toEqual([])
+  })
 })
 
 describe("packColumns", () => {
@@ -151,5 +177,21 @@ describe("packColumns", () => {
 
   test("terminates even when the height could not hold a bordered file", () => {
     expect(packColumns([run("a", 2)], 1).flat().length).toBe(2)
+  })
+})
+
+describe("capColumns", () => {
+  const column = (n: number) => [
+    { dir: "", files: Array.from({ length: n }, (_, i) => ({ path: `f${i}`, marks: [], line: 1 })), continued: false },
+  ]
+
+  test("keeps the first columns and counts the files in the rest", () => {
+    const capped = capColumns([column(3), column(2), column(4), column(1)], 2)
+    expect(capped.columns.length).toBe(2)
+    expect(capped.hidden).toBe(5)
+  })
+
+  test("hides nothing when the group already fits", () => {
+    expect(capColumns([column(3)], 2)).toEqual({ columns: [column(3)], hidden: 0 })
   })
 })

@@ -1,1 +1,113 @@
-{}
+{
+  "aperture-features-f040d1e9": {
+    "id": "aperture-features-f040d1e9",
+    "name": "Aperture Features",
+    "description": "Aperture marking system: how code is marked with concerns and displayed in the UI",
+    "palette": "categorical",
+    "facets": [
+      {
+        "id": "aperture-service",
+        "label": "aperture-service",
+        "description": "Main service interface with read/write APIs for marks and lenses",
+        "owner": "agent",
+        "createdBy": "build",
+        "color": "#D7005F"
+      },
+      {
+        "id": "data-model-types",
+        "label": "data-model-types",
+        "description": "Core types: Lens (collection of concerns), Facet (labeled category), Rule (query), Finder (pattern/symbol/diff)",
+        "owner": "agent",
+        "createdBy": "build",
+        "color": "#AF5F00"
+      },
+      {
+        "id": "rule-evaluation",
+        "label": "rule-evaluation",
+        "description": "Rule evaluation engine that finds lines matching patterns, symbols, git diffs, or AST queries",
+        "owner": "agent",
+        "createdBy": "build",
+        "color": "#AFAF00"
+      },
+      {
+        "id": "storage-layer",
+        "label": "storage-layer",
+        "description": "Persistent JSON storage for lenses, active lens pointer, and append-only history log",
+        "owner": "agent",
+        "createdBy": "build",
+        "color": "#00875F"
+      },
+      {
+        "id": "tui-rendering",
+        "label": "tui-rendering",
+        "description": "TUI top bar grid: groups files by facet combinations, packs into columns, renders with colored bands",
+        "owner": "agent",
+        "createdBy": "build",
+        "color": "#00AFD7"
+      }
+    ],
+    "owner": "agent",
+    "rules": [
+      {
+        "id": "aperture-service-66c563a2",
+        "facet": "aperture-service",
+        "find": {
+          "kind": "symbol",
+          "name": "Interface",
+          "path": "packages/opencode/src/aperture"
+        },
+        "createdBy": "build"
+      },
+      {
+        "id": "data-model-types-24b113e1",
+        "facet": "data-model-types",
+        "find": {
+          "kind": "symbol",
+          "name": "Lens",
+          "path": "packages/opencode/src/aperture/lenses.ts"
+        },
+        "createdBy": "build"
+      },
+      {
+        "id": "data-model-types-73b06ae2",
+        "facet": "data-model-types",
+        "find": {
+          "kind": "symbol",
+          "name": "Finder",
+          "path": "packages/opencode/src/aperture/lenses.ts"
+        },
+        "createdBy": "build"
+      },
+      {
+        "id": "rule-evaluation-d1381766",
+        "facet": "rule-evaluation",
+        "find": {
+          "kind": "symbol",
+          "name": "evaluate",
+          "path": "packages/opencode/src/aperture/rules.ts"
+        },
+        "createdBy": "build"
+      },
+      {
+        "id": "storage-layer-ca60a20f",
+        "facet": "storage-layer",
+        "find": {
+          "kind": "symbol",
+          "name": "MarkResult",
+          "path": "packages/opencode/src/aperture/lens-store.ts"
+        },
+        "createdBy": "build"
+      },
+      {
+        "id": "tui-rendering-22feca80",
+        "facet": "tui-rendering",
+        "find": {
+          "kind": "symbol",
+          "name": "groupByCombination",
+          "path": "packages/opencode/src/aperture/facet-grid.ts"
+        },
+        "createdBy": "build"
+      }
+    ]
+  }
+}

@@ -5,10 +5,12 @@
 // specific combination to the least — for facets a, b, c: abc, ab, ac, bc, a, b, c — because the
 // files carrying several concerns at once are usually the ones at issue.
 //
-// Within a group, files are ordered by directory and then name, and consecutive files sharing an
-// immediate parent directory form a *run*, which the renderer draws inside one containment border.
-// That is the only directory structure the grid keeps: a slice through the repo should cut across
-// directories, not be organised by them.
+// Within a group, files the agent changed this session come first, then other uncommitted changes
+// in the working tree, then everything by directory and name. Consecutive files sharing an immediate parent directory form a *run*, which the
+// renderer draws inside one containment border. Runs are cut *after* that sort, so a directory
+// holding both changed and unchanged files appears twice in a group — once among the changed runs
+// at the front, once in its usual place. That is the only directory structure the grid keeps: a
+// slice through the repo should cut across directories, not be organised by them.
 //
 // Dependency-free so the TUI can import it without dragging server code into its bundle, and so the
 // grouping is unit-tested rather than only eyeballed.
@@ -19,6 +21,10 @@ export interface MarkedFile {
   readonly marks: ReadonlyArray<{ readonly f: number; readonly l: number }>
   // The first marked line, where a click should open the file.
   readonly line: number
+  // Changed by the agent this session (`agent`), or otherwise uncommitted in the working tree
+  // (`tree`: shell commands, manual edits). Orthogonal to the facets, so it orders files within a
+  // group rather than forming a group of its own — a file still appears exactly once.
+  readonly changed?: "agent" | "tree"
 }
 
 export interface Run {
@@ -38,13 +44,22 @@ export interface Group {
 // dropped from every key rather than greyed in place: the grid is a scoping tool, so turning a
 // concern off in the legend should re-slice the files by the concerns still in play. A file whose
 // every facet is suppressed leaves the grid.
-export function groupByCombination(files: ReadonlyArray<MarkedFile>, suppressed: ReadonlySet<number>): Group[] {
+//
+// `keepUnmarked` admits files with no marks at all into a trailing group with an empty key — for
+// when the caller has narrowed to files that matter for another reason (the agent changed them),
+// and silently dropping the unmarked ones would hide exactly the changes the user asked to see.
+// A file whose facets are all *suppressed* still leaves: the user turned those concerns off.
+export function groupByCombination(
+  files: ReadonlyArray<MarkedFile>,
+  suppressed: ReadonlySet<number>,
+  options: { keepUnmarked?: boolean } = {},
+): Group[] {
   const byKey = new Map<string, { key: number[]; files: MarkedFile[] }>()
   for (const file of files) {
     const key = [...new Set(file.marks.filter((m) => m.l > 0 && !suppressed.has(m.f)).map((m) => m.f))].sort(
       (a, b) => a - b,
     )
-    if (key.length === 0) continue
+    if (key.length === 0 && !(options.keepUnmarked && file.marks.every((m) => m.l <= 0))) continue
     const id = key.join(",")
     const group = byKey.get(id) ?? { key, files: [] }
     group.files.push(file)
@@ -54,7 +69,10 @@ export function groupByCombination(files: ReadonlyArray<MarkedFile>, suppressed:
     .sort((a, b) => b.key.length - a.key.length || compareKeys(a.key, b.key))
     .map((group) => {
       const sorted = group.files.toSorted(
-        (a, b) => dirname(a.path).localeCompare(dirname(b.path)) || basename(a.path).localeCompare(basename(b.path)),
+        (a, b) =>
+          changeRank(b) - changeRank(a) ||
+          dirname(a.path).localeCompare(dirname(b.path)) ||
+          basename(a.path).localeCompare(basename(b.path)),
       )
       return { key: group.key, files: sorted, runs: runsOf(sorted) }
     })
@@ -101,6 +119,21 @@ export function packColumns(runs: ReadonlyArray<Run>, rows: number): Segment[][]
   }
   if (column.length) columns.push(column)
   return columns
+}
+
+// Keep a group's first `max` columns, and count the files in the rest so the renderer can offer
+// them. Capping is what stops one huge group from pushing every other group off the strip.
+export function capColumns(columns: ReadonlyArray<Segment[]>, max: number): { columns: Segment[][]; hidden: number } {
+  return {
+    columns: columns.slice(0, max),
+    hidden: columns.slice(max).reduce((n, column) => n + column.reduce((m, s) => m + s.files.length, 0), 0),
+  }
+}
+
+function changeRank(file: MarkedFile) {
+  if (file.changed === "agent") return 2
+  if (file.changed === "tree") return 1
+  return 0
 }
 
 function runsOf(files: ReadonlyArray<MarkedFile>): Run[] {

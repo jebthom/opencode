@@ -7,6 +7,7 @@ import {
   type MessageLike,
 } from "@/aperture/activity-model"
 import { computeFacetMapFiles } from "@/aperture/aperture"
+import { changedFiles, type ActivityEntry } from "@/aperture/activity"
 
 // Activity is *derived*, not recorded (PLAN.md G1): every tool call already lives in the
 // durable message store, so the log is a view of it rather than a second source of truth.
@@ -543,5 +544,47 @@ describe("facet agreement", () => {
     const scoped = computeFacetMapFiles(new Map([...HITS].filter(([path]) => touched.has(path))), FACETS)
     expect(Object.keys(scoped).sort()).toEqual(["src/a.ts", "src/c.ts"])
     for (const path of touched) expect(scoped[path]).toEqual(all[path]!)
+  })
+})
+
+describe("changedFiles", () => {
+  const entry = (
+    action: ActivityEntry["action"],
+    path?: string,
+    extra: Partial<ActivityEntry> = {},
+  ): ActivityEntry => ({
+    action,
+    target: path === undefined ? "none" : "file",
+    ...(path === undefined ? {} : { path }),
+    agent: "build",
+    sessionID: "s",
+    depth: 0,
+    callID: "c",
+    timestamp: 0,
+    ...extra,
+  })
+
+  test("counts only edits and writes to files, summing their size across turns", () => {
+    const changed = changedFiles([
+      {
+        promptedAt: 0,
+        agent: "build",
+        entries: [
+          entry("read", "a.ts"),
+          entry("search", "src", { target: "place" }),
+          entry("run", undefined, { changed: 3 }),
+          entry("edit", "a.ts", { additions: 2, deletions: 1 }),
+        ],
+      },
+      {
+        promptedAt: 1,
+        agent: "build",
+        entries: [entry("edit", "a.ts", { additions: 3 }), entry("create", "b.ts", { additions: 10 })],
+      },
+    ])
+    expect([...changed]).toEqual([
+      ["a.ts", { additions: 5, deletions: 1 }],
+      ["b.ts", { additions: 10, deletions: 0 }],
+    ])
   })
 })
