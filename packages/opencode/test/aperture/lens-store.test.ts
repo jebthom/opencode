@@ -13,6 +13,7 @@ import { MAX_FACETS, MAX_RULES, PALETTES, type Finder } from "@/aperture/lenses"
 const run = <A>(effect: Effect.Effect<A>) => Effect.runPromise(effect)
 const pattern = (p: string): Finder => ({ kind: "pattern", pattern: p })
 const AGENT: Actor = { kind: "agent", agent: "build", sessionID: "ses_1", turnID: "msg_turn1", reason: "curating" }
+const UNEXPLAINED: Actor = { kind: "agent", agent: "build", sessionID: "ses_1", turnID: "msg_turn1" }
 
 let dir: string
 beforeEach(async () => {
@@ -31,7 +32,8 @@ const create = (actor: Actor = USER, name = "Retry Handling") =>
         name,
         description: "retries",
         facet: "retry-path",
-        facetReason: "where retries re-enter",
+        what: "every retry call",
+        why: "where retries re-enter",
         find: pattern("retry\\("),
       },
       actor,
@@ -136,59 +138,101 @@ describe("aperture lens-store — mark / unmark", () => {
     ])
   })
 
-  test("an agent must give a reason to mint a concern; a user need not", async () => {
+  test("an agent must give a what and a why to mint a concern; a user need not", async () => {
     const lens = await lensOf(AGENT)
     const bare = await run(ApertureLensStore.mark(dir, lens.id, { facet: "backoff", find: pattern("sleep") }, AGENT))
-    expect(bare).toEqual({ status: "needs-reason", facet: "backoff" })
+    expect(bare).toEqual({ status: "needs-what-why", facet: "backoff", missing: ["what", "why"] })
+    const half = await run(
+      ApertureLensStore.mark(dir, lens.id, { facet: "backoff", what: "the waits", find: pattern("sleep") }, AGENT),
+    )
+    expect(half).toEqual({ status: "needs-what-why", facet: "backoff", missing: ["why"] })
     const missing = await run(
       ApertureLensStore.create(dir, { name: "Other", description: "", facet: "x", find: pattern("x") }, AGENT),
     )
-    expect(missing.status).toBe("needs-reason")
-    // Adding a rule to an existing concern needs no reason.
-    const more = await run(ApertureLensStore.mark(dir, lens.id, { facet: "retry-path", find: pattern("again") }, AGENT))
-    expect(more.status).toBe("ok")
+    expect(missing.status).toBe("needs-what-why")
     const user = await run(ApertureLensStore.mark(dir, lens.id, { facet: "backoff", find: pattern("sleep") }, USER))
     expect(user.status).toBe("ok")
   })
 
-  test("a reason on an existing concern replaces it and is recorded as a facet edit", async () => {
+  test("an agent's second rule on a concern needs a note; a replacement or a user's does not", async () => {
+    const lens = await lensOf(AGENT)
+    const bare = await run(ApertureLensStore.mark(dir, lens.id, { facet: "retry-path", find: pattern("again") }, AGENT))
+    expect(bare.status).toBe("needs-note")
+    const noted = await run(
+      ApertureLensStore.mark(dir, lens.id, { facet: "retry-path", note: "the callers", find: pattern("again") }, AGENT),
+    )
+    if (noted.status !== "ok") throw new Error(noted.status)
+    expect(noted.rule.note).toBe("the callers")
+    // Re-marking an identical query replaces it in place, so there is nothing new to tell apart.
+    const replaced = await run(
+      ApertureLensStore.mark(dir, lens.id, { facet: "retry-path", find: pattern("retry\\(") }, AGENT),
+    )
+    expect(replaced.status).toBe("ok")
+    const user = await run(ApertureLensStore.mark(dir, lens.id, { facet: "retry-path", find: pattern("loop") }, USER))
+    expect(user.status).toBe("ok")
+  })
+
+  test("a why on an existing concern replaces it and is recorded as a why edit", async () => {
     const lens = await lensOf(AGENT)
     const result = await run(
       ApertureLensStore.mark(
         dir,
         lens.id,
-        { facet: "retry-path", facetReason: "the callers the fix must reach", find: pattern("again") },
-        AGENT,
+        { facet: "retry-path", why: "the callers the fix must reach", note: "callers", find: pattern("again") },
+        UNEXPLAINED,
       ),
     )
     if (result.status !== "ok") throw new Error(result.status)
-    expect(result.facet.reason).toBe("the callers the fix must reach")
-    expect((await run(ApertureLensStore.get(dir, lens.id)))?.facets[0]?.reason).toBe("the callers the fix must reach")
-    const history = await run(ApertureLensHistory.read(dir, {}))
-    const edit = history.find((e) => e.op === "facet.edit")
-    expect(edit?.before).toMatchObject({ facet: { reason: "where retries re-enter" } })
-    expect(edit?.after).toMatchObject({ facet: { reason: "the callers the fix must reach" } })
+    expect(result.facet).toMatchObject({ what: "every retry call", why: "the callers the fix must reach" })
+    expect((await run(ApertureLensStore.get(dir, lens.id)))?.facets[0]?.why).toBe("the callers the fix must reach")
+    const edit = (await run(ApertureLensHistory.read(dir, {}))).find((e) => e.op === "facet.edit")
+    expect(edit?.fields).toEqual(["why"])
+    expect(edit?.before).toMatchObject({ facet: { why: "where retries re-enter" } })
+    expect(edit?.after).toMatchObject({ facet: { why: "the callers the fix must reach" } })
   })
 
-  test("update revises a reason, and a palette switch keeps each facet's slot", async () => {
+  test("an agent correcting a what or label must give a reason; rewriting a why need not", async () => {
+    const lens = await lensOf(AGENT)
+    const what = { facet: "retry-path", what: "every re-queue", find: pattern("retry\\(") }
+    expect(await run(ApertureLensStore.mark(dir, lens.id, what, UNEXPLAINED))).toEqual({
+      status: "needs-justification",
+      facet: "retry-path",
+      fields: ["what"],
+    })
+    const relabel = { facets: [{ ref: "retry-path", label: "Retries" }] }
+    expect(await run(ApertureLensStore.update(dir, lens.id, relabel, UNEXPLAINED))).toEqual({
+      status: "needs-justification",
+      facet: "retry-path",
+      fields: ["label"],
+    })
+    const rewhy = { facets: [{ ref: "retry-path", why: "verify the fix reached them" }] }
+    expect((await run(ApertureLensStore.update(dir, lens.id, rewhy, UNEXPLAINED))).status).toBe("ok")
+    const corrected = await run(ApertureLensStore.mark(dir, lens.id, what, AGENT))
+    if (corrected.status !== "ok") throw new Error(corrected.status)
+    expect(corrected.facet.what).toBe("every re-queue")
+    const edits = (await run(ApertureLensHistory.read(dir, {}))).filter((e) => e.op === "facet.edit")
+    expect(edits.map((e) => e.fields)).toEqual([["why"], ["what"]])
+  })
+
+  test("update rewrites a why, and a palette switch keeps each facet's slot", async () => {
     const lens = await lensOf()
     await run(ApertureLensStore.mark(dir, lens.id, { facet: "backoff", find: pattern("sleep") }, USER))
     const result = await run(
       ApertureLensStore.update(
         dir,
         lens.id,
-        { palette: "ordinal", facets: [{ ref: "backoff", reason: "how long callers wait" }] },
+        { palette: "ordinal", facets: [{ ref: "backoff", why: "how long callers wait" }] },
         USER,
       ),
     )
     if (result.status !== "ok") throw new Error(result.status)
-    expect(result.lens.facets.map((f) => [f.id, f.color, f.reason])).toEqual([
+    expect(result.lens.facets.map((f) => [f.id, f.color, f.why])).toEqual([
       ["retry-path", PALETTES.ordinal.colors[0]!, "where retries re-enter"],
       ["backoff", PALETTES.ordinal.colors[1]!, "how long callers wait"],
     ])
   })
 
-  test("a stored colour survives the read; v3 files without reasons read as empty", async () => {
+  test("a stored colour survives the read; a v3.1 reason becomes the what and the why starts empty", async () => {
     const file = path.join(dir, ".opencode", "aperture", "lenses.json")
     await fs.mkdir(path.dirname(file), { recursive: true })
     await fs.writeFile(
@@ -200,14 +244,21 @@ describe("aperture lens-store — mark / unmark", () => {
           description: "",
           palette: "categorical",
           owner: "agent",
-          facets: [{ id: "b", label: "b", description: "", owner: "agent", color: PALETTES.categorical.colors[1] }],
-          rules: [{ id: "b-1", facet: "b", find: { kind: "pattern", pattern: "b" } }],
+          facets: [
+            { id: "b", label: "b", description: "", owner: "agent", color: PALETTES.categorical.colors[1] },
+            { id: "c", label: "c", reason: "the c calls", owner: "agent", color: PALETTES.categorical.colors[2] },
+          ],
+          rules: [
+            { id: "b-1", facet: "b", find: { kind: "pattern", pattern: "b" } },
+            { id: "c-1", facet: "c", find: { kind: "pattern", pattern: "c" } },
+          ],
         },
       }),
     )
     const [lens] = await run(ApertureLensStore.list(dir))
     expect(lens?.facets).toEqual([
-      { id: "b", label: "b", description: "", reason: "", owner: "agent", color: PALETTES.categorical.colors[1]! },
+      { id: "b", label: "b", what: "", why: "", owner: "agent", color: PALETTES.categorical.colors[1]! },
+      { id: "c", label: "c", what: "the c calls", why: "", owner: "agent", color: PALETTES.categorical.colors[2]! },
     ])
   })
 
@@ -237,7 +288,7 @@ describe("aperture lens-store — ownership", () => {
       ApertureLensStore.mark(
         dir,
         lens.id,
-        { facet: "mine", facetReason: "r", find: pattern("q") },
+        { facet: "mine", what: "w", why: "r", find: pattern("q") },
         { ...AGENT, consented: true },
       ),
     )
@@ -249,7 +300,7 @@ describe("aperture lens-store — ownership", () => {
   test("an agent curates its own Lens freely", async () => {
     const lens = await lensOf(AGENT)
     expect(
-      (await run(ApertureLensStore.mark(dir, lens.id, { facet: "b", facetReason: "r", find: pattern("q") }, AGENT)))
+      (await run(ApertureLensStore.mark(dir, lens.id, { facet: "b", what: "w", why: "r", find: pattern("q") }, AGENT)))
         .status,
     ).toBe("ok")
     expect((await run(ApertureLensStore.unmark(dir, lens.id, { facet: "retry-path" }, AGENT))).status).toBe("ok")
@@ -262,7 +313,7 @@ describe("aperture lens-store — ownership", () => {
       ApertureLensStore.mark(
         dir,
         lens.id,
-        { facet: "asked-for", facetReason: "r", find: pattern("q") },
+        { facet: "asked-for", what: "w", why: "r", find: pattern("q") },
         { ...AGENT, kind: "user" },
       ),
     )
@@ -279,13 +330,13 @@ describe("aperture lens-store — update", () => {
       ApertureLensStore.update(
         dir,
         lens.id,
-        { name: "Retries", facets: [{ ref: "retry-path", label: "Retry path", description: "every retry" }] },
+        { name: "Retries", facets: [{ ref: "retry-path", label: "Retry path", why: "every retry" }] },
         USER,
       ),
     )
     if (result.status !== "ok") throw new Error(result.status)
     expect(result.lens.name).toBe("Retries")
-    expect(result.lens.facets[0]).toMatchObject({ id: "retry-path", label: "Retry path", description: "every retry" })
+    expect(result.lens.facets[0]).toMatchObject({ id: "retry-path", label: "Retry path", why: "every retry" })
     expect(result.lens.rules).toEqual(lens.rules)
   })
 
@@ -335,16 +386,16 @@ describe("aperture lens-store — v2 migration", () => {
         {
           id: "any-casts",
           label: "any-casts",
-          description: "",
-          reason: "",
+          what: "",
+          why: "",
           owner: "user",
           color: PALETTES.categorical.colors[0]!,
         },
         {
           id: "flags",
           label: "flags",
-          description: "",
-          reason: "",
+          what: "",
+          why: "",
           owner: "user",
           color: PALETTES.categorical.colors[1]!,
         },
@@ -393,7 +444,7 @@ describe("aperture lens-store — history", () => {
       ApertureLensStore.mark(
         dir,
         lens.id,
-        { facet: "b", facetReason: "r", find: pattern("q"), hits: { lines: 3, files: 1 } },
+        { facet: "b", what: "w", why: "r", find: pattern("q"), hits: { lines: 3, files: 1 } },
         AGENT,
       ),
     )
@@ -422,7 +473,7 @@ describe("aperture lens-store — history", () => {
       ApertureLensStore.mark(
         dir,
         lens.id,
-        { facet: "b", facetReason: "r", find: pattern("q") },
+        { facet: "b", what: "w", why: "r", find: pattern("q") },
         { ...AGENT, turnID: "msg_turn2" },
       ),
     )

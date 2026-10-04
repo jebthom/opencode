@@ -5030,7 +5030,8 @@ export type ApertureLinesResponses = {
         facet: string
         label: string
         color: string
-        reason: string
+        what: string
+        why: string
         queries: Array<string>
       }>
       owner: "user" | "agent"
@@ -5110,6 +5111,7 @@ export type ApertureHistoryResponses = {
     }
     facet?: string
     rule?: string
+    fields?: Array<"label" | "what" | "why">
     milestone?: {
       todo: string
       index: number
@@ -5157,7 +5159,8 @@ export type ApertureFacetMapResponses = {
         facet: string
         label: string
         color: string
-        reason: string
+        what: string
+        why: string
         queries: Array<string>
       }>
       owner: "user" | "agent"
@@ -5212,7 +5215,8 @@ export type ApertureActivityResponses = {
         facet: string
         label: string
         color: string
-        reason: string
+        what: string
+        why: string
         queries: Array<string>
       }>
       owner: "user" | "agent"
@@ -5286,7 +5290,8 @@ export type ApertureCycleLensResponses = {
         facet: string
         label: string
         color: string
-        reason: string
+        what: string
+        why: string
         queries: Array<string>
       }>
       owner: "user" | "agent"
@@ -5329,7 +5334,8 @@ export type ApertureDeleteLensResponses = {
         facet: string
         label: string
         color: string
-        reason: string
+        what: string
+        why: string
         queries: Array<string>
       }>
       owner: "user" | "agent"
@@ -5408,7 +5414,8 @@ export type ApertureSelectLensResponses = {
         facet: string
         label: string
         color: string
-        reason: string
+        what: string
+        why: string
         queries: Array<string>
       }>
       owner: "user" | "agent"

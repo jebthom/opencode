@@ -133,8 +133,11 @@ function migrate(raw: Record<string, unknown>): Lens {
       .map((f) => ({
         id: f["id"] as string,
         label: typeof f["label"] === "string" ? f["label"] : (f["id"] as string),
-        description: typeof f["description"] === "string" ? f["description"] : "",
-        reason: typeof f["reason"] === "string" ? f["reason"] : "",
+        // v3.1 facets carried one `reason`; it described what the lines are far more often than
+        // why they mattered, so it becomes the `what` and the `why` starts empty (and is flagged
+        // as missing in <aperture-state>).
+        what: typeof f["what"] === "string" ? f["what"] : typeof f["reason"] === "string" ? f["reason"] : "",
+        why: typeof f["why"] === "string" ? f["why"] : "",
         ...(typeof f["color"] === "string" ? { color: f["color"] } : {}),
         owner: resolveOwner(f["owner"]),
         ...(typeof f["createdBy"] === "string" ? { createdBy: f["createdBy"] } : {}),
@@ -308,11 +311,11 @@ function ref(lens: Lens) {
 export interface MarkInput {
   // A facet id or label (add another rule to that concern), or a new name (mint it).
   readonly facet: string
-  // Legend definition for a newly-minted concern. Ignored when the facet already exists.
-  readonly definition?: string
-  // How the concern helps the user understand the task (`Facet.reason`). Required when an agent
-  // mints a concern; given for an existing one, it replaces the reason.
-  readonly facetReason?: string
+  // What the marked lines are, and why they matter for the task now (`Facet.what` / `Facet.why`).
+  // Both are required when an agent mints a concern. Given for an existing one, `why` replaces the
+  // why, and `what` corrects the what (which then needs the actor's `reason`).
+  readonly what?: string
+  readonly why?: string
   readonly find: Finder
   readonly where?: GitFilter
   readonly note?: string
@@ -340,14 +343,58 @@ export type MarkResult =
   | Refusal
   | { readonly status: "facet-cap"; readonly lens: Lens; readonly max: number }
   | { readonly status: "rule-cap"; readonly lens: Lens; readonly max: number }
-  // An agent tried to mint a concern without saying how it helps. Nothing was written.
-  | { readonly status: "needs-reason"; readonly facet: string }
+  // An agent tried to mint a concern without saying what it marks and why. Nothing was written.
+  | { readonly status: "needs-what-why"; readonly facet: string; readonly missing: ReadonlyArray<"what" | "why"> }
+  // An agent added a second (or later) rule to a concern without a `note` saying which part of the
+  // concern it marks — the only thing that tells two lines of one facet apart. Nothing was written.
+  | { readonly status: "needs-note"; readonly lens: Lens; readonly facet: Facet }
+  | Unjustified
 
-// An agent must say why a concern it mints is worth the user's attention: the reason is what every
-// hover surface shows beside the query, and an empty one leaves the user to guess. A user marking
-// from the TUI is not asked.
-function reasonMissing(actor: Actor, input: MarkInput): boolean {
-  return actor.agent !== undefined && !input.facetReason?.trim()
+// An agent corrected a concern's identity (its `what` or `label`) without saying why. A correction
+// is legitimate, but rare and consequential enough that the history must carry a reason for it.
+type Unjustified = {
+  readonly status: "needs-justification"
+  readonly facet: string
+  readonly fields: ReadonlyArray<"label" | "what">
+}
+
+// An agent must say what a concern it mints marks and why it is worth the user's attention: both
+// are what every hover surface shows beside the query. A user marking from the TUI is not asked.
+function whatWhyMissing(actor: Actor, input: MarkInput): Array<"what" | "why"> {
+  if (actor.agent === undefined) return []
+  return [...(input.what?.trim() ? [] : ["what" as const]), ...(input.why?.trim() ? [] : ["why" as const])]
+}
+
+// A concern's identity fields an agent changed without giving a `reason`.
+function unjustified(actor: Actor, fields: ReadonlyArray<Revised>): Array<"label" | "what"> {
+  if (actor.agent === undefined || actor.reason) return []
+  return fields.filter((f): f is "label" | "what" => f === "label" || f === "what")
+}
+
+type Revised = "label" | "what" | "why"
+
+// Apply an edit to a facet, reporting which fields actually changed. Blank values keep the old one.
+function revise(facet: Facet, edit: { readonly label?: string; readonly what?: string; readonly why?: string }) {
+  const next: Facet = {
+    ...facet,
+    label: edit.label?.trim() || facet.label,
+    what: edit.what?.trim() || facet.what,
+    why: edit.why?.trim() || facet.why,
+  }
+  const fields = (["label", "what", "why"] as const).filter((k) => next[k] !== facet[k])
+  return { facet: next, fields }
+}
+
+function facetEdit(actor: Actor, lens: Lens, before: Facet, after: Facet, fields: ReadonlyArray<Revised>) {
+  return {
+    op: "facet.edit" as const,
+    actor,
+    lens: ref(lens),
+    facet: after.id,
+    fields,
+    before: { facet: before },
+    after: { facet: after },
+  }
 }
 
 // Create a Lens together with its first concern and rule, in one write. Creation and the first
@@ -357,13 +404,14 @@ export const create = (directory: string, input: CreateInput, actor: Actor): Eff
   withDoc(
     directory,
     Effect.gen(function* () {
-      if (reasonMissing(actor, input)) return { status: "needs-reason" as const, facet: input.facet.trim() }
+      const missing = whatWhyMissing(actor, input)
+      if (missing.length) return { status: "needs-what-why" as const, facet: input.facet.trim(), missing }
       const facet = assignColors("categorical", [
         {
           id: slugify(input.facet),
           label: input.facet.trim(),
-          description: input.definition?.trim() || `Lines matched by the "${input.facet.trim()}" rules.`,
-          reason: input.facetReason?.trim() ?? "",
+          what: input.what?.trim() ?? "",
+          why: input.why?.trim() ?? "",
           owner: actor.kind,
           ...(actor.agent ? { createdBy: actor.agent } : {}),
         },
@@ -409,31 +457,42 @@ export const mark = (directory: string, id: string, input: MarkInput, actor: Act
       if (consentNeeded(actor, prev, existing)) return { status: "needs-consent" as const, lens: prev, facet: existing }
       if (!existing && prev.facets.length >= MAX_FACETS)
         return { status: "facet-cap" as const, lens: prev, max: MAX_FACETS }
-      if (!existing && reasonMissing(actor, input))
-        return { status: "needs-reason" as const, facet: input.facet.trim() }
+      const missing = existing ? [] : whatWhyMissing(actor, input)
+      if (missing.length) return { status: "needs-what-why" as const, facet: input.facet.trim(), missing }
 
       const label = input.facet.trim()
-      const reason = input.facetReason?.trim()
-      // A new reason on an existing concern is an edit to it, recorded as one below.
-      const rereasoned = existing && reason && reason !== existing.reason ? { ...existing, reason } : undefined
+      // A what or why given for an existing concern is an edit to it, recorded as one below.
+      const revision = existing ? revise(existing, { what: input.what, why: input.why }) : undefined
+      const fields = unjustified(actor, revision?.fields ?? [])
+      if (fields.length) return { status: "needs-justification" as const, facet: existing!.id, fields }
+      const revised = revision?.fields.length ? revision.facet : undefined
       const facets = existing
-        ? prev.facets.map((t) => (t.id === rereasoned?.id ? rereasoned : t))
+        ? prev.facets.map((t) => (t.id === revised?.id ? revised : t))
         : assignColors(prev.palette, [
             ...prev.facets,
             {
               id: uniqueFacetId(prev.facets, label),
               label,
-              description: input.definition?.trim() || `Lines matched by the "${label}" rules.`,
-              reason: reason ?? "",
+              what: input.what?.trim() ?? "",
+              why: input.why?.trim() ?? "",
               owner: actor.kind,
               ...(actor.agent ? { createdBy: actor.agent } : {}),
             },
           ])
-      const facet = rereasoned ?? existing ?? facets[facets.length - 1]!
+      const facet = revised ?? existing ?? facets[facets.length - 1]!
       const rule = buildRule(facet.id, input, actor)
       const rules = [...(prev.rules ?? [])]
       const at = rules.findIndex((r) => r.id === rule.id)
       const replaced = at >= 0 ? rules[at] : undefined
+      // A second rule on a concern needs a note saying which part of the concern it marks. Replacing
+      // a rule in place adds nothing to tell apart, so it is exempt.
+      if (
+        actor.agent !== undefined &&
+        at < 0 &&
+        !input.note?.trim() &&
+        rules.some((r) => r.facet === facet.id)
+      )
+        return { status: "needs-note" as const, lens: prev, facet }
       // Enforced here rather than left to `normalizeRules`, which silently truncates on read —
       // an unchecked append would report success and then vanish on the next read.
       if (at < 0 && rules.length >= MAX_RULES) return { status: "rule-cap" as const, lens: prev, max: MAX_RULES }
@@ -448,18 +507,7 @@ export const mark = (directory: string, id: string, input: MarkInput, actor: Act
           ...(existing
             ? []
             : [{ op: "facet.add" as const, actor, lens: ref(next), facet: facet.id, after: { facet } }]),
-          ...(rereasoned
-            ? [
-                {
-                  op: "facet.edit" as const,
-                  actor,
-                  lens: ref(next),
-                  facet: facet.id,
-                  before: { facet: existing! },
-                  after: { facet: rereasoned },
-                },
-              ]
-            : []),
+          ...(revised ? [facetEdit(actor, next, existing!, revised, revision!.fields)] : []),
           ruleEntry(replaced ? "rule.replace" : "rule.add", actor, next, rule, input.hits, replaced),
         ])
       return {
@@ -593,13 +641,13 @@ export interface UpdateInput {
   readonly name?: string
   readonly description?: string
   readonly palette?: PaletteId
-  // Relabel or redefine existing facets, by id or label. Facets are added and removed only by
+  // Relabel existing facets, rewrite their why, or correct their what, by id or label. Facets are added and removed only by
   // mark/unmark, which is what keeps every facet backed by at least one rule.
   readonly facets?: ReadonlyArray<{
     readonly ref: string
     readonly label?: string
-    readonly description?: string
-    readonly reason?: string
+    readonly what?: string
+    readonly why?: string
   }>
 }
 
@@ -607,9 +655,10 @@ export type UpdateResult =
   | { readonly status: "ok"; readonly lens: Lens; readonly written: boolean }
   | Refusal
   | { readonly status: "unknown-facet"; readonly lens: Lens; readonly facet: string }
+  | Unjustified
 
-// Edit a Lens's metadata in place: its name, description and palette, and its facets' labels and
-// definitions. Nothing here changes what any rule matches, so no hit is re-derived.
+// Edit a Lens's metadata in place: its name, description and palette, and its facets' labels,
+// whats and whys. Nothing here changes what any rule matches, so no hit is re-derived.
 export const update = (directory: string, id: string, input: UpdateInput, actor: Actor): Effect.Effect<UpdateResult> =>
   withDoc(
     directory,
@@ -628,22 +677,17 @@ export const update = (directory: string, id: string, input: UpdateInput, actor:
         : edits.some((e) => consentNeeded(actor, prev, e.facet))
       if (needsConsent) return { status: "needs-consent" as const, lens: prev }
 
-      const byId = new Map(edits.map((e) => [e.facet!.id, e.edit]))
+      const revisions = edits.map((e) => ({ before: e.facet!, ...revise(e.facet!, e.edit) }))
+      const offending = revisions
+        .map((r) => ({ facet: r.before.id, fields: unjustified(actor, r.fields) }))
+        .find((r) => r.fields.length)
+      if (offending) return { status: "needs-justification" as const, ...offending }
+      const byId = new Map(revisions.map((r) => [r.before.id, r.facet]))
       const palette = input.palette ?? prev.palette
       const facets = repaletteColors(
         prev.palette,
         palette,
-        prev.facets.map((t) => {
-          const edit = byId.get(t.id)
-          return edit
-            ? {
-                ...t,
-                label: edit.label?.trim() || t.label,
-                description: edit.description?.trim() || t.description,
-                reason: edit.reason?.trim() || t.reason,
-              }
-            : t
-        }),
+        prev.facets.map((t) => byId.get(t.id) ?? t),
       )
       const next: Lens = {
         ...prev,
@@ -667,14 +711,9 @@ export const update = (directory: string, id: string, input: UpdateInput, actor:
                 },
               ]
             : []),
-          ...edits.map((e) => ({
-            op: "facet.edit" as const,
-            actor,
-            lens: ref(next),
-            facet: e.facet!.id,
-            before: { facet: e.facet! },
-            after: { facet: facets.find((t) => t.id === e.facet!.id)! },
-          })),
+          ...revisions
+            .filter((r) => r.fields.length)
+            .map((r) => facetEdit(actor, next, r.before, facets.find((t) => t.id === r.before.id)!, r.fields)),
         ])
       return { status: "ok" as const, lens: next, written }
     }),

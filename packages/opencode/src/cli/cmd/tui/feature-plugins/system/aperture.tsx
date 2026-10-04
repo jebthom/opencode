@@ -41,7 +41,14 @@ type FacetMap = {
     id: string
     name: string
     owner: "user" | "agent"
-    legend: readonly { facet: string; label: string; color: string; reason: string; queries: readonly string[] }[]
+    legend: readonly {
+      facet: string
+      label: string
+      color: string
+      what: string
+      why: string
+      queries: readonly string[]
+    }[]
   }
   facets: readonly string[]
   files: Record<string, { m: readonly { f: number; l: number; b: number }[]; line: number }>
@@ -56,10 +63,10 @@ const NAME_W = TILE_W - 2
 // Rows the grid has under each group's header row. Columns of bordered runs are packed into this.
 const GRID_ROWS = 9
 // The detail region between the Lens row and the legend. A terminal has no tooltip to hang an explanation on, so the
-// bar reserves fixed rows for one: what the pointer is over (a facet's query and reason, a group's
+// bar reserves fixed rows for one: what the pointer is over (a facet's what, why and query, a group's
 // combination, a file's marks), and otherwise the hints that make those hovers discoverable.
 // Fixed height, so hovering never reflows the grid.
-const DETAIL_ROWS = 2
+const DETAIL_ROWS = 3
 // Header (title + Lens controls) + detail + a blank row + legend row + the rule under it + group
 // header + grid + the bar's bottom border. NB: `routes/session/index.tsx` hides the bar outright on
 // short terminals using its own literal — move that with this.
@@ -553,17 +560,18 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                   <text wrapMode="none" fg={theme().text}>
                     <span style={{ fg: facetColor(entry().facet) }}>■ </span>
                     <b>{truncate(entry().label, detailWidth() - 2)}</b>
-                    <span style={{ fg: theme().textMuted }}>
-                      {truncate(
-                        "  " +
-                          (entry().queries.length ? "query: " + entry().queries.join(" · ") : "no rules") +
-                          (suppressed().has(entry().facet) ? "  (hidden — click its name to show)" : ""),
-                        Math.max(0, detailWidth() - 2 - entry().label.length),
-                      )}
-                    </span>
+                    {truncate(
+                      "  " +
+                        (entry().what || "—") +
+                        (suppressed().has(entry().facet) ? "  (hidden — click its name to show)" : ""),
+                      Math.max(0, detailWidth() - 2 - entry().label.length),
+                    )}
                   </text>
-                  <text wrapMode="none" fg={entry().reason ? theme().text : theme().textMuted}>
-                    {truncate("reason: " + (entry().reason || "none given"), detailWidth())}
+                  <text wrapMode="none" fg={entry().why ? theme().text : theme().textMuted}>
+                    {truncate("why: " + (entry().why || "none given"), detailWidth())}
+                  </text>
+                  <text wrapMode="none" fg={theme().textMuted}>
+                    {truncate(entry().queries.length ? "query: " + entry().queries.join(" · ") : "no rules", detailWidth())}
                   </text>
                 </>
               )}
@@ -580,7 +588,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                   <text wrapMode="none" fg={theme().textMuted}>
                     {truncate(
                       [
-                        ...(entry().group.key.length ? ["hover one ■ for its query and reason"] : []),
+                        ...(entry().group.key.length ? ["hover one ■ for its what, why and query"] : []),
                         ...(entry().toggle ? [entry().hidden > 0 ? "click to show every file" : "click to fold"] : []),
                       ].join(" · "),
                       detailWidth(),
@@ -853,7 +861,7 @@ function Hints(props: { show: boolean; width: number; theme: () => TuiThemeCurre
   return (
     <Show when={props.show}>
       <text wrapMode="none" fg={props.theme().textMuted}>
-        {truncate("Hover a ■ or a facet name for its query and reason · click a name to hide or show it", props.width)}
+        {truncate("Hover a ■ or a facet name for its what, why and query · click a name to hide or show it", props.width)}
       </text>
       <text wrapMode="none" fg={props.theme().textMuted}>
         {truncate(

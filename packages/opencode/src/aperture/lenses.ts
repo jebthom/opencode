@@ -1,5 +1,5 @@
 // *Lenses* for the Aperture view. A Lens is a named collection of *facets* — each a concern
-// with a label, a definition and a colour — plus the *rules* that decide, deterministically,
+// with a label, a what, a why and a colour — plus the *rules* that decide, deterministically,
 // which lines of the repo carry each facet.
 //
 // v3 retired the LLM painter: every facet is rule-owned, so a Lens's paint is a pure function of
@@ -22,11 +22,14 @@ export type Owner = "user" | "agent"
 export interface Facet {
   readonly id: string
   readonly label: string
-  // What the concern IS — a one-line definition.
-  readonly description: string
-  // Why the concern is on the Lens — how its query helps the user understand the task at hand.
-  // Shown beside the query on every hover surface; "" when nobody gave one.
-  readonly reason: string
+  // WHAT the marked lines are, as a phrase a newcomer can picture. This is the facet's identity:
+  // it is corrected when it misdescribes the lines, never repurposed — a new intent is a new facet
+  // (new id, new colour), so "the amber lines" never quietly changes meaning.
+  readonly what: string
+  // WHY to look at them for the task right now. Task-relative, so it is the half that goes stale
+  // and is rewritten as the work moves from understanding to changing to verifying.
+  // Both are shown on every hover surface; "" when nobody gave one.
+  readonly why: string
   readonly color: string
   readonly owner: Owner
   // The agent that minted the facet, when an agent did.
@@ -396,7 +399,8 @@ export interface ConcernSummary {
   readonly colorName: string
   readonly owner: Owner
   readonly rules: number
-  readonly reason: string
+  readonly what: string
+  readonly why: string
 }
 
 // A finder (and its git filter) as one readable line. Lives here so `lens_mark` (echoing back
@@ -439,18 +443,20 @@ export function concernRoster(lens: Pick<Lens, "facets" | "rules">): ConcernSumm
     colorName: COLOR_NAMES[t.color] ?? t.color,
     owner: t.owner,
     rules: counts.get(t.id) ?? 0,
-    reason: t.reason,
+    what: t.what,
+    why: t.why,
   }))
 }
 
 // The renderer's legend: ordered facet → label + colour, plus what a hover explains — the
-// facet's reason and its rules as readable queries. Drives the swatch row, the facet→colour map
+// facet's what and why, and its rules as readable queries. Drives the swatch row, the facet→colour map
 // every surface paints with, and the hover detail, so no client needs a hard-coded vocabulary.
 export interface LegendEntry {
   readonly facet: string
   readonly label: string
   readonly color: string
-  readonly reason: string
+  readonly what: string
+  readonly why: string
   readonly queries: ReadonlyArray<string>
 }
 
@@ -459,7 +465,8 @@ export function legend(lens: Pick<Lens, "facets" | "rules">): LegendEntry[] {
     facet: t.id,
     label: t.label,
     color: t.color,
-    reason: t.reason,
+    what: t.what,
+    why: t.why,
     queries: (lens.rules ?? []).filter((r) => r.facet === t.id).map((r) => describeFinder(r.find, r.where)),
   }))
 }

@@ -178,16 +178,8 @@ exports[`tool parameters JSON Schema (wire shape) lens_mark 1`] = `
       "description": "Keep only hits on lines git reports as changed against this ref or range — e.g. 'HEAD' (uncommitted), 'main', or 'HEAD~1..HEAD' (the last commit). Combine with a pattern to mark 'every call to x() that this change touched'.",
       "type": "string",
     },
-    "definition": {
-      "description": "One-line definition of the concern for the legend. Used only when minting a new concern.",
-      "type": "string",
-    },
     "facet": {
       "description": "The concern these lines belong to, kebab-case: 'retry-path', 'any-casts', 'feature-flag-reads'. An existing facet id or label adds another rule to that concern; a new name mints one (up to 6 per Lens). NEVER a generic name like 'hit', 'match' or 'result' — this is what the user reads in the legend, so it has to say what the lines have in common.",
-      "type": "string",
-    },
-    "facetReason": {
-      "description": "One sentence on how this concern helps the user understand the CURRENT TASK — not what the lines are (that is \`definition\`), but why looking at them matters now: 'every caller that must handle the new error type'. The user sees it beside the query whenever they hover the concern. REQUIRED when minting a concern; given for an existing one, it replaces the reason.",
       "type": "string",
     },
     "glob": {
@@ -220,7 +212,7 @@ exports[`tool parameters JSON Schema (wire shape) lens_mark 1`] = `
       "type": "string",
     },
     "note": {
-      "description": "One line on WHY these lines matter, shown to the user on hover. This is where your judgement lives — the finder can only match text, so 'this is the retry path' has to be said here.",
+      "description": "Which part of the concern THIS rule marks, shown on the hover of every line it marks: 'the definition', 'callers outside src/net', 'the test that pins the old behaviour'. REQUIRED when the concern already has a rule — it is the only thing that tells two lines of one concern apart. Optional on a concern's first rule, if the query doesn't explain itself.",
       "type": "string",
     },
     "path": {
@@ -232,7 +224,7 @@ exports[`tool parameters JSON Schema (wire shape) lens_mark 1`] = `
       "type": "string",
     },
     "reason": {
-      "description": "Why you are making this change now (this call, not the concern — see \`facetReason\`), recorded in the Lens history the user can review. Always give one when curating on your own initiative.",
+      "description": "Why you are making this change now (this call, not the concern — see \`why\`), recorded in the Lens history the user can review. Always give one when curating on your own initiative.",
       "type": "string",
     },
     "ref": {
@@ -245,6 +237,14 @@ exports[`tool parameters JSON Schema (wire shape) lens_mark 1`] = `
     },
     "since": {
       "description": "Keep only hits on lines last changed after this date ('2 weeks ago', '2026-09-01'), per git blame.",
+      "type": "string",
+    },
+    "what": {
+      "description": "WHAT the marked lines are, as a phrase a newcomer can picture: 'every place a failed request is re-queued'. Don't repeat the label. This is the concern's identity: it should never need to change. REQUIRED when minting a concern. Given for an existing concern, it CORRECTS a what that misdescribes the lines (pass \`reason\`); if the concern's intent has changed, mint a new concern and lens_unmark this one instead.",
+      "type": "string",
+    },
+    "why": {
+      "description": "WHY to look at these lines for the task right now. In an overview, how it fits: 'every other concern builds on these types, so read them first'. During a change, what to do or check: 'each must handle the new TimeoutError'. REQUIRED when minting a concern; given for an existing one, it replaces the why (lens_edit also does this). Keep what + why under ~120 characters.",
       "type": "string",
     },
   },

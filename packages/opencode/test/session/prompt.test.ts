@@ -2383,7 +2383,8 @@ const markProbe = {
   facet: "probe-lines",
   kind: "pattern",
   pattern: "probe",
-  facetReason: "where the probe is read",
+  what: "every read of the probe",
+  why: "where the probe is read",
   activate: true,
   reason: "show the probe",
 }
@@ -2509,6 +2510,10 @@ it.instance("a todo completed after the last Lens change triggers the end-of-tur
     const inputs = (yield* llm.inputs).map((input) => JSON.stringify(input))
     expect(inputs[2]).toContain("APERTURE MILESTONE")
     expect(inputs[3]).toContain('without a Lens change since you completed \\"part one\\"')
+    // The probe's why was set before the milestone, so every reminder names it as stale.
+    expect(inputs[2]).toContain('■ probe-lines: why was \\"where the probe is read\\"')
+    expect(inputs[3]).toContain("whys may be out of date: ■ probe-lines")
+    expect(inputs[3]).toContain("[STALE: set before the last completed todo]")
   }),
 )
 

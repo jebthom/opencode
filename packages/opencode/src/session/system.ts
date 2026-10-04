@@ -17,7 +17,7 @@ import { Permission } from "@/permission"
 import { Skill } from "@/skill"
 import { ApertureLensStore } from "@/aperture/lens-store"
 import { ApertureLensHistory } from "@/aperture/lens-history"
-import { ApertureLenses } from "@/aperture/lenses"
+import { ApertureLenses, type Lens } from "@/aperture/lenses"
 
 export function provider(model: Provider.Model) {
   if (model.api.id.includes("gpt-4") || model.api.id.includes("o1") || model.api.id.includes("o3"))
@@ -57,6 +57,25 @@ export interface Interface {
 // Distinct files edited without a Lens change before a todo-less turn is nudged.
 const NUDGE_FILES = 3
 
+// The agent's concerns on `lens` whose why may no longer hold: never given, or last set before the
+// most recent milestone (a completed todo is when a task moves from understanding to changing to
+// verifying, which is exactly when a why goes stale). The user's concerns are left out — rewriting
+// those would only raise consent prompts for something the agent was never asked to keep current.
+function staleWhys(lens: Lens, entries: ReadonlyArray<ApertureLensHistory.Entry>) {
+  const milestone = entries.findLast((e) => e.op === "milestone")?.seq ?? -1
+  return lens.facets
+    .filter((facet) => facet.owner === "agent")
+    .flatMap((facet) => {
+      if (!facet.why) return [{ facet, flag: "MISSING" }]
+      const set = entries.findLast(
+        (e) =>
+          e.facet === facet.id &&
+          (e.op === "facet.add" || (e.op === "facet.edit" && (!e.fields || e.fields.includes("why")))),
+      )
+      return (set?.seq ?? -1) < milestone ? [{ facet, flag: "STALE: set before the last completed todo" }] : []
+    })
+}
+
 export class Service extends Context.Service<Service, Interface>()("@opencode/SystemPrompt") {}
 
 export const layer = Layer.effect(
@@ -70,27 +89,36 @@ export const layer = Layer.effect(
       const all = yield* ApertureLensStore.list(ctx.directory)
       const active = yield* ApertureLensStore.getActive(ctx.directory)
       const recent = yield* ApertureLensHistory.read(ctx.directory, { limit: 5 })
-      const lenses = all.map((lens) => {
+      const stale = active ? staleWhys(active, yield* ApertureLensHistory.read(ctx.directory, { lens: active.id })) : []
+      // The active Lens in full (each concern's what and why, staleness flagged), the rest compactly:
+      // enough to reuse a concern instead of minting a near-duplicate.
+      const lenses = all.flatMap((lens) => {
         const roster = ApertureLenses.concernRoster(lens)
         const free = ApertureLenses.MAX_FACETS - roster.length
-        const concerns = roster.length
-          ? roster
-              .map(
-                (c) =>
-                  `${c.label} [${c.facet}] ${c.colorName}, ${c.rules} rule${c.rules === 1 ? "" : "s"}` +
-                  (c.owner === "user" ? ", the user's" : "") +
-                  ` (reason: ${c.reason || "none"})`,
-              )
-              .join("; ")
-          : "no concerns"
-        return (
+        const head =
           `- "${lens.name}" [${lens.id}] (${lens.owner === "user" ? "the user's" : "yours"})` +
-          `${lens.id === active?.id ? " ACTIVE" : ""}: ${concerns}. ${free} slot${free === 1 ? "" : "s"} free.`
-        )
+          `${lens.id === active?.id ? " ACTIVE" : ""}: ${roster.length ? "" : "no concerns. "}${free} slot${free === 1 ? "" : "s"} free.`
+        const name = (c: ApertureLenses.ConcernSummary) =>
+          `■ ${c.facet} (${c.label}) ${c.colorName}, ${c.rules} rule${c.rules === 1 ? "" : "s"}` +
+          (c.owner === "user" ? ", the user's" : "")
+        if (lens.id !== active?.id) return [head, ...roster.map((c) => `  ${name(c)} — ${c.what || "(no what)"}`)]
+        return [
+          head,
+          ...roster.flatMap((c) => {
+            const flag = stale.find((s) => s.facet.id === c.facet)?.flag
+            return [`  ${name(c)}`, `    what: ${c.what || "(none)"}`, `    why:  ${c.why || "(none)"}${flag ? `  [${flag}]` : ""}`]
+          }),
+        ]
       })
       return [
         "<aperture-state>",
         ...(lenses.length ? ["Lenses:", ...lenses] : ["No Lenses yet."]),
+        ...(stale.length
+          ? [
+              "Whys marked STALE or MISSING may no longer say why to look at those lines. If the concern still serves",
+              "this task, rewrite its why with lens_edit; if it no longer does, lens_unmark it. Keep its what.",
+            ]
+          : []),
         ...(recent.length
           ? [
               "Latest Lens changes:",
@@ -126,6 +154,7 @@ export const layer = Layer.effect(
       const stale = entries.findLast((e) => e.op === "milestone" && e.seq > (change?.seq ?? -1))
       const active = yield* ApertureLensStore.getActive(ctx.directory)
       if (change && !stale && active) return
+      const whys = active ? staleWhys(active, yield* ApertureLensHistory.read(ctx.directory, { lens: active.id })) : []
       const why = !change
         ? "without any change to the Lens view"
         : stale
@@ -142,6 +171,12 @@ export const layer = Layer.effect(
         "- You may read and search to find the exact lines. Do NOT edit files and do NOT continue the",
         "  task: only read-only tools and Lens tools.",
         "- If the reply was not about code in this repo, or the active Lens already shows it, change nothing.",
+        ...(whys.length
+          ? [
+              `- These concerns' whys may be out of date: ${whys.map((w) => `■ ${w.facet.id}`).join(", ")}. Rewrite`,
+              "  each with lens_edit if it still serves the task, or lens_unmark it if it doesn't.",
+            ]
+          : []),
         "End with ONE line for the user: what changed in the view, or `View unchanged: <why>`.",
         "</system-reminder>",
       ].join("\n")
@@ -170,6 +205,8 @@ export const layer = Layer.effect(
       const reached = entries.filter((e) => e.op === "milestone" && e.seq > (change?.seq ?? -1))
       const next = input.todos.find((t) => t.status === "in_progress" || t.status === "pending")
       const edited = files.length ? `Files you edited since the last Lens change: ${files.join(", ")}.` : undefined
+      const active = reached.length ? yield* ApertureLensStore.getActive(ctx.directory) : undefined
+      const whys = active ? staleWhys(active, yield* ApertureLensHistory.read(ctx.directory, { lens: active.id })) : []
       if (reached.length)
         return {
           key: `milestone:${reached[reached.length - 1].seq}`,
@@ -180,6 +217,12 @@ export const layer = Layer.effect(
             next ? `Next todo: "${next.content}".` : "No todos remain.",
             "Before continuing, bring your Lens in line with the task in one or two Lens calls:",
             '- mark the part you finished so the user can verify it (kind "diff", globbed to its files),',
+            ...(whys.length
+              ? [
+                  "- rewrite the why (lens_edit) of each concern that still applies to what comes next — its what stays:",
+                  ...whys.map((w) => `    ■ ${w.facet.id}: why was "${w.facet.why || "(none)"}"`),
+                ]
+              : []),
             "- lens_unmark your concerns that only served the finished part (the history keeps them),",
             ...(next ? ["- mark what the next todo will touch, if you already know."] : []),
             "Keep one Lens for the task; don't start a new Lens per todo. Then continue the task.",
@@ -272,16 +315,21 @@ export const layer = Layer.effect(
           '- After changing code, prefer marks that let the user VERIFY the change: kind "diff" (every line',
           '  you changed), or a pattern narrowed with changed:"HEAD" ("every call to x() this change',
           '  touched"). Use author/since when the question is about who or when.',
-          "- Every concern carries a REASON (`facetReason`): one sentence on how its query helps the user",
-          "  understand the current task. It is required when you mint a concern; update it with lens_edit",
-          "  when the task moves and the concern stays.",
+          "- Every concern carries a WHAT and a WHY. `what` is what the marked lines are, as a phrase a",
+          '  newcomer can picture ("every place a failed request is re-queued"), and it is the concern\'s',
+          "  identity: keep it. `why` is why to look at those lines for the task right now. As the task moves",
+          "  from understanding to changing to verifying, rewrite the why with lens_edit rather than minting",
+          "  a new concern. Correct a what only if it misdescribes the lines; if the intent changes, mint a",
+          "  new concern and lens_unmark the old one. Both are required when you mint a concern.",
+          "- When a concern has more than one rule, give each rule a `note` saying which part it marks",
+          '  ("the definition", "callers outside src/net"). It is what the user sees on a marked line\'s hover.',
           "- In chat, write a concern as ■ followed by its id, e.g. ■ retry-path. The user's view paints the",
           "  square in the concern's exact colour, linking your prose to the marks, so write the token",
-          "  instead of naming the colour. Whenever you create a concern or change its reason, say so in",
-          '  one sentence with the token and the reason, e.g. "I marked ■ retry-path: every place a failed',
-          "  request re-enters the queue, which is where the duplicate send has to start.\" When",
-          "  explaining, refer to concerns by token.",
-          "- Always pass `reason` (why this call, distinct from the concern's reason). Every change is",
+          "  instead of naming the colour. Whenever you create a concern or rewrite its why, say so in one",
+          '  sentence as token: what — why, e.g. "I marked ■ retry-path: every place a failed request is',
+          "  re-queued — the duplicate send has to start in one of these.\" When explaining, refer to",
+          "  concerns by token.",
+          "- Always pass `reason` (why this call, distinct from the concern's why). Every change is",
           "  recorded in a Lens history the user reviews, tied to the turn that made it.",
           "- Switch the view to your Lens (activate:true, or lens_select) when the active Lens is also",
           "  yours or there is none. Never switch away from the user's own Lens unasked.",

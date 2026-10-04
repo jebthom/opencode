@@ -16,7 +16,7 @@ import {
 } from "solid-js"
 import { Dynamic } from "solid-js/web"
 import { hexToRgba, type LegendEntry } from "@tui/feature-plugins/system/aperture-colors"
-import { facetTokenRenderer, FACET_TOKEN } from "@tui/feature-plugins/system/aperture-tokens"
+import { tintFacetBlocks, FACET_TOKEN } from "@tui/feature-plugins/system/aperture-tokens"
 import path from "path"
 import { useRoute, useRouteData } from "@tui/context/route"
 import { useProject } from "@tui/context/project"
@@ -25,7 +25,14 @@ import { useEvent } from "@tui/context/event"
 import { SplitBorder } from "@tui/component/border"
 import { Spinner } from "@tui/component/spinner"
 import { generateSubtleSyntax, selectedForeground, useTheme } from "@tui/context/theme"
-import { BoxRenderable, ScrollBoxRenderable, addDefaultParsers, TextAttributes, RGBA } from "@opentui/core"
+import {
+  BoxRenderable,
+  ScrollBoxRenderable,
+  addDefaultParsers,
+  TextAttributes,
+  RGBA,
+  type Renderable,
+} from "@opentui/core"
 import { Prompt, type PromptRef } from "@tui/component/prompt"
 import type {
   AssistantMessage,
@@ -249,13 +256,13 @@ export function Session() {
   const showTimestamps = createMemo(() => timestamps() === "show")
   // Aperture top bar: hidden for subagent sessions and very short terminals,
   // where the fixed-height strip would crowd out the conversation. The floor tracks the
-  // bar's own TOP_BAR_HEIGHT (17 since v3.1 added the detail region, its spacing and the legend
-  // rule) plus a couple of rows so the conversation is never reduced to nothing — move it if
+  // bar's own TOP_BAR_HEIGHT (18 since the detail region grew to three rows — what, why, query —
+  // plus its spacing and the legend rule) plus a couple of rows so the conversation is never reduced to nothing — move it if
   // that constant moves. Deliberately not imported: this route doesn't otherwise depend on
   // the plugin, which owns its own height.
   const apertureVisible = createMemo(() => {
     if (session()?.parentID) return false
-    if (dimensions().height < 20) return false
+    if (dimensions().height < 21) return false
     return aperture() === "show"
   })
   const contentWidth = createMemo(() => dimensions().width - (sidebarVisible() ? 42 : 0) - 4)
@@ -1777,11 +1784,11 @@ function ReasoningHeader(props: {
 function TextPart(props: { last: boolean; part: TextPart; message: AssistantMessage }) {
   const ctx = use()
   const { theme, syntax } = useTheme()
-  // Only a message that names a facet pays for renderNode, which turns off opentui's in-place
-  // block updates while streaming.
-  const renderNode = createMemo(() =>
-    props.part.text.includes(FACET_TOKEN) ? facetTokenRenderer(ctx.legend()) : undefined,
-  )
+  // Only a message that names a facet walks its blocks each frame. Not a renderNode: that turns off
+  // opentui's in-place block updates, which makes streamed text flicker.
+  const tintFacets = function (this: Renderable) {
+    tintFacetBlocks(this, ctx.legend())
+  }
   return (
     <Show when={props.part.text.trim()}>
       <box id={"text-" + props.part.id} paddingLeft={3} marginTop={1} flexShrink={0}>
@@ -1792,7 +1799,7 @@ function TextPart(props: { last: boolean; part: TextPart; message: AssistantMess
           content={props.part.text.trim()}
           tableOptions={{ style: "grid" }}
           conceal={ctx.conceal()}
-          renderNode={renderNode()}
+          renderAfter={props.part.text.includes(FACET_TOKEN) ? tintFacets : undefined}
           fg={theme.markdownText}
           bg={theme.background}
         />
@@ -2633,13 +2640,19 @@ function Skill(props: ToolProps<typeof SkillTool>) {
   )
 }
 
-// A lens_mark / lens_unmark / lens_edit call as the concerns it touched: `■ Label · detail · reason`
+// A lens_mark / lens_unmark / lens_edit call as the concerns it touched: `■ Label · detail · what`
+// (an edit shows the why instead, since rewriting it is what an edit is mostly for)
 // with the ■ in the concern's exact colour — the current legend's, or the colour it had when the
 // call ran if it has since been removed. A refusal falls back to the tool's own title.
 function LensTool(props: ToolProps<any>) {
   const { theme } = useTheme()
   const ctx = use()
-  const concerns = createMemo((): ReadonlyArray<LegendEntry & { reason: string }> => props.metadata.concerns ?? [])
+  // `reason` is the single field tool calls recorded before what/why split; it read as a what.
+  const concerns = createMemo(
+    (): ReadonlyArray<LegendEntry & { what?: string; why?: string; reason?: string }> => props.metadata.concerns ?? [],
+  )
+  const gloss = (concern: { what?: string; why?: string; reason?: string }) =>
+    props.tool === "lens_edit" && concern.why ? `why: ${concern.why}` : (concern.what ?? concern.reason)
   const color = (concern: LegendEntry) =>
     hexToRgba(ctx.legend().find((e) => e.facet === concern.facet)?.color ?? concern.color)
   const detail = () => {
@@ -2669,9 +2682,9 @@ function LensTool(props: ToolProps<any>) {
             <span style={{ fg: theme.text, bold: true }}>{concern.label}</span>
             {" · "}
             {detail()}
-            <Show when={concern.reason}>
+            <Show when={gloss(concern)}>
               {" · "}
-              {concern.reason}
+              {gloss(concern)}
             </Show>
           </InlineTool>
         )}

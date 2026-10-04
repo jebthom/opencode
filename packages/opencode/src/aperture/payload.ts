@@ -7,13 +7,15 @@ import { Schema } from "effect"
 // hit, so the surfaces need only two reads — the whole-repo facet map, and one file's line tags.
 
 // The active Lens's legend, so a renderer paints facets → colours and draws the swatch row
-// without any hard-coded vocabulary. `reason` (how the facet helps with the task) and `queries`
-// (its rules, as readable one-liners) are what the hover surfaces explain a facet with.
+// without any hard-coded vocabulary. `what` (what the marked lines are), `why` (why they matter
+// for the task now) and `queries` (its rules, as readable one-liners) are what the hover surfaces
+// explain a facet with.
 export const LegendEntry = Schema.Struct({
   facet: Schema.String,
   label: Schema.String,
   color: Schema.String,
-  reason: Schema.String,
+  what: Schema.String,
+  why: Schema.String,
   queries: Schema.Array(Schema.String),
 })
 export type LegendEntry = typeof LegendEntry.Type

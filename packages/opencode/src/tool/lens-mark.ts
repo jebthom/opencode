@@ -104,19 +104,27 @@ export const Parameters = Schema.Struct({
   }),
   note: Schema.optional(Schema.String).annotate({
     description: [
-      "One line on WHY these lines matter, shown to the user on hover. This is where your judgement",
-      "lives — the finder can only match text, so 'this is the retry path' has to be said here.",
+      "Which part of the concern THIS rule marks, shown on the hover of every line it marks:",
+      "'the definition', 'callers outside src/net', 'the test that pins the old behaviour'.",
+      "REQUIRED when the concern already has a rule — it is the only thing that tells two lines of",
+      "one concern apart. Optional on a concern's first rule, if the query doesn't explain itself.",
     ].join(" "),
   }),
-  definition: Schema.optional(Schema.String).annotate({
-    description: "One-line definition of the concern for the legend. Used only when minting a new concern.",
-  }),
-  facetReason: Schema.optional(Schema.String).annotate({
+  what: Schema.optional(Schema.String).annotate({
     description: [
-      "One sentence on how this concern helps the user understand the CURRENT TASK — not what the",
-      "lines are (that is `definition`), but why looking at them matters now: 'every caller that",
-      "must handle the new error type'. The user sees it beside the query whenever they hover the",
-      "concern. REQUIRED when minting a concern; given for an existing one, it replaces the reason.",
+      "WHAT the marked lines are, as a phrase a newcomer can picture: 'every place a failed request",
+      "is re-queued'. Don't repeat the label. This is the concern's identity: it should never need to",
+      "change. REQUIRED when minting a concern. Given for an existing concern, it CORRECTS a what that",
+      "misdescribes the lines (pass `reason`); if the concern's intent has changed, mint a new concern",
+      "and lens_unmark this one instead.",
+    ].join(" "),
+  }),
+  why: Schema.optional(Schema.String).annotate({
+    description: [
+      "WHY to look at these lines for the task right now. In an overview, how it fits: 'every other",
+      "concern builds on these types, so read them first'. During a change, what to do or check:",
+      "'each must handle the new TimeoutError'. REQUIRED when minting a concern; given for an",
+      "existing one, it replaces the why (lens_edit also does this). Keep what + why under ~120 characters.",
     ].join(" "),
   }),
   about: Schema.optional(Schema.String).annotate({
@@ -124,7 +132,7 @@ export const Parameters = Schema.Struct({
   }),
   reason: Schema.optional(Schema.String).annotate({
     description: [
-      "Why you are making this change now (this call, not the concern — see `facetReason`),",
+      "Why you are making this change now (this call, not the concern — see `why`),",
       "recorded in the Lens history the user can review.",
       "Always give one when curating on your own initiative.",
     ].join(" "),
@@ -211,8 +219,8 @@ export const LensMarkTool = Tool.define(
           const input = {
             lens: params.lens,
             facet: params.facet,
-            ...(params.definition ? { definition: params.definition } : {}),
-            ...(params.facetReason ? { facetReason: params.facetReason } : {}),
+            ...(params.what ? { what: params.what } : {}),
+            ...(params.why ? { why: params.why } : {}),
             ...(params.about ? { about: params.about } : {}),
             find: finder,
             ...(filter ? { where: filter } : {}),
@@ -293,15 +301,34 @@ export const LensMarkTool = Tool.define(
                   "Either add this rule to one of the concerns above, or free a slot with lens_unmark.",
                 ].join("\n"),
               }
-            case "needs-reason":
+            case "needs-what-why":
+              return {
+                title: "What and why required",
+                metadata,
+                output: [
+                  `Nothing was marked: "${result.facet}" is a new concern, and a new concern needs ${result.missing.map((m) => `\`${m}\``).join(" and ")}.`,
+                  "`what` says what the marked lines are; `why` says why to look at them for the task now.",
+                  "The user reads both beside the query whenever they hover the concern. Call lens_mark again with them.",
+                ].join("\n"),
+              }
+            case "needs-note":
+              return {
+                title: "Note required",
+                metadata,
+                output: [
+                  `Nothing was marked: "${result.facet.label}" already has a rule, so this one needs a \`note\` saying`,
+                  "which part of the concern it marks ('the definition', 'callers outside src/net'). It is the only",
+                  "thing that tells two lines of one concern apart on hover. Call lens_mark again with it.",
+                  "",
+                  `Rules on "${result.facet.label}":`,
+                  ...ruleLines(result.lens, result.facet.id),
+                ].join("\n"),
+              }
+            case "needs-justification":
               return {
                 title: "Reason required",
                 metadata,
-                output: [
-                  `Nothing was marked: "${result.facet}" is a new concern, and a new concern needs a \`facetReason\` —`,
-                  "one sentence on how these lines help the user understand the current task. The user reads it",
-                  "beside the query whenever they hover the concern. Call lens_mark again with it.",
-                ].join("\n"),
+                output: correctionRefusal(result.facet, result.fields),
               }
             case "rule-cap":
               yield* log("rejected-cap")
@@ -337,6 +364,9 @@ export const LensMarkTool = Tool.define(
                     `Marked ${diagnostic.hits} lines across ${diagnostic.files} files as "${facet.label}" [${facet.id}] (${swatch})`,
                     `on Lens "${lens.name}" [${lens.id}]${result.createdLens ? " — created by this call" : ""}.`,
                     `In chat, write it as ■ ${facet.id}; the user's view paints the square in its colour.`,
+                    ...(result.minted
+                      ? [`Tell the user in one sentence: ■ ${facet.id}: ${facet.what} — ${facet.why}`]
+                      : []),
                   ]
 
               return {
@@ -390,17 +420,37 @@ export const LensMarkTool = Tool.define(
 )
 
 // The concerns a call touched, as the chat renders them: `■ Label` in the concern's exact colour,
-// then its reason. Snapshotted into tool metadata so a removed concern still renders in the colour
+// then its what. Snapshotted into tool metadata so a removed concern still renders in the colour
 // it had.
 export interface Concern {
   readonly facet: string
   readonly label: string
   readonly color: string
-  readonly reason: string
+  readonly what: string
+  readonly why: string
 }
 
 export function concernsOf(facets: ReadonlyArray<Facet>): Concern[] {
-  return facets.map((f) => ({ facet: f.id, label: f.label, color: f.color, reason: f.reason }))
+  return facets.map((f) => ({ facet: f.id, label: f.label, color: f.color, what: f.what, why: f.why }))
+}
+
+// One concern's rules, one per line, with their notes — so an agent asked for a note can see what
+// the existing rules already cover.
+function ruleLines(lens: Pick<Lens, "rules">, facet: string): string[] {
+  return (lens.rules ?? [])
+    .filter((r) => r.facet === facet)
+    .map((r) => `  - ${describeFinder(r.find, r.where)}${r.note ? ` — ${r.note}` : " — (no note)"}`)
+}
+
+// The refusal for an identity change without a reason. Shared with lens_edit, the other way to
+// correct a concern.
+export function correctionRefusal(facet: string, fields: ReadonlyArray<"label" | "what">): string {
+  return [
+    `Nothing was changed: you changed the ${fields.join(" and ")} of "${facet}", which is the concern's identity.`,
+    "If it misdescribed the lines its rules mark, that is a correction: call again with `reason` saying what",
+    "was wrong. If the concern's intent has changed, mint a new concern with lens_mark and lens_unmark this",
+    "one instead — the user knows it by its colour, so it must not quietly come to mean something else.",
+  ].join("\n")
 }
 
 // The Lens's concerns, one per line — shipped on success AND on every refusal. See
@@ -411,7 +461,8 @@ export function rosterLines(lens: Pick<Lens, "facets" | "rules">): string[] {
   return roster.flatMap((c) => [
     `  - ${c.label} [${c.facet}] ${c.color} ${c.colorName} — ${c.rules} rule${c.rules === 1 ? "" : "s"}` +
       (c.owner === "user" ? " (the user's — ask before changing)" : " (yours)"),
-    `      reason: ${c.reason || "(none — give one with lens_edit facetReason)"}`,
+    `      what: ${c.what || "(none)"}`,
+    `      why:  ${c.why || "(none — give one with lens_edit)"}`,
   ])
 }
 

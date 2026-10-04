@@ -59,6 +59,10 @@ export interface Entry {
   readonly lens: { readonly id: string; readonly name: string }
   readonly facet?: string
   readonly rule?: string
+  // Set on "facet.edit" entries: which of the facet's fields changed. Staleness checks look for
+  // "why" here — a corrected `what` is identity, not a sign the facet was brought up to date.
+  // Entries written before this field existed are facet.edits of the old single `reason`.
+  readonly fields?: ReadonlyArray<"label" | "what" | "why">
   // Snapshots of the thing that changed, so the state at any point can be reconstructed by replay
   // and a removal still says what was removed.
   readonly before?: Snapshot

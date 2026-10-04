@@ -2,9 +2,10 @@ import {
   CodeRenderable,
   TextAttributes,
   TextTableRenderable,
-  type MarkdownOptions,
+  type OnChunksCallback,
   type Renderable,
   type TextChunk,
+  type TextTableContent,
 } from "@opentui/core"
 import { hexToRgba, type LegendEntry } from "./aperture-colors"
 
@@ -14,26 +15,45 @@ import { hexToRgba, type LegendEntry } from "./aperture-colors"
 // bar's detail region uses. Unknown names are left alone, so a stray ■ is just a ■.
 //
 // opentui's markdown only lets a caller replace whole top-level blocks (`renderNode`), not inline
-// tokens, so this keeps the default rendering and hooks the styled chunks it produces: every
-// paragraph, heading and list item is a CodeRenderable whose `onChunks` runs after highlighting
-// and conceal, and the text buffer is built from what it returns. Tables are tinted cell by cell.
+// tokens, and a `renderNode` makes it destroy and rebuild the changed block on every streamed
+// delta. A fresh streaming block draws nothing until its async highlight lands, so the reply
+// flickers. Instead this runs as the markdown's `renderAfter`: after the markdown has settled its
+// blocks for the frame and before any child renders, it hooks the styled chunks of each paragraph,
+// heading and list item (a CodeRenderable whose `onChunks` runs after highlighting and conceal) and
+// tints table cells. opentui updates blocks in place, so a hook stays on until the block is
+// replaced, and a replacement is hooked before its first highlight.
 
 export const FACET_TOKEN = "■"
 
-export function facetTokenRenderer(legend: ReadonlyArray<LegendEntry>): NonNullable<MarkdownOptions["renderNode"]> {
-  return (token, context) => {
-    if (!token.raw.includes(FACET_TOKEN)) return undefined
-    const node = context.defaultRender()
-    if (!node) return undefined
-    // A table's cells are chunks already, set once at construction.
-    if (node instanceof TextTableRenderable)
-      node.content = node.content.map((row) => row.map((cell) => cell && tintFacetTokens(cell, legend)))
-    codeRenderables(node).forEach((code) => {
-      const prior = code.onChunks
-      code.onChunks = async (chunks, ctx) => tintFacetTokens((await prior?.(chunks, ctx)) ?? chunks, legend)
-    })
-    return node
+const hooked = new WeakMap<
+  CodeRenderable,
+  { legend: ReadonlyArray<LegendEntry>; prior?: OnChunksCallback; hook: OnChunksCallback }
+>()
+const tinted = new WeakMap<TextTableRenderable, { legend: ReadonlyArray<LegendEntry>; content: TextTableContent }>()
+
+export function tintFacetBlocks(node: Renderable, legend: ReadonlyArray<LegendEntry>) {
+  if (node instanceof CodeRenderable) {
+    if (!node.content.includes(FACET_TOKEN)) return
+    const state = hooked.get(node)
+    if (state && state.legend === legend && node.onChunks === state.hook) return
+    // A hook from an earlier legend wraps the markdown's own callback (link detection); keep that.
+    const prior = state && node.onChunks === state.hook ? state.prior : node.onChunks
+    const hook: OnChunksCallback = async (chunks, ctx) =>
+      tintFacetTokens((await prior?.(chunks, ctx)) ?? chunks, legend)
+    hooked.set(node, { legend, prior, hook })
+    node.onChunks = hook
+    return
   }
+  // A table's cells are chunks already; markdown replaces `content` whenever the table changes.
+  if (node instanceof TextTableRenderable) {
+    const state = tinted.get(node)
+    if (state && state.legend === legend && state.content === node.content) return
+    const content = node.content.map((row) => row.map((cell) => cell && tintFacetTokens(cell, legend)))
+    tinted.set(node, { legend, content })
+    node.content = content
+    return
+  }
+  node.getChildren().forEach((child) => tintFacetBlocks(child as Renderable, legend))
 }
 
 export function tintFacetTokens(chunks: TextChunk[], legend: ReadonlyArray<LegendEntry>): TextChunk[] {
@@ -83,9 +103,4 @@ function restyle(chunks: TextChunk[], spans: Span[]): TextChunk[] {
       }
     })
   })
-}
-
-function codeRenderables(node: Renderable): CodeRenderable[] {
-  if (node instanceof CodeRenderable) return [node]
-  return node.getChildren().flatMap((child) => codeRenderables(child as Renderable))
 }

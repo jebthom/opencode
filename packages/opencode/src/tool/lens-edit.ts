@@ -2,10 +2,10 @@ import { Effect, Schema } from "effect"
 import { Aperture } from "@/aperture/aperture"
 import * as Tool from "./tool"
 import { slugify } from "@/aperture/lenses"
-import { concernsOf, rosterLines, type Concern } from "./lens-mark"
+import { concernsOf, correctionRefusal, rosterLines, type Concern } from "./lens-mark"
 import { actorOf, withConsent } from "./lens-consent"
 
-// Rename a Lens, or relabel/redefine its concerns. Changes no rule, so nothing is re-derived and
+// Rename a Lens, rewrite its concerns' whys, or correct their labels and whats. Changes no rule, so nothing is re-derived and
 // the marks stay exactly where they are. Concerns are added and removed only by lens_mark and
 // lens_unmark, which is what keeps every concern backed by at least one rule.
 
@@ -23,18 +23,30 @@ export const Parameters = Schema.Struct({
     Schema.Array(
       Schema.Struct({
         facet: Schema.String.annotate({ description: "Existing concern id or label." }),
-        label: Schema.optional(Schema.String).annotate({ description: "New legend label." }),
-        description: Schema.optional(Schema.String).annotate({ description: "New one-line definition." }),
-        facetReason: Schema.optional(Schema.String).annotate({
-          description: "New reason: one sentence on how this concern helps the user understand the current task.",
+        why: Schema.optional(Schema.String).annotate({
+          description: [
+            "New why: why to look at these lines for the task NOW. Rewrite it when the task moves on",
+            "(understand → change → verify) and the concern still applies, for a different purpose.",
+          ].join(" "),
+        }),
+        what: Schema.optional(Schema.String).annotate({
+          description: [
+            "Corrected what — ONLY when the current one misdescribes the lines the concern's rules mark",
+            "(requires `reason`). If the concern's intent has changed, mint a new concern with lens_mark",
+            "and lens_unmark this one instead.",
+          ].join(" "),
+        }),
+        label: Schema.optional(Schema.String).annotate({
+          description: "Corrected legend label — a fix, not a new intent (requires `reason`).",
         }),
       }),
     ),
   ).annotate({
-    description: "Concerns to relabel, redefine or re-reason. Concerns not listed are unchanged.",
+    description: "Concerns to update. Concerns not listed are unchanged.",
   }),
   reason: Schema.optional(Schema.String).annotate({
-    description: "Why you are making this change, recorded in the Lens history the user can review.",
+    description:
+      "Why you are making this change, recorded in the Lens history the user can review. Required when correcting a concern's what or label.",
   }),
   requestedByUser: Schema.optional(Schema.Boolean).annotate({
     description: "True ONLY when the user explicitly asked for this edit in this conversation.",
@@ -48,9 +60,10 @@ export const LensEditTool = Tool.define(
 
     return {
       description: [
-        "Rename an Aperture Lens, change its palette, or relabel/redefine its concerns. Free, and the",
-        "marks do not move. To add or remove a concern use lens_mark / lens_unmark. Editing one of the",
-        "user's own Lenses asks them first.",
+        "Rename an Aperture Lens, change its palette, or update its concerns: rewrite a concern's `why`",
+        "as the task moves on (the common case), or correct a `what`/label that misdescribes the lines.",
+        "A concern's what is its identity — for a new intent, mint a new concern with lens_mark. Free,",
+        "and the marks do not move. Editing one of the user's own Lenses asks them first.",
       ].join(" "),
       parameters: Parameters,
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
@@ -67,8 +80,8 @@ export const LensEditTool = Tool.define(
                   facets: params.facets.map((f) => ({
                     ref: f.facet,
                     ...(f.label ? { label: f.label } : {}),
-                    ...(f.description ? { description: f.description } : {}),
-                    ...(f.facetReason ? { reason: f.facetReason } : {}),
+                    ...(f.what ? { what: f.what } : {}),
+                    ...(f.why ? { why: f.why } : {}),
                   })),
                 }
               : {}),
@@ -92,6 +105,12 @@ export const LensEditTool = Tool.define(
                 title: "Not changed",
                 metadata,
                 output: `"${result.lens.name}" belongs to the user, and the edit was not approved.`,
+              }
+            case "needs-justification":
+              return {
+                title: "Reason required",
+                metadata,
+                output: correctionRefusal(result.facet, result.fields),
               }
             case "unknown-facet":
               return {

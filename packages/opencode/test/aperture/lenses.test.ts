@@ -34,11 +34,11 @@ const LENS: Lens = {
     {
       id: "retry-path",
       label: "retry-path",
-      description: "the retry path",
-      reason: "where the bug starts",
+      what: "every retry call",
+      why: "where the bug starts",
       owner: "user",
     },
-    { id: "backoff", label: "Backoff", description: "backoff math", reason: "", owner: "agent", createdBy: "build" },
+    { id: "backoff", label: "Backoff", what: "", why: "", owner: "agent", createdBy: "build" },
   ]),
   rules: [{ id: "retry-path-abc", facet: "retry-path", find: { kind: "pattern", pattern: "withRetry\\(" } }],
 }
@@ -111,8 +111,8 @@ describe("aperture lenses — palettes", () => {
 
   test("assignColors pairs new facets with palette colours in order", () => {
     const out = assignColors("categorical", [
-      { id: "a", label: "A", description: "first", reason: "", owner: "user" },
-      { id: "b", label: "B", description: "second", reason: "", owner: "agent" },
+      { id: "a", label: "A", what: "", why: "", owner: "user" },
+      { id: "b", label: "B", what: "", why: "", owner: "agent" },
     ])
     expect(out.map((t) => t.color)).toEqual([PALETTES.categorical.colors[0], PALETTES.categorical.colors[1]])
   })
@@ -120,7 +120,7 @@ describe("aperture lenses — palettes", () => {
   // Colour is pinned: the chat and every surface name a concern by its colour, so a removal must
   // not re-hue the survivors, and the freed slot goes to the next facet minted.
   test("survivors keep their colours and a new facet takes the lowest free slot", () => {
-    const facet = (id: string) => ({ id, label: id, description: "", reason: "", owner: "user" as const })
+    const facet = (id: string) => ({ id, label: id, what: "", why: "", owner: "user" as const })
     const three = assignColors("categorical", [facet("a"), facet("b"), facet("c")])
     const without = assignColors(
       "categorical",
@@ -135,8 +135,8 @@ describe("aperture lenses — palettes", () => {
     const facet = (id: string, color: string) => ({
       id,
       label: id,
-      description: "",
-      reason: "",
+      what: "",
+      why: "",
       owner: "user" as const,
       color,
     })
@@ -168,16 +168,17 @@ describe("aperture lenses — helpers", () => {
     expect(findFacet(LENS, "nope")).toBeUndefined()
   })
 
-  test("legend exposes facet/label/colour, the reason and the rules as queries", () => {
+  test("legend exposes facet/label/colour, the what, the why and the rules as queries", () => {
     expect(legend(LENS)).toEqual([
       {
         facet: "retry-path",
         label: "retry-path",
         color: LENS.facets[0]!.color,
-        reason: "where the bug starts",
+        what: "every retry call",
+        why: "where the bug starts",
         queries: ["pattern /withRetry\\(/"],
       },
-      { facet: "backoff", label: "Backoff", color: LENS.facets[1]!.color, reason: "", queries: [] },
+      { facet: "backoff", label: "Backoff", color: LENS.facets[1]!.color, what: "", why: "", queries: [] },
     ])
   })
 
@@ -197,7 +198,8 @@ describe("aperture lenses — helpers", () => {
         colorName: "crimson",
         owner: "user",
         rules: 1,
-        reason: "where the bug starts",
+        what: "every retry call",
+        why: "where the bug starts",
       },
       {
         facet: "backoff",
@@ -206,7 +208,8 @@ describe("aperture lenses — helpers", () => {
         colorName: "amber",
         owner: "agent",
         rules: 0,
-        reason: "",
+        what: "",
+        why: "",
       },
     ])
     for (const hex of PALETTES.categorical.colors) expect(COLOR_NAMES[hex]).toBeTruthy()

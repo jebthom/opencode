@@ -1,51 +1,51 @@
 {
-  "aperture-extension-0d1d9055": {
-    "id": "aperture-extension-0d1d9055",
+  "aperture-extension-cd23d5cd": {
+    "id": "aperture-extension-cd23d5cd",
     "name": "Aperture Extension",
-    "description": "Marks for Aperture Extension.",
+    "description": "Core architecture, features, and integration of the Aperture visualization system",
     "palette": "categorical",
     "facets": [
       {
         "id": "lens-data-model",
         "label": "lens-data-model",
-        "description": "Pure TypeScript types for Lens, Facet, Rule, and Finder patterns",
-        "reason": "Core domain model; dependency-free and shared across server, TUI, and VSCode",
+        "what": "Core domain types for Lenses, Facets, Rules, and Finders",
+        "why": "Understanding the data structures at the heart of the marking system",
         "color": "#D7005F",
         "owner": "agent",
         "createdBy": "build"
       },
       {
-        "id": "rule-evaluation-engine",
-        "label": "rule-evaluation-engine",
-        "description": "Evaluates pattern, symbol, diff, and structural rules against repository files",
-        "reason": "Where deterministic marking happens; handles git integration and memoization for performance",
+        "id": "rule-evaluation",
+        "label": "rule-evaluation",
+        "what": "Rule evaluation engine for patterns, symbols, and git diffs",
+        "why": "How rules find and match lines in the codebase",
         "color": "#AF5F00",
         "owner": "agent",
         "createdBy": "build"
       },
       {
-        "id": "lens-persistence",
-        "label": "lens-persistence",
-        "description": "Read-modify-write store with ownership enforcement, consent checks, and history recording",
-        "reason": "How Lenses are mutated safely; enforces user/agent ownership model and records audit trail",
+        "id": "aperture-service",
+        "label": "aperture-service",
+        "what": "Main Effect service orchestrating all Lens operations",
+        "why": "Central hub coordinating reads, mutations, and events across the system",
         "color": "#AFAF00",
         "owner": "agent",
         "createdBy": "build"
       },
       {
-        "id": "activity-tracking",
-        "label": "activity-tracking",
-        "description": "Derives per-turn agent activity (reads, edits, searches) from message store and active Lens",
-        "reason": "Enables visualization of agent work; live derivation from message store, recolored on Lens switch",
+        "id": "storage-persistence",
+        "label": "storage-persistence",
+        "what": "Persistent store with mutex-guarded mutations, migrations, and history",
+        "why": "How lenses are safely stored, loaded, and tracked over time",
         "color": "#00875F",
         "owner": "agent",
         "createdBy": "build"
       },
       {
-        "id": "color-system",
-        "label": "color-system",
-        "description": "xterm-256 color palette contract; categorical and ordinal palettes with pinned facet colors",
-        "reason": "Ensures color consistency across server, TUI, and VSCode; C1 contract prevents color drift",
+        "id": "vscode-gutter-paint",
+        "label": "vscode-gutter-paint",
+        "what": "VSCode gutter rendering, decorations, and hovers for marked lines",
+        "why": "How the marks are visualized in the editor",
         "owner": "agent",
         "createdBy": "build",
         "color": "#00AFD7"
@@ -64,42 +64,47 @@
         "createdBy": "build"
       },
       {
-        "id": "rule-evaluation-engine-d1381766",
-        "facet": "rule-evaluation-engine",
+        "id": "rule-evaluation-d1381766",
+        "facet": "rule-evaluation",
         "find": {
           "kind": "symbol",
           "name": "evaluate",
           "path": "packages/opencode/src/aperture/rules.ts"
         },
+        "note": "Main evaluation logic",
         "createdBy": "build"
       },
       {
-        "id": "lens-persistence-dd4e7fba",
-        "facet": "lens-persistence",
+        "id": "aperture-service-c6e17a72",
+        "facet": "aperture-service",
         "find": {
           "kind": "symbol",
-          "name": "mark",
-          "path": "packages/opencode/src/aperture/lens-store.ts"
+          "name": "Service",
+          "path": "packages/opencode/src/aperture/aperture.ts"
         },
+        "note": "Main service class",
         "createdBy": "build"
       },
       {
-        "id": "activity-tracking-c730f9e3",
-        "facet": "activity-tracking",
-        "find": {
-          "kind": "symbol",
-          "name": "deriveTurns",
-          "path": "packages/opencode/src/aperture/activity-model.ts"
-        },
-        "createdBy": "build"
-      },
-      {
-        "id": "color-system-359f855c",
-        "facet": "color-system",
+        "id": "storage-persistence-46a5927e",
+        "facet": "storage-persistence",
         "find": {
           "kind": "pattern",
-          "pattern": "CATEGORICAL_PALETTE|ORDINAL_PALETTE|COLOR_NAMES",
-          "path": "packages/opencode/src/aperture/lenses.ts"
+          "pattern": "export \\* as ApertureLensStore",
+          "path": "packages/opencode/src/aperture"
+        },
+        "note": "Store namespace export",
+        "createdBy": "build"
+      },
+      {
+        "id": "vscode-gutter-paint-ddf181d7",
+        "facet": "vscode-gutter-paint",
+        "find": {
+          "kind": "pattern",
+          "pattern": "gutter|decoration|TextEditor|repaint",
+          "glob": [
+            "sdks/aperture-vscode/src/**/*.ts"
+          ]
         },
         "createdBy": "build"
       }

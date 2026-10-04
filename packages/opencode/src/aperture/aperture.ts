@@ -74,9 +74,9 @@ export interface MarkLensInput {
   readonly lens: string
   // The concern: an existing facet id/label (add another rule to it) or a new name (mint it).
   readonly facet: string
-  readonly definition?: string
-  // How the concern helps the user understand the task (`Facet.reason`).
-  readonly facetReason?: string
+  // What the marked lines are and why they matter now (`Facet.what` / `Facet.why`).
+  readonly what?: string
+  readonly why?: string
   // Lens description, used only when this call creates the Lens.
   readonly about?: string
   readonly find: Finder
@@ -515,8 +515,8 @@ export const layer = Layer.effect(
       // painted, so the agent can narrow it or drop it deliberately.
       const mark: ApertureLensStore.MarkInput = {
         facet: input.facet,
-        ...(input.definition ? { definition: input.definition } : {}),
-        ...(input.facetReason ? { facetReason: input.facetReason } : {}),
+        ...(input.what ? { what: input.what } : {}),
+        ...(input.why ? { why: input.why } : {}),
         find: input.find,
         ...(input.where ? { where: input.where } : {}),
         ...(input.note ? { note: input.note } : {}),

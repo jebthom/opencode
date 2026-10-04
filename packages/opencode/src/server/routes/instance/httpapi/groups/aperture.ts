@@ -59,6 +59,8 @@ const HistoryEntry = Schema.Struct({
   lens: Schema.Struct({ id: Schema.String, name: Schema.String }),
   facet: Schema.optional(Schema.String),
   rule: Schema.optional(Schema.String),
+  // Set on "facet.edit" entries: which of the facet's fields changed.
+  fields: Schema.optional(Schema.Array(Schema.Literals(["label", "what", "why"]))),
   // Set on "milestone" entries: the completed todo and its position in the todo list.
   milestone: Schema.optional(Schema.Struct({ todo: Schema.String, index: Schema.Int })),
   // Snapshots of what changed: `{ lens }`, `{ facet, rules? }`, `{ rule }`, or on a milestone

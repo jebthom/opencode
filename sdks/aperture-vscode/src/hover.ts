@@ -9,28 +9,38 @@ export type HoverLegendEntry = {
   facet: string
   label: string
   color: string
-  reason?: string
+  what?: string
+  why?: string
   queries?: ReadonlyArray<string>
 }
 
-// The tags covering one line: which facet, and the query of the rule that marked it.
-export type HoverTag = { facet?: string; query?: string }
+// The tags covering one line: which facet, the query of the rule that marked it, and that rule's
+// note (which part of the concern it marks).
+export type HoverTag = { facet?: string; query?: string; note?: string }
 
 export function swatch(hex: string): string {
   return `<span style="color:${hex};">■</span>`
 }
 
-// Every facet on a line, in legend order: `■ Label — reason`, then the queries of the rules that
-// marked THIS line (not every rule on the facet — the gutter answers "why is this line here").
+// Every facet on a line, in legend order: `■ Label — what`, then `Why: why`, then the rules that
+// marked THIS line (not every rule on the facet — the gutter answers "why is this line here"), each
+// as its query and note.
 export function lineHover(tags: ReadonlyArray<HoverTag>, legend: ReadonlyArray<HoverLegendEntry>): string {
   return legend
     .filter((entry) => tags.some((t) => t.facet === entry.facet))
     .map((entry) => {
-      const queries = [...new Set(tags.filter((t) => t.facet === entry.facet && t.query).map((t) => t.query!))]
-      const reason = entry.reason ? ` — ${escapeMarkdown(entry.reason)}` : ""
+      const rules = [
+        ...new Set(
+          tags
+            .filter((t) => t.facet === entry.facet && t.query)
+            .map((t) => `\`${t.query!.replaceAll("`", "'")}\`` + (t.note ? ` — ${escapeMarkdown(t.note)}` : "")),
+        ),
+      ]
+      const what = entry.what ? ` — ${escapeMarkdown(entry.what)}` : ""
       return [
-        `${swatch(entry.color)} **${escapeMarkdown(entry.label)}**${reason}`,
-        ...queries.map((q) => `\`${q.replaceAll("`", "'")}\``),
+        `${swatch(entry.color)} **${escapeMarkdown(entry.label)}**${what}`,
+        ...(entry.why ? [`*Why:* ${escapeMarkdown(entry.why)}`] : []),
+        ...rules,
       ].join("  \n")
     })
     .join("\n\n")
