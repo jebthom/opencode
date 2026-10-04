@@ -396,11 +396,13 @@ describe("chipTooltip", () => {
         { f: 0, l: 12 },
         { f: 1, l: 3 },
       ]),
-    ).toBe("Parsing 12 lines · Server 3 lines")
+    ).toBe(
+      '<span style="color:#4E79A7;">■</span> Parsing 12 lines · <span style="color:#F28E2B;">■</span> Server 3 lines',
+    )
   })
 
   test("one line is singular", () => {
-    expect(chipTooltip(FACETS, LEGEND, [{ f: 1, l: 1 }])).toBe("Server 1 line")
+    expect(chipTooltip(FACETS, LEGEND, [{ f: 1, l: 1 }])).toBe('<span style="color:#F28E2B;">■</span> Server 1 line')
   })
 
   test("no marks is an empty breakdown", () => {

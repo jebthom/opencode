@@ -1,6 +1,7 @@
 import * as vscode from "vscode"
 import type { ChipLayout } from "./chip"
 import * as ops from "./commands"
+import { lineHover, type HoverLegendEntry } from "./hover"
 import { ChipIcons, type IconDelivery } from "./icons"
 import { buildModel, type FacetFile, type FacetFiles, type TreeModel } from "./model"
 import { ApertureOpenEditors } from "./open-editors"
@@ -121,7 +122,7 @@ export function activate(context: vscode.ExtensionContext) {
   }
 
   // A marked line range. `hue` is the server's resolution of `facet` against the legend.
-  type LineTag = { startLine: number; endLine: number; facet?: string; hue?: string; note?: string }
+  type LineTag = { startLine: number; endLine: number; facet?: string; hue?: string; query?: string; note?: string }
 
   // The colour a tag's stripe paints, honouring the legend filter (PLAN O4): the filtered legend
   // swaps a suppressed facet to the muted hue, and `hue` is the fallback for a facet the legend
@@ -165,11 +166,21 @@ export function activate(context: vscode.ExtensionContext) {
       for (let line = tag.startLine - 1; line <= tag.endLine - 1; line++) if (line >= 0) hueByLine.set(line, hue)
     }
 
-    // One range per line, so each line carries exactly one bar in its resolved hue.
-    const rangesByColor = new Map<string, vscode.Range[]>()
+    // One range per line, so each line carries exactly one bar in its resolved hue. The range
+    // spans the line's text because VSCode raises a decoration's hover over text only, never
+    // over its gutter icon; the hover lists every facet on the line, not just the one that won
+    // the bar.
+    const rangesByColor = new Map<string, vscode.DecorationOptions[]>()
     for (const [line, hue] of hueByLine) {
+      if (line >= editor.document.lineCount) continue
+      const markdown = lineHover(
+        lineTags.filter((t) => t.startLine - 1 <= line && line <= t.endLine - 1),
+        facetLegend,
+      )
+      const hover = new vscode.MarkdownString(markdown)
+      hover.supportHtml = true
       const list = rangesByColor.get(hue) ?? []
-      list.push(new vscode.Range(line, 0, line, 0))
+      list.push({ range: editor.document.lineAt(line).range, ...(markdown ? { hoverMessage: hover } : {}) })
       rangesByColor.set(hue, list)
     }
 
@@ -557,10 +568,13 @@ export function activate(context: vscode.ExtensionContext) {
     const uri = vscode.Uri.joinPath(folder.uri, relPath)
     const at = line !== undefined && line > 0 ? new vscode.Position(line - 1, 0) : undefined
     try {
-      await vscode.window.showTextDocument(uri, {
+      const editor = await vscode.window.showTextDocument(uri, {
         preview: false,
         ...(at ? { selection: new vscode.Range(at, at) } : {}),
       })
+      // An editor that was already open keeps its scroll position under a new selection, so
+      // centre the first mark explicitly.
+      if (at) editor.revealRange(new vscode.Range(at, at), vscode.TextEditorRevealType.InCenterIfOutsideViewport)
     } catch {
       // file may have moved/been deleted — ignore.
     }
@@ -570,6 +584,8 @@ export function activate(context: vscode.ExtensionContext) {
   function handleEvent(evt: { type?: string; properties?: any }) {
     if (evt.type === "tui.file.open" && typeof evt.properties?.path === "string") {
       void revealFile(evt.properties.path, typeof evt.properties.line === "number" ? evt.properties.line : undefined)
+    } else if (evt.type === "tui.directory.reveal" && typeof evt.properties?.path === "string") {
+      void revealInTree(evt.properties.path, { expand: true, show: true })
     } else if (evt.type === "aperture.invalidated") {
       scheduleRepaint()
       scheduleFacetMap()
@@ -794,4 +810,4 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-export type LegendEntry = { facet: string; label: string; color: string }
+export type LegendEntry = HoverLegendEntry

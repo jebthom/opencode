@@ -9,6 +9,8 @@
 // to "an SVG string", so it is unit-testable (test/chip.test.ts) and the layout can be
 // swapped without touching the tree.
 
+import { swatch } from "./hover"
+
 export type ChipLayout = "bar6" | "bar-proportional" | "mosaic6"
 export type Theme = "light" | "dark"
 
@@ -340,12 +342,17 @@ export function chipKey(segments: ReadonlyArray<Segment>, layout: ChipLayout): s
 }
 
 // The hover text: marked lines per facet — the exact counts the chip necessarily rounds to whole
-// cells, and the number a user asking "how much of this is here" wants anyway.
+// cells, and the number a user asking "how much of this is here" wants anyway — each behind a ■
+// in the colour its chip cell paints. HTML: the MarkdownString needs `supportHtml`.
 export function chipTooltip(
   facets: ReadonlyArray<string>,
   legend: ReadonlyArray<LegendEntry>,
   marks: ReadonlyArray<{ f: number; l: number }> | undefined,
 ): string {
-  const labelOf = (index: number) => legend.find((e) => e.facet === facets[index])?.label ?? facets[index] ?? "?"
-  return (marks ?? []).map((m) => `${labelOf(m.f)} ${m.l} line${m.l === 1 ? "" : "s"}`).join(" · ")
+  return (marks ?? [])
+    .map((m) => {
+      const entry = legend.find((e) => e.facet === facets[m.f])
+      return `${swatch(hexFor(entry?.color))} ${entry?.label ?? facets[m.f] ?? "?"} ${m.l} line${m.l === 1 ? "" : "s"}`
+    })
+    .join(" · ")
 }

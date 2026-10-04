@@ -121,6 +121,7 @@ export class ApertureTree implements vscode.TreeDataProvider<Node>, vscode.TreeD
 
     const breakdown = chipTooltip(facets, legend, this.ctx.model().marks(node.rel, node.dir))
     const tooltip = new vscode.MarkdownString()
+    tooltip.supportHtml = true
     tooltip.appendMarkdown(`**${node.name}**\n\n${breakdown}`)
     item.tooltip = tooltip
     return item
