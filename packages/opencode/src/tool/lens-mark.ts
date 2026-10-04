@@ -1,6 +1,7 @@
 import { Effect, Schema } from "effect"
 import { Aperture } from "@/aperture/aperture"
 import {
+  type Facet,
   type Finder,
   type GitFilter,
   type Lens,
@@ -176,6 +177,7 @@ export const LensMarkTool = Tool.define(
             minted?: boolean
             createdLens?: boolean
             overCap?: boolean
+            concerns?: Concern[]
           } = {}
           // Assemble the finder from the flat params, then validate — so a missing field is
           // reported as prose the agent can act on rather than as a decode failure.
@@ -334,6 +336,7 @@ export const LensMarkTool = Tool.define(
                 : [
                     `Marked ${diagnostic.hits} lines across ${diagnostic.files} files as "${facet.label}" [${facet.id}] (${swatch})`,
                     `on Lens "${lens.name}" [${lens.id}]${result.createdLens ? " — created by this call" : ""}.`,
+                    `In chat, write it as ■ ${facet.id}; the user's view paints the square in its colour.`,
                   ]
 
               return {
@@ -349,6 +352,7 @@ export const LensMarkTool = Tool.define(
                   minted: result.minted,
                   createdLens: result.createdLens,
                   overCap: diagnostic.overCap === true,
+                  concerns: concernsOf([facet]),
                 }),
                 output: [
                   ...head,
@@ -384,6 +388,20 @@ export const LensMarkTool = Tool.define(
     }
   }),
 )
+
+// The concerns a call touched, as the chat renders them: `■ Label` in the concern's exact colour,
+// then its reason. Snapshotted into tool metadata so a removed concern still renders in the colour
+// it had.
+export interface Concern {
+  readonly facet: string
+  readonly label: string
+  readonly color: string
+  readonly reason: string
+}
+
+export function concernsOf(facets: ReadonlyArray<Facet>): Concern[] {
+  return facets.map((f) => ({ facet: f.id, label: f.label, color: f.color, reason: f.reason }))
+}
 
 // The Lens's concerns, one per line — shipped on success AND on every refusal. See
 // `concernRoster` for why.

@@ -3,7 +3,7 @@ import { Aperture } from "@/aperture/aperture"
 import { MAX_FACETS } from "@/aperture/lenses"
 import * as StudyLog from "@/aperture/study-log"
 import * as Tool from "./tool"
-import { rosterLines } from "./lens-mark"
+import { concernsOf, rosterLines, type Concern } from "./lens-mark"
 import { actorOf, withConsent } from "./lens-consent"
 
 // Remove a rule, or a whole concern, from an Aperture Lens — the counterpart to lens_mark, and the
@@ -51,7 +51,7 @@ export const LensUnmarkTool = Tool.define(
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
         Effect.gen(function* () {
           // One metadata shape across every return, as lens_facet_files does.
-          const metadata: { lens?: string; removed?: number; facet?: string } = {}
+          const metadata: { lens?: string; removed?: number; facet?: string; concerns?: Concern[] } = {}
           // Exactly one target. Both or neither is a genuine ambiguity about what to delete, and
           // guessing at a destructive operation is the wrong default.
           if (!params.rule === !params.facet)
@@ -132,6 +132,9 @@ export const LensUnmarkTool = Tool.define(
                   lens: lens.id,
                   removed: removedRules.length,
                   ...(removedFacet ? { facet: removedFacet.id } : {}),
+                  concerns: concernsOf(
+                    removedFacet ? [removedFacet] : lens.facets.filter((f) => f.id === removedRules[0]?.facet),
+                  ),
                 }),
                 output: [
                   removedFacet

@@ -3,6 +3,7 @@ import {
   createContext,
   createEffect,
   createMemo,
+  createResource,
   createSignal,
   For,
   Match,
@@ -14,6 +15,8 @@ import {
   useContext,
 } from "solid-js"
 import { Dynamic } from "solid-js/web"
+import { hexToRgba, type LegendEntry } from "@tui/feature-plugins/system/aperture-colors"
+import { facetTokenRenderer, FACET_TOKEN } from "@tui/feature-plugins/system/aperture-tokens"
 import path from "path"
 import { useRoute, useRouteData } from "@tui/context/route"
 import { useProject } from "@tui/context/project"
@@ -170,6 +173,7 @@ const context = createContext<{
   showGenericToolOutput: () => boolean
   diffWrapMode: () => "word" | "none"
   providers: () => ReadonlyMap<string, Provider>
+  legend: () => ReadonlyArray<LegendEntry>
   sync: ReturnType<typeof useSync>
   tui: ReturnType<typeof useTuiConfig>
 }>()
@@ -261,6 +265,33 @@ export function Session() {
   const toast = useToast()
   const sdk = useSDK()
   const editor = useEditorContext()
+
+  // The active Lens's legend, so chat can paint facet tokens and lens tool rows in each facet's
+  // exact colour. A concern removed since keeps the colour the session's last lens tool call
+  // recorded for it, so earlier prose still links to it. Compared by value: aperture.invalidated
+  // also fires on file-watcher events, and a new legend rebuilds every message that names a facet.
+  const [facetMap, { refetch: refetchFacetMap }] = createResource(
+    () => route.sessionID,
+    async () => (await sdk.client.aperture.facetMap({}, { throwOnError: true })).data?.lens?.legend ?? [],
+  )
+  event.on("aperture.invalidated", () => refetchFacetMap())
+  const legend = createMemo(
+    () => {
+      const past = messages()
+        .flatMap((m) => sync.data.part[m.id] ?? [])
+        .flatMap((p): LegendEntry[] =>
+          p.type === "tool" && p.tool.startsWith("lens_") && p.state.status === "completed"
+            ? ((p.state.metadata?.concerns as LegendEntry[] | undefined) ?? [])
+            : [],
+        )
+        .toReversed()
+      return [...(facetMap.latest ?? []), ...past]
+        .filter((e, i, all) => all.findIndex((x) => x.facet === e.facet) === i)
+        .map((e) => ({ facet: e.facet, label: e.label, color: e.color }))
+    },
+    [],
+    { equals: (a, b) => JSON.stringify(a) === JSON.stringify(b) },
+  )
 
   createEffect(() => {
     const sessionID = route.sessionID
@@ -1233,6 +1264,7 @@ export function Session() {
           showGenericToolOutput,
           diffWrapMode,
           providers,
+          legend,
           sync,
           tui: tuiConfig,
         }}
@@ -1745,6 +1777,11 @@ function ReasoningHeader(props: {
 function TextPart(props: { last: boolean; part: TextPart; message: AssistantMessage }) {
   const ctx = use()
   const { theme, syntax } = useTheme()
+  // Only a message that names a facet pays for renderNode, which turns off opentui's in-place
+  // block updates while streaming.
+  const renderNode = createMemo(() =>
+    props.part.text.includes(FACET_TOKEN) ? facetTokenRenderer(ctx.legend()) : undefined,
+  )
   return (
     <Show when={props.part.text.trim()}>
       <box id={"text-" + props.part.id} paddingLeft={3} marginTop={1} flexShrink={0}>
@@ -1755,6 +1792,7 @@ function TextPart(props: { last: boolean; part: TextPart; message: AssistantMess
           content={props.part.text.trim()}
           tableOptions={{ style: "grid" }}
           conceal={ctx.conceal()}
+          renderNode={renderNode()}
           fg={theme.markdownText}
           bg={theme.background}
         />
@@ -1840,6 +1878,9 @@ function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMess
         </Match>
         <Match when={props.part.tool === "skill"}>
           <Skill {...toolprops} />
+        </Match>
+        <Match when={["lens_mark", "lens_unmark", "lens_edit"].includes(props.part.tool)}>
+          <LensTool {...toolprops} />
         </Match>
         <Match when={true}>
           <GenericTool {...toolprops} />
@@ -2589,6 +2630,53 @@ function Skill(props: ToolProps<typeof SkillTool>) {
     <InlineTool icon="→" pending="Loading skill..." complete={props.input.name} part={props.part}>
       Skill "{props.input.name}"
     </InlineTool>
+  )
+}
+
+// A lens_mark / lens_unmark / lens_edit call as the concerns it touched: `■ Label · detail · reason`
+// with the ■ in the concern's exact colour — the current legend's, or the colour it had when the
+// call ran if it has since been removed. A refusal falls back to the tool's own title.
+function LensTool(props: ToolProps<any>) {
+  const { theme } = useTheme()
+  const ctx = use()
+  const concerns = createMemo((): ReadonlyArray<LegendEntry & { reason: string }> => props.metadata.concerns ?? [])
+  const color = (concern: LegendEntry) =>
+    hexToRgba(ctx.legend().find((e) => e.facet === concern.facet)?.color ?? concern.color)
+  const detail = () => {
+    if (props.tool === "lens_unmark") return props.metadata.facet ? "removed" : "rule removed"
+    if (props.tool === "lens_edit") return "edited"
+    if (props.metadata.overCap) return `too broad: ${props.metadata.hits} lines, not painted`
+    return `${props.metadata.hits} lines in ${props.metadata.files} file${props.metadata.files === 1 ? "" : "s"}`
+  }
+  const title = () => (props.part.state.status === "completed" ? props.part.state.title : props.tool)
+  return (
+    <Show
+      when={props.part.state.status === "completed" && concerns().length > 0}
+      fallback={
+        <InlineTool
+          icon="⚙"
+          pending="Updating the Lens..."
+          complete={props.part.state.status !== "pending"}
+          part={props.part}
+        >
+          {props.tool} · {title()}
+        </InlineTool>
+      }
+    >
+      <For each={concerns()}>
+        {(concern) => (
+          <InlineTool icon={FACET_TOKEN} iconColor={color(concern)} pending="" complete={true} part={props.part}>
+            <span style={{ fg: theme.text, bold: true }}>{concern.label}</span>
+            {" · "}
+            {detail()}
+            <Show when={concern.reason}>
+              {" · "}
+              {concern.reason}
+            </Show>
+          </InlineTool>
+        )}
+      </For>
+    </Show>
   )
 }
 

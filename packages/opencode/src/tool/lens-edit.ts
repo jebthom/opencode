@@ -1,7 +1,8 @@
 import { Effect, Schema } from "effect"
 import { Aperture } from "@/aperture/aperture"
 import * as Tool from "./tool"
-import { rosterLines } from "./lens-mark"
+import { slugify } from "@/aperture/lenses"
+import { concernsOf, rosterLines, type Concern } from "./lens-mark"
 import { actorOf, withConsent } from "./lens-consent"
 
 // Rename a Lens, or relabel/redefine its concerns. Changes no rule, so nothing is re-derived and
@@ -55,7 +56,7 @@ export const LensEditTool = Tool.define(
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
         Effect.gen(function* () {
           // One metadata shape across every return, as the other lens tools do.
-          const metadata: { lens?: string } = {}
+          const metadata: { lens?: string; concerns?: Concern[] } = {}
           const input = {
             lens: params.lens,
             ...(params.name ? { name: params.name } : {}),
@@ -104,7 +105,14 @@ export const LensEditTool = Tool.define(
             case "ok":
               return {
                 title: `Edited ${result.lens.name}`,
-                metadata: Object.assign(metadata, { lens: result.lens.id }),
+                metadata: Object.assign(metadata, {
+                  lens: result.lens.id,
+                  concerns: concernsOf(
+                    result.lens.facets.filter((f) =>
+                      params.facets?.some((e) => [f.id, f.label].includes(e.facet) || slugify(e.facet) === f.id),
+                    ),
+                  ),
+                }),
                 output: [
                   `Updated "${result.lens.name}" [${result.lens.id}].`,
                   ...(result.written
