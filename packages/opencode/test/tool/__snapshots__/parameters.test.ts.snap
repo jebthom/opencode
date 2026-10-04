@@ -186,6 +186,10 @@ exports[`tool parameters JSON Schema (wire shape) lens_mark 1`] = `
       "description": "The concern these lines belong to, kebab-case: 'retry-path', 'any-casts', 'feature-flag-reads'. An existing facet id or label adds another rule to that concern; a new name mints one (up to 6 per Lens). NEVER a generic name like 'hit', 'match' or 'result' — this is what the user reads in the legend, so it has to say what the lines have in common.",
       "type": "string",
     },
+    "facetReason": {
+      "description": "One sentence on how this concern helps the user understand the CURRENT TASK — not what the lines are (that is \`definition\`), but why looking at them matters now: 'every caller that must handle the new error type'. The user sees it beside the query whenever they hover the concern. REQUIRED when minting a concern; given for an existing one, it replaces the reason.",
+      "type": "string",
+    },
     "glob": {
       "description": "Repo-relative globs restricting the search, e.g. ['packages/*/src/**/*.ts']. The cheapest way to narrow a rule that matched too much.",
       "items": {
@@ -228,7 +232,7 @@ exports[`tool parameters JSON Schema (wire shape) lens_mark 1`] = `
       "type": "string",
     },
     "reason": {
-      "description": "Why you are making this change now, recorded in the Lens history the user can review. Always give one when curating on your own initiative.",
+      "description": "Why you are making this change now (this call, not the concern — see \`facetReason\`), recorded in the Lens history the user can review. Always give one when curating on your own initiative.",
       "type": "string",
     },
     "ref": {

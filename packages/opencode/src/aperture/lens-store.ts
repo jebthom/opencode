@@ -15,6 +15,7 @@ import {
   MAX_RULES,
   assignColors,
   findFacet,
+  repaletteColors,
   isValidFinder,
   slugify,
   whereProblem,
@@ -115,8 +116,9 @@ function resolveOwner(stored: unknown): Owner {
 // someone chose. Anything without an explicit owner predates ownership and is conservatively the
 // user's.
 //
-// Facet colour is re-derived from (palette, position) on every read so PALETTES stays the only
-// place a colour is decided.
+// A stored facet colour is kept when it belongs to the palette and no earlier facet holds it;
+// anything else (a hand-edit, a pre-pinning file whose colours were positional anyway) gets the
+// lowest free slot. So PALETTES still decides every colour, but a facet keeps its own.
 function migrate(raw: Record<string, unknown>): Lens {
   const palette = resolvePalette(raw["palette"])
   const rawRules = Array.isArray(raw["rules"]) ? (raw["rules"] as Array<Record<string, unknown>>) : []
@@ -132,6 +134,8 @@ function migrate(raw: Record<string, unknown>): Lens {
         id: f["id"] as string,
         label: typeof f["label"] === "string" ? f["label"] : (f["id"] as string),
         description: typeof f["description"] === "string" ? f["description"] : "",
+        reason: typeof f["reason"] === "string" ? f["reason"] : "",
+        ...(typeof f["color"] === "string" ? { color: f["color"] } : {}),
         owner: resolveOwner(f["owner"]),
         ...(typeof f["createdBy"] === "string" ? { createdBy: f["createdBy"] } : {}),
       })),
@@ -306,6 +310,9 @@ export interface MarkInput {
   readonly facet: string
   // Legend definition for a newly-minted concern. Ignored when the facet already exists.
   readonly definition?: string
+  // How the concern helps the user understand the task (`Facet.reason`). Required when an agent
+  // mints a concern; given for an existing one, it replaces the reason.
+  readonly facetReason?: string
   readonly find: Finder
   readonly where?: GitFilter
   readonly note?: string
@@ -333,6 +340,15 @@ export type MarkResult =
   | Refusal
   | { readonly status: "facet-cap"; readonly lens: Lens; readonly max: number }
   | { readonly status: "rule-cap"; readonly lens: Lens; readonly max: number }
+  // An agent tried to mint a concern without saying how it helps. Nothing was written.
+  | { readonly status: "needs-reason"; readonly facet: string }
+
+// An agent must say why a concern it mints is worth the user's attention: the reason is what every
+// hover surface shows beside the query, and an empty one leaves the user to guess. A user marking
+// from the TUI is not asked.
+function reasonMissing(actor: Actor, input: MarkInput): boolean {
+  return actor.agent !== undefined && !input.facetReason?.trim()
+}
 
 // Create a Lens together with its first concern and rule, in one write. Creation and the first
 // mark are the same call on purpose: create-then-mark would persist a facet-less Lens between the
@@ -341,11 +357,13 @@ export const create = (directory: string, input: CreateInput, actor: Actor): Eff
   withDoc(
     directory,
     Effect.gen(function* () {
+      if (reasonMissing(actor, input)) return { status: "needs-reason" as const, facet: input.facet.trim() }
       const facet = assignColors("categorical", [
         {
           id: slugify(input.facet),
           label: input.facet.trim(),
           description: input.definition?.trim() || `Lines matched by the "${input.facet.trim()}" rules.`,
+          reason: input.facetReason?.trim() ?? "",
           owner: actor.kind,
           ...(actor.agent ? { createdBy: actor.agent } : {}),
         },
@@ -391,21 +409,27 @@ export const mark = (directory: string, id: string, input: MarkInput, actor: Act
       if (consentNeeded(actor, prev, existing)) return { status: "needs-consent" as const, lens: prev, facet: existing }
       if (!existing && prev.facets.length >= MAX_FACETS)
         return { status: "facet-cap" as const, lens: prev, max: MAX_FACETS }
+      if (!existing && reasonMissing(actor, input))
+        return { status: "needs-reason" as const, facet: input.facet.trim() }
 
       const label = input.facet.trim()
+      const reason = input.facetReason?.trim()
+      // A new reason on an existing concern is an edit to it, recorded as one below.
+      const rereasoned = existing && reason && reason !== existing.reason ? { ...existing, reason } : undefined
       const facets = existing
-        ? prev.facets
+        ? prev.facets.map((t) => (t.id === rereasoned?.id ? rereasoned : t))
         : assignColors(prev.palette, [
             ...prev.facets,
             {
               id: uniqueFacetId(prev.facets, label),
               label,
               description: input.definition?.trim() || `Lines matched by the "${label}" rules.`,
+              reason: reason ?? "",
               owner: actor.kind,
               ...(actor.agent ? { createdBy: actor.agent } : {}),
             },
           ])
-      const facet = existing ?? facets[facets.length - 1]!
+      const facet = rereasoned ?? existing ?? facets[facets.length - 1]!
       const rule = buildRule(facet.id, input, actor)
       const rules = [...(prev.rules ?? [])]
       const at = rules.findIndex((r) => r.id === rule.id)
@@ -424,6 +448,18 @@ export const mark = (directory: string, id: string, input: MarkInput, actor: Act
           ...(existing
             ? []
             : [{ op: "facet.add" as const, actor, lens: ref(next), facet: facet.id, after: { facet } }]),
+          ...(rereasoned
+            ? [
+                {
+                  op: "facet.edit" as const,
+                  actor,
+                  lens: ref(next),
+                  facet: facet.id,
+                  before: { facet: existing! },
+                  after: { facet: rereasoned },
+                },
+              ]
+            : []),
           ruleEntry(replaced ? "rule.replace" : "rule.add", actor, next, rule, input.hits, replaced),
         ])
       return {
@@ -480,15 +516,6 @@ export type UnmarkResult =
       readonly lens: Lens
       readonly removedRules: ReadonlyArray<Rule>
       readonly removedFacet?: Facet
-      // Facets whose hue moved as a consequence. Facet colour is derived from array position, so
-      // removing anything but the last facet re-hues every facet after it. Reported rather than
-      // prevented: the caller must tell the user.
-      readonly recolored: ReadonlyArray<{
-        readonly facet: string
-        readonly label: string
-        readonly from: string
-        readonly to: string
-      }>
       readonly written: boolean
     }
   | Refusal
@@ -522,18 +549,10 @@ export const unmark = (
       if (consentNeeded(actor, prev, owning)) return { status: "needs-consent" as const, lens: prev, facet: owning }
 
       const removedRules = target ? prevRules.filter((r) => r.facet === target.id) : [victim!]
-      const facets = target
-        ? assignColors(
-            prev.palette,
-            prev.facets.filter((t) => t.id !== target.id),
-          )
-        : prev.facets
+      // The survivors keep their colours; the removed facet's slot is free for the next mint.
+      const facets = target ? prev.facets.filter((t) => t.id !== target.id) : prev.facets
       const removedIds = new Set(removedRules.map((r) => r.id))
       const rules = prevRules.filter((r) => !removedIds.has(r.id))
-      const before = new Map(prev.facets.map((t) => [t.id, t.color]))
-      const recolored = facets
-        .filter((t) => before.get(t.id) !== t.color)
-        .map((t) => ({ facet: t.id, label: t.label, from: before.get(t.id)!, to: t.color }))
 
       const next: Lens = { ...prev, facets, rules: rules.length ? rules : undefined }
       project[id] = next
@@ -565,7 +584,6 @@ export const unmark = (
         lens: next,
         removedRules,
         ...(target ? { removedFacet: target } : {}),
-        recolored,
         written,
       }
     }),
@@ -577,7 +595,12 @@ export interface UpdateInput {
   readonly palette?: PaletteId
   // Relabel or redefine existing facets, by id or label. Facets are added and removed only by
   // mark/unmark, which is what keeps every facet backed by at least one rule.
-  readonly facets?: ReadonlyArray<{ readonly ref: string; readonly label?: string; readonly description?: string }>
+  readonly facets?: ReadonlyArray<{
+    readonly ref: string
+    readonly label?: string
+    readonly description?: string
+    readonly reason?: string
+  }>
 }
 
 export type UpdateResult =
@@ -607,7 +630,8 @@ export const update = (directory: string, id: string, input: UpdateInput, actor:
 
       const byId = new Map(edits.map((e) => [e.facet!.id, e.edit]))
       const palette = input.palette ?? prev.palette
-      const facets = assignColors(
+      const facets = repaletteColors(
+        prev.palette,
         palette,
         prev.facets.map((t) => {
           const edit = byId.get(t.id)
@@ -616,6 +640,7 @@ export const update = (directory: string, id: string, input: UpdateInput, actor:
                 ...t,
                 label: edit.label?.trim() || t.label,
                 description: edit.description?.trim() || t.description,
+                reason: edit.reason?.trim() || t.reason,
               }
             : t
         }),

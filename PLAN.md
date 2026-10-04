@@ -90,13 +90,39 @@ completed after the turn's last Lens change.
   at 9 rows, horizontal scroll), the consent prompt's rendering, and an end-to-end build-agent
   task that curates a Lens across several turns.
 
+## v3.1 milestones (triaged 2026-10-04)
+
+**Reason** is a new per-facet field: one sentence on how the facet's query helps the user understand
+the current task. It is separate from `Facet.description` (what the facet is), `Rule.note` (why a rule
+exists) and `actor.reason` (why a call was made).
+
+**Exact-colour invariant.** Colour is the point of the interface, so every surface renders a facet in
+its exact palette hex, taken from the server's facet `color`. No surface keeps its own colour table,
+and approximations such as emoji squares are not allowed. The palette uses xterm-256 values, so
+256-colour terminals show them exactly.
+
+**Deprecated for now:** all Lens-history UI. That covers a sidebar history list, preview-then-adopt
+of a past Lens (with a diff of reasons, queries and groups), and milestone step-through. The data and
+route stay; open decision #3 stays open.
+
+| Milestone | Scope |
+| --- | --- |
+| **M1 Data foundation** — *done* | `Facet.reason`: lens_mark's `facetReason` sets it, and an agent must give one when it mints a concern (`needs-reason` otherwise). A user marking from the TUI is not asked. Passing it for an existing concern replaces it as a `facet.edit`, and lens_edit `facets[].facetReason` revises it. Every legend entry (`/aperture/facets`, `/aperture/lines`, activity) carries `reason` and `queries` (the facet's rules via `describeFinder`), and each line tag carries its rule's `query`. The SDK is regenerated. **Stable colours:** `assignColors` keeps a facet's stored colour and gives new facets the lowest free slot, so a removal no longer re-hues the survivors, and `lens_unmark` no longer reports a recolour. A palette switch keeps each facet's slot (`repaletteColors`). The `<aperture>` prompt asks for name, colour word and Reason in chat; M3 adds the colour token. `<aperture-state>` and the tool roster list each reason. |
+| **M2 TUI surfaces** | The top bar gets a reserved 2–3 row detail region, with no pop-ups. When idle it shows affordance hints. Hovering a legend entry or a containment `■` shows the full name, queries and Reason. File tiles keep `describeFile`. The sidebar replaces proportional bands with containment squares (one `■` per facet present, `□` when unmarked), matching the top bar's group headers. Sidebar file opens pass the first marked line. The grid layout and density get a live check (open decision #6). |
+| **M3 Chat** | Spike opentui `renderNode` in `TextPart`. Add a colour-token helper: the agent writes a facet token, which renders as `■ Label` with the `■` in exact hex. Add a custom chat renderer for lens_mark, lens_unmark and lens_edit (`■ Label · N lines · reason`). The prompt asks the agent to refer to facets by name and token. |
+| **M4 VSCode** | Line hover through `DecorationOptions.hoverMessage`, listing every facet on the line with its name, queries and Reason. VSCode shows hovers over line text, not over the gutter icon. Tree chip tooltip gets exact-hex `■` and names. Revealing a file calls `revealRange(InCenterIfOutsideViewport)` to centre the first mark. Handle `tui.directory.reveal`. |
+| **M5 Live end-to-end** | Consent prompt rendering. A multi-turn, multi-part build task (open decision #7) that checks the Reason and colour tokens appear in chat and that colours match across all surfaces. Settle open decisions #1, #2 and #4. |
+
+Order: M1 comes first. After it, M2, M3 and M4 can be done in any order. M5 comes last. S1b (#5) is
+still deferred.
+
 ## Open decisions
 
 | # | Decision | Notes |
 | --- | --- | --- |
 | 1 | Whether the per-turn `<aperture-state>` reminder should also carry hit counts | Needs the Aperture service in `SystemPrompt`; today it carries rule counts only. |
 | 2 | Whether an agent may add its own concern to a user's Lens without consent | Currently no: any change to a user-owned Lens asks. Revisit if it proves noisy. |
-| 3 | History UI in the sidebar / explorer | Data and route exist (`/aperture/history`); no surface renders it yet. `milestone` entries carry a full Lens snapshot, so a "step through the task's parts" review view is a pure replay. |
+| 3 | History UI in the sidebar / explorer — **deprecated for v3.1** | Data and route exist (`/aperture/history`); no surface renders it yet. `milestone` entries carry a full Lens snapshot, so a "step through the task's parts" review view is a pure replay. |
 | 7 | Milestone nudge tuning | The nudge threshold (3 files) and whether a nudge should also fire on `in_progress` transitions (to mark the *next* part up front) have not been checked in a live multi-part session. |
 | 4 | `since` semantics | Uses `git blame --since` (commit-date boundary). Author date may be what users expect. |
 | 5 | S1b — the ast-grep structural backend | Unchanged from sprint 2: stored, reported as unsupported. |

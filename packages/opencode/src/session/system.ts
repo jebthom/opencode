@@ -78,7 +78,8 @@ export const layer = Layer.effect(
               .map(
                 (c) =>
                   `${c.label} [${c.facet}] ${c.colorName}, ${c.rules} rule${c.rules === 1 ? "" : "s"}` +
-                  (c.owner === "user" ? ", the user's" : ""),
+                  (c.owner === "user" ? ", the user's" : "") +
+                  ` (reason: ${c.reason || "none"})`,
               )
               .join("; ")
           : "no concerns"
@@ -271,8 +272,14 @@ export const layer = Layer.effect(
           '- After changing code, prefer marks that let the user VERIFY the change: kind "diff" (every line',
           '  you changed), or a pattern narrowed with changed:"HEAD" ("every call to x() this change',
           '  touched"). Use author/since when the question is about who or when.',
-          "- Always pass `reason`. Every change is recorded in a Lens history the user reviews, tied to",
-          "  the turn that made it.",
+          "- Every concern carries a REASON (`facetReason`): one sentence on how its query helps the user",
+          "  understand the current task. It is required when you mint a concern; update it with lens_edit",
+          "  when the task moves and the concern stays. Whenever you create a concern or change its reason,",
+          '  say so in the chat in one sentence with its name, colour and reason, e.g. "I marked',
+          "  retry-path (amber): every place a failed request re-enters the queue, which is where the",
+          '  duplicate send has to start." When explaining, refer to concerns by name and colour.',
+          "- Always pass `reason` (why this call, distinct from the concern's reason). Every change is",
+          "  recorded in a Lens history the user reviews, tied to the turn that made it.",
           "- Switch the view to your Lens (activate:true, or lens_select) when the active Lens is also",
           "  yours or there is none. Never switch away from the user's own Lens unasked.",
           '- Concerns marked "the user\'s" belong to the user. Never change or remove them on your own',

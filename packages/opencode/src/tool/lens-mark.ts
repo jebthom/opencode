@@ -110,12 +110,21 @@ export const Parameters = Schema.Struct({
   definition: Schema.optional(Schema.String).annotate({
     description: "One-line definition of the concern for the legend. Used only when minting a new concern.",
   }),
+  facetReason: Schema.optional(Schema.String).annotate({
+    description: [
+      "One sentence on how this concern helps the user understand the CURRENT TASK — not what the",
+      "lines are (that is `definition`), but why looking at them matters now: 'every caller that",
+      "must handle the new error type'. The user sees it beside the query whenever they hover the",
+      "concern. REQUIRED when minting a concern; given for an existing one, it replaces the reason.",
+    ].join(" "),
+  }),
   about: Schema.optional(Schema.String).annotate({
     description: "One line describing the Lens. Used only when this call creates it.",
   }),
   reason: Schema.optional(Schema.String).annotate({
     description: [
-      "Why you are making this change now, recorded in the Lens history the user can review.",
+      "Why you are making this change now (this call, not the concern — see `facetReason`),",
+      "recorded in the Lens history the user can review.",
       "Always give one when curating on your own initiative.",
     ].join(" "),
   }),
@@ -201,6 +210,7 @@ export const LensMarkTool = Tool.define(
             lens: params.lens,
             facet: params.facet,
             ...(params.definition ? { definition: params.definition } : {}),
+            ...(params.facetReason ? { facetReason: params.facetReason } : {}),
             ...(params.about ? { about: params.about } : {}),
             find: finder,
             ...(filter ? { where: filter } : {}),
@@ -279,6 +289,16 @@ export const LensMarkTool = Tool.define(
                   ...rosterLines(result.lens),
                   "",
                   "Either add this rule to one of the concerns above, or free a slot with lens_unmark.",
+                ].join("\n"),
+              }
+            case "needs-reason":
+              return {
+                title: "Reason required",
+                metadata,
+                output: [
+                  `Nothing was marked: "${result.facet}" is a new concern, and a new concern needs a \`facetReason\` —`,
+                  "one sentence on how these lines help the user understand the current task. The user reads it",
+                  "beside the query whenever they hover the concern. Call lens_mark again with it.",
                 ].join("\n"),
               }
             case "rule-cap":
@@ -370,11 +390,11 @@ export const LensMarkTool = Tool.define(
 export function rosterLines(lens: Pick<Lens, "facets" | "rules">): string[] {
   const roster = concernRoster(lens)
   if (roster.length === 0) return ["  (none yet — nothing is marked)"]
-  return roster.map(
-    (c) =>
-      `  - ${c.label} [${c.facet}] ${c.color} ${c.colorName} — ${c.rules} rule${c.rules === 1 ? "" : "s"}` +
+  return roster.flatMap((c) => [
+    `  - ${c.label} [${c.facet}] ${c.color} ${c.colorName} — ${c.rules} rule${c.rules === 1 ? "" : "s"}` +
       (c.owner === "user" ? " (the user's — ask before changing)" : " (yours)"),
-  )
+    `      reason: ${c.reason || "(none — give one with lens_edit facetReason)"}`,
+  ])
 }
 
 function visibility(activation: "switched" | "already-active" | "not-requested" | "needs-consent", name: string) {

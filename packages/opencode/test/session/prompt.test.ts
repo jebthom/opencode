@@ -2383,6 +2383,7 @@ const markProbe = {
   facet: "probe-lines",
   kind: "pattern",
   pattern: "probe",
+  facetReason: "where the probe is read",
   activate: true,
   reason: "show the probe",
 }

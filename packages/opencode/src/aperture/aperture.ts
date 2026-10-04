@@ -29,6 +29,7 @@ import {
   type GitFilter,
   type Lens,
   type Rule,
+  describeFinder,
   facetsWithin,
   findFacet,
   isGitRule,
@@ -74,6 +75,8 @@ export interface MarkLensInput {
   // The concern: an existing facet id/label (add another rule to it) or a new name (mint it).
   readonly facet: string
   readonly definition?: string
+  // How the concern helps the user understand the task (`Facet.reason`).
+  readonly facetReason?: string
   // Lens description, used only when this call creates the Lens.
   readonly about?: string
   readonly find: Finder
@@ -513,6 +516,7 @@ export const layer = Layer.effect(
       const mark: ApertureLensStore.MarkInput = {
         facet: input.facet,
         ...(input.definition ? { definition: input.definition } : {}),
+        ...(input.facetReason ? { facetReason: input.facetReason } : {}),
         find: input.find,
         ...(input.where ? { where: input.where } : {}),
         ...(input.note ? { note: input.note } : {}),
@@ -658,6 +662,7 @@ export const layer = Layer.effect(
       const rel = ApertureFiles.normalizePath(file)
       const { lens, hits } = yield* viewed(ctx.directory)
       const colorByFacet = new Map(lens?.facets.map((t) => [t.id, t.color]))
+      const queryByRule = new Map(lens?.rules?.map((r) => [r.id, describeFinder(r.find, r.where)]))
       const tags = (hits.get(rel) ?? []).flatMap((hit) =>
         hit.ranges.map(
           ([startLine, endLine]): AperturePayload.LineTag => ({
@@ -666,6 +671,7 @@ export const layer = Layer.effect(
             facet: hit.facet,
             ...(colorByFacet.get(hit.facet) ? { hue: colorByFacet.get(hit.facet)! } : {}),
             rule: hit.rule,
+            ...(queryByRule.get(hit.rule) ? { query: queryByRule.get(hit.rule)! } : {}),
             ...(hit.note ? { note: hit.note } : {}),
           }),
         ),

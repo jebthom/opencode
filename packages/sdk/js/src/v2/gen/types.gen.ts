@@ -5030,6 +5030,8 @@ export type ApertureLinesResponses = {
         facet: string
         label: string
         color: string
+        reason: string
+        queries: Array<string>
       }>
       owner: "user" | "agent"
     }
@@ -5040,6 +5042,7 @@ export type ApertureLinesResponses = {
       facet: string
       hue?: string
       rule?: string
+      query?: string
       note?: string
     }>
     suppressed: Array<string>
@@ -5154,6 +5157,8 @@ export type ApertureFacetMapResponses = {
         facet: string
         label: string
         color: string
+        reason: string
+        queries: Array<string>
       }>
       owner: "user" | "agent"
     }
@@ -5207,6 +5212,8 @@ export type ApertureActivityResponses = {
         facet: string
         label: string
         color: string
+        reason: string
+        queries: Array<string>
       }>
       owner: "user" | "agent"
     }
@@ -5279,6 +5286,8 @@ export type ApertureCycleLensResponses = {
         facet: string
         label: string
         color: string
+        reason: string
+        queries: Array<string>
       }>
       owner: "user" | "agent"
     }
@@ -5320,6 +5329,8 @@ export type ApertureDeleteLensResponses = {
         facet: string
         label: string
         color: string
+        reason: string
+        queries: Array<string>
       }>
       owner: "user" | "agent"
     }
@@ -5397,6 +5408,8 @@ export type ApertureSelectLensResponses = {
         facet: string
         label: string
         color: string
+        reason: string
+        queries: Array<string>
       }>
       owner: "user" | "agent"
     }

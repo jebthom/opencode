@@ -117,7 +117,7 @@ export const LensUnmarkTool = Tool.define(
                 ].join("\n"),
               }
             case "ok": {
-              const { lens, removedRules, removedFacet, recolored } = result
+              const { lens, removedRules, removedFacet } = result
               yield* StudyLog.record(ctx.sessionID, {
                 type: "rule",
                 op: removedFacet ? "removed-facet" : "removed",
@@ -143,18 +143,6 @@ export const LensUnmarkTool = Tool.define(
                         "",
                         "WARNING: the write to .opencode/aperture/lenses.json failed, so this removal may not persist.",
                       ]),
-                  // The recolour has to be said out loud: the user is looking at the legend, and a
-                  // concern silently changing hue is exactly the colour-instability the rest of
-                  // Aperture works to avoid. It happens because facet colour is derived from
-                  // position, so removing anything but the last concern shifts the ones after it.
-                  ...(recolored.length
-                    ? [
-                        "",
-                        "Because a concern's colour comes from its position, this re-coloured:",
-                        ...recolored.map((r) => `  - ${r.label} [${r.facet}] ${r.from} -> ${r.to}`),
-                        "Any legend filter the user had set is keyed by id and is unaffected.",
-                      ]
-                    : []),
                   "",
                   `Concerns on "${lens.name}":`,
                   ...rosterLines(lens),

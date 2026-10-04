@@ -7,6 +7,7 @@ import {
   ORDINAL_PALETTE_IDS,
   MAX_FACETS,
   assignColors,
+  repaletteColors,
   isGitRule,
   isValidFacet,
   isValidFinder,
@@ -30,8 +31,14 @@ const LENS: Lens = {
   palette: "categorical",
   owner: "user",
   facets: assignColors("categorical", [
-    { id: "retry-path", label: "retry-path", description: "the retry path", owner: "user" },
-    { id: "backoff", label: "Backoff", description: "backoff math", owner: "agent", createdBy: "build" },
+    {
+      id: "retry-path",
+      label: "retry-path",
+      description: "the retry path",
+      reason: "where the bug starts",
+      owner: "user",
+    },
+    { id: "backoff", label: "Backoff", description: "backoff math", reason: "", owner: "agent", createdBy: "build" },
   ]),
   rules: [{ id: "retry-path-abc", facet: "retry-path", find: { kind: "pattern", pattern: "withRetry\\(" } }],
 }
@@ -102,29 +109,52 @@ describe("aperture lenses — palettes", () => {
       }
   })
 
-  test("assignColors pairs facets with palette colours in order", () => {
+  test("assignColors pairs new facets with palette colours in order", () => {
     const out = assignColors("categorical", [
-      { id: "a", label: "A", description: "first", owner: "user" },
-      { id: "b", label: "B", description: "second", owner: "agent" },
+      { id: "a", label: "A", description: "first", reason: "", owner: "user" },
+      { id: "b", label: "B", description: "second", reason: "", owner: "agent" },
     ])
     expect(out.map((t) => t.color)).toEqual([PALETTES.categorical.colors[0], PALETTES.categorical.colors[1]])
   })
 
-  // KNOWN AND DELIBERATE: facet colour is derived from array position, so removing a facet
-  // re-hues every facet after it. lens_unmark reports the shift rather than persisting a colour
-  // slot, which would be a second source of truth.
-  test("removing a middle facet re-colours the ones after it", () => {
-    const three = assignColors("categorical", [
-      { id: "a", label: "a", description: "", owner: "user" },
-      { id: "b", label: "b", description: "", owner: "user" },
-      { id: "c", label: "c", description: "", owner: "user" },
-    ])
+  // Colour is pinned: the chat and every surface name a concern by its colour, so a removal must
+  // not re-hue the survivors, and the freed slot goes to the next facet minted.
+  test("survivors keep their colours and a new facet takes the lowest free slot", () => {
+    const facet = (id: string) => ({ id, label: id, description: "", reason: "", owner: "user" as const })
+    const three = assignColors("categorical", [facet("a"), facet("b"), facet("c")])
     const without = assignColors(
       "categorical",
       three.filter((t) => t.id !== "b"),
     )
-    expect(without.find((t) => t.id === "a")!.color).toBe(three[0]!.color)
-    expect(without.find((t) => t.id === "c")!.color).toBe(three[1]!.color)
+    expect(without.map((t) => t.color)).toEqual([three[0]!.color, three[2]!.color])
+    const refilled = assignColors("categorical", [...without, facet("d")])
+    expect(refilled.find((t) => t.id === "d")!.color).toBe(three[1]!.color)
+  })
+
+  test("assignColors re-slots a colour that is foreign or already taken", () => {
+    const facet = (id: string, color: string) => ({
+      id,
+      label: id,
+      description: "",
+      reason: "",
+      owner: "user" as const,
+      color,
+    })
+    const out = assignColors("categorical", [
+      facet("a", PALETTES.categorical.colors[2]!),
+      facet("b", PALETTES.categorical.colors[2]!),
+      facet("c", "#123456"),
+    ])
+    expect(out.map((t) => t.color)).toEqual([
+      PALETTES.categorical.colors[2],
+      PALETTES.categorical.colors[0],
+      PALETTES.categorical.colors[1],
+    ])
+  })
+
+  test("repaletteColors keeps each facet's slot under the new palette", () => {
+    const out = repaletteColors("categorical", "ordinal", LENS.facets)
+    expect(out.map((t) => t.color)).toEqual([PALETTES.ordinal.colors[0], PALETTES.ordinal.colors[1]])
   })
 })
 
@@ -138,8 +168,17 @@ describe("aperture lenses — helpers", () => {
     expect(findFacet(LENS, "nope")).toBeUndefined()
   })
 
-  test("legend exposes facet/label/colour per facet", () => {
-    expect(legend(LENS)[1]).toEqual({ facet: "backoff", label: "Backoff", color: LENS.facets[1]!.color })
+  test("legend exposes facet/label/colour, the reason and the rules as queries", () => {
+    expect(legend(LENS)).toEqual([
+      {
+        facet: "retry-path",
+        label: "retry-path",
+        color: LENS.facets[0]!.color,
+        reason: "where the bug starts",
+        queries: ["pattern /withRetry\\(/"],
+      },
+      { facet: "backoff", label: "Backoff", color: LENS.facets[1]!.color, reason: "", queries: [] },
+    ])
   })
 
   // The guard on the legend filter (O4): a filter is only meaningful in the vocabulary it was
@@ -158,6 +197,7 @@ describe("aperture lenses — helpers", () => {
         colorName: "crimson",
         owner: "user",
         rules: 1,
+        reason: "where the bug starts",
       },
       {
         facet: "backoff",
@@ -166,6 +206,7 @@ describe("aperture lenses — helpers", () => {
         colorName: "amber",
         owner: "agent",
         rules: 0,
+        reason: "",
       },
     ])
     for (const hex of PALETTES.categorical.colors) expect(COLOR_NAMES[hex]).toBeTruthy()

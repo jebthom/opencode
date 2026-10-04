@@ -24,9 +24,14 @@ export const Parameters = Schema.Struct({
         facet: Schema.String.annotate({ description: "Existing concern id or label." }),
         label: Schema.optional(Schema.String).annotate({ description: "New legend label." }),
         description: Schema.optional(Schema.String).annotate({ description: "New one-line definition." }),
+        facetReason: Schema.optional(Schema.String).annotate({
+          description: "New reason: one sentence on how this concern helps the user understand the current task.",
+        }),
       }),
     ),
-  ).annotate({ description: "Concerns to relabel or redefine. Concerns not listed are unchanged." }),
+  ).annotate({
+    description: "Concerns to relabel, redefine or re-reason. Concerns not listed are unchanged.",
+  }),
   reason: Schema.optional(Schema.String).annotate({
     description: "Why you are making this change, recorded in the Lens history the user can review.",
   }),
@@ -62,6 +67,7 @@ export const LensEditTool = Tool.define(
                     ref: f.facet,
                     ...(f.label ? { label: f.label } : {}),
                     ...(f.description ? { description: f.description } : {}),
+                    ...(f.facetReason ? { reason: f.facetReason } : {}),
                   })),
                 }
               : {}),

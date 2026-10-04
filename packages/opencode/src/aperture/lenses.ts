@@ -16,12 +16,17 @@
 // own initiative may change only agent-owned Lenses, and needs consent to touch a user's.
 export type Owner = "user" | "agent"
 
-// A single facet within a Lens. `color` is a literal hex string (`#RRGGBB`), derived from the
-// Lens's palette and the facet's position on every read (see lens-store `migrate`).
+// A single facet within a Lens. `color` is a literal hex string (`#RRGGBB`) from the Lens's
+// palette, pinned when the facet is minted (see `assignColors`) so it never moves while the facet
+// lives.
 export interface Facet {
   readonly id: string
   readonly label: string
+  // What the concern IS — a one-line definition.
   readonly description: string
+  // Why the concern is on the Lens — how its query helps the user understand the task at hand.
+  // Shown beside the query on every hover surface; "" when nobody gave one.
+  readonly reason: string
   readonly color: string
   readonly owner: Owner
   // The agent that minted the facet, when an agent did.
@@ -322,11 +327,44 @@ export function isPaletteId(value: unknown): value is PaletteId {
   return typeof value === "string" && value in PALETTES
 }
 
-// Pair each facet with the palette colour at its index. Facets beyond the palette
-// length wrap (callers should enforce MAX_FACETS, but wrapping keeps it total).
-export function assignColors(palette: PaletteId, facets: ReadonlyArray<Omit<Facet, "color">>): Facet[] {
+// Give each facet a palette colour, keeping the one it already has. A facet without a usable
+// colour (none yet, not in this palette, or already taken by an earlier facet) gets the lowest
+// free slot. Colour is pinned rather than derived from position because the chat, the legend and
+// the gutter all name a concern by its colour: re-hueing the survivors when one is removed would
+// make every earlier "the amber lines" point at a different concern. Facets beyond the palette
+// length wrap (callers enforce MAX_FACETS, but wrapping keeps it total).
+export function assignColors(
+  palette: PaletteId,
+  facets: ReadonlyArray<Omit<Facet, "color"> & { readonly color?: string }>,
+): Facet[] {
   const colors = PALETTES[palette].colors
-  return facets.map((facet, i) => ({ ...facet, color: colors[i % colors.length]! }))
+  const taken = new Set<string>()
+  const kept = facets.map((facet) => {
+    if (!facet.color || !colors.includes(facet.color) || taken.has(facet.color)) return undefined
+    taken.add(facet.color)
+    return facet.color
+  })
+  const free = colors.filter((c) => !taken.has(c))
+  const unpinned = kept.flatMap((color, i) => (color ? [] : [i]))
+  return facets.map((facet, i) => ({
+    ...facet,
+    color: kept[i] ?? free[unpinned.indexOf(i)] ?? colors[i % colors.length]!,
+  }))
+}
+
+// The same slots under another palette — a palette switch re-hues every facet by the slot it
+// holds, which for the two current palettes is "reverse the ramp". Deliberate and user-visible,
+// unlike the silent re-hue a removal used to cause.
+export function repaletteColors(from: PaletteId, to: PaletteId, facets: ReadonlyArray<Facet>): Facet[] {
+  const source = PALETTES[from].colors
+  const target = PALETTES[to].colors
+  return assignColors(
+    to,
+    facets.map((facet) => {
+      const slot = source.indexOf(facet.color)
+      return { ...facet, color: slot >= 0 ? target[slot] : undefined }
+    }),
+  )
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -358,6 +396,7 @@ export interface ConcernSummary {
   readonly colorName: string
   readonly owner: Owner
   readonly rules: number
+  readonly reason: string
 }
 
 // A finder (and its git filter) as one readable line. Lives here so `lens_mark` (echoing back
@@ -400,19 +439,29 @@ export function concernRoster(lens: Pick<Lens, "facets" | "rules">): ConcernSumm
     colorName: COLOR_NAMES[t.color] ?? t.color,
     owner: t.owner,
     rules: counts.get(t.id) ?? 0,
+    reason: t.reason,
   }))
 }
 
-// The renderer's legend: ordered facet → label + colour. Drives both the swatch row and the
-// facet→colour map every surface paints with, so no client needs a hard-coded vocabulary.
+// The renderer's legend: ordered facet → label + colour, plus what a hover explains — the
+// facet's reason and its rules as readable queries. Drives the swatch row, the facet→colour map
+// every surface paints with, and the hover detail, so no client needs a hard-coded vocabulary.
 export interface LegendEntry {
   readonly facet: string
   readonly label: string
   readonly color: string
+  readonly reason: string
+  readonly queries: ReadonlyArray<string>
 }
 
-export function legend(lens: Pick<Lens, "facets">): LegendEntry[] {
-  return lens.facets.map((t) => ({ facet: t.id, label: t.label, color: t.color }))
+export function legend(lens: Pick<Lens, "facets" | "rules">): LegendEntry[] {
+  return lens.facets.map((t) => ({
+    facet: t.id,
+    label: t.label,
+    color: t.color,
+    reason: t.reason,
+    queries: (lens.rules ?? []).filter((r) => r.facet === t.id).map((r) => describeFinder(r.find, r.where)),
+  }))
 }
 
 // Narrow a set of facet ids to those this Lens actually has. Order and duplicates are dropped;

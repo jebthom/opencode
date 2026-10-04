@@ -27,7 +27,13 @@ const create = (actor: Actor = USER, name = "Retry Handling") =>
   run(
     ApertureLensStore.create(
       dir,
-      { name, description: "retries", facet: "retry-path", find: pattern("retry\\(") },
+      {
+        name,
+        description: "retries",
+        facet: "retry-path",
+        facetReason: "where retries re-enter",
+        find: pattern("retry\\("),
+      },
       actor,
     ),
   )
@@ -114,20 +120,94 @@ describe("aperture lens-store — mark / unmark", () => {
     expect(tooMany.status).toBe("rule-cap")
   })
 
-  test("unmarking a concern takes its rules and reports the recolour", async () => {
+  test("unmarking a concern takes its rules and leaves the others' colours alone", async () => {
     const lens = await lensOf()
     await run(ApertureLensStore.mark(dir, lens.id, { facet: "backoff", find: pattern("sleep") }, USER))
     const result = await run(ApertureLensStore.unmark(dir, lens.id, { facet: "retry-path" }, USER))
     if (result.status !== "ok") throw new Error(result.status)
     expect(result.removedRules.map((r) => r.facet)).toEqual(["retry-path"])
-    expect(result.lens.facets.map((f) => f.id)).toEqual(["backoff"])
-    expect(result.recolored).toEqual([
-      {
-        facet: "backoff",
-        label: "backoff",
-        from: PALETTES.categorical.colors[1]!,
-        to: PALETTES.categorical.colors[0]!,
-      },
+    expect(result.lens.facets.map((f) => [f.id, f.color])).toEqual([["backoff", PALETTES.categorical.colors[1]!]])
+    // Survives a re-read, and the freed slot goes to the next concern minted.
+    const minted = await run(ApertureLensStore.mark(dir, lens.id, { facet: "jitter", find: pattern("rand") }, USER))
+    if (minted.status !== "ok") throw new Error(minted.status)
+    expect(minted.lens.facets.map((f) => [f.id, f.color])).toEqual([
+      ["backoff", PALETTES.categorical.colors[1]!],
+      ["jitter", PALETTES.categorical.colors[0]!],
+    ])
+  })
+
+  test("an agent must give a reason to mint a concern; a user need not", async () => {
+    const lens = await lensOf(AGENT)
+    const bare = await run(ApertureLensStore.mark(dir, lens.id, { facet: "backoff", find: pattern("sleep") }, AGENT))
+    expect(bare).toEqual({ status: "needs-reason", facet: "backoff" })
+    const missing = await run(
+      ApertureLensStore.create(dir, { name: "Other", description: "", facet: "x", find: pattern("x") }, AGENT),
+    )
+    expect(missing.status).toBe("needs-reason")
+    // Adding a rule to an existing concern needs no reason.
+    const more = await run(ApertureLensStore.mark(dir, lens.id, { facet: "retry-path", find: pattern("again") }, AGENT))
+    expect(more.status).toBe("ok")
+    const user = await run(ApertureLensStore.mark(dir, lens.id, { facet: "backoff", find: pattern("sleep") }, USER))
+    expect(user.status).toBe("ok")
+  })
+
+  test("a reason on an existing concern replaces it and is recorded as a facet edit", async () => {
+    const lens = await lensOf(AGENT)
+    const result = await run(
+      ApertureLensStore.mark(
+        dir,
+        lens.id,
+        { facet: "retry-path", facetReason: "the callers the fix must reach", find: pattern("again") },
+        AGENT,
+      ),
+    )
+    if (result.status !== "ok") throw new Error(result.status)
+    expect(result.facet.reason).toBe("the callers the fix must reach")
+    expect((await run(ApertureLensStore.get(dir, lens.id)))?.facets[0]?.reason).toBe("the callers the fix must reach")
+    const history = await run(ApertureLensHistory.read(dir, {}))
+    const edit = history.find((e) => e.op === "facet.edit")
+    expect(edit?.before).toMatchObject({ facet: { reason: "where retries re-enter" } })
+    expect(edit?.after).toMatchObject({ facet: { reason: "the callers the fix must reach" } })
+  })
+
+  test("update revises a reason, and a palette switch keeps each facet's slot", async () => {
+    const lens = await lensOf()
+    await run(ApertureLensStore.mark(dir, lens.id, { facet: "backoff", find: pattern("sleep") }, USER))
+    const result = await run(
+      ApertureLensStore.update(
+        dir,
+        lens.id,
+        { palette: "ordinal", facets: [{ ref: "backoff", reason: "how long callers wait" }] },
+        USER,
+      ),
+    )
+    if (result.status !== "ok") throw new Error(result.status)
+    expect(result.lens.facets.map((f) => [f.id, f.color, f.reason])).toEqual([
+      ["retry-path", PALETTES.ordinal.colors[0]!, "where retries re-enter"],
+      ["backoff", PALETTES.ordinal.colors[1]!, "how long callers wait"],
+    ])
+  })
+
+  test("a stored colour survives the read; v3 files without reasons read as empty", async () => {
+    const file = path.join(dir, ".opencode", "aperture", "lenses.json")
+    await fs.mkdir(path.dirname(file), { recursive: true })
+    await fs.writeFile(
+      file,
+      JSON.stringify({
+        v3: {
+          id: "v3",
+          name: "V3",
+          description: "",
+          palette: "categorical",
+          owner: "agent",
+          facets: [{ id: "b", label: "b", description: "", owner: "agent", color: PALETTES.categorical.colors[1] }],
+          rules: [{ id: "b-1", facet: "b", find: { kind: "pattern", pattern: "b" } }],
+        },
+      }),
+    )
+    const [lens] = await run(ApertureLensStore.list(dir))
+    expect(lens?.facets).toEqual([
+      { id: "b", label: "b", description: "", reason: "", owner: "agent", color: PALETTES.categorical.colors[1]! },
     ])
   })
 
@@ -154,7 +234,12 @@ describe("aperture lens-store — ownership", () => {
   test("consent, or the user's own request, lets the change through", async () => {
     const lens = await lensOf(USER)
     const consented = await run(
-      ApertureLensStore.mark(dir, lens.id, { facet: "mine", find: pattern("q") }, { ...AGENT, consented: true }),
+      ApertureLensStore.mark(
+        dir,
+        lens.id,
+        { facet: "mine", facetReason: "r", find: pattern("q") },
+        { ...AGENT, consented: true },
+      ),
     )
     expect(consented.status).toBe("ok")
     const requested = await run(ApertureLensStore.unmark(dir, lens.id, { facet: "mine" }, { ...AGENT, kind: "user" }))
@@ -163,9 +248,10 @@ describe("aperture lens-store — ownership", () => {
 
   test("an agent curates its own Lens freely", async () => {
     const lens = await lensOf(AGENT)
-    expect((await run(ApertureLensStore.mark(dir, lens.id, { facet: "b", find: pattern("q") }, AGENT))).status).toBe(
-      "ok",
-    )
+    expect(
+      (await run(ApertureLensStore.mark(dir, lens.id, { facet: "b", facetReason: "r", find: pattern("q") }, AGENT)))
+        .status,
+    ).toBe("ok")
     expect((await run(ApertureLensStore.unmark(dir, lens.id, { facet: "retry-path" }, AGENT))).status).toBe("ok")
     expect((await run(ApertureLensStore.remove(dir, lens.id, AGENT))).status).toBe("ok")
   })
@@ -173,7 +259,12 @@ describe("aperture lens-store — ownership", () => {
   test("a user-owned concern on an agent's Lens is still the user's", async () => {
     const lens = await lensOf(AGENT)
     await run(
-      ApertureLensStore.mark(dir, lens.id, { facet: "asked-for", find: pattern("q") }, { ...AGENT, kind: "user" }),
+      ApertureLensStore.mark(
+        dir,
+        lens.id,
+        { facet: "asked-for", facetReason: "r", find: pattern("q") },
+        { ...AGENT, kind: "user" },
+      ),
     )
     expect((await run(ApertureLensStore.unmark(dir, lens.id, { facet: "asked-for" }, AGENT))).status).toBe(
       "needs-consent",
@@ -241,8 +332,22 @@ describe("aperture lens-store — v2 migration", () => {
       palette: "categorical",
       owner: "user",
       facets: [
-        { id: "any-casts", label: "any-casts", description: "", owner: "user", color: PALETTES.categorical.colors[0]! },
-        { id: "flags", label: "flags", description: "", owner: "user", color: PALETTES.categorical.colors[1]! },
+        {
+          id: "any-casts",
+          label: "any-casts",
+          description: "",
+          reason: "",
+          owner: "user",
+          color: PALETTES.categorical.colors[0]!,
+        },
+        {
+          id: "flags",
+          label: "flags",
+          description: "",
+          reason: "",
+          owner: "user",
+          color: PALETTES.categorical.colors[1]!,
+        },
       ],
       rules: [{ id: "flags-1", facet: "flags", find: { kind: "pattern", pattern: "flag\\(" } }],
     })
@@ -285,7 +390,12 @@ describe("aperture lens-store — history", () => {
   test("every change is appended with its actor, turn and snapshots, in order", async () => {
     const lens = await lensOf(AGENT)
     await run(
-      ApertureLensStore.mark(dir, lens.id, { facet: "b", find: pattern("q"), hits: { lines: 3, files: 1 } }, AGENT),
+      ApertureLensStore.mark(
+        dir,
+        lens.id,
+        { facet: "b", facetReason: "r", find: pattern("q"), hits: { lines: 3, files: 1 } },
+        AGENT,
+      ),
     )
     await run(ApertureLensStore.unmark(dir, lens.id, { facet: "b" }, { ...AGENT, turnID: "msg_turn2" }))
     await run(ApertureLensStore.setActive(dir, lens, USER))
@@ -309,7 +419,12 @@ describe("aperture lens-store — history", () => {
   test("filters by turn, so a chat turn maps to exactly the Lens changes it made", async () => {
     const lens = await lensOf(AGENT)
     await run(
-      ApertureLensStore.mark(dir, lens.id, { facet: "b", find: pattern("q") }, { ...AGENT, turnID: "msg_turn2" }),
+      ApertureLensStore.mark(
+        dir,
+        lens.id,
+        { facet: "b", facetReason: "r", find: pattern("q") },
+        { ...AGENT, turnID: "msg_turn2" },
+      ),
     )
     const turn2 = await run(ApertureLensHistory.read(dir, { turnID: "msg_turn2" }))
     expect(turn2.map((e) => e.op)).toEqual(["facet.add", "rule.add"])
