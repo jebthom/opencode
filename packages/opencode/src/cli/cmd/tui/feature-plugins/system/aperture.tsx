@@ -2,7 +2,7 @@ import type { TuiPlugin, TuiPluginApi, TuiThemeCurrent } from "@opencode-ai/plug
 import type { MouseEvent, ScrollBoxRenderable } from "@opentui/core"
 import { useTerminalDimensions } from "@opentui/solid"
 import type { InternalTuiPlugin } from "../../plugin/internal"
-import { createEffect, createMemo, createResource, createSignal, For, onCleanup, Show } from "solid-js"
+import { createEffect, createMemo, createResource, createSignal, For, Match, onCleanup, Show, Switch } from "solid-js"
 import { allocateCells } from "@/aperture/treemap"
 import { changedFiles, type Turn } from "@/aperture/activity"
 import {
@@ -40,7 +40,7 @@ type FacetMap = {
     id: string
     name: string
     owner: "user" | "agent"
-    legend: readonly { facet: string; label: string; color: string }[]
+    legend: readonly { facet: string; label: string; color: string; reason: string; queries: readonly string[] }[]
   }
   facets: readonly string[]
   files: Record<string, { m: readonly { f: number; l: number; b: number }[]; line: number }>
@@ -54,10 +54,15 @@ const TILE_W = 22
 const NAME_W = TILE_W - 2
 // Rows the grid has under each group's header row. Columns of bordered runs are packed into this.
 const GRID_ROWS = 9
-// Title row + legend row + group header + grid + the bar's bottom border. NB:
+// The detail region under the legend. A terminal has no tooltip to hang an explanation on, so the
+// bar reserves fixed rows for one: what the pointer is over (a facet's query and reason, a group's
+// combination, a file's marks), and otherwise the hints that make those hovers discoverable.
+// Fixed height, so hovering never reflows the grid.
+const DETAIL_ROWS = 2
+// Title row + legend row + detail + group header + grid + the bar's bottom border. NB:
 // `routes/session/index.tsx` hides the bar outright on short terminals using its own literal —
 // move that with this.
-const TOP_BAR_HEIGHT = 2 + 1 + GRID_ROWS + 1
+const TOP_BAR_HEIGHT = 2 + DETAIL_ROWS + 1 + GRID_ROWS + 1
 const GROUP_GAP = 1
 const BAR_PADDING_X = 2
 const LEGEND_GAP = 2
@@ -97,8 +102,8 @@ const SQUARE_CORNERS = {
 function View(props: { api: TuiPluginApi; session_id: string }) {
   const theme = () => props.api.theme.current
   const dimensions = useTerminalDimensions()
-  // What the pointer is over, shown in the title row; cleared on mouse-out.
-  const [hovered, setHovered] = createSignal<string | undefined>()
+  // What the pointer is over, explained in the detail region; cleared on mouse-out.
+  const [hovered, setHovered] = createSignal<Hovered | undefined>()
   // Facets toggled off in the legend (O4). Held here so a click re-slices on the next frame, and
   // on the server so the VSCode extension follows in the same gesture.
   const [suppressed, setSuppressed] = createSignal<ReadonlySet<string>>(new Set())
@@ -363,7 +368,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     return items.reduce((a, b) => a + b, 0) + (items.length - 1)
   }
   // Fit the one-row legend: when it would overflow, even-trim the facet labels to the largest
-  // shared cap that fits (never below LEGEND_LABEL_MIN). The hover line shows the full label.
+  // shared cap that fits (never below LEGEND_LABEL_MIN). The detail region shows the full label.
   const trimmedLegend = createMemo(() => {
     const entries = legendEntries()
     const reset = suppressed().size > 0 ? 1 : 0
@@ -385,7 +390,6 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     }
     return entries.map((e) => ({
       ...e,
-      full: e.label,
       label: e.label.length > cap ? e.label.slice(0, cap - 1) + "…" : e.label,
     }))
   })
@@ -413,11 +417,33 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     const agent = agentChanged().get(file.path)
     const uncommitted = treeChanged().get(file.path)
     return [
-      file.path,
       ...group.key.map((f) => `${labelOf(f)} ${lines.get(f) ?? 0} line${lines.get(f) === 1 ? "" : "s"}`),
       ...(agent ? [`changed by agent +${agent.additions} −${agent.deletions}`] : []),
       ...(uncommitted ? [`uncommitted +${uncommitted.additions} −${uncommitted.deletions}`] : []),
-    ].join(" · ")
+    ]
+  }
+
+  // The detail region's subject, narrowed per kind for <Match>. A facet that vanished under the
+  // pointer (a Lens switch) falls back to the hints rather than describing nothing.
+  const detailWidth = () => dimensions().width - BAR_PADDING_X * 2
+  const hoveredFacet = () => {
+    const h = hovered()
+    return h?.kind === "facet" ? legendEntries().find((e) => e.facet === h.facet) : undefined
+  }
+  const hoveredGroup = () => {
+    const h = hovered()
+    return h?.kind === "group" ? h : undefined
+  }
+  const hoveredFile = () => {
+    const h = hovered()
+    return h?.kind === "file" ? h : undefined
+  }
+  const combinationText = (group: Group) => {
+    if (group.key.length === 0) return "changed files that carry no facet"
+    const n = group.files.length
+    const files = `${n} file${n === 1 ? "" : "s"}`
+    if (group.key.length === 1) return `${files} marked only by ${labelOf(group.key[0]!)}`
+    return `${files} marked by exactly ${group.key.map(labelOf).join(" + ")}`
   }
 
   const groupWidth = (entry: { group: Group; columns: Segment[][]; toggle: boolean }) =>
@@ -479,8 +505,8 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
             ⟳
           </text>
         </box>
-        <text fg={hovered() ? theme().text : theme().textMuted} wrapMode="none">
-          {hovered() ?? summary()}
+        <text fg={theme().textMuted} wrapMode="none">
+          {summary()}
         </text>
       </box>
 
@@ -516,7 +542,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
               flexDirection="row"
               flexShrink={0}
               onMouseDown={() => toggleFacet(entry.facet)}
-              onMouseOver={() => setHovered(entry.full)}
+              onMouseOver={() => setHovered({ kind: "facet", facet: entry.facet })}
               onMouseOut={() => setHovered(undefined)}
             >
               <text fg={facetColor(entry.facet)} wrapMode="none">
@@ -542,6 +568,70 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
             {changedLabel()}
           </text>
         </Show>
+      </box>
+
+      <box flexDirection="column" height={DETAIL_ROWS} flexShrink={0}>
+        <Switch fallback={<Hints show={!!lens()} width={detailWidth()} theme={theme} />}>
+          <Match when={hoveredFacet()}>
+            {(entry) => (
+              <>
+                <text wrapMode="none" fg={theme().text}>
+                  <span style={{ fg: facetColor(entry().facet) }}>■ </span>
+                  <b>{truncate(entry().label, detailWidth() - 2)}</b>
+                  <span style={{ fg: theme().textMuted }}>
+                    {truncate(
+                      "  " +
+                        (entry().queries.length ? "query: " + entry().queries.join(" · ") : "no rules") +
+                        (suppressed().has(entry().facet) ? "  (hidden — click its name to show)" : ""),
+                      Math.max(0, detailWidth() - 2 - entry().label.length),
+                    )}
+                  </span>
+                </text>
+                <text wrapMode="none" fg={entry().reason ? theme().text : theme().textMuted}>
+                  {truncate("reason: " + (entry().reason || "none given"), detailWidth())}
+                </text>
+              </>
+            )}
+          </Match>
+          <Match when={hoveredGroup()}>
+            {(entry) => (
+              <>
+                <text wrapMode="none" fg={theme().text}>
+                  <For each={entry().group.key}>
+                    {(f) => <span style={{ fg: facetColor(facetIds()[f] ?? "") }}>■ </span>}
+                  </For>
+                  {truncate(combinationText(entry().group), detailWidth() - entry().group.key.length * 2)}
+                </text>
+                <text wrapMode="none" fg={theme().textMuted}>
+                  {truncate(
+                    [
+                      ...(entry().group.key.length ? ["hover one ■ for its query and reason"] : []),
+                      ...(entry().toggle ? [entry().hidden > 0 ? "click to show every file" : "click to fold"] : []),
+                    ].join(" · "),
+                    detailWidth(),
+                  )}
+                </text>
+              </>
+            )}
+          </Match>
+          <Match when={hoveredFile()}>
+            {(entry) => (
+              <>
+                <text wrapMode="none" fg={theme().text}>
+                  {truncate(entry().file.path, detailWidth())}
+                </text>
+                <text wrapMode="none" fg={theme().textMuted}>
+                  {truncate(
+                    [...describeFile(entry().file, entry().group), `click to open at line ${entry().file.line}`].join(
+                      " · ",
+                    ),
+                    detailWidth(),
+                  )}
+                </text>
+              </>
+            )}
+          </Match>
+        </Switch>
       </box>
 
       <Show
@@ -574,13 +664,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                   height={1}
                   flexShrink={0}
                   onMouseDown={() => entry.toggle && toggleExpanded(entry.group)}
-                  onMouseOver={() =>
-                    setHovered(
-                      entry.group.key.length === 0
-                        ? "changed files that carry no facet"
-                        : entry.group.key.map(labelOf).join(" + "),
-                    )
-                  }
+                  onMouseOver={() => setHovered({ kind: "group", ...entry })}
                   onMouseOut={() => setHovered(undefined)}
                 >
                   <Show when={entry.group.key.length === 0}>
@@ -590,7 +674,16 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                   </Show>
                   <For each={entry.group.key}>
                     {(f) => (
-                      <text fg={facetColor(facetIds()[f] ?? "")} wrapMode="none">
+                      <text
+                        fg={facetColor(facetIds()[f] ?? "")}
+                        wrapMode="none"
+                        // Claims the hover for its own facet: over/out bubble, and the header's
+                        // handler would otherwise replace this with the whole combination.
+                        onMouseOver={(event: MouseEvent) => {
+                          event.stopPropagation()
+                          setHovered({ kind: "facet", facet: facetIds()[f] ?? "" })
+                        }}
+                      >
                         {"■ "}
                       </text>
                     )}
@@ -620,7 +713,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                                 {(file) => (
                                   <box
                                     onMouseDown={() => openFile(file)}
-                                    onMouseOver={() => setHovered(describeFile(file, entry.group))}
+                                    onMouseOver={() => setHovered({ kind: "file", file, group: entry.group })}
                                     onMouseOut={() => setHovered(undefined)}
                                   >
                                     <NameRow
@@ -707,6 +800,29 @@ function NameRow(props: {
   )
 }
 
+type Hovered =
+  | { readonly kind: "facet"; readonly facet: string }
+  | { readonly kind: "group"; readonly group: Group; readonly toggle: boolean; readonly hidden: number }
+  | { readonly kind: "file"; readonly file: MarkedFile; readonly group: Group }
+
+// What the detail region shows when nothing is hovered: the bar's affordances, since none of them
+// is visible until the pointer finds it.
+function Hints(props: { show: boolean; width: number; theme: () => TuiThemeCurrent }) {
+  return (
+    <Show when={props.show}>
+      <text wrapMode="none" fg={props.theme().textMuted}>
+        {truncate("Hover a ■ or a facet name for its query and reason · click a name to hide or show it", props.width)}
+      </text>
+      <text wrapMode="none" fg={props.theme().textMuted}>
+        {truncate(
+          "Click a file to open it at its first mark · scroll to pan · click a crowded group to expand it",
+          props.width,
+        )}
+      </text>
+    </Show>
+  )
+}
+
 function headerText(group: Group) {
   const n = group.files.length
   const agent = group.files.filter((file) => file.changed === "agent").length
@@ -740,6 +856,7 @@ function segmentTitle(segment: Segment) {
 }
 
 function truncate(s: string, max: number) {
+  if (max <= 0) return ""
   return s.length > max ? s.slice(0, max - 1) + "…" : s
 }
 

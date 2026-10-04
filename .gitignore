@@ -30,3 +30,6 @@ UPCOMING_CHANGELOG.md
 logs/
 *.bun-build
 tsconfig.tsbuildinfo
+
+# Diagnostic log for the auto-session bug; untracked until a terser study log replaces it.
+perf/autosession.log

@@ -1,11 +1,9 @@
 import type { TuiPlugin, TuiPluginApi, TuiThemeCurrent } from "@opencode-ai/plugin/tui"
 import type { InternalTuiPlugin } from "../../plugin/internal"
 import { createMemo, createResource, createSignal, For, Match, onCleanup, Show, Switch } from "solid-js"
-import { allocateCells, buildGrid, coalesce } from "@/aperture/treemap"
 import { stepsForTurns, stepWeight, type Step, type TurnSteps } from "@/aperture/activity-steps"
 import type { Action, Turn } from "@/aperture/activity"
-import { facetColors, resolveColor, GREY_CELL } from "../system/aperture-colors"
-import { UNTAGGED_HUE } from "@/aperture/lenses"
+import { facetColors } from "../system/aperture-colors"
 
 const id = "internal:sidebar-activity"
 
@@ -18,7 +16,9 @@ const id = "internal:sidebar-activity"
 // the step rule rather than being imposed on it: a gathering step aggregates a whole run of
 // reads into one row, while every mutation is its own step and therefore its own row. The
 // asymmetry IS the encoding of "a mutation the user did not notice is the failure this view
-// exists to prevent". Horizontal carries composition; magnitude is the trailing `×n`.
+// exists to prevent". Each row names what it touched and shows which facets those files carry —
+// containment, one square per facet, in the same colours and order as the top bar's group
+// headers — and magnitude is the trailing `×n`.
 //
 // Segmentation lives in `aperture/activity-steps.ts` — pure, tested, and free of any
 // orientation — so this file holds only the drawing. Data comes from GET /aperture/activity
@@ -44,21 +44,20 @@ const SIDEBAR_COLS = 36
 // point, and the endpoint pages backwards so a long session costs what a fresh one does.
 const ACTIVITY_TURNS = 12
 
-// Row anatomy: spine/indent, the action verb, a space, then the band or label, then `×n`.
+// Row anatomy: spine/indent, the action verb, a space, the name or label, the facet squares, then
+// `×n`.
 const SPINE_COLS = 2
 const COUNT_COLS = 5
 const INDENT_COLS = 2
-// The verb is padded to a fixed width so the bands line up into a column across rows of
-// different actions. That alignment is what makes two steps comparable at a glance, and it
-// is worth the columns it costs the band. Wide enough for "Search" plus a clear gap.
+// The verb is padded to a fixed width so the names line up into a column across rows of
+// different actions. Wide enough for "Search" plus a clear gap.
 const VERB_COLS = 8
-// A mutation names its file, so its band must stay wide enough for a name to survive after
-// the change size has taken its columns. A guard rather than a working constraint: even
-// `+999 −999` on an indented lane leaves 13.
-const MIN_NAME_COLS = 10
-// The band fills whatever the tail leaves. A gathering row's tail is the `×n` gutter; a
-// mutation's is its change size, which is content-sized and so varies by row.
-const bandMax = (depth: number, tail: number) => SIDEBAR_COLS - SPINE_COLS - VERB_COLS - 1 - tail - depth * INDENT_COLS
+// A name must stay wide enough to survive after the squares and the change size have taken their
+// columns. A guard rather than a working constraint.
+const MIN_NAME_COLS = 8
+// What the name and the squares share: whatever the tail leaves. A gathering row's tail is the
+// `×n` gutter; a mutation's is its change size, which is content-sized and so varies by row.
+const rowMax = (depth: number, tail: number) => SIDEBAR_COLS - SPINE_COLS - VERB_COLS - 1 - tail - depth * INDENT_COLS
 
 // The change a step made, split into the pieces that colour differently. Read straight off
 // the step — every number here was persisted by the tool that made the change, so nothing
@@ -70,7 +69,7 @@ const bandMax = (depth: number, tail: number) => SIDEBAR_COLS - SPINE_COLS - VER
 // knowledge the snapshot patch behind it does not have.
 type Stats = { added?: string; removed?: string; changed?: string }
 
-// Three digits each, so a huge refactor cannot push the band below a readable name.
+// Three digits each, so a huge refactor cannot push the name below a readable width.
 const clampCount = (n: number) => (n >= 1000 ? `${Math.floor(n / 1000)}k` : `${n}`)
 
 function statsOf(step: Step): Stats | undefined {
@@ -90,11 +89,11 @@ const statsCols = (stats: Stats) =>
 // reader had to memorise. With the taller budget the words fit, and they need no legend.
 // The reveal affordance, drawn in the column the verb padding was already spending. The
 // longest verb is "Search" (6), so padding the word to VERB_COLS - 1 and then appending the
-// icon still lands on exactly VERB_COLS: `Search ↗`. The icon costs the band nothing, and
-// the arithmetic bandMax subtracts is unchanged.
+// icon still lands on exactly VERB_COLS: `Search ↗`. The icon costs the name nothing, and
+// the arithmetic rowMax subtracts is unchanged.
 //
 // A single-width glyph, deliberately: an emoji speech bubble is double-width and would
-// shear the left edge of every band on the row below it. Its *absence* is meaningful too —
+// shear the left edge of every name on the row below it. Its *absence* is meaningful too —
 // a row with no icon is one the chat cannot show, which is how a sub-agent's steps read as
 // "this happened somewhere you cannot scroll to".
 const GO_CHAT = "↗"
@@ -132,8 +131,8 @@ type Row =
   | { kind: "lane"; key: string; agent: string; depth: number; messageID?: string; partID?: string }
   | { kind: "step"; key: string; step: Step }
   // One target of an expanded survey step (G4.4), indented a level exactly as a sub-agent
-  // lane is. `path` is undefined for nothing; a place carries no facet mix, so it draws its
-  // name without a band.
+  // lane is. A place is a directory or search scope, not a file, so it draws its name without
+  // facet squares.
   | { kind: "entry"; key: string; depth: number; path: string; action: Action; count: number; place: boolean }
 
 function View(props: { api: TuiPluginApi; session_id: string }) {
@@ -228,7 +227,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
           out.push({ kind: "step", key, step })
           if (!open.has(key)) return
           // Files first, then the directories and search scopes — the files are what the
-          // aggregate was hiding, and a place has no band to compare against them anyway.
+          // aggregate was hiding, and a place has no facet squares to compare against them anyway.
           step.files.forEach((file, i) =>
             out.push({
               kind: "entry",
@@ -257,36 +256,19 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     return out
   })
 
-  // Per-facet marked lines for a step, summed across the files it touched. Places contribute
-  // nothing by design — a survey step is already an aggregate, and folding a directory's subtree
-  // into it would report marks in code the agent never opened.
-  // Takes a path list rather than a step so an expanded child row (one file) and the aggregate it
-  // came from (all of them) reduce through exactly the same arithmetic — the expansion has to
-  // agree with the row it opened, or the affordance undermines the reading.
-  const bandsFor = (paths: ReadonlyArray<string>) => {
-    const files = data()?.files
-    if (!files) return []
-    const totals = new Map<string, number>()
-    for (const path of paths) {
-      for (const mark of files[path]?.m ?? []) {
-        const facet = facets()[mark.f]
-        if (facet === undefined) continue
-        totals.set(facet, (totals.get(facet) ?? 0) + mark.l)
-      }
-    }
-    return [...totals].map(([key, value]) => ({ key, value }))
-  }
-
-  // The colours of one band, left to right. Falls back to the dark grey when nothing here is
-  // marked, rather than an empty row that reads as a rendering bug.
-  const bandColors = (paths: ReadonlyArray<string>, width: number): TuiThemeCurrent["text"][] => {
-    const bands = bandsFor(paths)
-    if (bands.length === 0) return Array.from({ length: width }, () => resolveColor(theme(), UNTAGGED_HUE))
-    const flat: string[] = []
-    for (const a of allocateCells(bands, width)) for (let i = 0; i < a.n; i++) flat.push(a.key)
-    if (flat.length === 0) return Array.from({ length: width }, () => colors().colorFor(GREY_CELL))
-    while (flat.length < width) flat.push(GREY_CELL)
-    return flat.map((key) => colors().colorFor(key))
+  // Which facets the files a row touched contain: one slot per legend facet, in legend order,
+  // holding its colour when any of the files carries it and undefined otherwise. Presence only —
+  // how many lines is the top bar's business — and a facet filtered out of the legend is absent,
+  // the same re-slicing the top bar's groups do. Places contribute nothing by design: folding a
+  // directory's subtree in would report marks in code the agent never opened.
+  // Takes a path list rather than a step so an expanded child row (one file) and the step it came
+  // from (all of them) reduce the same way.
+  const slotsFor = (paths: ReadonlyArray<string>): Slot[] => {
+    const files = data()?.files ?? {}
+    const present = new Set(paths.flatMap((path) => (files[path]?.m ?? []).filter((m) => m.l > 0).map((m) => m.f)))
+    return facets().map((facet, i) =>
+      present.has(i) && !suppressed().has(facet) ? colors().facetColor(facet) : undefined,
+    )
   }
 
   // Open a file in the editor — the same call a top-bar file tile makes, so a path opens
@@ -300,7 +282,9 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
       lens: data()?.lens?.id ?? "",
       detail: path,
     })
-    void props.api.client.tui.openFile({ path })
+    // At its first marked line, as the top bar opens it; an unmarked file opens at the top.
+    const line = data()?.files[path]?.line
+    void props.api.client.tui.openFile({ path, ...(line ? { line } : {}) })
   }
 
   // Scroll the chat to the tool call this row stands for, where the transcript already
@@ -410,7 +394,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                         step={it().step}
                         expanded={expanded().has(it().key)}
                         theme={theme}
-                        colorsFor={bandColors}
+                        slotsFor={slotsFor}
                         onToggle={() => toggle(it().key)}
                         onOpen={openFile}
                         onReveal={revealInChat}
@@ -428,7 +412,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                         place={it().place}
                         depth={it().depth}
                         theme={theme}
-                        colorsFor={bandColors}
+                        slotsFor={slotsFor}
                         onOpen={openFile}
                         onHover={() => setHovered(it().path || "(repo root)")}
                         onLeave={() => setHovered(undefined)}
@@ -498,24 +482,24 @@ function LabelRow(props: { row: Row; theme: () => TuiThemeCurrent; onReveal: (ta
 
 type LaneAnchor = { messageID?: string; partID?: string }
 
-// One step, one row: the spine, the action verb, then either a facet band (gathering) or a
-// named band (a changed file) or a plain label (a command, a fetch).
+// One step, one row: the spine, the action verb, then either a name and its facet squares (a
+// changed file, or what a gathering step read) or a plain label (a command, a fetch).
 //
 // The row has two hit areas, and which is which is decided by what the reader is pointing
 // at rather than by a modifier:
 //
 //   - the **verb and its icon** reveal the act in the chat, where the full diff is drawn;
-//   - the **band or label** keeps what it has always meant — a row standing for many targets
+//   - the **name or label** keeps what it has always meant — a row standing for many targets
 //     expands (G4.4), a row standing for exactly one file opens it (G4.3).
 //
 // So the new gesture costs nothing: it spends the eight columns of the verb, which were
-// previously inert, and neither existing affordance loses any of its target. The band is the
+// previously inert, and neither existing affordance loses any of its target. The name is the
 // bulk of the row, so expanding a gathering step is still an easy click.
 function StepRow(props: {
   step: Step
   expanded: boolean
   theme: () => TuiThemeCurrent
-  colorsFor: (paths: ReadonlyArray<string>, width: number) => TuiThemeCurrent["text"][]
+  slotsFor: (paths: ReadonlyArray<string>) => Slot[]
   onToggle: () => void
   onOpen: (path: string) => void
   onReveal: (target: LaneAnchor) => void
@@ -539,68 +523,48 @@ function StepRow(props: {
   // mutation and a single-file gathering step alike.
   const only = () => (expandable() ? undefined : props.step.files[0]?.path)
 
-  // A mutate step holds exactly one file, so it can afford to name it — identity is the
-  // whole point of showing a mutation. A survey step names nothing and scales instead.
+  // A mutate step holds exactly one file, and identity is the whole point of showing a mutation.
   const named = () => (props.step.mode === "survey" ? undefined : props.step.files[0]?.path)
 
   // The change this step made, if it made one. Present exactly on mutations, which is why
   // the renderer tests for it rather than for the mode.
   const stats = createMemo(() => statsOf(props.step))
 
-  // What the row spends to the right of the band: the `×n` gutter for a gathering step, the
+  // What the row spends to the right of the squares: the `×n` gutter for a gathering step, the
   // change size for a mutation. A mutate step always weighs exactly 1 (only survey entries
   // ever join an open draft), so its `×n` is always blank — the stats are reusing reserved
-  // columns rather than taking any from the band.
+  // columns.
   const tail = () => {
     const s = stats()
     return s === undefined ? COUNT_COLS : statsCols(s)
   }
 
-  // Every *gathering* band is the same length, so they all begin and end in the same
-  // columns.
-  //
-  // This replaced an area-scaled width (sqrt of the file count against the largest step on
-  // screen). Scaling made the bar carry magnitude, but at the cost of the one reading the
-  // band is actually for: with ragged widths two steps' *proportions* cannot be compared by
-  // eye, which is the whole point of painting a mix. Magnitude is carried by the trailing
-  // `×n`, which states it exactly rather than implying it.
-  //
-  // A mutation's band ends a few columns short of that shared edge, because its tail is
-  // content-sized. That is the right trade rather than an erosion of the rule: the rule
-  // exists so two mixes can be compared by eye, and a mutate band has no mix — it is one
-  // solid colour carrying a name. Holding the edge would mean shrinking *every* gathering
-  // band to the worst case, costing real mix resolution (20 cells resolve a 5% facet; 15
-  // resolve only 6.7%) to protect a reading mutations do not participate in. The band is
-  // still capped at the gathering width, so a short tail widens nothing — the left edges
-  // stay aligned, which is the half of the alignment the eye actually follows.
+  const slots = createMemo(() => props.slotsFor(props.step.files.map((f) => f.path)))
+  // The name's width: what the tail and the squares leave, capped at the gathering width so the
+  // squares start in the same column on every row (a short change size ends its row early rather
+  // than shifting them). Zero when the step touched no file — a shell command or a fetch says
+  // what it was in words instead.
   const width = () => {
-    // No file means no mix to paint — a shell command or a fetch would otherwise draw a
-    // full-width bar of untagged grey, which reads as an unpainted *file* rather than as an
-    // act that touched none. The row spends those columns on its description instead.
     if (props.step.files.length === 0) return 0
-    return Math.max(MIN_NAME_COLS, Math.min(bandMax(depth(), tail()), bandMax(depth(), COUNT_COLS)))
+    const room = Math.min(rowMax(depth(), tail()), rowMax(depth(), COUNT_COLS))
+    return Math.max(MIN_NAME_COLS, room - squaresCols(slots()))
+  }
+  // A mutation names its file; a gathering step names its one file, or counts its targets.
+  const label = () => {
+    const path = named() ?? only()
+    if (path !== undefined) return basename(path)
+    const files = `${props.step.files.length} files`
+    return props.step.places.length > 0 ? `${files} +${props.step.places.length}` : files
   }
 
-  const cells = createMemo(() => {
-    const w = width()
-    if (w <= 0) return []
-    const label = named()
-    const name = label === undefined ? "" : truncate(basename(label), w)
-    const colors = props.colorsFor(
-      props.step.files.map((f) => f.path),
-      w,
-    )
-    return Array.from({ length: w }, (_, i) => ({ bg: colors[i]!, ch: name[i] ?? " " }))
-  })
-
-  // A step with no file to paint (a shell command, a fetch, a run of directory listings)
+  // A step with no file to show (a shell command, a fetch, a run of directory listings)
   // says what it was in words instead of leaving the row blank. The tool's own recorded
   // title is the best of those words by far — for a shell command it is the model-written
   // description the chat renders, so a `Run` row reads "Output the text smoke-three"
   // rather than naming the agent that happened to run it.
   const beatLabel = () => props.step.titles[0] ?? (props.step.places.length > 0 ? "looked around" : props.step.agent)
 
-  // What the band or label does when clicked — unchanged from G4.3/G4.4.
+  // What the name or label does when clicked — unchanged from G4.3/G4.4.
   const click = () => {
     if (expandable()) return props.onToggle()
     const path = only()
@@ -629,7 +593,7 @@ function StepRow(props: {
         {`${" ".repeat(depth() * INDENT_COLS)}${expandable() ? (props.expanded ? "▾ " : "▸ ") : " ".repeat(SPINE_COLS)}${verb()}${anchor() ? GO_CHAT : " "} `}
       </text>
       <Show
-        when={cells().length > 0}
+        when={width() > 0}
         fallback={
           <text fg={props.theme().textMuted} wrapMode="none" onMouseDown={click}>
             {beatLabel()}
@@ -637,12 +601,14 @@ function StepRow(props: {
         }
       >
         <box flexDirection="row" height={1} flexShrink={0} onMouseDown={click}>
-          <Band cells={cells()} theme={props.theme} />
+          <text fg={props.theme().text} wrapMode="none" flexShrink={0}>
+            {truncate(label(), width()).padEnd(width())}
+          </text>
+          <Squares slots={slots()} theme={props.theme} />
         </box>
       </Show>
-      {/* The change size sits OUTSIDE the band rather than inside it: band text is forced to
-          the background colour for contrast over the fill, which would throw away the
-          green/red — and the colour is most of why `+12 −3` parses without being read. */}
+      {/* The change size in green/red — the colour is most of why `+12 −3` parses without
+          being read. */}
       <Show
         when={stats()}
         fallback={
@@ -690,8 +656,8 @@ function StatsTail(props: { stats: Stats; theme: () => TuiThemeCurrent }) {
   )
 }
 
-// One target of an expanded survey step (G4.4): the file's own name over its own facet
-// band, indented past the aggregate it came from. Clicking opens it.
+// One target of an expanded survey step (G4.4): the file's own name and its own facet squares,
+// indented past the aggregate it came from. Clicking opens it.
 //
 // This is deliberately the same shape a mutation row draws, so an expanded read and a
 // recorded edit of the same file look alike — the difference between them is the verb, not
@@ -703,22 +669,16 @@ function EntryRow(props: {
   place: boolean
   depth: number
   theme: () => TuiThemeCurrent
-  colorsFor: (paths: ReadonlyArray<string>, width: number) => TuiThemeCurrent["text"][]
+  slotsFor: (paths: ReadonlyArray<string>) => Slot[]
   onOpen: (path: string) => void
   onHover: () => void
   onLeave: () => void
 }) {
-  // An expanded child is a *read*, so it always draws against the gathering gutter — the
-  // aggregate it opened from does too, which is what keeps the two edges lined up.
-  const width = () => bandMax(props.depth, COUNT_COLS)
+  // An expanded child is a *read*, so it always draws against the gathering gutter — the step it
+  // opened from does too, which is what keeps the squares lined up.
+  const slots = createMemo(() => props.slotsFor([props.path]))
+  const width = () => Math.max(MIN_NAME_COLS, rowMax(props.depth, COUNT_COLS) - squaresCols(slots()))
   const label = () => (props.place ? (props.path === "" ? "(repo root)" : props.path) : basename(props.path))
-
-  const cells = createMemo(() => {
-    const w = width()
-    const name = truncate(label(), w)
-    const colors = props.colorsFor([props.path], w)
-    return Array.from({ length: w }, (_, i) => ({ bg: colors[i]!, ch: name[i] ?? " " }))
-  })
 
   return (
     <box
@@ -741,7 +701,10 @@ function EntryRow(props: {
           </text>
         }
       >
-        <Band cells={cells()} theme={props.theme} />
+        <text fg={props.theme().text} wrapMode="none" flexShrink={0}>
+          {truncate(label(), width()).padEnd(width())}
+        </text>
+        <Squares slots={slots()} theme={props.theme} />
       </Show>
       <text fg={props.theme().textMuted} wrapMode="none">
         {props.count > 1 ? ` ×${props.count}` : ""}
@@ -750,42 +713,29 @@ function EntryRow(props: {
   )
 }
 
-// A run of coloured character cells, drawn as few elements as their colours allow.
-function Band(props: { cells: { bg: TuiThemeCurrent["text"]; ch: string }[]; theme: () => TuiThemeCurrent }) {
-  return (
-    <box flexDirection="row" height={1} flexShrink={0}>
-      <For each={coalesceCells(props.cells)}>
-        {(run) => (
-          <Show
-            when={run.text.trim().length > 0}
-            fallback={<box width={run.len} height={1} flexShrink={0} backgroundColor={run.bg} />}
-          >
-            {/* Dark text over the band, the treatment the top bar's file tiles use: every
-                band colour is a light fill, so a name reads against all of them without
-                having to know which facet it landed on. */}
-            <text bg={run.bg} fg={props.theme().background} wrapMode="none">
-              {run.text}
-            </text>
-          </Show>
-        )}
-      </For>
-    </box>
-  )
-}
+// One slot per legend facet: its colour when the row's files carry it, undefined when not.
+type Slot = TuiThemeCurrent["text"] | undefined
 
-// Collapse a row of coloured character cells into same-colour runs, so a solid band draws
-// as one element instead of thirty. Mirrors `coalesce` in treemap.ts, but carries the
-// characters along — a run is only mergeable when its colour matches, whatever it spells.
-function coalesceCells(cells: { bg: TuiThemeCurrent["text"]; ch: string }[]) {
-  const runs: { bg: TuiThemeCurrent["text"]; text: string; len: number }[] = []
-  for (const cell of cells) {
-    const last = runs[runs.length - 1]
-    if (last && last.bg === cell.bg) {
-      last.text += cell.ch
-      last.len++
-    } else runs.push({ bg: cell.bg, text: cell.ch, len: 1 })
-  }
-  return runs
+// Columns the squares take, with the space before them; none when there is no Lens.
+const squaresCols = (slots: ReadonlyArray<Slot>) => (slots.length > 0 ? slots.length + 1 : 0)
+
+// A row's containment: one square per facet, in fixed legend slots so a facet stays in the same
+// column down the whole path and the rows read as a matrix. Packed without gaps — the sidebar is
+// 36 columns, and distinct colours already separate them. A row carrying no facet shows one
+// hollow square, the top bar's mark for the unmarked group.
+function Squares(props: { slots: ReadonlyArray<Slot>; theme: () => TuiThemeCurrent }) {
+  return (
+    <Show when={props.slots.length > 0}>
+      <text wrapMode="none" flexShrink={0} fg={props.theme().textMuted}>
+        {" "}
+        <Show when={props.slots.some((slot) => slot !== undefined)} fallback={"□".padEnd(props.slots.length)}>
+          <For each={[...props.slots]}>
+            {(slot) => <span style={{ fg: slot ?? props.theme().textMuted }}>{slot ? "■" : " "}</span>}
+          </For>
+        </Show>
+      </text>
+    </Show>
+  )
 }
 
 // The action a step's mark shows. A step is single-mode by construction, but a gathering run
