@@ -17,6 +17,7 @@ import {
 } from "@/aperture/facet-grid"
 import { facetColors } from "./aperture-colors"
 import { openLensPicker } from "./aperture-lens-picker"
+import { tint } from "@tui/context/theme"
 
 const id = "internal:aperture"
 
@@ -54,23 +55,29 @@ const TILE_W = 22
 const NAME_W = TILE_W - 2
 // Rows the grid has under each group's header row. Columns of bordered runs are packed into this.
 const GRID_ROWS = 9
-// The detail region under the legend. A terminal has no tooltip to hang an explanation on, so the
+// The detail region between the Lens row and the legend. A terminal has no tooltip to hang an explanation on, so the
 // bar reserves fixed rows for one: what the pointer is over (a facet's query and reason, a group's
 // combination, a file's marks), and otherwise the hints that make those hovers discoverable.
 // Fixed height, so hovering never reflows the grid.
 const DETAIL_ROWS = 2
-// Title row + legend row + detail + group header + grid + the bar's bottom border. NB:
-// `routes/session/index.tsx` hides the bar outright on short terminals using its own literal —
-// move that with this.
-const TOP_BAR_HEIGHT = 2 + DETAIL_ROWS + 1 + GRID_ROWS + 1
+// Header (title + Lens controls) + detail + a blank row + legend row + the rule under it + group
+// header + grid + the bar's bottom border. NB: `routes/session/index.tsx` hides the bar outright on
+// short terminals using its own literal — move that with this.
+const TOP_BAR_HEIGHT = 1 + DETAIL_ROWS + 1 + 1 + 1 + 1 + GRID_ROWS + 1
 const GROUP_GAP = 1
 const BAR_PADDING_X = 2
 const LEGEND_GAP = 2
 // Even-trim floor for legend facet labels: the legend is one row that must neither wrap nor clip.
 const LEGEND_LABEL_MIN = 6
+// The header band and its buttons are the panel blended toward the text colour, so they stand out
+// by the same proportion in light and dark themes. The theme's own backgroundElement sits one
+// barely visible step from the panel.
+const HEADER_TINT = 0.16
+const BUTTON_TINT = 0.07
 // Columns held back from the fit test for ambiguous-width glyphs (■ ◀ ▶ ⌄).
 const LEGEND_SAFETY_PAD = 2
 const LEGEND_RESET = "↺"
+const LEGEND_LABEL = "Legend:"
 const HSCROLL_STEP = 3
 // Catch-all for changes nothing tells us about (manual IDE edits outside opencode). The facet map
 // is memoized server-side, so a poll costs a map lookup unless something actually changed.
@@ -353,29 +360,23 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     logInteraction("lens.delete", activeId())
     void props.api.client.aperture.deleteLens({ lens: activeId() })
   }
-  const deleteLabel = () => (confirmingDelete() ? "✕ confirm?" : "✕")
+  const deleteLabel = () => (confirmingDelete() ? "✕ Delete lens? click again" : "✕ Delete lens")
   createEffect(() => {
     activeId()
     setConfirmingDelete(false)
   })
 
-  // The lens cluster's rendered width (◀ name ▶ ⌄ ✕ with gap 1), so the legend trim below
-  // charges exactly what renders.
   const lensLabel = () => (lens() ? lens()!.name + (lens()!.owner === "agent" ? " (agent)" : "") : "")
-  const lensClusterWidth = () => {
-    if (!lens()) return 0
-    const items = [1, lensLabel().length, 1, 1, deleteLabel().length]
-    return items.reduce((a, b) => a + b, 0) + (items.length - 1)
-  }
   // Fit the one-row legend: when it would overflow, even-trim the facet labels to the largest
   // shared cap that fits (never below LEGEND_LABEL_MIN). The detail region shows the full label.
   const trimmedLegend = createMemo(() => {
     const entries = legendEntries()
     const reset = suppressed().size > 0 ? 1 : 0
     const toggle = showChangedToggle() ? 1 : 0
-    const children = (lens() ? 1 : 0) + entries.length + reset + toggle
+    const label = entries.length > 0 ? 1 : 0
+    const children = label + entries.length + reset + toggle
     const fixed =
-      lensClusterWidth() +
+      label * LEGEND_LABEL.length +
       entries.length * 2 +
       reset * LEGEND_RESET.length +
       toggle * changedLabel().length +
@@ -425,7 +426,8 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
 
   // The detail region's subject, narrowed per kind for <Match>. A facet that vanished under the
   // pointer (a Lens switch) falls back to the hints rather than describing nothing.
-  const detailWidth = () => dimensions().width - BAR_PADDING_X * 2
+  // Less the detail region's left rule and the space after it.
+  const detailWidth = () => dimensions().width - BAR_PADDING_X * 2 - 2
   const hoveredFacet = () => {
     const h = hovered()
     return h?.kind === "facet" ? legendEntries().find((e) => e.facet === h.facet) : undefined
@@ -485,288 +487,328 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
       height={barHeight()}
       flexDirection="column"
       backgroundColor={theme().backgroundPanel}
-      paddingLeft={BAR_PADDING_X}
-      paddingRight={BAR_PADDING_X}
       border={["bottom"]}
       borderColor={theme().border}
     >
-      <box flexDirection="row" justifyContent="space-between">
+      {/* The bar's regions are told apart without spending rows on rules: the header is a band of
+          its own shade, its controls are darker pills, the detail region hangs off a left rule like
+          a quote, and one rule divides the legend from the groups it keys. */}
+      <box
+        flexDirection="row"
+        justifyContent="space-between"
+        height={1}
+        flexShrink={0}
+        backgroundColor={tint(theme().backgroundPanel, theme().text, HEADER_TINT)}
+        paddingLeft={BAR_PADDING_X}
+        paddingRight={BAR_PADDING_X}
+      >
         <box flexDirection="row" gap={1} flexShrink={0}>
-          <text fg={theme().text}>
+          <text fg={theme().text} wrapMode="none">
             <b>Aperture</b>
           </text>
-          <text
-            fg={theme().accent}
-            onMouseDown={() => {
-              logInteraction("refresh")
-              refetch()
-            }}
-          >
-            ⟳
-          </text>
+          <Show when={lens()}>
+            <text fg={theme().textMuted} wrapMode="none">
+              ·
+            </text>
+            <Button label="◀" fg={theme().accent} theme={theme} onMouseDown={() => cycleLens("prev")} />
+            <text fg={theme().text} onMouseDown={() => cycleLens("next")} wrapMode="none">
+              {lensLabel()}
+            </text>
+            <Button label="▶" fg={theme().accent} theme={theme} onMouseDown={() => cycleLens("next")} />
+            <text wrapMode="none"> </text>
+            {/* Opened on mouse *up*: the dialog backdrop dismisses itself on the mouse-up it sees
+                outside its box, so opening on mouse-down would close it immediately. */}
+            <Button
+              label="⌄ Lens list"
+              fg={theme().text}
+              theme={theme}
+              onMouseUp={() => openLensPicker(props.api, props.session_id)}
+            />
+            <Button
+              label={deleteLabel()}
+              fg={confirmingDelete() ? theme().error : theme().text}
+              theme={theme}
+              onMouseDown={() => deleteActiveLens()}
+            />
+          </Show>
         </box>
         <text fg={theme().textMuted} wrapMode="none">
           {summary()}
         </text>
       </box>
 
-      <box flexDirection="row" gap={LEGEND_GAP} height={1} flexShrink={0}>
-        <Show when={lens()}>
-          <box flexDirection="row" gap={1} flexShrink={0}>
-            <text fg={theme().accent} onMouseDown={() => cycleLens("prev")} wrapMode="none">
-              ◀
-            </text>
-            <text fg={theme().accent} onMouseDown={() => cycleLens("next")} wrapMode="none">
-              {lensLabel()}
-            </text>
-            <text fg={theme().accent} onMouseDown={() => cycleLens("next")} wrapMode="none">
-              ▶
-            </text>
-            {/* Opened on mouse *up*: the dialog backdrop dismisses itself on the mouse-up it sees
-                outside its box, so opening on mouse-down would close it immediately. */}
-            <text fg={theme().textMuted} onMouseUp={() => openLensPicker(props.api, props.session_id)} wrapMode="none">
-              ⌄
-            </text>
-            <text
-              fg={confirmingDelete() ? theme().error : theme().textMuted}
-              onMouseDown={() => deleteActiveLens()}
-              wrapMode="none"
-            >
-              {deleteLabel()}
-            </text>
-          </box>
-        </Show>
-        <For each={trimmedLegend()}>
-          {(entry) => (
-            <box
-              flexDirection="row"
-              flexShrink={0}
-              onMouseDown={() => toggleFacet(entry.facet)}
-              onMouseOver={() => setHovered({ kind: "facet", facet: entry.facet })}
-              onMouseOut={() => setHovered(undefined)}
-            >
-              <text fg={facetColor(entry.facet)} wrapMode="none">
-                ■
-              </text>
-              <text fg={suppressed().has(entry.facet) ? theme().border : theme().textMuted} wrapMode="none">
-                {" " + entry.label}
-              </text>
-            </box>
-          )}
-        </For>
-        <Show when={suppressed().size > 0}>
-          <text fg={theme().accent} onMouseDown={() => clearFilter()} wrapMode="none">
-            {LEGEND_RESET}
-          </text>
-        </Show>
-        <Show when={showChangedToggle()}>
-          <text
-            fg={scope() !== "all" ? theme().accent : theme().textMuted}
-            onMouseDown={() => cycleScope()}
-            wrapMode="none"
-          >
-            {changedLabel()}
-          </text>
-        </Show>
-      </box>
-
-      <box flexDirection="column" height={DETAIL_ROWS} flexShrink={0}>
-        <Switch fallback={<Hints show={!!lens()} width={detailWidth()} theme={theme} />}>
-          <Match when={hoveredFacet()}>
-            {(entry) => (
-              <>
-                <text wrapMode="none" fg={theme().text}>
-                  <span style={{ fg: facetColor(entry().facet) }}>■ </span>
-                  <b>{truncate(entry().label, detailWidth() - 2)}</b>
-                  <span style={{ fg: theme().textMuted }}>
-                    {truncate(
-                      "  " +
-                        (entry().queries.length ? "query: " + entry().queries.join(" · ") : "no rules") +
-                        (suppressed().has(entry().facet) ? "  (hidden — click its name to show)" : ""),
-                      Math.max(0, detailWidth() - 2 - entry().label.length),
-                    )}
-                  </span>
-                </text>
-                <text wrapMode="none" fg={entry().reason ? theme().text : theme().textMuted}>
-                  {truncate("reason: " + (entry().reason || "none given"), detailWidth())}
-                </text>
-              </>
-            )}
-          </Match>
-          <Match when={hoveredGroup()}>
-            {(entry) => (
-              <>
-                <text wrapMode="none" fg={theme().text}>
-                  <For each={entry().group.key}>
-                    {(f) => <span style={{ fg: facetColor(facetIds()[f] ?? "") }}>■ </span>}
-                  </For>
-                  {truncate(combinationText(entry().group), detailWidth() - entry().group.key.length * 2)}
-                </text>
-                <text wrapMode="none" fg={theme().textMuted}>
-                  {truncate(
-                    [
-                      ...(entry().group.key.length ? ["hover one ■ for its query and reason"] : []),
-                      ...(entry().toggle ? [entry().hidden > 0 ? "click to show every file" : "click to fold"] : []),
-                    ].join(" · "),
-                    detailWidth(),
-                  )}
-                </text>
-              </>
-            )}
-          </Match>
-          <Match when={hoveredFile()}>
-            {(entry) => (
-              <>
-                <text wrapMode="none" fg={theme().text}>
-                  {truncate(entry().file.path, detailWidth())}
-                </text>
-                <text wrapMode="none" fg={theme().textMuted}>
-                  {truncate(
-                    [...describeFile(entry().file, entry().group), `click to open at line ${entry().file.line}`].join(
-                      " · ",
-                    ),
-                    detailWidth(),
-                  )}
-                </text>
-              </>
-            )}
-          </Match>
-        </Switch>
-      </box>
-
-      <Show
-        when={groups().length > 0}
-        fallback={
-          <text fg={theme().textMuted} wrapMode="none">
-            {emptyMessage()}
-          </text>
-        }
-      >
-        {/* NB: the scrollbox's `scrollX`/`scrollY` are constructor-only and inert as props, so
-            the content box is configured directly: no maxWidth (horizontal overflow scrolls),
-            maxHeight pinned (no vertical scroll). */}
-        <scrollbox
-          ref={(r: ScrollBoxRenderable) => (scroll = r)}
-          flexGrow={1}
-          onMouseScroll={onWheel}
-          contentOptions={{ flexDirection: "row", gap: GROUP_GAP, maxWidth: undefined, maxHeight: "100%" }}
-          verticalScrollbarOptions={{ visible: false }}
-          horizontalScrollbarOptions={{
-            showArrows: false,
-            trackOptions: { foregroundColor: theme().textMuted, backgroundColor: theme().backgroundPanel },
-          }}
+      <box flexDirection="column" flexGrow={1} paddingLeft={BAR_PADDING_X} paddingRight={BAR_PADDING_X}>
+        <box
+          flexDirection="column"
+          height={DETAIL_ROWS}
+          flexShrink={0}
+          border={["left"]}
+          borderColor={theme().border}
+          paddingLeft={1}
         >
-          <For each={groups()}>
-            {(entry) => (
-              <box flexDirection="column" flexShrink={0} width={groupWidth(entry)}>
-                <box
-                  flexDirection="row"
-                  height={1}
-                  flexShrink={0}
-                  onMouseDown={() => entry.toggle && toggleExpanded(entry.group)}
-                  onMouseOver={() => setHovered({ kind: "group", ...entry })}
-                  onMouseOut={() => setHovered(undefined)}
-                >
-                  <Show when={entry.group.key.length === 0}>
-                    <text fg={theme().textMuted} wrapMode="none">
-                      {"□ "}
-                    </text>
-                  </Show>
-                  <For each={entry.group.key}>
-                    {(f) => (
-                      <text
-                        fg={facetColor(facetIds()[f] ?? "")}
-                        wrapMode="none"
-                        // Claims the hover for its own facet: over/out bubble, and the header's
-                        // handler would otherwise replace this with the whole combination.
-                        onMouseOver={(event: MouseEvent) => {
-                          event.stopPropagation()
-                          setHovered({ kind: "facet", facet: facetIds()[f] ?? "" })
-                        }}
-                      >
-                        {"■ "}
-                      </text>
-                    )}
-                  </For>
-                  <text fg={theme().textMuted} wrapMode="none">
-                    {headerText(entry.group)}
+          <Switch fallback={<Hints show={!!lens()} width={detailWidth()} theme={theme} />}>
+            <Match when={hoveredFacet()}>
+              {(entry) => (
+                <>
+                  <text wrapMode="none" fg={theme().text}>
+                    <span style={{ fg: facetColor(entry().facet) }}>■ </span>
+                    <b>{truncate(entry().label, detailWidth() - 2)}</b>
+                    <span style={{ fg: theme().textMuted }}>
+                      {truncate(
+                        "  " +
+                          (entry().queries.length ? "query: " + entry().queries.join(" · ") : "no rules") +
+                          (suppressed().has(entry().facet) ? "  (hidden — click its name to show)" : ""),
+                        Math.max(0, detailWidth() - 2 - entry().label.length),
+                      )}
+                    </span>
                   </text>
-                </box>
-                <box flexDirection="row" flexShrink={0}>
-                  <For each={entry.columns}>
-                    {(column) => (
-                      <box flexDirection="column" flexShrink={0}>
-                        <For each={column}>
-                          {(segment) => (
-                            <box
-                              border
-                              customBorderChars={SQUARE_CORNERS}
-                              borderColor={theme().border}
-                              title={segmentTitle(segment)}
-                              titleAlignment="left"
-                              width={TILE_W}
-                              height={segment.files.length + SEGMENT_BORDER_ROWS}
-                              flexShrink={0}
-                              flexDirection="column"
-                            >
-                              <For each={segment.files}>
-                                {(file) => (
-                                  <box
-                                    onMouseDown={() => openFile(file)}
-                                    onMouseOver={() => setHovered({ kind: "file", file, group: entry.group })}
-                                    onMouseOut={() => setHovered(undefined)}
-                                  >
-                                    <NameRow
-                                      name={truncate(changeMark(file) + basename(file.path), NAME_W)}
-                                      width={NAME_W}
-                                      colors={() => bandColors(file, entry.group)}
-                                      // No band behind an unmarked file, so its name needs the ordinary text colour.
-                                      textColor={() =>
-                                        entry.group.key.length === 0 ? theme().text : theme().background
-                                      }
-                                      theme={theme}
-                                    />
-                                  </box>
-                                )}
-                              </For>
-                            </box>
-                          )}
-                        </For>
-                      </box>
+                  <text wrapMode="none" fg={entry().reason ? theme().text : theme().textMuted}>
+                    {truncate("reason: " + (entry().reason || "none given"), detailWidth())}
+                  </text>
+                </>
+              )}
+            </Match>
+            <Match when={hoveredGroup()}>
+              {(entry) => (
+                <>
+                  <text wrapMode="none" fg={theme().text}>
+                    <For each={entry().group.key}>
+                      {(f) => <span style={{ fg: facetColor(facetIds()[f] ?? "") }}>■ </span>}
+                    </For>
+                    {truncate(combinationText(entry().group), detailWidth() - entry().group.key.length * 2)}
+                  </text>
+                  <text wrapMode="none" fg={theme().textMuted}>
+                    {truncate(
+                      [
+                        ...(entry().group.key.length ? ["hover one ■ for its query and reason"] : []),
+                        ...(entry().toggle ? [entry().hidden > 0 ? "click to show every file" : "click to fold"] : []),
+                      ].join(" · "),
+                      detailWidth(),
                     )}
-                  </For>
-                  <Show when={entry.toggle}>
-                    <box
-                      width={MORE_W}
-                      flexShrink={0}
-                      flexDirection="column"
-                      paddingLeft={1}
-                      onMouseDown={() => toggleExpanded(entry.group)}
-                    >
-                      <Show
-                        when={entry.hidden > 0}
-                        fallback={
-                          <text fg={theme().accent} wrapMode="none">
-                            ◂ less
-                          </text>
-                        }
-                      >
-                        <text fg={theme().accent} wrapMode="none">
-                          {`+${entry.hidden}`}
-                        </text>
-                        <text fg={theme().accent} wrapMode="none">
-                          more ▸
-                        </text>
-                      </Show>
-                    </box>
-                  </Show>
-                </box>
+                  </text>
+                </>
+              )}
+            </Match>
+            <Match when={hoveredFile()}>
+              {(entry) => (
+                <>
+                  <text wrapMode="none" fg={theme().text}>
+                    {truncate(entry().file.path, detailWidth())}
+                  </text>
+                  <text wrapMode="none" fg={theme().textMuted}>
+                    {truncate(
+                      [...describeFile(entry().file, entry().group), `click to open at line ${entry().file.line}`].join(
+                        " · ",
+                      ),
+                      detailWidth(),
+                    )}
+                  </text>
+                </>
+              )}
+            </Match>
+          </Switch>
+        </box>
+
+        <box height={1} flexShrink={0} />
+
+        <box flexDirection="row" gap={LEGEND_GAP} height={1} flexShrink={0}>
+          <Show when={trimmedLegend().length > 0}>
+            <text fg={theme().textMuted} wrapMode="none">
+              {LEGEND_LABEL}
+            </text>
+          </Show>
+          <For each={trimmedLegend()}>
+            {(entry) => (
+              <box
+                flexDirection="row"
+                flexShrink={0}
+                onMouseDown={() => toggleFacet(entry.facet)}
+                onMouseOver={() => setHovered({ kind: "facet", facet: entry.facet })}
+                onMouseOut={() => setHovered(undefined)}
+              >
+                <text fg={facetColor(entry.facet)} wrapMode="none">
+                  ■
+                </text>
+                <text fg={suppressed().has(entry.facet) ? theme().border : theme().textMuted} wrapMode="none">
+                  {" " + entry.label}
+                </text>
               </box>
             )}
           </For>
-        </scrollbox>
-      </Show>
+          <Show when={suppressed().size > 0}>
+            <text fg={theme().accent} onMouseDown={() => clearFilter()} wrapMode="none">
+              {LEGEND_RESET}
+            </text>
+          </Show>
+          <Show when={showChangedToggle()}>
+            <text
+              fg={scope() !== "all" ? theme().accent : theme().textMuted}
+              onMouseDown={() => cycleScope()}
+              wrapMode="none"
+            >
+              {changedLabel()}
+            </text>
+          </Show>
+        </box>
+
+        <box height={1} flexShrink={0} border={["bottom"]} borderColor={theme().border} />
+
+        <Show
+          when={groups().length > 0}
+          fallback={
+            <text fg={theme().textMuted} wrapMode="none">
+              {emptyMessage()}
+            </text>
+          }
+        >
+          {/* NB: the scrollbox's `scrollX`/`scrollY` are constructor-only and inert as props, so
+            the content box is configured directly: no maxWidth (horizontal overflow scrolls),
+            maxHeight pinned (no vertical scroll). */}
+          <scrollbox
+            ref={(r: ScrollBoxRenderable) => (scroll = r)}
+            flexGrow={1}
+            onMouseScroll={onWheel}
+            contentOptions={{ flexDirection: "row", gap: GROUP_GAP, maxWidth: undefined, maxHeight: "100%" }}
+            verticalScrollbarOptions={{ visible: false }}
+            horizontalScrollbarOptions={{
+              showArrows: false,
+              trackOptions: { foregroundColor: theme().textMuted, backgroundColor: theme().backgroundPanel },
+            }}
+          >
+            <For each={groups()}>
+              {(entry) => (
+                <box flexDirection="column" flexShrink={0} width={groupWidth(entry)}>
+                  <box
+                    flexDirection="row"
+                    height={1}
+                    flexShrink={0}
+                    onMouseDown={() => entry.toggle && toggleExpanded(entry.group)}
+                    onMouseOver={() => setHovered({ kind: "group", ...entry })}
+                    onMouseOut={() => setHovered(undefined)}
+                  >
+                    <Show when={entry.group.key.length === 0}>
+                      <text fg={theme().textMuted} wrapMode="none">
+                        {"□ "}
+                      </text>
+                    </Show>
+                    <For each={entry.group.key}>
+                      {(f) => (
+                        <text
+                          fg={facetColor(facetIds()[f] ?? "")}
+                          wrapMode="none"
+                          // Claims the hover for its own facet: over/out bubble, and the header's
+                          // handler would otherwise replace this with the whole combination.
+                          onMouseOver={(event: MouseEvent) => {
+                            event.stopPropagation()
+                            setHovered({ kind: "facet", facet: facetIds()[f] ?? "" })
+                          }}
+                        >
+                          {"■ "}
+                        </text>
+                      )}
+                    </For>
+                    <text fg={theme().textMuted} wrapMode="none">
+                      {headerText(entry.group)}
+                    </text>
+                  </box>
+                  <box flexDirection="row" flexShrink={0}>
+                    <For each={entry.columns}>
+                      {(column) => (
+                        <box flexDirection="column" flexShrink={0}>
+                          <For each={column}>
+                            {(segment) => (
+                              <box
+                                border
+                                customBorderChars={SQUARE_CORNERS}
+                                borderColor={theme().border}
+                                title={segmentTitle(segment)}
+                                titleAlignment="left"
+                                width={TILE_W}
+                                height={segment.files.length + SEGMENT_BORDER_ROWS}
+                                flexShrink={0}
+                                flexDirection="column"
+                              >
+                                <For each={segment.files}>
+                                  {(file) => (
+                                    <box
+                                      onMouseDown={() => openFile(file)}
+                                      onMouseOver={() => setHovered({ kind: "file", file, group: entry.group })}
+                                      onMouseOut={() => setHovered(undefined)}
+                                    >
+                                      <NameRow
+                                        name={truncate(changeMark(file) + basename(file.path), NAME_W)}
+                                        width={NAME_W}
+                                        colors={() => bandColors(file, entry.group)}
+                                        // No band behind an unmarked file, so its name needs the ordinary text colour.
+                                        textColor={() =>
+                                          entry.group.key.length === 0 ? theme().text : theme().background
+                                        }
+                                        theme={theme}
+                                      />
+                                    </box>
+                                  )}
+                                </For>
+                              </box>
+                            )}
+                          </For>
+                        </box>
+                      )}
+                    </For>
+                    <Show when={entry.toggle}>
+                      <box
+                        width={MORE_W}
+                        flexShrink={0}
+                        flexDirection="column"
+                        paddingLeft={1}
+                        onMouseDown={() => toggleExpanded(entry.group)}
+                      >
+                        <Show
+                          when={entry.hidden > 0}
+                          fallback={
+                            <text fg={theme().accent} wrapMode="none">
+                              ◂ less
+                            </text>
+                          }
+                        >
+                          <text fg={theme().accent} wrapMode="none">
+                            {`+${entry.hidden}`}
+                          </text>
+                          <text fg={theme().accent} wrapMode="none">
+                            more ▸
+                          </text>
+                        </Show>
+                      </box>
+                    </Show>
+                  </box>
+                </box>
+              )}
+            </For>
+          </scrollbox>
+        </Show>
+      </box>
     </box>
+  )
+}
+
+// A clickable control in the header: a pill darker than the band, padded by a space each side, so it reads as a
+// button without the two rows a border would cost.
+function Button(props: {
+  label: string
+  fg: TuiThemeCurrent["text"]
+  theme: () => TuiThemeCurrent
+  onMouseDown?: () => void
+  onMouseUp?: () => void
+}) {
+  return (
+    <text
+      fg={props.fg}
+      bg={tint(props.theme().backgroundPanel, props.theme().text, BUTTON_TINT)}
+      onMouseDown={props.onMouseDown}
+      onMouseUp={props.onMouseUp}
+      wrapMode="none"
+    >
+      {` ${props.label} `}
+    </text>
   )
 }
 

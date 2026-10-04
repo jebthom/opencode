@@ -249,13 +249,13 @@ export function Session() {
   const showTimestamps = createMemo(() => timestamps() === "show")
   // Aperture top bar: hidden for subagent sessions and very short terminals,
   // where the fixed-height strip would crowd out the conversation. The floor tracks the
-  // bar's own TOP_BAR_HEIGHT (15 since the v3.1 detail region, was 13) plus a
-  // couple of rows so the conversation is never reduced to nothing — move it if that
-  // constant moves. Deliberately not imported: this route doesn't otherwise depend on
+  // bar's own TOP_BAR_HEIGHT (17 since v3.1 added the detail region, its spacing and the legend
+  // rule) plus a couple of rows so the conversation is never reduced to nothing — move it if
+  // that constant moves. Deliberately not imported: this route doesn't otherwise depend on
   // the plugin, which owns its own height.
   const apertureVisible = createMemo(() => {
     if (session()?.parentID) return false
-    if (dimensions().height < 18) return false
+    if (dimensions().height < 20) return false
     return aperture() === "show"
   })
   const contentWidth = createMemo(() => dimensions().width - (sidebarVisible() ? 42 : 0) - 4)

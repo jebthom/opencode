@@ -1,46 +1,51 @@
 {
-  "aperture-features-f040d1e9": {
-    "id": "aperture-features-f040d1e9",
-    "name": "Aperture Features",
-    "description": "Aperture marking system: how code is marked with concerns and displayed in the UI",
+  "aperture-extension-0d1d9055": {
+    "id": "aperture-extension-0d1d9055",
+    "name": "Aperture Extension",
+    "description": "Marks for Aperture Extension.",
     "palette": "categorical",
     "facets": [
       {
-        "id": "aperture-service",
-        "label": "aperture-service",
-        "description": "Main service interface with read/write APIs for marks and lenses",
+        "id": "lens-data-model",
+        "label": "lens-data-model",
+        "description": "Pure TypeScript types for Lens, Facet, Rule, and Finder patterns",
+        "reason": "Core domain model; dependency-free and shared across server, TUI, and VSCode",
+        "color": "#D7005F",
         "owner": "agent",
-        "createdBy": "build",
-        "color": "#D7005F"
+        "createdBy": "build"
       },
       {
-        "id": "data-model-types",
-        "label": "data-model-types",
-        "description": "Core types: Lens (collection of concerns), Facet (labeled category), Rule (query), Finder (pattern/symbol/diff)",
+        "id": "rule-evaluation-engine",
+        "label": "rule-evaluation-engine",
+        "description": "Evaluates pattern, symbol, diff, and structural rules against repository files",
+        "reason": "Where deterministic marking happens; handles git integration and memoization for performance",
+        "color": "#AF5F00",
         "owner": "agent",
-        "createdBy": "build",
-        "color": "#AF5F00"
+        "createdBy": "build"
       },
       {
-        "id": "rule-evaluation",
-        "label": "rule-evaluation",
-        "description": "Rule evaluation engine that finds lines matching patterns, symbols, git diffs, or AST queries",
+        "id": "lens-persistence",
+        "label": "lens-persistence",
+        "description": "Read-modify-write store with ownership enforcement, consent checks, and history recording",
+        "reason": "How Lenses are mutated safely; enforces user/agent ownership model and records audit trail",
+        "color": "#AFAF00",
         "owner": "agent",
-        "createdBy": "build",
-        "color": "#AFAF00"
+        "createdBy": "build"
       },
       {
-        "id": "storage-layer",
-        "label": "storage-layer",
-        "description": "Persistent JSON storage for lenses, active lens pointer, and append-only history log",
+        "id": "activity-tracking",
+        "label": "activity-tracking",
+        "description": "Derives per-turn agent activity (reads, edits, searches) from message store and active Lens",
+        "reason": "Enables visualization of agent work; live derivation from message store, recolored on Lens switch",
+        "color": "#00875F",
         "owner": "agent",
-        "createdBy": "build",
-        "color": "#00875F"
+        "createdBy": "build"
       },
       {
-        "id": "tui-rendering",
-        "label": "tui-rendering",
-        "description": "TUI top bar grid: groups files by facet combinations, packs into columns, renders with colored bands",
+        "id": "color-system",
+        "label": "color-system",
+        "description": "xterm-256 color palette contract; categorical and ordinal palettes with pinned facet colors",
+        "reason": "Ensures color consistency across server, TUI, and VSCode; C1 contract prevents color drift",
         "owner": "agent",
         "createdBy": "build",
         "color": "#00AFD7"
@@ -49,18 +54,8 @@
     "owner": "agent",
     "rules": [
       {
-        "id": "aperture-service-66c563a2",
-        "facet": "aperture-service",
-        "find": {
-          "kind": "symbol",
-          "name": "Interface",
-          "path": "packages/opencode/src/aperture"
-        },
-        "createdBy": "build"
-      },
-      {
-        "id": "data-model-types-24b113e1",
-        "facet": "data-model-types",
+        "id": "lens-data-model-24b113e1",
+        "facet": "lens-data-model",
         "find": {
           "kind": "symbol",
           "name": "Lens",
@@ -69,18 +64,8 @@
         "createdBy": "build"
       },
       {
-        "id": "data-model-types-73b06ae2",
-        "facet": "data-model-types",
-        "find": {
-          "kind": "symbol",
-          "name": "Finder",
-          "path": "packages/opencode/src/aperture/lenses.ts"
-        },
-        "createdBy": "build"
-      },
-      {
-        "id": "rule-evaluation-d1381766",
-        "facet": "rule-evaluation",
+        "id": "rule-evaluation-engine-d1381766",
+        "facet": "rule-evaluation-engine",
         "find": {
           "kind": "symbol",
           "name": "evaluate",
@@ -89,22 +74,32 @@
         "createdBy": "build"
       },
       {
-        "id": "storage-layer-ca60a20f",
-        "facet": "storage-layer",
+        "id": "lens-persistence-dd4e7fba",
+        "facet": "lens-persistence",
         "find": {
           "kind": "symbol",
-          "name": "MarkResult",
+          "name": "mark",
           "path": "packages/opencode/src/aperture/lens-store.ts"
         },
         "createdBy": "build"
       },
       {
-        "id": "tui-rendering-22feca80",
-        "facet": "tui-rendering",
+        "id": "activity-tracking-c730f9e3",
+        "facet": "activity-tracking",
         "find": {
           "kind": "symbol",
-          "name": "groupByCombination",
-          "path": "packages/opencode/src/aperture/facet-grid.ts"
+          "name": "deriveTurns",
+          "path": "packages/opencode/src/aperture/activity-model.ts"
+        },
+        "createdBy": "build"
+      },
+      {
+        "id": "color-system-359f855c",
+        "facet": "color-system",
+        "find": {
+          "kind": "pattern",
+          "pattern": "CATEGORICAL_PALETTE|ORDINAL_PALETTE|COLOR_NAMES",
+          "path": "packages/opencode/src/aperture/lenses.ts"
         },
         "createdBy": "build"
       }
