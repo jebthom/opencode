@@ -2,6 +2,7 @@ import { Effect, Option, Schema } from "effect"
 import { appendFile, mkdir, readFile } from "node:fs/promises"
 import path from "node:path"
 import type { Facet, Lens, Owner, Rule } from "./lenses"
+import { LENS_DIR } from "./plumbing"
 
 // The append-only history of every Lens definition change (v3): who created, edited or removed
 // which Lens, facet or rule, when, why, and in which chat turn.
@@ -91,7 +92,7 @@ export interface Query {
 }
 
 function historyFile(directory: string) {
-  return path.join(directory, ".opencode", "aperture", "lens-history.jsonl")
+  return path.join(directory, ...LENS_DIR, "lens-history.jsonl")
 }
 
 // The next sequence number per directory. Seeded from the file's line count on first use, then

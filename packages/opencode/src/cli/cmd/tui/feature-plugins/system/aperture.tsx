@@ -5,6 +5,7 @@ import type { InternalTuiPlugin } from "../../plugin/internal"
 import { createEffect, createMemo, createResource, createSignal, For, Match, onCleanup, Show, Switch } from "solid-js"
 import { allocateCells } from "@/aperture/treemap"
 import { changedFiles, type Turn } from "@/aperture/activity"
+import { isPlumbing } from "@/aperture/plumbing"
 import {
   basename,
   capColumns,
@@ -197,12 +198,14 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   // git reports paths from the repo root, Aperture from the project directory, which may sit
   // below it — so the directory's offset inside the worktree is stripped. A deletion leaves
   // nothing to open, so deleted paths are dropped, from the agent's changes too (the activity
-  // log records an apply_patch delete as an edit).
+  // log records an apply_patch delete as an edit). Aperture's own files (Lens definitions and
+  // history, session logs) are dropped too: they change every turn and aren't work on the repo.
   const treeStatus = createMemo(() => {
     const prefix = relativePrefix(props.api.state.path.worktree, props.api.state.path.directory)
-    return (tree.error ? [] : (tree() ?? [])).flatMap((item) =>
-      item.file.startsWith(prefix) ? [{ ...item, file: item.file.slice(prefix.length) }] : [],
-    )
+    return (tree.error ? [] : (tree() ?? [])).flatMap((item) => {
+      const file = item.file.slice(prefix.length)
+      return item.file.startsWith(prefix) && !isPlumbing(file) ? [{ ...item, file }] : []
+    })
   })
   const deleted = createMemo(
     () => new Set(treeStatus().flatMap((item) => (item.status === "deleted" ? [item.file] : []))),
@@ -220,7 +223,9 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   const agentChanged = createMemo(
     () =>
       new Map(
-        [...changedFiles(activity.error ? [] : (activity()?.turns ?? []))].filter(([path]) => !deleted().has(path)),
+        [...changedFiles(activity.error ? [] : (activity()?.turns ?? []))].filter(
+          ([path]) => !deleted().has(path) && !isPlumbing(path),
+        ),
       ),
   )
   const changeOf = (path: string) => {

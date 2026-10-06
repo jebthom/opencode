@@ -1,4 +1,4 @@
-import { ApertureActivity, type Action, type ActivityEntry, type Mode, type Turn } from "./activity"
+import { ApertureActivity, type Action, type ActivityEntry, type EntryConcern, type Mode, type Turn } from "./activity"
 
 // Segmentation for the Activity View (PLAN.md G2/G3): turn a turn's flat entry list into
 // the nodes of a vertical path.
@@ -81,6 +81,10 @@ export interface Step {
   readonly additions?: number
   readonly deletions?: number
   readonly changed?: number
+  // A Lens change's Lens and the concerns it touched; empty on every other step. Only a
+  // `curate` step has any, and it holds exactly one entry, so there is nothing to merge.
+  readonly lens?: string
+  readonly concerns: ReadonlyArray<EntryConcern>
   // Where to find this step in the chat, taken from its FIRST entry. First rather than last
   // because `startedAt` is the first entry's too, so a row's identity and its destination
   // agree — and a gathering run reads better from its opening than from its close. A step
@@ -117,6 +121,8 @@ interface Draft {
   additions?: number
   deletions?: number
   changed?: number
+  readonly lens?: string
+  readonly concerns: ReadonlyArray<EntryConcern>
   readonly messageID?: string
   readonly partID?: string
 }
@@ -178,6 +184,8 @@ function openDraft(lane: Draft[], entry: ActivityEntry, mode: Mode): Draft {
     places: new Map(),
     beats: new Map(),
     titles: new Set(),
+    lens: entry.lens,
+    concerns: entry.concerns ?? [],
     // Set here and never in `absorb`, so a run keeps the anchor of the entry that opened it.
     messageID: entry.messageID,
     partID: entry.partID,
@@ -232,6 +240,8 @@ function freeze(draft: Draft): Step {
     ...(draft.additions !== undefined ? { additions: draft.additions } : {}),
     ...(draft.deletions !== undefined ? { deletions: draft.deletions } : {}),
     ...(draft.changed !== undefined ? { changed: draft.changed } : {}),
+    ...(draft.lens !== undefined ? { lens: draft.lens } : {}),
+    concerns: draft.concerns,
     ...(draft.messageID !== undefined ? { messageID: draft.messageID } : {}),
     ...(draft.partID !== undefined ? { partID: draft.partID } : {}),
   }

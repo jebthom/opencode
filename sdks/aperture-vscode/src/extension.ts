@@ -2,6 +2,7 @@ import * as vscode from "vscode"
 import type { ChipLayout } from "./chip"
 import * as ops from "./commands"
 import { lineHover, type HoverLegendEntry } from "./hover"
+import { lineColor, MUTED_HEX } from "./line-color"
 import { ChipIcons, type IconDelivery } from "./icons"
 import { buildModel, type FacetFile, type FacetFiles, type TreeModel } from "./model"
 import { ApertureOpenEditors } from "./open-editors"
@@ -48,9 +49,9 @@ const MAX_TREE_FILES = 50000
 
 // The hue a facet takes while it is filtered out of the legend (PLAN O4). The same value
 // chip.ts falls back to, so the tree chip and the gutter stripe grey to one colour — and the one the TUI also reads as "off" rather than as a facet of its own.
-// This is NONE_HUE from the server's lenses.ts, duplicated as a literal because the
-// extension bundle deliberately has no dependency on the server package.
-const SUPPRESSED_HUE = "#8A8A8A"
+// This is NONE_HUE from the server's lenses.ts (see line-color.ts), and lineColor treats it as
+// the hue every active facet overdraws.
+const SUPPRESSED_HUE = MUTED_HEX
 
 // A THEME_ROLE_COLORS table used to live here, mapping opencode theme-role tokens
 // ("info", "textMuted") onto VSCode ThemeColor ids, with a parallel THEME_ROLE_HEX in
@@ -158,13 +159,16 @@ export function activate(context: vscode.ExtensionContext) {
     log(`lines ${relPath}: ${lineTags.length} tags`)
 
     // Resolve a hue per LINE: two rules can mark the same line, and two decorations on one line
-    // would double-draw the strip. Later tags win, which is the rules' own last-writer-wins order.
-    const hueByLine = new Map<number, string>()
+    // would double-draw the strip. Every hue on the line is collected, then lineColor picks one:
+    // active facets beat the muted hue, and several active facets blend.
+    const huesByLine = new Map<number, Set<string>>()
     for (const tag of lineTags) {
       const hue = hueForTag(tag)
       if (!hue || resolveHue(hue) === undefined) continue
-      for (let line = tag.startLine - 1; line <= tag.endLine - 1; line++) if (line >= 0) hueByLine.set(line, hue)
+      for (let line = Math.max(0, tag.startLine - 1); line <= tag.endLine - 1; line++)
+        huesByLine.set(line, (huesByLine.get(line) ?? new Set()).add(hue))
     }
+    const hueByLine = new Map([...huesByLine].map(([line, hues]) => [line, lineColor(hues)!]))
 
     // One range per line, so each line carries exactly one bar in its resolved hue. The range
     // spans the line's text because VSCode raises a decoration's hover over text only, never

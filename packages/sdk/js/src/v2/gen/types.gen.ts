@@ -5227,7 +5227,7 @@ export type ApertureActivityResponses = {
       agent: string
       entries: Array<{
         path?: string
-        action: "read" | "search" | "create" | "edit" | "run" | "fetch"
+        action: "read" | "search" | "create" | "edit" | "run" | "fetch" | "facet-add" | "facet-remove" | "facet-edit"
         target: "file" | "place" | "none"
         agent: string
         sessionID: string
@@ -5238,6 +5238,12 @@ export type ApertureActivityResponses = {
         additions?: number
         deletions?: number
         changed?: number
+        lens?: string
+        concerns?: Array<{
+          facet: string
+          label: string
+          color: string
+        }>
         messageID?: string
         partID?: string
       }>

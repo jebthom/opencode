@@ -179,6 +179,26 @@ export function deriveTurns(messages: ReadonlyArray<MessageLike>, options: Deriv
         continue
       }
 
+      // A Lens change: never a file, and which kind it was is in its result, not its name. The
+      // read-only Lens tools (and refused or failed changes) yield nothing.
+      if (part.tool.startsWith("lens_")) {
+        const change = lensChangeOf(part)
+        if (change)
+          turn.entries.push({
+            agent,
+            sessionID: options.sessionID,
+            depth,
+            callID: part.callID ?? "",
+            timestamp: part.state?.time?.start ?? created,
+            messageID: part.messageID,
+            partID: part.id,
+            ...titleOf(part),
+            ...change,
+            target: "none",
+          })
+        continue
+      }
+
       const action = ApertureActivity.actionFromTool(part.tool)
       if (!action) continue
       const base = {
@@ -372,6 +392,45 @@ function patchedFiles(
     })
   }
   return out
+}
+
+// What a Lens tool call changed, from the metadata it persisted on success (tool/lens-mark.ts,
+// lens-unmark.ts, lens-edit.ts). Each fills `metadata.lens` only once the change has landed —
+// every refusal, declined consent and unknown target returns it empty — so its absence is the
+// test for "nothing changed", and those calls drop out like the read-only Lens tools do.
+//
+//  - lens_mark minting a concern (`minted`) is a new facet; adding a rule to one that exists is
+//    an edit, since the concern the user knows is still there and only its reach moved.
+//  - lens_unmark naming a `facet` removed the concern outright; naming only a rule is an edit.
+//  - lens_edit only ever rewrites (labels, whats, whys, the Lens's name or palette).
+function lensChangeOf(
+  part: PartLike,
+): { action: ApertureActivity.Action; lens: string; concerns: ApertureActivity.EntryConcern[] } | undefined {
+  if (part.state?.status !== "completed") return undefined
+  const metadata = part.state.metadata ?? {}
+  const lens = metadata["lens"]
+  if (typeof lens !== "string") return undefined
+  const action = (() => {
+    if (part.tool === "lens_mark") return metadata["minted"] === true ? "facet-add" : "facet-edit"
+    if (part.tool === "lens_unmark") return typeof metadata["facet"] === "string" ? "facet-remove" : "facet-edit"
+    if (part.tool === "lens_edit") return "facet-edit"
+    return undefined
+  })()
+  if (!action) return undefined
+  const concerns = Array.isArray(metadata["concerns"]) ? metadata["concerns"] : []
+  return {
+    action,
+    lens,
+    concerns: concerns.flatMap((c: unknown) => {
+      if (typeof c !== "object" || c === null) return []
+      const record = c as Record<string, unknown>
+      const facet = record["facet"]
+      const label = record["label"]
+      const color = record["color"]
+      if (typeof facet !== "string" || typeof label !== "string" || typeof color !== "string") return []
+      return [{ facet, label, color }]
+    }),
+  }
 }
 
 // A user message counts as a prompt when it carries text the user actually wrote.

@@ -15,8 +15,11 @@
 // One action category per recorded act. `create` covers the write tool (whole-file
 // write, whether the file is new or overwritten); `read` and `edit` map straight from
 // their tools. `search` is a scoped look-around (grep/glob/lsp), `run` a shell command,
-// `fetch` anything reaching outside the codebase. Order is the display order in a legend.
-export const ACTIONS = ["read", "search", "create", "edit", "run", "fetch"] as const
+// `fetch` anything reaching outside the codebase. The three `facet-*` actions are changes to
+// the Lens itself (see lensChangeOf in activity-model.ts): a concern minted, a concern removed
+// with all its rules, and everything in between — a rule added to or removed from an existing
+// concern, or a concern's label/what/why rewritten. Order is the display order in a legend.
+export const ACTIONS = ["read", "search", "create", "edit", "run", "fetch", "facet-add", "facet-remove", "facet-edit"] as const
 export type Action = (typeof ACTIONS)[number]
 
 // What an action *is*, which is what decides whether it may be aggregated (G2 §1).
@@ -24,12 +27,15 @@ export type Action = (typeof ACTIONS)[number]
 //  - `survey`  gathering inside the repo: reads, directory listings, searches.
 //  - `mutate`  anything that can leave a lasting effect: edits, writes, shell commands.
 //  - `external` reaching outside the codebase: web fetches, MCP calls.
+//  - `curate`  changing the Lens: what the user is shown, not the repo. Kept apart from
+//              `mutate` because nothing on disk the user works on moved, and kept unaggregated
+//              because a concern appearing or vanishing is exactly what the user must notice.
 //
 // Only `survey` aggregates. A step is a maximal run of consecutive survey entries, or a
 // *single* non-survey entry — because aggregation asserts the individual acts need not be
 // distinguished, which is true of gathering and false of anything consequential. A
 // mutation the user did not notice is the failure mode this view exists to prevent.
-export const MODES = ["survey", "mutate", "external"] as const
+export const MODES = ["survey", "mutate", "external", "curate"] as const
 export type Mode = (typeof MODES)[number]
 
 export function modeOf(action: Action): Mode {
@@ -43,6 +49,10 @@ export function modeOf(action: Action): Mode {
       return "mutate"
     case "fetch":
       return "external"
+    case "facet-add":
+    case "facet-remove":
+    case "facet-edit":
+      return "curate"
   }
 }
 
@@ -54,7 +64,7 @@ export function modeOf(action: Action): Mode {
 //            so admitting a directory would fold an aggregate into an aggregate — one
 //            read of `packages/` would outweigh nine real files and report the mix of code
 //            the agent never opened (PLAN.md G2).
-//  - `none`  a pathless act (a shell command, a web fetch).
+//  - `none`  a pathless act (a shell command, a web fetch, a Lens change).
 export const TARGETS = ["file", "place", "none"] as const
 export type Target = (typeof TARGETS)[number]
 
@@ -93,6 +103,11 @@ export type Target = (typeof TARGETS)[number]
 // command (see the window rule in activity-model.ts), which is why it is a separate field
 // with a separate name rather than more `additions`.
 //
+// `lens` and `concerns` appear only on a `facet-*` entry: the Lens it changed and the concerns
+// it touched, as the tool snapshotted them (tool/lens-mark.ts `Concern`). A snapshot rather than
+// a lookup because a removed concern is no longer on any Lens to look up, and the row still has
+// to say which one went — in the colour it had.
+//
 // `messageID`/`partID` say **where this act is visible in the viewed session's chat**,
 // which is not the same as where the tool call lives. For work the session did itself they
 // are that call's own message and part. For a sub-agent's work they are the *parent's*
@@ -113,8 +128,17 @@ export interface ActivityEntry {
   readonly additions?: number
   readonly deletions?: number
   readonly changed?: number
+  readonly lens?: string
+  readonly concerns?: ReadonlyArray<EntryConcern>
   readonly messageID?: string
   readonly partID?: string
+}
+
+// One concern a Lens change touched: enough to draw its square and name it.
+export interface EntryConcern {
+  readonly facet: string
+  readonly label: string
+  readonly color: string
 }
 
 // How much of a tool's title to carry. Long enough for a real bash description, short
@@ -145,6 +169,9 @@ const IGNORED_TOOLS = new Set(["todowrite", "todoread", "question", "plan", "pla
 // Map a tool name to the action it represents, or undefined for tools we deliberately
 // ignore. The `write` tool — which both overwrites whole files and creates new ones —
 // maps to `create`.
+//
+// The Lens tools never reach here: which `facet-*` action a call was depends on its result, not
+// its name, so activity-model.ts classifies them itself (lensChangeOf).
 //
 // The default arm is load-bearing, not a fallback: an *unrecognised* tool is an MCP tool
 // or a plugin tool. MCP registers as `sanitize(clientName) + "_" + sanitize(toolName)`

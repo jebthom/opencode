@@ -2,8 +2,8 @@ import type { TuiPlugin, TuiPluginApi, TuiThemeCurrent } from "@opencode-ai/plug
 import type { InternalTuiPlugin } from "../../plugin/internal"
 import { createMemo, createResource, createSignal, For, Match, onCleanup, Show, Switch } from "solid-js"
 import { stepsForTurns, stepWeight, type Step, type TurnSteps } from "@/aperture/activity-steps"
-import type { Action, Turn } from "@/aperture/activity"
-import { facetColors } from "../system/aperture-colors"
+import type { Action, EntryConcern, Turn } from "@/aperture/activity"
+import { facetColors, resolveColor } from "../system/aperture-colors"
 
 const id = "internal:sidebar-activity"
 
@@ -106,6 +106,11 @@ const VERBS: Record<Action, string> = {
   create: "Write",
   run: "Run",
   fetch: "Fetch",
+  // Lens changes. "Refine" rather than "Edit" so a concern being reworded never reads as a file
+  // being edited; the row's coloured square is what says it is a concern at all.
+  "facet-add": "New",
+  "facet-remove": "Remove",
+  "facet-edit": "Refine",
 }
 
 // The wire shape of GET /aperture/activity. Declared locally for the same reason the top
@@ -271,6 +276,15 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     )
   }
 
+  // A concern's colour on a Lens-change row. The live legend's while the change was to the
+  // active Lens and the concern is still on it — so the filter greys it like every other square
+  // here — and otherwise the hex the tool snapshotted, which is how a removed concern, or one on
+  // another Lens, still shows the colour it had.
+  const concernColor = (step: Step, concern: EntryConcern) =>
+    step.lens === data()?.lens?.id && facets().includes(concern.facet)
+      ? colors().facetColor(concern.facet)
+      : resolveColor(theme(), concern.color)
+
   // Open a file in the editor — the same call a top-bar file tile makes, so a path opens
   // the same way whichever Aperture surface the user clicked it in. Logged like a top-bar
   // click so the study log records the surface a navigation came from. Fire-and-forget:
@@ -319,6 +333,13 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   // title is appended only when it says something the path does not.
   const [hovered, setHovered] = createSignal<string>()
   const describe = (step: Step): string => {
+    // A Lens change: the concerns it touched, then the tool's own title ("12 lines · Parsing",
+    // "Removed rule", "Edited <Lens>") — skipping a label the title already says.
+    if (step.mode === "curate") {
+      const title = step.titles[0]
+      const labels = step.concerns.map((c) => c.label).filter((label) => !title?.includes(label))
+      return [...labels, ...(title ? [title] : [])].join(" · ") || step.agent
+    }
     if (step.mode !== "survey") {
       const parts: string[] = []
       const path = step.files[0]?.path
@@ -395,6 +416,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                         expanded={expanded().has(it().key)}
                         theme={theme}
                         slotsFor={slotsFor}
+                        concernColor={concernColor}
                         onToggle={() => toggle(it().key)}
                         onOpen={openFile}
                         onReveal={revealInChat}
@@ -500,6 +522,7 @@ function StepRow(props: {
   expanded: boolean
   theme: () => TuiThemeCurrent
   slotsFor: (paths: ReadonlyArray<string>) => Slot[]
+  concernColor: (step: Step, concern: EntryConcern) => TuiThemeCurrent["text"]
   onToggle: () => void
   onOpen: (path: string) => void
   onReveal: (target: LaneAnchor) => void
@@ -595,9 +618,21 @@ function StepRow(props: {
       <Show
         when={width() > 0}
         fallback={
-          <text fg={props.theme().textMuted} wrapMode="none" onMouseDown={click}>
-            {beatLabel()}
-          </text>
+          <Show
+            when={props.step.concerns.length > 0}
+            fallback={
+              <text fg={props.theme().textMuted} wrapMode="none" onMouseDown={click}>
+                {beatLabel()}
+              </text>
+            }
+          >
+            <ConcernLabel
+              step={props.step}
+              width={rowMax(depth(), COUNT_COLS)}
+              theme={props.theme}
+              concernColor={props.concernColor}
+            />
+          </Show>
         }
       >
         <box flexDirection="row" height={1} flexShrink={0} onMouseDown={click}>
@@ -620,6 +655,27 @@ function StepRow(props: {
         {(s) => <StatsTail stats={s()} theme={props.theme} />}
       </Show>
     </box>
+  )
+}
+
+// A Lens change names the concerns it touched rather than a file: one square each in the
+// concern's colour, then the label when there is one concern, or a count when a lens_edit
+// rewrote several.
+function ConcernLabel(props: {
+  step: Step
+  width: number
+  theme: () => TuiThemeCurrent
+  concernColor: (step: Step, concern: EntryConcern) => TuiThemeCurrent["text"]
+}) {
+  const label = () =>
+    props.step.concerns.length === 1 ? props.step.concerns[0]!.label : `${props.step.concerns.length} concerns`
+  return (
+    <text fg={props.theme().text} wrapMode="none" flexShrink={0}>
+      <For each={[...props.step.concerns]}>
+        {(concern) => <span style={{ fg: props.concernColor(props.step, concern) }}>■</span>}
+      </For>
+      {" " + truncate(label(), Math.max(MIN_NAME_COLS, props.width - props.step.concerns.length - 1))}
+    </text>
   )
 }
 

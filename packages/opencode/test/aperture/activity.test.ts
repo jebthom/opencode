@@ -235,6 +235,47 @@ describe("deriveTurns", () => {
     ])
   })
 
+  test("a Lens change is a new, removed or refined concern, read from what the call returned", () => {
+    const parsing = { facet: "parsing", label: "Parsing", color: "#4E79A7", what: "w", why: "y" }
+    const errors = { facet: "errors", label: "Errors", color: "#E15759", what: "w", why: "y" }
+    const turns = derive([
+      user("go"),
+      assistant([
+        tool("lens_mark", {}, { metadata: { lens: "l", rule: "r1", minted: true, concerns: [parsing] } }),
+        tool("lens_mark", {}, { metadata: { lens: "l", rule: "r2", minted: false, concerns: [parsing] } }),
+        tool("lens_unmark", {}, { metadata: { lens: "l", removed: 1, concerns: [parsing] } }),
+        tool("lens_unmark", {}, { metadata: { lens: "l", removed: 2, facet: "errors", concerns: [errors] } }),
+        tool("lens_edit", {}, { metadata: { lens: "l", concerns: [parsing, errors] } }),
+      ]),
+    ])
+    expect(turns[0]!.entries.map((e) => [e.action, e.target, e.lens, e.concerns?.map((c) => c.facet)])).toEqual([
+      ["facet-add", "none", "l", ["parsing"]],
+      ["facet-edit", "none", "l", ["parsing"]],
+      ["facet-edit", "none", "l", ["parsing"]],
+      ["facet-remove", "none", "l", ["errors"]],
+      ["facet-edit", "none", "l", ["parsing", "errors"]],
+    ])
+    // The snapshot is trimmed to what a row draws.
+    expect(turns[0]!.entries[0]!.concerns).toEqual([{ facet: "parsing", label: "Parsing", color: "#4E79A7" }])
+  })
+
+  test("Lens reads, refused or failed changes, and calls still running record nothing", () => {
+    // Every Lens tool leaves `metadata.lens` unset on a refusal; that is the test for "nothing changed".
+    const turns = derive([
+      user("go"),
+      assistant([
+        tool("lens_list", {}),
+        tool("lens_facet_files", {}, { metadata: { lens: "l" } }),
+        tool("lens_select", {}, { metadata: {} }),
+        tool("lens_mark", {}, { metadata: {} }),
+        tool("lens_unmark", {}, { metadata: {} }),
+        tool("lens_edit", {}, { status: "error" }),
+        tool("lens_mark", {}, { status: "running", metadata: { lens: "l", rule: "r", minted: true } }),
+      ]),
+    ])
+    expect(turns[0]!.entries).toEqual([])
+  })
+
   test("a synthetic user message does NOT open a turn", () => {
     // Tool-result injections, background sub-agent completions and compaction all arrive as
     // synthetic user messages. Splitting on them would shatter one prompt into many turns —

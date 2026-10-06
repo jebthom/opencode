@@ -6,18 +6,19 @@
 // Remove this file and its call sites once the issue is resolved.
 import { appendFileSync, mkdirSync } from "node:fs"
 import path from "node:path"
+import { AUTOSESSION_LOG } from "@/aperture/plumbing"
 
 let ensured = false
 
 export function logAutoSession(record: Record<string, unknown>) {
   try {
-    const dir = path.join(process.cwd(), "perf")
+    const dir = path.join(process.cwd(), ...AUTOSESSION_LOG.slice(0, -1))
     if (!ensured) {
       mkdirSync(dir, { recursive: true })
       ensured = true
     }
     const line = JSON.stringify({ ts: new Date().toISOString(), pid: process.pid, ...record }) + "\n"
-    appendFileSync(path.join(dir, "autosession.log"), line)
+    appendFileSync(path.join(process.cwd(), ...AUTOSESSION_LOG), line)
   } catch {}
 }
 

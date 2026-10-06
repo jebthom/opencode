@@ -27,6 +27,7 @@ import { appendFile, mkdir, writeFile } from "node:fs/promises"
 import { execFile } from "node:child_process"
 import path from "node:path"
 import { Effect } from "effect"
+import { SESSION_LOG_DIR } from "./plumbing"
 
 // Minimal structural snapshot of a session — avoids importing session.ts (cycle).
 export interface SessionMeta {
@@ -193,7 +194,7 @@ export function register(meta: SessionMeta): Effect.Effect<void> {
       return
     }
     // Root session: create the folder + manifest header.
-    const folder = path.join(meta.directory, "perf", "logs", "sessions", folderStamp(meta.createdMs, meta.id))
+    const folder = path.join(meta.directory, ...SESSION_LOG_DIR, folderStamp(meta.createdMs, meta.id))
     const summary = freshSummary(meta.createdMs)
     const entry: Entry = {
       folder,

@@ -151,7 +151,17 @@ const ActivityQuery = Schema.Struct({
 // the client segments by, which is what keeps parallel sub-agents from interleaving.
 const ActivityEntrySchema = Schema.Struct({
   path: Schema.optional(Schema.String),
-  action: Schema.Literals(["read", "search", "create", "edit", "run", "fetch"]),
+  action: Schema.Literals([
+    "read",
+    "search",
+    "create",
+    "edit",
+    "run",
+    "fetch",
+    "facet-add",
+    "facet-remove",
+    "facet-edit",
+  ]),
   target: Schema.Literals(["file", "place", "none"]),
   agent: Schema.String,
   sessionID: Schema.String,
@@ -168,6 +178,12 @@ const ActivityEntrySchema = Schema.Struct({
   additions: Schema.optional(Schema.Int),
   deletions: Schema.optional(Schema.Int),
   changed: Schema.optional(Schema.Int),
+  // A Lens change (`facet-*`) only: the Lens it changed and the concerns it touched, snapshotted
+  // by the tool so a removed concern can still be named in the colour it had.
+  lens: Schema.optional(Schema.String),
+  concerns: Schema.optional(
+    Schema.Array(Schema.Struct({ facet: Schema.String, label: Schema.String, color: Schema.String })),
+  ),
   // Where this act is visible in the *viewed* session's chat, which the client uses to
   // reveal it. Sub-agent entries carry the parent's `task` call rather than their own part:
   // the child session's parts are not in this transcript at all.

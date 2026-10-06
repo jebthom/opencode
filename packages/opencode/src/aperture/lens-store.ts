@@ -21,6 +21,7 @@ import {
   whereProblem,
 } from "./lenses"
 import { ApertureLensHistory, type Actor } from "./lens-history"
+import { LENS_DIR } from "./plumbing"
 
 // Per-project store for Lenses plus the pointer to the active one, persisted under
 // `.opencode/aperture/` so a Lens is shareable, committable, and readable by an agent directly.
@@ -35,7 +36,7 @@ import { ApertureLensHistory, type Actor } from "./lens-history"
 //    from inside the same mutex, so the log and the definitions can never disagree about order.
 
 function apertureDir(directory: string) {
-  return path.join(directory, ".opencode", "aperture")
+  return path.join(directory, ...LENS_DIR)
 }
 
 // The committable Lens definitions (Record<lensID, Lens>).

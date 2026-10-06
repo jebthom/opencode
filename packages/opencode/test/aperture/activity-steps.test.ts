@@ -152,6 +152,22 @@ describe("run boundaries", () => {
     ).toEqual(["survey", "external", "survey"])
   })
 
+  test("each Lens change is its own step, carrying its Lens and concerns", () => {
+    const concerns = [{ facet: "parsing", label: "Parsing", color: "#4E79A7" }]
+    const steps = stepsForTurn(
+      turn([
+        entry("read", { path: "a.ts" }),
+        { ...entry("facet-add"), lens: "l", concerns },
+        { ...entry("facet-edit"), lens: "l", concerns },
+        entry("read", { path: "b.ts" }),
+      ]),
+    ).lanes[0]!.steps
+    expect(modes(steps)).toEqual(["survey", "curate", "curate", "survey"])
+    expect(steps[1]!.lens).toBe("l")
+    expect(steps[1]!.concerns).toEqual(concerns)
+    expect(steps[0]!.concerns).toEqual([])
+  })
+
   test("an agent switch inside one session breaks a gathering run", () => {
     // A plan→build switch is a real change of actor even at the same depth.
     const steps = stepsForTurn(
