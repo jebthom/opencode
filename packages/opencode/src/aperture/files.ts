@@ -6,6 +6,7 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 // at (a file, a directory, or neither) — see Aperture.activity.
 
 const SOURCE_GLOB = "**/*.{ts,tsx,js,jsx,mjs,cjs,mts,cts,py}"
+const SOURCE = new Bun.Glob(SOURCE_GLOB)
 
 // Directories that never carry useful structure. Pruned during the walk so trees like
 // node_modules never appear.
@@ -31,6 +32,12 @@ export const listFiles = Effect.fn("Aperture.listFiles")(function* (root: string
 // how two surfaces end up disagreeing about what is in the repo.
 export function isIgnoredPath(rel: string) {
   return rel.split("/").some((seg) => IGNORED_DIR_SET.has(seg))
+}
+
+// True for a path inside the source-file set `listFiles` walks, for callers holding a path from
+// somewhere else (git's changed files) that must agree with it about what the repo's code is.
+export function isSourcePath(rel: string) {
+  return SOURCE.match(rel) && !isIgnoredPath(rel)
 }
 
 // Canonical repo-relative form: POSIX separators, no leading/trailing slashes, no "." or empty

@@ -2535,3 +2535,111 @@ it.instance("edits to several files with no todos and no Lens change nudge once"
     expect(count(inputs[4], "without updating the Lens")).toBe(1)
   }),
 )
+
+// Unmarked matches ("strays"): a rule globbed to one file matches the same code in another changed
+// file, which the view would show as unmarked. They are re-listed in each turn's state until a rule
+// settles them, nudged when they appear mid-turn, and never cost a curation step of their own once
+// the agent has been shown them.
+const scopedProbe = { ...markProbe, glob: ["probe.ts"] }
+
+const nextTurn = Effect.fn("test.nextTurn")(function* (sessionID: SessionID, text: string) {
+  const prompt = yield* SessionPrompt.Service
+  yield* prompt.prompt({ sessionID, agent: "build", noReply: true, parts: [{ type: "text", text }] })
+})
+
+it.instance(
+  "unmarked matches are re-listed every turn until a rule settles them",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(apertureCfg)
+      const prompt = yield* SessionPrompt.Service
+      yield* writeText(path.join(dir, "probe.ts"), "export const probe = 1\n")
+      yield* writeText(path.join(dir, "other.ts"), "export const probe = 2\n")
+      const { session } = yield* buildTurn("where is the probe?")
+      yield* llm.tool("lens_mark", scopedProbe)
+      yield* llm.text("it is in probe.ts")
+      yield* prompt.loop({ sessionID: session.id })
+
+      yield* nextTurn(session.id, "tell me a joke")
+      yield* llm.text("a joke")
+      yield* llm.text("View unchanged: not about code")
+      yield* prompt.loop({ sessionID: session.id })
+
+      yield* nextTurn(session.id, "another joke")
+      yield* llm.tool("lens_mark", { ...scopedProbe, glob: ["other.ts"], note: "the copy in other.ts" })
+      yield* llm.text("marked the copy")
+      yield* prompt.loop({ sessionID: session.id })
+
+      yield* nextTurn(session.id, "and another")
+      yield* llm.text("a third joke")
+      yield* llm.text("View unchanged: not about code")
+      yield* prompt.loop({ sessionID: session.id })
+
+      const inputs = (yield* llm.inputs).map((input) => JSON.stringify(input))
+      expect(inputs).toHaveLength(8)
+      // Turn 2: listed at turn start, and the "no Lens change" check asks to settle them.
+      expect(inputs[2]).toContain("Unmarked matches")
+      expect(inputs[2]).toContain("■ probe-lines: other.ts at 1")
+      expect(inputs[3]).toContain('settle the \\"Unmarked matches\\"')
+      // Turn 3: still listed until the rule for other.ts lands.
+      expect(inputs[4]).toContain("■ probe-lines: other.ts at 1")
+      // Turn 4: settled, so gone.
+      expect(inputs[6]).not.toContain("Unmarked matches")
+      expect(inputs[7]).not.toContain("Unmarked matches")
+    }),
+  { git: true },
+  30_000,
+)
+
+it.instance(
+  "unmarked matches already listed this turn do not add a curation step",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(apertureCfg)
+      const prompt = yield* SessionPrompt.Service
+      yield* writeText(path.join(dir, "probe.ts"), "export const probe = 1\n")
+      yield* writeText(path.join(dir, "other.ts"), "export const probe = 2\n")
+      const { session } = yield* buildTurn("where is the probe?")
+      yield* llm.tool("lens_mark", scopedProbe)
+      yield* llm.text("it is in probe.ts")
+      yield* prompt.loop({ sessionID: session.id })
+
+      yield* nextTurn(session.id, "where is it again?")
+      // Re-marking the same rule is a Lens change, so the turn passes the usual check.
+      yield* llm.tool("lens_mark", scopedProbe)
+      yield* llm.text("still in probe.ts")
+      yield* prompt.loop({ sessionID: session.id })
+
+      expect(yield* llm.calls).toBe(4)
+      const inputs = (yield* llm.inputs).map((input) => JSON.stringify(input))
+      expect(inputs[2]).toContain("Unmarked matches")
+      expect(inputs[3]).not.toContain("APERTURE CHECK")
+    }),
+  { git: true },
+)
+
+it.instance(
+  "an unmarked match that appears mid-turn is nudged once",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(apertureCfg)
+      const prompt = yield* SessionPrompt.Service
+      yield* writeText(path.join(dir, "probe.ts"), "export const probe = 1\n")
+      const { session } = yield* buildTurn("copy the probe")
+      yield* llm.tool("lens_mark", scopedProbe)
+      yield* llm.tool("write", { filePath: path.join(dir, "copy.ts"), content: "export const probe = 3\n" })
+      yield* llm.tool("read", { filePath: path.join(dir, "copy.ts") })
+      yield* llm.text("copied")
+      yield* prompt.loop({ sessionID: session.id })
+
+      // Shown by the nudge, so the end-of-turn check doesn't spend a fifth call on it.
+      expect(yield* llm.calls).toBe(4)
+      const inputs = (yield* llm.inputs).map((input) => JSON.stringify(input))
+      expect(inputs[1]).not.toContain("new unmarked matches")
+      expect(inputs[2]).toContain("APERTURE: new unmarked matches")
+      expect(inputs[2]).toContain("■ probe-lines: copy.ts at 1")
+      // Re-spliced in place on later steps, never added again.
+      expect(count(inputs[3], "new unmarked matches")).toBe(1)
+    }),
+  { git: true },
+)

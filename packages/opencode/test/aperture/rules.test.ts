@@ -134,6 +134,36 @@ describe("aperture rules — evaluation", () => {
     expect([...res.byFile.keys()]).toEqual(["src/hits.ts"])
   })
 
+  // The incremental path names the changed files on ripgrep's command line, and ripgrep never
+  // applies --glob to a named path. A rule globbed to one file used to paint any edited file that
+  // matched, until the next whole-repo pass took the marks away again.
+  test("an incremental pass honours a glob exactly as the whole-repo pass does", async () => {
+    const globbed = rule("r", { kind: "pattern", pattern: "needle", glob: ["src/hits.ts"] })
+    const files = ["src/hits.ts", "other/elsewhere.ts"]
+    const incremental = await run(ApertureRules.evaluate(dir, [globbed], files))
+    const full = await run(ApertureRules.evaluate(dir, [globbed]))
+    expect([...incremental.byFile.keys()]).toEqual(["src/hits.ts"])
+    expect([...full.byFile.keys()]).toEqual(["src/hits.ts"])
+  })
+
+  test("an incremental pass reads globs the way ripgrep does", async () => {
+    const files = ["src/hits.ts", "other/elsewhere.ts"]
+    const scope = async (glob: string[]) =>
+      [
+        ...(await run(ApertureRules.evaluate(dir, [rule("r", { kind: "pattern", pattern: "needle", glob })], files)))
+          .byFile.keys(),
+      ].sort()
+    // No slash: a basename at any depth.
+    expect(await scope(["elsewhere.ts"])).toEqual(["other/elsewhere.ts"])
+    // A slash anchors at the root, so a path suffix matches nothing.
+    expect(await scope(["hits.ts/x", "rc/hits.ts"])).toEqual([])
+    expect(await scope(["/src/hits.ts"])).toEqual(["src/hits.ts"])
+    // Exclusions only: everything else is in scope. The last matching glob decides.
+    expect(await scope(["!src/**"])).toEqual(["other/elsewhere.ts"])
+    expect(await scope(["*.ts", "!src/**"])).toEqual(["other/elsewhere.ts"])
+    expect(await scope(["!src/**", "src/hits.ts"])).toEqual(["src/hits.ts"])
+  })
+
   test("pattern is case-sensitive by default and case-insensitive on request", async () => {
     const sensitive = await run(ApertureRules.evaluate(dir, [rule("r", { kind: "pattern", pattern: "NEEDLE" })]))
     expect(sensitive.byFile.size).toBe(0)
@@ -242,5 +272,80 @@ describe("aperture rules — evaluation", () => {
     expect(hit.facet).toBe("retry")
     expect(hit.note).toBe("the retry path")
     expect(hit.rule).toBe("r")
+  })
+
+  // Agents glob a rule to the file they were reading, so a changed file holding the same code
+  // shows as unmarked. `strays` is what finds those lines so the agent can be asked about them.
+  test("strays are a scoped rule's matches in the given files outside its scope", async () => {
+    const globbed = rule("r", { kind: "pattern", pattern: "needle", glob: ["src/hits.ts"] })
+    const found = await run(ApertureRules.strays(dir, [globbed], ["src/hits.ts", "other/elsewhere.ts"]))
+    expect(found).toEqual([{ rules: ["r"], facet: "retry-path", file: "other/elsewhere.ts", ranges: [[1, 1]] }])
+  })
+
+  test("a symbol rule's path is its scope", async () => {
+    const scoped = rule("r", { kind: "symbol", name: "arrowStyle", path: "other" })
+    const found = await run(ApertureRules.strays(dir, [scoped], ["src/idioms.ts"]))
+    expect(found.map((s) => s.file)).toEqual(["src/idioms.ts"])
+  })
+
+  test("lines another rule of the same concern paints are not strays", async () => {
+    const found = await run(
+      ApertureRules.strays(
+        dir,
+        [
+          rule("a", { kind: "pattern", pattern: "needle", glob: ["src/hits.ts"] }),
+          rule("b", { kind: "pattern", pattern: "five", glob: ["other/elsewhere.ts"] }),
+        ],
+        ["other/elsewhere.ts"],
+      ),
+    )
+    expect(found).toEqual([])
+  })
+
+  test("a concern-wide rule of a DIFFERENT concern does not cover a stray", async () => {
+    const found = await run(
+      ApertureRules.strays(
+        dir,
+        [
+          rule("a", { kind: "pattern", pattern: "needle", glob: ["src/hits.ts"] }),
+          rule("b", { kind: "pattern", pattern: "five" }, { facet: "other-concern" }),
+        ],
+        ["other/elsewhere.ts"],
+      ),
+    )
+    expect(found.map((s) => s.rules)).toEqual([["a"]])
+  })
+
+  test("two rules of one concern matching the same lines give one stray naming both", async () => {
+    const found = await run(
+      ApertureRules.strays(
+        dir,
+        [
+          rule("a", { kind: "pattern", pattern: "needle", glob: ["src/hits.ts"] }),
+          rule("b", { kind: "pattern", pattern: "five|needle", glob: ["src/idioms.ts"] }),
+        ],
+        ["other/elsewhere.ts"],
+      ),
+    )
+    expect(found).toEqual([{ rules: ["a", "b"], facet: "retry-path", file: "other/elsewhere.ts", ranges: [[1, 1]] }])
+  })
+
+  // An exclusion is a deliberate "not these", so dropping the scope keeps it.
+  test("exclusion globs still apply when looking for strays", async () => {
+    const found = await run(
+      ApertureRules.strays(
+        dir,
+        [rule("r", { kind: "pattern", pattern: "needle", glob: ["src/hits.ts", "!other/**"] })],
+        ["other/elsewhere.ts"],
+      ),
+    )
+    expect(found).toEqual([])
+  })
+
+  test("an unscoped rule has no strays", async () => {
+    const found = await run(
+      ApertureRules.strays(dir, [rule("r", { kind: "pattern", pattern: "needle" })], ["other/elsewhere.ts"]),
+    )
+    expect(found).toEqual([])
   })
 })

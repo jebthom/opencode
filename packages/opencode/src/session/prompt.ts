@@ -1428,7 +1428,7 @@ export const layer = Layer.effect(
             Effect.provideService(Session.Service, sessions),
           )
           if (apertureNote?.turn !== lastUser.id)
-            apertureNote = { turn: lastUser.id, text: yield* sys.apertureState(agent) }
+            apertureNote = { turn: lastUser.id, text: yield* sys.apertureState(agent, lastUser.id) }
           const turnMessage = msgs.findLast((m) => m.info.role === "user")
           if (apertureNote.text && turnMessage)
             turnMessage.parts.push({

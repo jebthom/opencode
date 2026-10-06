@@ -1,4 +1,6 @@
 import { Context, Effect, Layer } from "effect"
+import { statSync } from "fs"
+import path from "path"
 
 import { InstanceState } from "@/effect/instance-state"
 
@@ -18,6 +20,10 @@ import { Skill } from "@/skill"
 import { ApertureLensStore } from "@/aperture/lens-store"
 import { ApertureLensHistory } from "@/aperture/lens-history"
 import { ApertureLenses, type Lens } from "@/aperture/lenses"
+import { ApertureRules } from "@/aperture/rules"
+import { ApertureGitLookup } from "@/aperture/git-lookup"
+import { ApertureFiles } from "@/aperture/files"
+import { Git } from "@/git"
 
 export function provider(model: Provider.Model) {
   if (model.api.id.includes("gpt-4") || model.api.id.includes("o1") || model.api.id.includes("o3"))
@@ -42,7 +48,7 @@ export interface Interface {
   // The live Aperture state — Lenses, their concerns and owners, the latest changes — injected
   // once per user turn as a reminder rather than into the system prompt, so the system prompt
   // stays byte-stable (and cacheable) while the agent curates.
-  readonly apertureState: (agent: Agent.Info) => Effect.Effect<string | undefined>
+  readonly apertureState: (agent: Agent.Info, turnID: string) => Effect.Effect<string | undefined>
   readonly apertureCheck: (agent: Agent.Info, turnID: string) => Effect.Effect<string | undefined>
   readonly apertureNudge: (
     agent: Agent.Info,
@@ -56,6 +62,12 @@ export interface Interface {
 
 // Distinct files edited without a Lens change before a todo-less turn is nudged.
 const NUDGE_FILES = 3
+// Changed files scanned for stray matches, and stray matches (one per concern and file) listed at once. A bulk
+// change (a codemod, a vendored directory) must not turn every step into a repo-wide search.
+const STRAY_MAX_FILES = 200
+const STRAY_MAX_LISTED = 5
+// Line runs shown per stray before eliding; the agent reads the file for the rest.
+const STRAY_MAX_RUNS = 4
 
 // The agent's concerns on `lens` whose why may no longer hold: never given, or last set before the
 // most recent milestone (a completed todo is when a task moves from understanding to changing to
@@ -82,10 +94,105 @@ export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const skill = yield* Skill.Service
+    const git = yield* Git.Service
 
-    const apertureState = Effect.fn("SystemPrompt.apertureState")(function* (agent: Agent.Info) {
+    // What each directory's current turn has already shown the agent, so a stray is listed once per
+    // turn (in the turn-start state, or a nudge when it appears mid-turn) rather than every step.
+    // Nothing carries across turns on purpose: a stray stays outstanding until a rule settles it.
+    const shown = new Map<string, { readonly turn: string; readonly keys: Set<string> }>()
+    const shownIn = (directory: string, turn: string) => {
+      const current = shown.get(directory)
+      if (current?.turn === turn) return current.keys
+      const keys = new Set<string>()
+      shown.set(directory, { turn, keys })
+      return keys
+    }
+    // Keyed with the line count, so more of the same code appearing in a file is new.
+    const strayKey = (lens: Lens, stray: ApertureRules.Stray) =>
+      [lens.id, stray.facet, stray.file, stray.ranges.reduce((n, [a, b]) => n + b - a + 1, 0)].join("\0")
+    const strayCache = new Map<string, { readonly key: string; readonly found: ApertureRules.Stray[] }>()
+
+    // Matches of the active Lens's rules, in changed files, that the rules' scopes leave out.
+    // "Changed" is everything git reports against HEAD, untracked files included, so a file the
+    // user or a shell command created counts as much as one the agent edited; `edited` adds the
+    // agent's own edits for a directory that is not a git repo.
+    const strays = (directory: string, edited: ReadonlyArray<string>) =>
+      Effect.gen(function* () {
+        const lens = yield* ApertureLensStore.getActive(directory)
+        if (!lens?.rules?.length) return undefined
+        const repo = yield* git.isRepo(directory)
+        const changed = repo ? yield* changedFiles(directory) : []
+        // Source files only, as everywhere else in Aperture: logs, lockfiles and Aperture's own state
+        // (which quotes every rule's pattern verbatim) would otherwise always match.
+        const files = [...new Set([...edited, ...changed])]
+          .filter(ApertureFiles.isSourcePath)
+          .flatMap((file) => {
+            const stat = statSync(path.join(directory, file), { throwIfNoEntry: false })
+            return stat?.isFile() ? [{ file, stamp: `${stat.mtimeMs}:${stat.size}` }] : []
+          })
+          .slice(0, STRAY_MAX_FILES)
+        // This runs on every step, and most steps change nothing, so the search is skipped while
+        // the rules and every candidate file are as they were last time.
+        const key = [ApertureRules.rulesHash(lens.rules), ...files.map((f) => `${f.file}@${f.stamp}`)].join("\n")
+        const cached = strayCache.get(directory)
+        const found =
+          cached?.key === key
+            ? cached.found
+            : yield* ApertureRules.strays(
+                directory,
+                lens.rules,
+                files.map((f) => f.file),
+                repo ? ApertureGitLookup.make(git, directory) : undefined,
+              )
+        strayCache.set(directory, { key, found })
+        return found.length ? { lens, strays: found } : undefined
+      })
+
+    // Files changed against HEAD, plus untracked ones, relative to `directory`. Deleted files are
+    // dropped by the stat in `strays`.
+    const changedFiles = (directory: string) =>
+      Effect.gen(function* () {
+        const diff = yield* git.run(["diff", "--name-only", "--relative", "HEAD", "--"], { cwd: directory })
+        const untracked = yield* git.run(["ls-files", "--others", "--exclude-standard"], { cwd: directory })
+        return [diff, untracked].flatMap((result) =>
+          result.exitCode === 0
+            ? result
+                .text()
+                .split("\n")
+                .flatMap((line) => (line.trim() ? [line.trim()] : []))
+            : [],
+        )
+      })
+
+    // The strays as a short list for the agent, and recorded as shown this turn. Capped, and terse
+    // on purpose: it is repeated every turn until settled, so each line has to earn its context.
+    const strayList = (
+      directory: string,
+      turn: string,
+      found: { readonly lens: Lens; readonly strays: ReadonlyArray<ApertureRules.Stray> },
+    ) => {
+      const keys = shownIn(directory, turn)
+      for (const stray of found.strays) keys.add(strayKey(found.lens, stray))
+      const listed = found.strays.slice(0, STRAY_MAX_LISTED)
+      const rest = found.strays.slice(STRAY_MAX_LISTED)
+      return [
+        ...listed.map((stray) => {
+          const owner =
+            found.lens.facets.find((f) => f.id === stray.facet)?.owner === "user" ? " (the user's: ask first)" : ""
+          const runs = stray.ranges.map(([a, b]) => (a === b ? `${a}` : `${a}-${b}`))
+          const at = runs.slice(0, STRAY_MAX_RUNS).join(", ") + (runs.length > STRAY_MAX_RUNS ? ", …" : "")
+          return `- ■ ${stray.facet}${owner}: ${stray.file} at ${at} (rule ${stray.rules.join(", ")})`
+        }),
+        ...(rest.length ? [`- …and ${rest.length} more in ${new Set(rest.map((s) => s.file)).size} file(s)`] : []),
+        "Settle each with Lens calls: lines that belong → widen the rule's glob/path, or add a rule with a note;",
+        "lines that don't → add \"!<file>\" to the rule's glob. To revise a rule, lens_mark the new one, then lens_unmark the old.",
+      ]
+    }
+
+    const apertureState = Effect.fn("SystemPrompt.apertureState")(function* (agent: Agent.Info, turnID: string) {
       if (agent.name !== "build" && agent.name !== "plan") return
       const ctx = yield* InstanceState.context
+      const unmarked = yield* strays(ctx.directory, [])
       const all = yield* ApertureLensStore.list(ctx.directory)
       const active = yield* ApertureLensStore.getActive(ctx.directory)
       const recent = yield* ApertureLensHistory.read(ctx.directory, { limit: 5 })
@@ -106,7 +213,11 @@ export const layer = Layer.effect(
           head,
           ...roster.flatMap((c) => {
             const flag = stale.find((s) => s.facet.id === c.facet)?.flag
-            return [`  ${name(c)}`, `    what: ${c.what || "(none)"}`, `    why:  ${c.why || "(none)"}${flag ? `  [${flag}]` : ""}`]
+            return [
+              `  ${name(c)}`,
+              `    what: ${c.what || "(none)"}`,
+              `    why:  ${c.why || "(none)"}${flag ? `  [${flag}]` : ""}`,
+            ]
           }),
         ]
       })
@@ -117,6 +228,14 @@ export const layer = Layer.effect(
           ? [
               "Whys marked STALE or MISSING may no longer say why to look at those lines. If the concern still serves",
               "this task, rewrite its why with lens_edit; if it no longer does, lens_unmark it. Keep its what.",
+            ]
+          : []),
+        // Re-listed every turn until a rule settles them: an unmarked match reads to the user as
+        // "the code isn't here", which is the one thing the view must never say wrongly.
+        ...(unmarked
+          ? [
+              "Unmarked matches — changed files with lines a rule matches outside its glob/path, so the view shows them unmarked:",
+              ...strayList(ctx.directory, turnID, unmarked),
             ]
           : []),
         ...(recent.length
@@ -153,15 +272,32 @@ export const layer = Layer.effect(
       // A turn that curated early and then finished more todos still owes the view an update.
       const stale = entries.findLast((e) => e.op === "milestone" && e.seq > (change?.seq ?? -1))
       const active = yield* ApertureLensStore.getActive(ctx.directory)
-      if (change && !stale && active) return
+      // Strays the agent has already been shown this turn don't earn a curation step of their own —
+      // that would spend a model call every turn on a choice the agent has already seen. Only ones
+      // that appeared too late for a nudge (the last step's edits) do.
+      const unmarked = yield* strays(ctx.directory, [])
+      const seen = shownIn(ctx.directory, turnID)
+      const unseen = unmarked?.strays.some((stray) => !seen.has(strayKey(unmarked.lens, stray))) ?? false
+      if (change && !stale && active && !unseen) return
       const whys = active ? staleWhys(active, yield* ApertureLensHistory.read(ctx.directory, { lens: active.id })) : []
+      // The state block below re-lists the strays, so the reminder only points at them.
+      const state = (yield* apertureState(agent, turnID)) ?? ""
+      if (change && !stale && active)
+        return [
+          state,
+          "<system-reminder>",
+          'APERTURE CHECK: files changed this turn hold unmarked matches, listed above under "Unmarked matches".',
+          "Settle them now with Lens calls; do NOT edit files or continue the task.",
+          "End with ONE line for the user: what changed in the view, or `View unchanged: <why>`.",
+          "</system-reminder>",
+        ].join("\n")
       const why = !change
         ? "without any change to the Lens view"
         : stale
           ? `without a Lens change since you completed "${stale.milestone?.todo}"`
           : "with no Lens active"
       return [
-        (yield* apertureState(agent)) ?? "",
+        state,
         "<system-reminder>",
         `APERTURE CHECK: this turn ended ${why}.`,
         "Before the user replies, bring the view in line with the reply you just gave:",
@@ -170,7 +306,8 @@ export const layer = Layer.effect(
         "  is active, in which case mark without activating.",
         "- You may read and search to find the exact lines. Do NOT edit files and do NOT continue the",
         "  task: only read-only tools and Lens tools.",
-        "- If the reply was not about code in this repo, or the active Lens already shows it, change nothing.",
+        "- If the reply was not about code in this repo, or the active Lens already shows it, leave its concerns.",
+        ...(unmarked ? ['- Whatever the reply was about, settle the "Unmarked matches" listed above.'] : []),
         ...(whys.length
           ? [
               `- These concerns' whys may be out of date: ${whys.map((w) => `■ ${w.facet.id}`).join(", ")}. Rewrite`,
@@ -205,6 +342,23 @@ export const layer = Layer.effect(
       const reached = entries.filter((e) => e.op === "milestone" && e.seq > (change?.seq ?? -1))
       const next = input.todos.find((t) => t.status === "in_progress" || t.status === "pending")
       const edited = files.length ? `Files you edited since the last Lens change: ${files.join(", ")}.` : undefined
+      // Only strays that appeared this turn after the turn-start state listed them. Checked before
+      // the milestone: a milestone nudge repeats its key until the Lens changes and the caller drops
+      // repeats, so strays folded into one could be recorded as shown without being sent.
+      const unmarked = yield* strays(ctx.directory, files)
+      const seen = shownIn(ctx.directory, input.turnID)
+      const fresh = unmarked?.strays.filter((stray) => !seen.has(strayKey(unmarked.lens, stray))) ?? []
+      if (unmarked && fresh.length)
+        return {
+          key: `strays:${fresh.map((stray) => strayKey(unmarked.lens, stray)).join("|")}`,
+          text: [
+            "<system-reminder>",
+            "APERTURE: new unmarked matches — lines a rule matches outside its glob/path, so the view shows them unmarked:",
+            ...strayList(ctx.directory, input.turnID, { lens: unmarked.lens, strays: fresh }),
+            "Then continue the task.",
+            "</system-reminder>",
+          ].join("\n"),
+        }
       const active = reached.length ? yield* ApertureLensStore.getActive(ctx.directory) : undefined
       const whys = active ? staleWhys(active, yield* ApertureLensHistory.read(ctx.directory, { lens: active.id })) : []
       if (reached.length)
@@ -327,7 +481,7 @@ export const layer = Layer.effect(
           "  square in the concern's exact colour, linking your prose to the marks, so write the token",
           "  instead of naming the colour. Whenever you create a concern or rewrite its why, say so in one",
           '  sentence as token: what — why, e.g. "I marked ■ retry-path: every place a failed request is',
-          "  re-queued — the duplicate send has to start in one of these.\" When explaining, refer to",
+          '  re-queued — the duplicate send has to start in one of these." When explaining, refer to',
           "  concerns by token.",
           "- Always pass `reason` (why this call, distinct from the concern's why). Every change is",
           "  recorded in a Lens history the user reviews, tied to the turn that made it.",
@@ -376,6 +530,6 @@ export const layer = Layer.effect(
   }),
 )
 
-export const defaultLayer = layer.pipe(Layer.provide(Skill.defaultLayer))
+export const defaultLayer = layer.pipe(Layer.provide(Skill.defaultLayer), Layer.provide(Git.defaultLayer))
 
 export * as SystemPrompt from "./system"

@@ -159,6 +159,101 @@ export const evaluate = (
     return { byFile, diagnostics }
   })
 
+// Lines in `files` that a rule's finder matches but its scope leaves out — the rule with its
+// whitelist globs (or symbol `path`) dropped — and that no rule of the same concern paints. Agents
+// routinely glob a rule to the one file they were reading, so a new or edited file holding the
+// same code shows as unmarked, and the user reads that as "the code isn't here". This is what lets
+// the caller ask the agent to widen the rule or add one. Exclusion globs are kept: they record a
+// deliberate "not these". `diff` rules are left out — unscoped, they mean every changed line.
+//
+// One Stray per concern and file: two rules of a concern often match the same lines, and listing
+// them twice would spend the agent's context on a duplicate. `rules` names every rule involved.
+export interface Stray {
+  readonly rules: ReadonlyArray<string>
+  readonly facet: string
+  readonly file: string
+  readonly ranges: ReadonlyArray<readonly [number, number]>
+}
+
+export const strays = (
+  directory: string,
+  rules: ReadonlyArray<Rule>,
+  files: ReadonlyArray<string>,
+  git?: GitLookup,
+): Effect.Effect<Stray[]> =>
+  Effect.gen(function* () {
+    // Each rule runs widened over only the files its scope leaves out: an in-scope file's matches
+    // are the rule's own paint, and a rule with nothing outside its scope costs no search at all.
+    const found = (yield* Effect.forEach(rules, (rule) =>
+      Effect.gen(function* () {
+        const find = unscoped(rule.find)
+        const inScope = inScopeOf(rule.find)
+        const outside = find ? files.filter((file) => !inScope(file)) : []
+        if (!find || outside.length === 0) return []
+        const result = yield* evaluate(directory, [{ ...rule, find }], outside, git)
+        return [...result.byFile].flatMap(([file, hits]) =>
+          hits.map((hit) => ({ rule: hit.rule, facet: hit.facet, file, ranges: hit.ranges })),
+        )
+      }),
+    )).flat()
+    if (found.length === 0) return []
+    const painted = yield* evaluate(
+      directory,
+      rules.filter((rule) => found.some((stray) => stray.facet === rule.facet)),
+      [...new Set(found.map((stray) => stray.file))],
+      git,
+    )
+    const grouped = new Map<string, { rules: string[]; facet: string; file: string; lines: Set<number> }>()
+    for (const stray of found) {
+      const covered = (painted.byFile.get(stray.file) ?? [])
+        .filter((hit) => hit.facet === stray.facet)
+        .flatMap((hit) => hit.ranges)
+      const lines = stray.ranges.flatMap(([start, end]) =>
+        Array.from({ length: end - start + 1 }, (_, i) => start + i).filter(
+          (line) => !covered.some(([a, b]) => a <= line && line <= b),
+        ),
+      )
+      if (lines.length === 0) continue
+      const key = `${stray.facet}\0${stray.file}`
+      const group = grouped.get(key) ?? { rules: [], facet: stray.facet, file: stray.file, lines: new Set<number>() }
+      group.rules.push(stray.rule)
+      for (const line of lines) group.lines.add(line)
+      grouped.set(key, group)
+    }
+    return [...grouped.values()].map((group) => {
+      const sorted = [...group.lines].sort((a, b) => a - b)
+      return {
+        rules: group.rules,
+        facet: group.facet,
+        file: group.file,
+        ranges: runsOf(sorted[0]!, sorted[sorted.length - 1]!, (line) => group.lines.has(line)),
+      }
+    })
+  })
+
+// Whether a repo-relative file is inside the finder's scope (its globs, or a symbol's path).
+function inScopeOf(find: Finder): (file: string) => boolean {
+  if (find.kind === "symbol") {
+    const under = find.path ? normalize(find.path).replace(/\/+$/, "") : undefined
+    return (file) => !under || file === under || file.startsWith(under + "/")
+  }
+  if (find.kind === "pattern" && find.glob?.length) return globScope(find.glob)
+  return () => true
+}
+
+// The finder with its scope removed, or undefined when it has none to remove.
+function unscoped(find: Finder): Finder | undefined {
+  if (find.kind === "symbol") return find.path ? { kind: "symbol", name: find.name } : undefined
+  if (find.kind !== "pattern" || !find.glob?.some((g) => !g.startsWith("!"))) return undefined
+  const exclusions = find.glob.filter((g) => g.startsWith("!"))
+  return {
+    kind: "pattern",
+    pattern: find.pattern,
+    ...(exclusions.length ? { glob: exclusions } : {}),
+    ...(find.caseSensitive === false ? { caseSensitive: false } : {}),
+  }
+}
+
 export function capOf(find: Finder): number {
   return find.kind === "diff" ? MAX_DIFF_HITS : MAX_RULE_HITS
 }
@@ -270,12 +365,18 @@ const patternHits = (
   cap: number,
 ): Effect.Effect<Found, PlatformError | Error> =>
   Effect.gen(function* () {
+    // Ripgrep never applies `--glob` to a path named on its command line, so on the incremental
+    // path the globs are applied here. Without this, a file outside a rule's glob gained the
+    // rule's marks the moment it was edited and lost them on the next whole-repo pass.
+    const inScope = find.glob?.length ? globScope(find.glob) : undefined
+    const scoped = files && inScope ? files.filter((file) => inScope(normalize(file))) : files
+    if (scoped && scoped.length === 0) return { raw: new Map() }
     const rg = yield* Ripgrep.Service
     const result = yield* rg.search({
       cwd: directory,
       pattern: find.caseSensitive === false ? `(?i)${find.pattern}` : find.pattern,
       ...(find.glob?.length ? { glob: [...find.glob] } : {}),
-      ...(files ? { file: [...files] } : {}),
+      ...(scoped ? { file: [...scoped] } : {}),
     })
     const perFile = new Map<string, Array<readonly [number, number]>>()
     let raw = 0
@@ -338,8 +439,7 @@ const symbolHits = (
   files: ReadonlyArray<string> | undefined,
 ): Effect.Effect<Found, PlatformError | Error> =>
   Effect.gen(function* () {
-    const under = find.path ? normalize(find.path).replace(/\/+$/, "") : undefined
-    const inScope = (rel: string) => !under || rel === under || rel.startsWith(under + "/")
+    const inScope = inScopeOf(find)
 
     let candidates: string[]
     if (files) {
@@ -386,12 +486,12 @@ const diffHits = (
   Effect.gen(function* () {
     const changes = yield* git.changes(find.ref ?? "HEAD")
     const only = files ? new Set(files.map(normalize)) : undefined
-    const globs = find.glob?.map((g) => new Bun.Glob(g))
+    const inScope = find.glob?.length ? globScope(find.glob) : undefined
     const raw: Raw = new Map()
     let lines = 0
     for (const [file, ranges] of changes) {
       if (only && !only.has(file)) continue
-      if (globs && !globs.some((g) => g.match(file))) continue
+      if (inScope && !inScope(file)) continue
       const list = ranges === "all" ? [[1, Number.MAX_SAFE_INTEGER] as const] : [...ranges]
       raw.set(file, list)
       // An untracked file's size is unknown until it is read, so it counts as one line here; the
@@ -510,6 +610,30 @@ function measure(ranges: ReadonlyArray<readonly [number, number]>, content: stri
     for (let i = start - 1; i <= end - 1; i++) bytes += lineBytes[i] ?? 0
   }
   return { ranges: clamped, lines, bytes }
+}
+
+// A predicate deciding whether a repo-relative file is inside `globs`, read the way ripgrep reads
+// `--glob` during a walk, so that filtering a file list agrees with searching the repo:
+//   - a glob with no "/" matches the file's basename at any depth ("*.ts" matches "a/b.ts");
+//   - any other glob is anchored at the root ("src/x.ts" never matches "pkg/src/x.ts"), and a
+//     leading "/" only makes that explicit;
+//   - "!" excludes, and the LAST glob that matches decides;
+//   - a file no glob matches is in scope only when every glob is an exclusion.
+// A directory glob ("src/aperture") does not match the files beneath it, in ripgrep or here.
+function globScope(globs: ReadonlyArray<string>): (file: string) => boolean {
+  const compiled = globs.map((glob) => {
+    const exclude = glob.startsWith("!")
+    const body = exclude ? glob.slice(1) : glob
+    return {
+      exclude,
+      glob: new Bun.Glob(body.includes("/") ? body.replace(/^\/+/, "") : `**/${body}`),
+    }
+  })
+  const fallback = compiled.every((c) => c.exclude)
+  return (file) => {
+    const last = compiled.findLast((c) => c.glob.match(file))
+    return last ? !last.exclude : fallback
+  }
 }
 
 // Ripgrep already strips a leading "./" (see `clean`), but it reports native separators on

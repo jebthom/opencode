@@ -6,6 +6,7 @@ import { Skill } from "../../src/skill"
 import { Permission } from "../../src/permission"
 import { Storage } from "../../src/storage/storage"
 import { SystemPrompt } from "../../src/session/system"
+import { Git } from "../../src/git"
 import { testEffect } from "../lib/effect"
 
 const skills: Skill.Info[] = [
@@ -74,6 +75,7 @@ const it = testEffect(
       ),
     ),
     Layer.provide(storageStub),
+    Layer.provide(Git.defaultLayer),
   ),
 )
 

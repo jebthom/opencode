@@ -1,111 +1,163 @@
 {
-  "aperture-extension-cd23d5cd": {
-    "id": "aperture-extension-cd23d5cd",
+  "aperture-extension-ddc7b57d": {
+    "id": "aperture-extension-ddc7b57d",
     "name": "Aperture Extension",
-    "description": "Core architecture, features, and integration of the Aperture visualization system",
+    "description": "Marks for Aperture Extension.",
     "palette": "categorical",
     "facets": [
       {
-        "id": "lens-data-model",
-        "label": "lens-data-model",
-        "what": "Core domain types for Lenses, Facets, Rules, and Finders",
-        "why": "Understanding the data structures at the heart of the marking system",
+        "id": "rule-evaluation",
+        "label": "rule-evaluation",
+        "what": "core rule matching engine transforming finders into line ranges",
+        "why": "entry point for understanding how Aperture evaluates all rule types",
         "color": "#D7005F",
         "owner": "agent",
         "createdBy": "build"
       },
       {
-        "id": "rule-evaluation",
-        "label": "rule-evaluation",
-        "what": "Rule evaluation engine for patterns, symbols, and git diffs",
-        "why": "How rules find and match lines in the codebase",
+        "id": "finder-validation",
+        "label": "finder-validation",
+        "what": "schema validation for Finder and GitFilter shapes with detailed errors",
+        "why": "shows how queries are validated before marking",
         "color": "#AF5F00",
         "owner": "agent",
         "createdBy": "build"
       },
       {
-        "id": "aperture-service",
-        "label": "aperture-service",
-        "what": "Main Effect service orchestrating all Lens operations",
-        "why": "Central hub coordinating reads, mutations, and events across the system",
+        "id": "lens-persistence",
+        "label": "lens-persistence",
+        "what": "read/write operations for lenses.json with migration and history logging",
+        "why": "shows how Aperture state persists and evolves",
         "color": "#AFAF00",
         "owner": "agent",
         "createdBy": "build"
       },
       {
-        "id": "storage-persistence",
-        "label": "storage-persistence",
-        "what": "Persistent store with mutex-guarded mutations, migrations, and history",
-        "why": "How lenses are safely stored, loaded, and tracked over time",
+        "id": "ownership-consent",
+        "label": "ownership-consent",
+        "what": "access control model enforcing user ownership and agent consent",
+        "why": "shows permissions model for mutations across aperture and session layers",
         "color": "#00875F",
         "owner": "agent",
         "createdBy": "build"
       },
       {
-        "id": "vscode-gutter-paint",
-        "label": "vscode-gutter-paint",
-        "what": "VSCode gutter rendering, decorations, and hovers for marked lines",
-        "why": "How the marks are visualized in the editor",
+        "id": "incremental-memoization",
+        "label": "incremental-memoization",
+        "what": "per-file memoization and incremental re-evaluation strategy",
+        "why": "shows performance optimization: memoization structure, incremental re-eval on file changes, and cache-clearing on session idle",
+        "color": "#00AFD7",
         "owner": "agent",
-        "createdBy": "build",
-        "color": "#00AFD7"
+        "createdBy": "build"
+      },
+      {
+        "id": "git-integration",
+        "label": "git-integration",
+        "what": "git backend for diff/blame filtering and changed-line detection",
+        "why": "shows how Aperture filters rules by git history across implementation and call sites",
+        "color": "#5F5FD7",
+        "owner": "agent",
+        "createdBy": "build"
       }
     ],
     "owner": "agent",
     "rules": [
       {
-        "id": "lens-data-model-24b113e1",
-        "facet": "lens-data-model",
-        "find": {
-          "kind": "symbol",
-          "name": "Lens",
-          "path": "packages/opencode/src/aperture/lenses.ts"
-        },
-        "createdBy": "build"
-      },
-      {
-        "id": "rule-evaluation-d1381766",
-        "facet": "rule-evaluation",
-        "find": {
-          "kind": "symbol",
-          "name": "evaluate",
-          "path": "packages/opencode/src/aperture/rules.ts"
-        },
-        "note": "Main evaluation logic",
-        "createdBy": "build"
-      },
-      {
-        "id": "aperture-service-c6e17a72",
-        "facet": "aperture-service",
-        "find": {
-          "kind": "symbol",
-          "name": "Service",
-          "path": "packages/opencode/src/aperture/aperture.ts"
-        },
-        "note": "Main service class",
-        "createdBy": "build"
-      },
-      {
-        "id": "storage-persistence-46a5927e",
-        "facet": "storage-persistence",
+        "id": "ownership-consent-3791c85d",
+        "facet": "ownership-consent",
         "find": {
           "kind": "pattern",
-          "pattern": "export \\* as ApertureLensStore",
-          "path": "packages/opencode/src/aperture"
-        },
-        "note": "Store namespace export",
-        "createdBy": "build"
-      },
-      {
-        "id": "vscode-gutter-paint-ddf181d7",
-        "facet": "vscode-gutter-paint",
-        "find": {
-          "kind": "pattern",
-          "pattern": "gutter|decoration|TextEditor|repaint",
+          "pattern": "(consentNeeded|switchNeedsConsent|canMutate|owner\\s*===)",
           "glob": [
-            "sdks/aperture-vscode/src/**/*.ts"
+            "packages/opencode/src/aperture/lens-store.ts",
+            "packages/opencode/src/aperture/aperture.ts",
+            "packages/opencode/src/session/system.ts"
           ]
         },
+        "createdBy": "build"
+      },
+      {
+        "id": "git-integration-acea5a9f",
+        "facet": "git-integration",
+        "find": {
+          "kind": "pattern",
+          "pattern": "(export\\s+function\\s+make|const\\s+changes|const\\s+blame|GitLookup)",
+          "glob": [
+            "packages/opencode/src/aperture/git-lookup.ts",
+            "packages/opencode/src/aperture/rules.ts",
+            "packages/opencode/src/session/system.ts"
+          ]
+        },
+        "createdBy": "build"
+      },
+      {
+        "id": "rule-evaluation-34c4d9c4",
+        "facet": "rule-evaluation",
+        "find": {
+          "kind": "pattern",
+          "pattern": "^(export\\s+)?(const\\s+evaluate|function\\s+evaluate)",
+          "glob": [
+            "!perf/**",
+            "packages/opencode/**"
+          ]
+        },
+        "note": "core engine in rules.ts",
+        "createdBy": "build"
+      },
+      {
+        "id": "finder-validation-2b824036",
+        "facet": "finder-validation",
+        "find": {
+          "kind": "pattern",
+          "pattern": "isValidFinder|finderProblem|whereProblem",
+          "glob": [
+            "!perf/**",
+            "packages/opencode/**"
+          ]
+        },
+        "note": "schema validation in lenses.ts",
+        "createdBy": "build"
+      },
+      {
+        "id": "lens-persistence-93476510",
+        "facet": "lens-persistence",
+        "find": {
+          "kind": "pattern",
+          "pattern": "readProject|writeProject|export\\s+const\\s+(list|get|mark|unmark|update|remove)\\s*=",
+          "glob": [
+            "!perf/**",
+            "packages/opencode/**"
+          ]
+        },
+        "note": "read/write and exports in files.ts",
+        "createdBy": "build"
+      },
+      {
+        "id": "incremental-memoization-4fc5c322",
+        "facet": "incremental-memoization",
+        "find": {
+          "kind": "pattern",
+          "pattern": "interface\\s+RuleMemo|ruleMemo\\[|ruleHitsFor|capOf|clampAll",
+          "glob": [
+            "!perf/**",
+            "packages/opencode/**"
+          ]
+        },
+        "note": "memo structures in aperture.ts and rules.ts",
+        "createdBy": "build"
+      },
+      {
+        "id": "incremental-memoization-b77a8044",
+        "facet": "incremental-memoization",
+        "find": {
+          "kind": "pattern",
+          "pattern": "onSessionIdle|filesCache\\.delete|isRepoCache\\.delete|ruleMemo\\.delete",
+          "glob": [
+            "!perf/**",
+            "packages/opencode/**"
+          ]
+        },
+        "note": "cache-clearing on session idle",
         "createdBy": "build"
       }
     ]
