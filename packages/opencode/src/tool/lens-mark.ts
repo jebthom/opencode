@@ -25,7 +25,7 @@ import { actorOf, withConsent } from "./lens-consent"
 // concerns that best help the user verify the current work, adding and removing facets as the
 // task moves. Every call lands in the Lens history with the turn it came from.
 //
-// Deterministic — no model call, no repaint, no tokens. The return value is the safety
+// Deterministic — no model call, no tokens. The return value is the safety
 // mechanism: an agent that writes a loose regex sees the hit count and narrows it instead of
 // silently colouring a third of the repo.
 
@@ -41,8 +41,8 @@ export const Parameters = Schema.Struct({
   lens: Schema.String.annotate({
     description: [
       "Id or name of the Lens to mark on (see lens_list). A name that doesn't exist creates a Lens",
-      "with that name — give it a descriptive one ('Retry Handling', not 'search'), and check",
-      "lens_list first so you add to an existing Lens instead of making a near-duplicate.",
+      "with that name — name it after the part of the work ('Webhook limits: sender', not 'search'),",
+      "and check lens_list first so you add to that part's Lens instead of making a near-duplicate.",
     ].join(" "),
   }),
   facet: Schema.String.annotate({
@@ -121,9 +121,10 @@ export const Parameters = Schema.Struct({
   }),
   why: Schema.optional(Schema.String).annotate({
     description: [
-      "WHY to look at these lines for the task right now. In an overview, how it fits: 'every other",
-      "concern builds on these types, so read them first'. During a change, what to do or check:",
-      "'each must handle the new TimeoutError'. REQUIRED when minting a concern; given for an",
+      "WHY to look at these lines for the task right now. Before a change, what you'll do there: 'the",
+      "limiter will wrap this call'. After it, what to check: 'each must handle the new TimeoutError'.",
+      "For a precedent in this codebase, what you followed: 'the consent flow this tool copies'.",
+      "REQUIRED when minting a concern; given for an",
       "existing one, it replaces the why (lens_edit also does this). Keep what + why under ~120 characters.",
     ].join(" "),
   }),
@@ -164,12 +165,11 @@ export const LensMarkTool = Tool.define(
         "What is stored is the QUERY (a regex, a declaration name, or a git diff, optionally narrowed",
         "by git history — changed in a ref, by an author, since a date), not the line numbers — it is",
         "re-run against the files on every read, so the paint follows the code as it changes.",
-        "Free and instant: no model call, no repainting. Returns the hit count, a sample of matched",
+        "Free and instant. Returns the hit count, a sample of matched",
         "lines and the concern's colour. Check the count AND read the samples — the count catches a",
         "query that is too broad, the samples catch one that matched the wrong thing (a 'pattern'",
         "rule matches comments and strings, so a small plausible count can still be all prose).",
-        "Several unrelated concerns can live on one Lens; the user filters the legend down to the",
-        "ones they care about.",
+        "A Lens groups the concerns of one part of the work; a separate part gets its own Lens.",
       ].join(" "),
       parameters: Parameters,
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>

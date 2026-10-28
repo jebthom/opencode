@@ -25,8 +25,8 @@ export const Parameters = Schema.Struct({
         facet: Schema.String.annotate({ description: "Existing concern id or label." }),
         why: Schema.optional(Schema.String).annotate({
           description: [
-            "New why: why to look at these lines for the task NOW. Rewrite it when the task moves on",
-            "(understand → change → verify) and the concern still applies, for a different purpose.",
+            "New why: why to look at these lines for the task NOW. Rewrite it at a checkpoint: before a",
+            "change it says what you'll do there; after it, what to check.",
           ].join(" "),
         }),
         what: Schema.optional(Schema.String).annotate({

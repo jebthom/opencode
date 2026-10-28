@@ -2459,7 +2459,8 @@ it.instance("aperture check skips subagent sessions", () =>
 )
 
 // Mid-turn Aperture nudges (SystemPrompt.apertureNudge): a completed todo checkpoints the Lens and
-// the next step is told to curate; with no todos, edits to several files do the same.
+// the next step is asked whether a new part starts; a turn that edits before any Lens change is
+// nudged once.
 const todos = (first: string) => ({
   todos: [
     { content: "part one", status: first, priority: "high" },
@@ -2517,22 +2518,24 @@ it.instance("a todo completed after the last Lens change triggers the end-of-tur
   }),
 )
 
-it.instance("edits to several files with no todos and no Lens change nudge once", () =>
+it.instance("the first edit of a turn with no Lens change nudges once, with or without todos", () =>
   Effect.gen(function* () {
     const { dir, llm } = yield* useServerConfig(apertureCfg)
     const prompt = yield* SessionPrompt.Service
     const { session } = yield* buildTurn("make the change")
+    yield* llm.tool("todowrite", todos("in_progress"))
     yield* llm.tool("write", { filePath: path.join(dir, "a.ts"), content: "export const a = 1\n" })
     yield* llm.tool("write", { filePath: path.join(dir, "b.ts"), content: "export const b = 1\n" })
-    yield* llm.tool("write", { filePath: path.join(dir, "c.ts"), content: "export const c = 1\n" })
     yield* llm.text("done")
     yield* llm.text("View unchanged: nothing to mark")
 
     yield* prompt.loop({ sessionID: session.id })
     const inputs = (yield* llm.inputs).map((input) => JSON.stringify(input))
-    expect(inputs[2]).not.toContain("without updating the Lens")
-    expect(inputs[3]).toContain("APERTURE: you have edited 3 files without updating the Lens: a.ts, b.ts, c.ts")
-    expect(count(inputs[4], "without updating the Lens")).toBe(1)
+    expect(inputs[1]).not.toContain("you started editing")
+    expect(inputs[2]).toContain("APERTURE: you started editing (a.ts) with no Lens change this turn")
+    // Sent once per turn: later edits don't re-nudge, and it is re-spliced in place, never duplicated.
+    expect(count(inputs[3], "you started editing")).toBe(1)
+    expect(inputs[3]).not.toContain("you started editing (a.ts, b.ts)")
   }),
 )
 

@@ -60,8 +60,6 @@ export interface Interface {
   ) => Effect.Effect<{ readonly key: string; readonly text: string } | undefined>
 }
 
-// Distinct files edited without a Lens change before a todo-less turn is nudged.
-const NUDGE_FILES = 3
 // Changed files scanned for stray matches, and stray matches (one per concern and file) listed at once. A bulk
 // change (a codemod, a vendored directory) must not turn every step into a repo-wide search.
 const STRAY_MAX_FILES = 200
@@ -226,8 +224,8 @@ export const layer = Layer.effect(
         ...(lenses.length ? ["Lenses:", ...lenses] : ["No Lenses yet."]),
         ...(stale.length
           ? [
-              "Whys marked STALE or MISSING may no longer say why to look at those lines. If the concern still serves",
-              "this task, rewrite its why with lens_edit; if it no longer does, lens_unmark it. Keep its what.",
+              "Whys marked STALE or MISSING may no longer say why to look at those lines. If this Lens still serves",
+              "the message, rewrite them with lens_edit at your next checkpoint; keep each what.",
             ]
           : []),
         // Re-listed every turn until a rule settles them: an unmarked match reads to the user as
@@ -252,10 +250,10 @@ export const layer = Layer.effect(
         // The standing rule (a relevant Lens is always active) is stated in the system prompt, but
         // restating it next to the user's message is what makes agents act on it for questions.
         !active
-          ? "No Lens is active. If this message is about code in this repo, your reply must leave a Lens of yours active that shows it."
+          ? "No Lens is active. If this message is about code in this repo, mark it on a Lens of yours and activate it once grounded: before your first edit or explanation."
           : active.owner === "user"
             ? `The user's Lens "${active.name}" is active; don't switch away from it. Mark on your own Lens without activating it.`
-            : `Your Lens "${active.name}" is active. If this message moves to a different task, update it or start a new Lens and activate it.`,
+            : `Your Lens "${active.name}" is active. If this message starts a new task or part, give it its own Lens once grounded, before your first edit or explanation; if it continues this one, change the Lens only at a checkpoint.`,
         "</aperture-state>",
       ].join("\n")
     })
@@ -300,18 +298,18 @@ export const layer = Layer.effect(
         state,
         "<system-reminder>",
         `APERTURE CHECK: this turn ended ${why}.`,
-        "Before the user replies, bring the view in line with the reply you just gave:",
-        "- If it discussed code in this repo, mark the 2-4 concerns it walked through on a Lens of your",
-        "  own (create one named after the task if needed) and activate it — unless the user's own Lens",
-        "  is active, in which case mark without activating.",
+        "This is the end-of-turn checkpoint: before the user replies, bring the view in line with this turn's work.",
+        "- Each part you changed or explained needs a Lens of yours showing it: the changed lines (kind",
+        '  "diff") and the 2-4 concerns your reply walked through, with whys that say what to check.',
+        "  Activate the last part's Lens, unless the user's own Lens is active: then mark without activating.",
         "- You may read and search to find the exact lines. Do NOT edit files and do NOT continue the",
         "  task: only read-only tools and Lens tools.",
-        "- If the reply was not about code in this repo, or the active Lens already shows it, leave its concerns.",
+        "- If the reply was not about code in this repo, or the view already shows it, change nothing.",
         ...(unmarked ? ['- Whatever the reply was about, settle the "Unmarked matches" listed above.'] : []),
         ...(whys.length
           ? [
               `- These concerns' whys may be out of date: ${whys.map((w) => `■ ${w.facet.id}`).join(", ")}. Rewrite`,
-              "  each with lens_edit if it still serves the task, or lens_unmark it if it doesn't.",
+              "  each with lens_edit to say what to check, if its Lens still serves this turn.",
             ]
           : []),
         "End with ONE line for the user: what changed in the view, or `View unchanged: <why>`.",
@@ -319,12 +317,13 @@ export const layer = Layer.effect(
       ].join("\n")
     })
 
-    // The mid-turn nudge at a task boundary. A long build turn can cover several parts of a task,
-    // and the end-of-turn check alone lets the view go stale in between. The boundary is the
-    // agent's own todo completing (a "milestone" history entry, written by todowrite); with no
-    // todos, it is edits to NUDGE_FILES distinct files since the last Lens change. The nudge is
-    // concrete — the todo, the files, the next todo — so the agent makes a small local decision
-    // instead of recalling a general rule. `key` lets the caller send each nudge once.
+    // The mid-turn nudges, at the checkpoints the system prompt names. The Lens should change only
+    // at those, so the user isn't watching concerns churn at agent speed. A completed todo (a
+    // "milestone" history entry, written by todowrite) asks the agent to decide whether the next
+    // todo starts a new part — only the agent can tell a step from a part. A turn that starts
+    // editing with no Lens change at all missed the before-acting checkpoint, and is nudged once.
+    // The nudge is concrete — the todo, the files, the next todo — so the agent makes a small local
+    // decision instead of recalling a general rule. `key` lets the caller send each nudge once.
     const apertureNudge = Effect.fn("SystemPrompt.apertureNudge")(function* (
       agent: Agent.Info,
       input: {
@@ -368,29 +367,34 @@ export const layer = Layer.effect(
             "<system-reminder>",
             `APERTURE MILESTONE: you completed ${reached.map((e) => `"${e.milestone?.todo}"`).join(", ")}.`,
             ...(edited ? [edited] : []),
-            next ? `Next todo: "${next.content}".` : "No todos remain.",
-            "Before continuing, bring your Lens in line with the task in one or two Lens calls:",
-            '- mark the part you finished so the user can verify it (kind "diff", globbed to its files),',
+            ...(next
+              ? [
+                  `Next todo: "${next.content}". Decide whether it continues this part or starts a new one:`,
+                  "- Same part: leave the Lens as it is, unless a mark has proved wrong.",
+                  "- New part (a checkpoint): finish this part's Lens, keeping it as the part's record; then, once",
+                  "  grounded in the next part, give it its own Lens and activate it.",
+                ]
+              : ["No todos remain: finish this part's Lens before you reply."]),
+            'Finishing a Lens: mark the changed lines (kind "diff", globbed to the part\'s files) and rewrite',
             ...(whys.length
               ? [
-                  "- rewrite the why (lens_edit) of each concern that still applies to what comes next — its what stays:",
+                  "whys (lens_edit) to say what to check — each what stays:",
                   ...whys.map((w) => `    ■ ${w.facet.id}: why was "${w.facet.why || "(none)"}"`),
                 ]
-              : []),
-            "- lens_unmark your concerns that only served the finished part (the history keeps them),",
-            ...(next ? ["- mark what the next todo will touch, if you already know."] : []),
-            "Keep one Lens for the task; don't start a new Lens per todo. Then continue the task.",
+              : ["whys (lens_edit) to say what to check."]),
+            "Then continue the task.",
             "</system-reminder>",
           ].join("\n"),
         }
-      if (input.todos.length || files.length < NUDGE_FILES) return
+      if (change || !files.length) return
       return {
-        key: `edits:${change?.seq ?? -1}`,
+        key: `edits:${input.turnID}`,
         text: [
           "<system-reminder>",
-          `APERTURE: you have edited ${files.length} files without updating the Lens: ${files.join(", ")}.`,
-          'If they belong to the task, mark them (kind "diff", globbed to these files) under a concern',
-          "that says what the change is, then continue the task.",
+          `APERTURE: you started editing (${files.join(", ")}) with no Lens change this turn.`,
+          "If the active Lens doesn't already show this work, mark it now (the before-acting checkpoint): the",
+          'code you\'re changing, its call sites and tests, and a kind "diff" concern globbed to these files.',
+          "Then continue the task.",
           "</system-reminder>",
         ].join("\n"),
       }
@@ -436,87 +440,76 @@ export const layer = Layer.effect(
         if (agent.name !== "build" && agent.name !== "plan") return
         return [
           "<aperture>",
-          "The Aperture view shows the user WHERE things are in this repo. A Lens is a named set of up",
-          `to ${ApertureLenses.MAX_FACETS} concerns (facets); each concern marks the exact LINES matched by deterministic`,
-          "rules — a regex, a declaration name, or a git diff, optionally narrowed by git history (changed",
-          "in a ref, by an author, since a date). The top bar groups the marked files by which concerns",
-          "they carry; the editor gutter paints the marked lines. Nothing is inferred: every mark comes",
-          "from a query the user can check, and it is re-run on every read, so it follows the code.",
-          "The current Lenses arrive in an <aperture-state> reminder with each user message.",
+          "Aperture is your visual channel to the user: a Lens highlights the exact lines in this repo that",
+          "your work is about, so the user can follow your reasoning and check your changes in the code.",
+          `A Lens is a named group of up to ${ApertureLenses.MAX_FACETS} concerns (facets). Each concern has a colour, a what, a why, and`,
+          "deterministic rules — a regex, a declaration name, or a git diff, optionally narrowed by git",
+          "history — that are re-run on every read, so the marks follow the code. The current Lenses",
+          "arrive in an <aperture-state> reminder with each user message.",
           "",
-          "YOU ANSWER IN TWO CHANNELS. Your chat text says WHAT and WHY; your marks show WHERE. The view is",
-          "not a side task to tidy up after the answer — it is half of the answer, and you update it",
-          "alongside the text the way you would point at a screen while talking. The standing rule: from",
-          "the user's first message about this repo onward, a Lens relevant to the current task is",
-          "ACTIVE. If your reply is done and the view still shows nothing, or shows an earlier task, the",
-          "reply is not done.",
+          "Your chat says WHAT and WHY; your marks show WHERE. A reply about code in this repo is not done",
+          "until a Lens of yours shows it.",
           "",
-          "CURATING THE VIEW. Keep one Lens of your own for the current task (lens_mark with a new Lens",
-          "name creates it, named after the task) and curate its concerns as the work moves:",
-          '- Questions count as much as edits. "How does X work?", "tell me about feature Y", "where do we',
-          '  handle Z?" are the CORE case: mark the 2-4 concerns your explanation walks through (the entry',
-          "  point, the core logic, the state or config it reads, the tests) BEFORE you write the",
-          '  explanation, then name each concern and its colour in the text ("the retry path, in amber")',
-          "  so the user can follow the prose into the code.",
-          "- When the work is a change, mark the code you are about to change, the call sites it",
-          "  affects, and the tests that cover it.",
-          "- At milestones — a todo completed, a feature landed, a plan finalised — update it: mark what",
-          "  became relevant, and lens_unmark your concerns that no longer help. A stale concern is noise.",
-          "  A multi-part task keeps ONE Lens that evolves part by part, not a Lens per part: completing",
-          "  a todo checkpoints the Lens in its history, so pruning a finished part's concerns loses nothing.",
-          "- When the task changes, the view changes too: start a new Lens for the new task rather than",
-          "  leaving the old one active.",
-          '- After changing code, prefer marks that let the user VERIFY the change: kind "diff" (every line',
-          '  you changed), or a pattern narrowed with changed:"HEAD" ("every call to x() this change',
-          '  touched"). Use author/since when the question is about who or when.',
-          "- Every concern carries a WHAT and a WHY. `what` is what the marked lines are, as a phrase a",
-          '  newcomer can picture ("every place a failed request is re-queued"), and it is the concern\'s',
-          "  identity: keep it. `why` is why to look at those lines for the task right now. As the task moves",
-          "  from understanding to changing to verifying, rewrite the why with lens_edit rather than minting",
-          "  a new concern. Correct a what only if it misdescribes the lines; if the intent changes, mint a",
-          "  new concern and lens_unmark the old one. Both are required when you mint a concern.",
-          "- When a concern has more than one rule, give each rule a `note` saying which part it marks",
-          '  ("the definition", "callers outside src/net"). It is what the user sees on a marked line\'s hover.',
-          "- In chat, write a concern as ■ followed by its id, e.g. ■ retry-path. The user's view paints the",
-          "  square in the concern's exact colour, linking your prose to the marks, so write the token",
-          "  instead of naming the colour. Whenever you create a concern or rewrite its why, say so in one",
-          '  sentence as token: what — why, e.g. "I marked ■ retry-path: every place a failed request is',
-          '  re-queued — the duplicate send has to start in one of these." When explaining, refer to',
-          "  concerns by token.",
-          "- Always pass `reason` (why this call, distinct from the concern's why). Every change is",
-          "  recorded in a Lens history the user reviews, tied to the turn that made it.",
-          "- Switch the view to your Lens (activate:true, or lens_select) when the active Lens is also",
-          "  yours or there is none. Never switch away from the user's own Lens unasked.",
-          '- Concerns marked "the user\'s" belong to the user. Never change or remove them on your own',
-          "  initiative; if one really must change, the tool asks the user first.",
-          "- Skip marking only when the message is not about code in this repo (a greeting, a general",
-          "  programming question), or the active Lens already shows what this reply discusses. Keep",
-          "  each turn to a few changes: add to the view, don't churn it.",
+          'LENSES. One Lens per part of the work, named after it ("Webhook limits: sender"). A part is a',
+          "distinct feature, fix or question; the steps within it (todos like \"add tests\", \"update callers\")",
+          "share its Lens. A task with several parts, planned as milestones or not, gets several Lenses, so",
+          "the user can return to part A after you've moved on to part B. Each time you finish a step, decide",
+          "explicitly whether the next one continues this part or starts a new one. A finished part's Lens",
+          "is its record: add to it for a follow-up, but don't prune it. To dig deeper into one part, start a",
+          "new Lens and split its concerns into finer ones.",
           "",
-          "WHEN THE USER ASKS for a mark, a Lens or a switch, do it directly and pass requestedByUser:true —",
-          "it is then theirs.",
+          "WHEN TO UPDATE. The user reads the view while you work, and concerns that change at your speed",
+          "are unreadable. Marks moving with the code as you edit are fine; adding, removing or rewriting",
+          "concerns happens only at these checkpoints:",
+          "1. After grounding, before acting. Once you've read enough (including any explore results) to know",
+          "   which code you'll explain or change, and before your first edit or your explanation, mark it on",
+          "   the part's Lens and activate it. Marks made after grounding stay stable; marks made before get",
+          "   redone. For a change: the code you'll change, the call sites it affects, the tests that cover",
+          '   it, and a kind "diff" concern globbed to the part\'s files so your edits appear as you make them.',
+          "   For a question: the 2-4 concerns your explanation walks through.",
+          "2. At a part boundary. Finish the part's Lens (as in 3), then start and activate the next part's",
+          "   Lens (as in 1).",
+          "3. When a part or the turn ends. Make the Lens verifiable: the changed lines (kind \"diff\", or a",
+          '   pattern narrowed with changed:"HEAD" — "every call to x() this change touched"), and whys',
+          "   rewritten to say what to check.",
+          "Between checkpoints, leave concerns alone and save what you learn for the next one. The exceptions:",
+          "a mark that proved wrong, unmarked matches the state lists, and anything the user asks for.",
           "",
-          "MARKING WELL.",
-          '- Name the CONCERN, never the search: "retry-path", "any-casts", "feature-flag-reads". The name',
-          '  is what the user reads in the legend, so "hit" or "match" says nothing.',
-          "- Check the count AND read the samples lens_mark returns. A count of hundreds where you expected",
-          "  a dozen means the query is too broad — narrow it with a glob or a tighter pattern (past the cap",
-          "  a rule is stored but paints nothing). A small, plausible count can still be the wrong lines: a",
-          '  `pattern` rule matches comments and strings too ("as any" finds the prose "has anything").',
-          "  If the samples are not what you meant, re-mark with a pattern anchored to real syntax.",
-          "- Prefer adding a rule to an existing concern, and a concern to an existing Lens of yours, over",
-          "  minting near-duplicates. The user greys out concerns they don't want from the legend.",
+          "CONCERNS.",
+          '- `what` is what the lines are, as a phrase a newcomer can picture ("every place a failed request',
+          '  is re-queued"). Like its colour, it is the concern\'s identity: keep it. A new intent is a new concern.',
+          "- `why` is why to look at those lines now: before a change, what you'll do there; after it, what",
+          "  to check. A provisional why is fine at checkpoint 1; rewrite it with lens_edit at a later one.",
+          "- Show the precedent. If your change follows a pattern already in this codebase (a sibling module",
+          "  you modelled it on, this repo's way of handling errors, tests or config), mark one or two",
+          "  instances of it as their own concern, with a why naming what you followed. Language idioms and",
+          "  general techniques don't count.",
+          "- Prefer adding a rule (with a `note` saying which part it marks) or a concern to an existing Lens",
+          "  of yours for the same part over minting near-duplicates.",
+          "- In chat, write a concern as ■ followed by its id (■ retry-path); the user's view paints the",
+          "  square in its colour. At each checkpoint, announce each new or rewritten concern in one sentence",
+          "  as ■ id: what — why. Between checkpoints, say nothing about the view.",
           "",
-          "DELEGATING EXPLORATION. Explore subagents have NO Lens tools — they propose, you install. When",
-          'you dispatch subagent_type "explore" for a where-is or how-does question, put in the task prompt',
+          "OWNERSHIP. Activate your Lens (activate:true, or lens_select) whenever the active Lens is yours or",
+          "there is none, including at each part boundary, so the view tracks your work. Never switch away",
+          "from the user's own Lens unasked: mark on yours and tell them it exists. When the user asks for a",
+          "mark, a Lens or a switch, do it and pass requestedByUser:true; it is then theirs, and the tools ask",
+          "before you change it.",
+          "",
+          "Skip marking only when the message is not about code in this repo, or the active Lens already",
+          "shows what your reply discusses.",
+          "",
+          "DELEGATING EXPLORATION. Explore subagents have NO Lens tools: they propose, you install. When you",
+          'dispatch subagent_type "explore" for a where-is or how-does question, put in the task prompt',
           '(a) the concern ids of your current Lens, and (b) the sentence: "End your report with a PROPOSED',
-          'MARKS section." Then call lens_mark for each proposal worth keeping.',
+          'MARKS section." At your next checkpoint, call lens_mark for each proposal worth keeping.',
           ...(agent.name === "plan"
             ? [
                 "",
                 'PLANNING. Marking fits planning well: "where does X happen today?" is most of what planning',
-                "asks, and a mark changes no code. Mark the concerns your plan depends on as you establish",
-                "them, and reference them in the plan by token (■ id) so the reader can see them.",
+                "asks, and a mark changes no code. Once grounded, mark the concerns each part of the plan",
+                "depends on, on that part's Lens, and reference them in the plan by token (■ id) so the reader",
+                "can see them.",
               ]
             : []),
           "</aperture>",

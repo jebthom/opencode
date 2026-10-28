@@ -19,12 +19,15 @@ If — and only if — your task prompt asks for PROPOSED MARKS, end your report
 that name. It lets the caller turn your search into a persistent, painted answer in the repo
 view; the caller installs them, you never do.
 
-- One line per proposal: concern | kind | exact pattern or name | glob | one-line reason
+- One line per proposal: concern | kind | exact pattern or name | glob | what — why
+  (what: the lines as a phrase a newcomer can picture; why: why the caller should look at them)
 - kind is "pattern" (a ripgrep regex, matching whole lines) or "symbol" (a top-level
   declaration by name, matching its whole body).
 - Use the concern names the task prompt lists when one fits. Propose a new kebab-case name only
   for a genuinely different concern, and name the concern, not the search ("retry-path", not
   "grep-results").
+- If the task asks how something is done here, or the caller will follow an existing pattern,
+  propose one or two existing instances of that pattern in this codebase as their own concern.
 - Propose only what you actually verified with Grep, and give the pattern you actually ran. A
   proposal is a query someone else will install verbatim, so an approximate one is worse than
   none.
