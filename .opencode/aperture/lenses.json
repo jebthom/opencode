@@ -1,163 +1,152 @@
 {
-  "aperture-extension-ddc7b57d": {
-    "id": "aperture-extension-ddc7b57d",
-    "name": "Aperture Extension",
-    "description": "Marks for Aperture Extension.",
+  "facet-representation-test-bda87a2f": {
+    "id": "facet-representation-test-bda87a2f",
+    "name": "Facet representation test",
+    "description": "Test of the multi-facet representation in a single file.",
     "palette": "categorical",
     "facets": [
       {
-        "id": "rule-evaluation",
-        "label": "rule-evaluation",
-        "what": "core rule matching engine transforming finders into line ranges",
-        "why": "entry point for understanding how Aperture evaluates all rule types",
+        "id": "test1",
+        "label": "test1",
+        "what": "the two style-guide lines under test (Bun APIs, mocks)",
+        "why": "Testing a two-facet and three-facet line layout in one file.",
         "color": "#D7005F",
-        "owner": "agent",
+        "owner": "user",
         "createdBy": "build"
       },
       {
-        "id": "finder-validation",
-        "label": "finder-validation",
-        "what": "schema validation for Finder and GitFilter shapes with detailed errors",
-        "why": "shows how queries are validated before marking",
+        "id": "test2",
+        "label": "test2",
+        "what": "the same two style-guide lines (second facet)",
+        "why": "Second facet on the same lines, to test two-facet lines.",
         "color": "#AF5F00",
-        "owner": "agent",
+        "owner": "user",
         "createdBy": "build"
       },
       {
-        "id": "lens-persistence",
-        "label": "lens-persistence",
-        "what": "read/write operations for lenses.json with migration and history logging",
-        "why": "shows how Aperture state persists and evolves",
+        "id": "test3",
+        "label": "test3",
+        "what": "the mocks line only (third facet)",
+        "why": "Third facet on one line, so that line carries all three.",
         "color": "#AFAF00",
-        "owner": "agent",
-        "createdBy": "build"
-      },
-      {
-        "id": "ownership-consent",
-        "label": "ownership-consent",
-        "what": "access control model enforcing user ownership and agent consent",
-        "why": "shows permissions model for mutations across aperture and session layers",
-        "color": "#00875F",
-        "owner": "agent",
-        "createdBy": "build"
-      },
-      {
-        "id": "incremental-memoization",
-        "label": "incremental-memoization",
-        "what": "per-file memoization and incremental re-evaluation strategy",
-        "why": "shows performance optimization: memoization structure, incremental re-eval on file changes, and cache-clearing on session idle",
-        "color": "#00AFD7",
-        "owner": "agent",
-        "createdBy": "build"
-      },
-      {
-        "id": "git-integration",
-        "label": "git-integration",
-        "what": "git backend for diff/blame filtering and changed-line detection",
-        "why": "shows how Aperture filters rules by git history across implementation and call sites",
-        "color": "#5F5FD7",
-        "owner": "agent",
+        "owner": "user",
         "createdBy": "build"
       }
     ],
-    "owner": "agent",
+    "owner": "user",
     "rules": [
       {
-        "id": "ownership-consent-3791c85d",
-        "facet": "ownership-consent",
+        "id": "test1-74c36b58",
+        "facet": "test1",
         "find": {
           "kind": "pattern",
-          "pattern": "(consentNeeded|switchNeedsConsent|canMutate|owner\\s*===)",
+          "pattern": "Bun APIs|Avoid mocks",
           "glob": [
-            "packages/opencode/src/aperture/lens-store.ts",
-            "packages/opencode/src/aperture/aperture.ts",
-            "packages/opencode/src/session/system.ts"
+            "AGENTS.md"
           ]
         },
         "createdBy": "build"
       },
       {
-        "id": "git-integration-acea5a9f",
-        "facet": "git-integration",
+        "id": "test2-74c36b58",
+        "facet": "test2",
         "find": {
           "kind": "pattern",
-          "pattern": "(export\\s+function\\s+make|const\\s+changes|const\\s+blame|GitLookup)",
+          "pattern": "Bun APIs|Avoid mocks",
           "glob": [
-            "packages/opencode/src/aperture/git-lookup.ts",
-            "packages/opencode/src/aperture/rules.ts",
-            "packages/opencode/src/session/system.ts"
+            "AGENTS.md"
           ]
         },
         "createdBy": "build"
       },
       {
-        "id": "rule-evaluation-34c4d9c4",
-        "facet": "rule-evaluation",
+        "id": "test3-75f5a3ad",
+        "facet": "test3",
         "find": {
           "kind": "pattern",
-          "pattern": "^(export\\s+)?(const\\s+evaluate|function\\s+evaluate)",
+          "pattern": "Avoid mocks",
           "glob": [
-            "!perf/**",
-            "packages/opencode/**"
+            "AGENTS.md"
           ]
         },
-        "note": "core engine in rules.ts",
         "createdBy": "build"
       },
       {
-        "id": "finder-validation-2b824036",
-        "facet": "finder-validation",
+        "id": "test1-75d0925b",
+        "facet": "test1",
         "find": {
           "kind": "pattern",
-          "pattern": "isValidFinder|finderProblem|whereProblem",
+          "pattern": "Prefer functional array methods",
           "glob": [
-            "!perf/**",
-            "packages/opencode/**"
+            "AGENTS.md"
           ]
         },
-        "note": "schema validation in lenses.ts",
+        "note": "test1 only: the functional array methods line (single facet)",
         "createdBy": "build"
       },
       {
-        "id": "lens-persistence-93476510",
-        "facet": "lens-persistence",
+        "id": "test2-909c4d3b",
+        "facet": "test2",
         "find": {
           "kind": "pattern",
-          "pattern": "readProject|writeProject|export\\s+const\\s+(list|get|mark|unmark|update|remove)\\s*=",
+          "pattern": "Never alias imports",
           "glob": [
-            "!perf/**",
-            "packages/opencode/**"
+            "AGENTS.md"
           ]
         },
-        "note": "read/write and exports in files.ts",
+        "note": "test2 only: the never-alias-imports line (single facet)",
         "createdBy": "build"
       },
       {
-        "id": "incremental-memoization-4fc5c322",
-        "facet": "incremental-memoization",
+        "id": "test3-69f1252a",
+        "facet": "test3",
         "find": {
           "kind": "pattern",
-          "pattern": "interface\\s+RuleMemo|ruleMemo\\[|ruleHitsFor|capOf|clampAll",
+          "pattern": "Prefer `const` over `let`",
           "glob": [
-            "!perf/**",
-            "packages/opencode/**"
+            "AGENTS.md"
           ]
         },
-        "note": "memo structures in aperture.ts and rules.ts",
+        "note": "test3 only: the prefer-const line (single facet)",
         "createdBy": "build"
       },
       {
-        "id": "incremental-memoization-b77a8044",
-        "facet": "incremental-memoization",
+        "id": "test1-c819b0bd",
+        "facet": "test1",
         "find": {
           "kind": "pattern",
-          "pattern": "onSessionIdle|filesCache\\.delete|isRepoCache\\.delete|ruleMemo\\.delete",
+          "pattern": "^# Contributing to OpenCode$",
           "glob": [
-            "!perf/**",
-            "packages/opencode/**"
+            "CONTRIBUTING.md"
           ]
         },
-        "note": "cache-clearing on session idle",
+        "note": "test1 on the CONTRIBUTING title line (single line, two facets)",
+        "createdBy": "build"
+      },
+      {
+        "id": "test2-c819b0bd",
+        "facet": "test2",
+        "find": {
+          "kind": "pattern",
+          "pattern": "^# Contributing to OpenCode$",
+          "glob": [
+            "CONTRIBUTING.md"
+          ]
+        },
+        "note": "test2 on the CONTRIBUTING title line (single line, two facets)",
+        "createdBy": "build"
+      },
+      {
+        "id": "test1-a1691fd1",
+        "facet": "test1",
+        "find": {
+          "kind": "pattern",
+          "pattern": "^# Aperture — v3: deterministic facets",
+          "glob": [
+            "PLAN.md"
+          ]
+        },
+        "note": "test1 only: the PLAN.md title line (second file, single facet)",
         "createdBy": "build"
       }
     ]

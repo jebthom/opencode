@@ -2,7 +2,7 @@ import * as vscode from "vscode"
 import type { ChipLayout } from "./chip"
 import * as ops from "./commands"
 import { lineHover, type HoverLegendEntry } from "./hover"
-import { lineColor, MUTED_HEX } from "./line-color"
+import { blend, lineBands, MUTED_HEX } from "./line-color"
 import { ChipIcons, type IconDelivery } from "./icons"
 import { buildModel, type FacetFile, type FacetFiles, type TreeModel } from "./model"
 import { ApertureOpenEditors } from "./open-editors"
@@ -49,7 +49,7 @@ const MAX_TREE_FILES = 50000
 
 // The hue a facet takes while it is filtered out of the legend (PLAN O4). The same value
 // chip.ts falls back to, so the tree chip and the gutter stripe grey to one colour — and the one the TUI also reads as "off" rather than as a facet of its own.
-// This is NONE_HUE from the server's lenses.ts (see line-color.ts), and lineColor treats it as
+// This is NONE_HUE from the server's lenses.ts (see line-color.ts), and lineBands treats it as
 // the hue every active facet overdraws.
 const SUPPRESSED_HUE = MUTED_HEX
 
@@ -65,9 +65,10 @@ const SUPPRESSED_HUE = MUTED_HEX
 // non-hex hue is now a bug or a version skew, and `resolveHue` leaves it unpainted rather
 // than guessing at a colour the TUI isn't showing.
 
-// One decoration type per hex color, created lazily and reused. Cleared (set to an empty
-// range list) on every repaint for colors not present this pass, so stale strips vanish.
-const decorationByColor = new Map<string, vscode.TextEditorDecorationType>()
+// One decoration type per band combination ("|"-joined hexes, e.g. "#4E79A7|#F28E2B"), created
+// lazily and reused. Cleared (set to an empty range list) on every repaint for combinations not
+// present this pass, so stale strips vanish.
+const decorationByBands = new Map<string, vscode.TextEditorDecorationType>()
 
 let sse: { abort: () => void } | undefined
 let repaintTimer: ReturnType<typeof setTimeout> | undefined
@@ -97,27 +98,39 @@ export function activate(context: vscode.ExtensionContext) {
     return hue.startsWith("#") ? hue : undefined
   }
 
-  // Keyed by the raw hue string (hex or token), so a token and a hex never collide and
-  // each maps to one reused decoration type.
-  function decorationFor(hue: string): vscode.TextEditorDecorationType {
-    let deco = decorationByColor.get(hue)
+  // Keyed by the "|"-joined band hexes from lineBands, so each combination maps to one reused
+  // decoration type.
+  function decorationFor(key: string): vscode.TextEditorDecorationType {
+    let deco = decorationByBands.get(key)
     if (!deco) {
-      const color = resolveHue(hue)
+      const bands = key.split("|")
       // A bar drawn as a gutter icon in the glyph margin, not inline `before` content: an inline
       // block pushes that line's text (and its indent guides) right, which only looked aligned
       // back when extents tiled every line. Line tags mark a few lines, so those lines jutted out.
       // The SVG fills an 18x18 cell (the glyph margin's width) and "cover" stretches it to the
-      // line height, keeping the bar full-height and centred.
-      const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 18 18"><rect x="${(18 - STRIP_WIDTH_PX) / 2}" width="${STRIP_WIDTH_PX}" height="18" fill="${color}"/></svg>`
+      // line height, keeping the bar full-height and centred. Overlapping facets split the bar
+      // into horizontal bands, one exact hex each, so a run of overlapping lines reads as a
+      // stripe of legend colours rather than a blend no legend entry has; crispEdges stops the
+      // scaled band boundaries anti-aliasing into a blended pixel row.
+      const height = 18 / bands.length
+      const rects = bands
+        .map(
+          (color, i) =>
+            `<rect x="${(18 - STRIP_WIDTH_PX) / 2}" y="${i * height}" width="${STRIP_WIDTH_PX}" height="${height}" fill="${color}"/>`,
+        )
+        .join("")
+      const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 18 18" shape-rendering="crispEdges">${rects}</svg>`
       deco = vscode.window.createTextEditorDecorationType({
         gutterIconPath: vscode.Uri.parse(`data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`),
         gutterIconSize: "cover",
-        overviewRulerColor: color,
+        // The ruler takes a single colour per mark and squeezes many lines into a pixel, so bands
+        // would blur back together there anyway: it shows their average instead.
+        overviewRulerColor: blend(bands),
         // Not Left: git's quick-diff marks live there at 60% alpha and composite over ours,
         // so a facet under a changed hunk showed a blended colour in the scrollbar.
         overviewRulerLane: vscode.OverviewRulerLane.Center,
       })
-      decorationByColor.set(hue, deco)
+      decorationByBands.set(key, deco)
     }
     return deco
   }
@@ -159,8 +172,8 @@ export function activate(context: vscode.ExtensionContext) {
     log(`lines ${relPath}: ${lineTags.length} tags`)
 
     // Resolve a hue per LINE: two rules can mark the same line, and two decorations on one line
-    // would double-draw the strip. Every hue on the line is collected, then lineColor picks one:
-    // active facets beat the muted hue, and several active facets blend.
+    // would double-draw the strip. Every hue on the line is collected, then lineBands picks the
+    // bands: active facets beat the muted hue, and several active facets each get a band.
     const huesByLine = new Map<number, Set<string>>()
     for (const tag of lineTags) {
       const hue = hueForTag(tag)
@@ -168,14 +181,15 @@ export function activate(context: vscode.ExtensionContext) {
       for (let line = Math.max(0, tag.startLine - 1); line <= tag.endLine - 1; line++)
         huesByLine.set(line, (huesByLine.get(line) ?? new Set()).add(hue))
     }
-    const hueByLine = new Map([...huesByLine].map(([line, hues]) => [line, lineColor(hues)!]))
+    const legendOrder = facetLegend.map((e) => e.color)
+    const bandsByLine = new Map([...huesByLine].map(([line, hues]) => [line, lineBands(hues, legendOrder).join("|")]))
 
-    // One range per line, so each line carries exactly one bar in its resolved hue. The range
+    // One range per line, so each line carries exactly one bar in its resolved bands. The range
     // spans the line's text because VSCode raises a decoration's hover over text only, never
-    // over its gutter icon; the hover lists every facet on the line, not just the one that won
-    // the bar.
-    const rangesByColor = new Map<string, vscode.DecorationOptions[]>()
-    for (const [line, hue] of hueByLine) {
+    // over its gutter icon; the hover lists every facet on the line, not just the first
+    // band.
+    const rangesByBands = new Map<string, vscode.DecorationOptions[]>()
+    for (const [line, bands] of bandsByLine) {
       if (line >= editor.document.lineCount) continue
       const markdown = lineHover(
         lineTags.filter((t) => t.startLine - 1 <= line && line <= t.endLine - 1),
@@ -183,14 +197,14 @@ export function activate(context: vscode.ExtensionContext) {
       )
       const hover = new vscode.MarkdownString(markdown)
       hover.supportHtml = true
-      const list = rangesByColor.get(hue) ?? []
+      const list = rangesByBands.get(bands) ?? []
       list.push({ range: editor.document.lineAt(line).range, ...(markdown ? { hoverMessage: hover } : {}) })
-      rangesByColor.set(hue, list)
+      rangesByBands.set(bands, list)
     }
 
-    // Apply present colors and clear any cached color absent this pass.
-    for (const color of new Set([...decorationByColor.keys(), ...rangesByColor.keys()])) {
-      editor.setDecorations(decorationFor(color), rangesByColor.get(color) ?? [])
+    // Apply present combinations and clear any cached combination absent this pass.
+    for (const key of new Set([...decorationByBands.keys(), ...rangesByBands.keys()])) {
+      editor.setDecorations(decorationFor(key), rangesByBands.get(key) ?? [])
     }
   }
 
@@ -806,8 +820,8 @@ export function deactivate() {
   if (fileSetTimer) clearTimeout(fileSetTimer)
   sse?.abort()
   sse = undefined
-  for (const deco of decorationByColor.values()) deco.dispose()
-  decorationByColor.clear()
+  for (const deco of decorationByBands.values()) deco.dispose()
+  decorationByBands.clear()
 }
 
 function delay(ms: number): Promise<void> {
